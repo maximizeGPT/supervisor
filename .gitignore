@@ -6,6 +6,9 @@ Package.resolved
 *.xcworkspace/
 DerivedData/
 
+# Build output (.app bundles produced by Scripts/build-app.sh)
+build/
+
 # Compiled spike binaries (rebuilt from source as needed)
 spikes/kqueue_spike
 spikes/notify_spike
