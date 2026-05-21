@@ -1,0 +1,31 @@
+# Swift / SPM
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# Compiled spike binaries (rebuilt from source as needed)
+spikes/kqueue_spike
+spikes/notify_spike
+spikes/NotifySpike.app/
+spikes/*.log
+spikes/*.err
+spikes/entitlements.plist
+
+# macOS
+.DS_Store
+*.swp
+
+# Secrets
+*.env
+.env
+.env.*
+ANTHROPIC_API_KEY
+secrets/
+
+# Local test artifacts
+test-output/
+coverage/
+*.xcresult
