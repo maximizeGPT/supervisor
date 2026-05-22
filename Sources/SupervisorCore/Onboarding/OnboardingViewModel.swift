@@ -128,6 +128,19 @@ public final class OnboardingViewModel: ObservableObject {
         }
     }
 
+    /// User clicked "Skip for now" on the AX step. Matches the §6.6
+    /// proceed-with-degradation philosophy (same shape as the Notifications
+    /// step's denied → continue-anyway path). v0.1.0 has no Inject
+    /// intervention so AX isn't actually used at runtime; for v0.1.1+ a
+    /// PermissionMonitor event will re-surface the popover when the user
+    /// triggers an action that needs AX.
+    public func skipAX() async {
+        guard case .axCheck = state else { return }
+        let status = await permissions.notificationStatus()
+        trace.emit("onboarding", "AX skipped by user; advancing to notif step (notif=\(status))")
+        state = .notifCheck(status: status)
+    }
+
     /// Ask macOS to prompt the user for notifications. On success, re-poll
     /// status and refresh state. Handles the Spike-2 "Code=1" error path
     /// by treating it as denied and advancing — the user can still see

@@ -211,6 +211,24 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         if notifDegraded {
             trace.emit("app", "running with notification degradation (banner suppressed; flags still appear in Notification Center)")
         }
+
+        // Catch users who skipped onboarding (key + AX already present in
+        // Keychain from a previous run) but whose notification permission
+        // was never requested. Without this, `getNotificationSettings`
+        // stays at .notDetermined forever and flags land silently in
+        // Notification Center rather than as banners. Fires once on entry;
+        // macOS shows the prompt only the first time per app identity.
+        Task { [weak self] in
+            guard let self = self else { return }
+            let status = await self.permissions.notificationStatus()
+            if status == .notDetermined {
+                self.trace.emit("app", "notification status notDetermined on running-state entry — requesting once")
+                _ = try? await self.permissions.requestNotifications()
+                let after = await self.permissions.notificationStatus()
+                self.trace.emit("app", "notification status after request: \(after)")
+            }
+        }
+
         trace.emit("app", "running state ready — watching \(paths.claudeProjectsDir.path)")
     }
 

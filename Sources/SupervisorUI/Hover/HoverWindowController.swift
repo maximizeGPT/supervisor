@@ -13,6 +13,19 @@ import SupervisorCore
 @MainActor
 public final class HoverWindowController {
 
+    /// Single source of truth for the hover panel's dimensions. Used at
+    /// init (contentRect), at position-time (origin math), and at every
+    /// re-anchor. Don't compute the size from `panel.frame.size` —
+    /// during early init the panel reports (0, 0) until the SwiftUI
+    /// hosting controller realizes its content. We hit that exact bug
+    /// during the Checkpoint C visual smoke: the hover ended up at
+    /// (1908, 2)–(2148, 42), only the leftmost 12 px on-screen. Caught
+    /// by Mohammed reporting "some bubble top right but not sure".
+    public static let panelSize = NSSize(width: 240, height: 40)
+
+    /// Pixel inset from the right edge and top edge of visibleFrame.
+    private static let edgeInset: CGFloat = 12
+
     private let vm: HoverViewModel
     private let panel: NSPanel
 
@@ -20,7 +33,7 @@ public final class HoverWindowController {
         self.vm = vm
 
         let panel = HoverPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 240, height: 40),
+            contentRect: NSRect(origin: .zero, size: Self.panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: true
@@ -50,10 +63,18 @@ public final class HoverWindowController {
     private func positionTopRight() {
         guard let screen = NSScreen.main else { return }
         let frame = screen.visibleFrame
-        let panelSize = panel.frame.size
+
+        // Belt: pin the content size now so layout has the right rect.
+        panel.setContentSize(Self.panelSize)
+
+        // Suspenders: compute origin from the known constant, not from
+        // `panel.frame.size`. If the SwiftUI hosting controller hasn't
+        // realized layout yet (Checkpoint-C-visual-smoke bug), frame.size
+        // can be (0, 0) — using the constant makes the position correct
+        // regardless of init timing.
         let origin = NSPoint(
-            x: frame.maxX - panelSize.width - 12,
-            y: frame.maxY - panelSize.height - 12
+            x: frame.maxX - Self.panelSize.width - Self.edgeInset,
+            y: frame.maxY - Self.panelSize.height - Self.edgeInset
         )
         panel.setFrameOrigin(origin)
     }

@@ -35,6 +35,10 @@ struct AXCheckStep: View {
                     Task { await vm.recheckAX() }
                 }
 
+                Button("Skip") {
+                    Task { await vm.skipAX() }
+                }
+
                 Spacer()
 
                 if prompted {
@@ -44,7 +48,7 @@ struct AXCheckStep: View {
                 }
             }
 
-            Text("Tip: if Supervisor doesn't appear in the list after you click the toggle, drag Supervisor.app from Finder into the list.")
+            Text("Skip is fine — v0.1.0's intervention surface is notify-only and doesn't use Accessibility. Inject (v0.1.1+) will prompt you again when it's needed. If macOS isn't accepting your grant (a known unsigned-app pattern), use Skip and continue.")
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
