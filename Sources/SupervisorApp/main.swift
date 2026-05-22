@@ -177,7 +177,11 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             trace: trace
         )
         engine.onActivityChange = { [weak self] activity in
-            self?.hoverVM?.acknowledgeFlag()  // brief idle reset between flags
+            // No pre-acknowledge: triageFinishedNoFlag already sets idle,
+            // and unconditional acknowledgeFlag floods the trace log
+            // with "flag acknowledged" on every transition (caught during
+            // the Checkpoint C smoke — was producing ~3500 false-trace
+            // lines in 20s of light activity).
             switch activity {
             case .triaging:           self?.hoverVM?.triageStarted()
             case .idle:               self?.hoverVM?.triageFinishedNoFlag()

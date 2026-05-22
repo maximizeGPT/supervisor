@@ -73,6 +73,15 @@ let package = Package(
             dependencies: ["SupervisorCore"],
             path: "Sources/SupervisorStatusBar"
         ),
+        // Dev helper: writes the Anthropic key into the same Keychain
+        // entry Supervisor reads, via KeychainAccess (same ACL identity).
+        // Not built into release bundles; used during Checkpoint C smoke
+        // and any time a developer needs to bypass onboarding.
+        .executableTarget(
+            name: "SupervisorDevTools",
+            dependencies: ["SupervisorCore"],
+            path: "Sources/SupervisorDevTools"
+        ),
         .testTarget(
             name: "SupervisorCoreTests",
             dependencies: ["SupervisorCore"],
