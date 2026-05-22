@@ -1,21 +1,21 @@
-// SupervisorApp main entry — Phase B.5.
+// SupervisorApp main entry — Phase C lifecycle.
 //
-// Lifecycle:
-//   1. Boot SupervisorCore: ConfigPaths, TraceLog, PermissionChecker.
-//   2. Decide whether onboarding is needed (key missing OR AX missing).
-//      - Needed → present OnboardingWindowController; the window owns the
-//        view model and signals completion via callback.
-//      - Not needed → straight to running state.
-//   3. Running state:
-//        - Spawn the SupervisorHeartbeat companion as a child process.
-//        - Start PermissionMonitor; subscribe to its events.
-//        - On axRevoked → show PermissionLostPopover.
-//        - On axRegranted → dismiss the popover.
-//   4. On `applicationWillTerminate` → terminate the heartbeat child so
-//      the status bar transitions to red without lag.
+// Boots SupervisorCore, runs onboarding if needed, then enters the
+// running state:
 //
-// Phase C will add the hover window. Phase B is "main app comes up and
-// stays up; status bar goes green; AX revocation triggers the popover."
+//   - Spawns SupervisorHeartbeat as a child process
+//   - Starts PermissionMonitor (AX revoke → popover)
+//   - Opens SupervisorDatabase (sessions / flags / cost)
+//   - Constructs AnthropicClient with key from Keychain + DefaultRedactor
+//   - Constructs HoverViewModel + HoverWindowController
+//   - Starts TriageEngine, wires onDecision to FlagStore + Notifier +
+//     HoverViewModel.flagRaised
+//   - Starts SessionDiscovery on ~/.claude/projects/ — sessions arrive
+//     into EventBus, TriageEngine pulls them and flags
+//
+// On clean exit: teardown is the reverse. Crash-survival of the
+// heartbeat companion is Phase C.x — for v0.1.0 a crash of main leaks
+// the child until the user kills it manually.
 
 import AppKit
 import Combine
@@ -31,10 +31,28 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private let permissions: any PermissionChecker
     private let keyStore: any APIKeyStore
 
+    // Onboarding
     private var onboarding: OnboardingWindowController?
+
+    // Running state
+    private var hoverVM: HoverViewModel?
+    private var hoverWindow: HoverWindowController?
+    private var database: SupervisorDatabase?
+    private var sessionStore: SessionStore?
+    private var flagStore: FlagStore?
+    private var costStore: CostStore?
+    private var anthropic: AnthropicClient?
+    private var triageEngine: TriageEngine?
+    private var discovery: SessionDiscovery?
+    private var notifier: Notifier?
+    private var bus: EventBus?
+
+    // Permission monitor
     private var permissionMonitor: PermissionMonitor?
     private var permissionPopover: PermissionLostPopover?
     private var permissionCancellable: AnyCancellable?
+
+    // Heartbeat child
     private var heartbeatProcess: Process?
 
     override init() {
@@ -50,7 +68,6 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         trace.emit("app", "applicationDidFinishLaunching pid=\(ProcessInfo.processInfo.processIdentifier)")
 
-        // Determine entry point.
         let hasKey: Bool = ((try? keyStore.read()) ?? nil) != nil
         let axOK = permissions.isAXGranted()
 
@@ -65,23 +82,21 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         trace.emit("app", "applicationWillTerminate; tearing down")
-        stopHeartbeat()
+        triageEngine?.stop()
+        discovery?.stop()
         permissionMonitor?.stop()
+        hoverWindow?.dismiss()
+        stopHeartbeat()
         trace.sync()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        // Hot-probe permissions so a user touching System Settings is
-        // reflected immediately when they come back to Supervisor.
         Task { await permissionMonitor?.probeNow() }
     }
 
     // MARK: - Onboarding
 
     private func presentOnboarding() {
-        // Force activation policy to .regular while onboarding is up so the
-        // window can become key & accept input. We drop back to .accessory
-        // once onboarding completes (no dock icon, menu-bar-app shape).
         NSApp.setActivationPolicy(.regular)
 
         let vm = OnboardingViewModel(
@@ -107,36 +122,134 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         trace.emit("app", "onboarding complete notifDegraded=\(notifDegraded)")
         onboarding?.dismiss()
         onboarding = nil
-        NSApp.setActivationPolicy(.accessory)   // back to menu-bar-only
+        NSApp.setActivationPolicy(.accessory)
         enterRunningState(notifDegraded: notifDegraded)
     }
 
     // MARK: - Running state
 
     private func enterRunningState(notifDegraded: Bool) {
+        // 1. Storage
+        do {
+            let db = try SupervisorDatabase(path: paths.databasePath)
+            self.database = db
+            self.sessionStore = SessionStore(database: db)
+            self.flagStore = FlagStore(database: db)
+            self.costStore = CostStore(database: db)
+            trace.emit("app", "storage opened at \(paths.databasePath.path)")
+        } catch {
+            trace.emit("app", "FATAL: storage open failed: \(error)")
+            return
+        }
+
+        // 2. Bus + Hover
+        let bus = EventBus(trace: trace)
+        self.bus = bus
+        let hoverVM = HoverViewModel(bus: bus, trace: trace)
+        self.hoverVM = hoverVM
+        let hoverWindow = HoverWindowController(vm: hoverVM)
+        self.hoverWindow = hoverWindow
+        hoverWindow.present()
+
+        // 3. Anthropic client (key required — should be present post-onboarding)
+        guard let key = (try? keyStore.read()) ?? nil else {
+            trace.emit("app", "FATAL: no API key after onboarding; aborting")
+            return
+        }
+        let client = AnthropicClient(
+            apiKey: key,
+            redactor: DefaultRedactor(),
+            traceLog: trace
+        )
+        self.anthropic = client
+
+        // 4. Notifier
+        let notifier = Notifier(trace: trace)
+        self.notifier = notifier
+
+        // 5. Triage engine
+        let engine = TriageEngine(
+            client: client,
+            bus: bus,
+            model: Config.defaults.triageModel,
+            windowSize: 30,
+            costStore: costStore,
+            trace: trace
+        )
+        engine.onActivityChange = { [weak self] activity in
+            self?.hoverVM?.acknowledgeFlag()  // brief idle reset between flags
+            switch activity {
+            case .triaging:           self?.hoverVM?.triageStarted()
+            case .idle:               self?.hoverVM?.triageFinishedNoFlag()
+            case .flagged(let sev):   self?.hoverVM?.flagRaised(severity: sev)
+            }
+        }
+        engine.onDecision = { [weak self] decision in
+            Task { @MainActor in self?.handle(decision: decision) }
+        }
+        engine.start()
+        self.triageEngine = engine
+
+        // 6. Discovery (kicks off tails for every Claude Code session)
+        let discovery = SessionDiscovery(
+            claudeProjectsDir: paths.claudeProjectsDir,
+            bus: bus,
+            sessionStore: sessionStore,
+            trace: trace
+        )
+        discovery.start()
+        self.discovery = discovery
+
+        // 7. Companions: heartbeat + permission monitor
         startHeartbeat()
         startPermissionMonitor()
 
         if notifDegraded {
-            trace.emit("app", "running with notif degradation (banners suppressed)")
-            // Phase C will surface this in the hover window. For Phase B
-            // it's only in the trace log.
+            trace.emit("app", "running with notification degradation (banner suppressed; flags still appear in Notification Center)")
         }
+        trace.emit("app", "running state ready — watching \(paths.claudeProjectsDir.path)")
+    }
+
+    // MARK: - Flag routing
+
+    private func handle(decision: TriageDecision) {
+        // 1. Persist to flags table.
+        let flag = StoredFlag(
+            sessionId: decision.sessionId,
+            category: decision.candidate.category,
+            severity: decision.candidate.severity,
+            action: .notify,                          // v0.1.0 is notify-only
+            reasoning: decision.candidate.reasoning,
+            evidenceUuids: [decision.triggeringEvent.toolUseId],
+            haikuInputTokens: decision.usage.input_tokens,
+            haikuOutputTokens: decision.usage.output_tokens
+        )
+        do {
+            try flagStore?.insert(flag)
+            trace.emit("flag", "persisted id=\(flag.id) severity=\(flag.severity.rawValue) session=\(flag.sessionId)")
+        } catch {
+            trace.emit("flag", "ERROR persist failed: \(error)")
+        }
+
+        // 2. Post notification.
+        Task {
+            let outcome = await notifier?.post(decision: decision)
+            trace.emit("flag", "notifier outcome: \(outcome.map { "\($0)" } ?? "(no notifier)")")
+        }
+
+        // 3. Hover view already updated by engine.onActivityChange.
     }
 
     // MARK: - Heartbeat child
 
     private func startHeartbeat() {
         stopHeartbeat()
-
         guard let url = locateHeartbeatExecutable() else {
             trace.emit("app", "ERROR cannot locate SupervisorHeartbeat executable")
             return
         }
-
         let proc = Process()
         proc.executableURL = url
-        proc.arguments = []
         do {
             try proc.run()
             heartbeatProcess = proc
@@ -153,8 +266,6 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         heartbeatProcess = nil
     }
 
-    /// Search candidates in bundle Resources, alongside the main executable,
-    /// and in the SwiftPM .build tree. Whichever exists wins.
     private func locateHeartbeatExecutable() -> URL? {
         var candidates: [URL] = []
         if let res = Bundle.main.resourceURL {
@@ -162,12 +273,6 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         }
         if let exec = Bundle.main.executableURL {
             candidates.append(exec.deletingLastPathComponent().appendingPathComponent("SupervisorHeartbeat"))
-        }
-        // Dev-build fallback. Walk up from the running executable looking
-        // for a sibling SupervisorHeartbeat binary in the SwiftPM layout.
-        if let exec = Bundle.main.executableURL {
-            let buildDir = exec.deletingLastPathComponent()
-            candidates.append(buildDir.appendingPathComponent("SupervisorHeartbeat"))
         }
         for candidate in candidates {
             if FileManager.default.isExecutableFile(atPath: candidate.path) {
@@ -210,16 +315,11 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 }
 
 // MARK: - Bootstrap
-//
-// Top-level main.swift runs in a nonisolated context, but the delegate is
-// @MainActor-isolated. Bootstrap is single-threaded on the main thread,
-// so `MainActor.assumeIsolated` is the correct bridge.
 
 MainActor.assumeIsolated {
     let delegate = SupervisorAppDelegate()
     let app = NSApplication.shared
     app.delegate = delegate
-    // Start as .accessory; onboarding flips to .regular while needed.
     app.setActivationPolicy(.accessory)
     app.run()
 }
