@@ -5,20 +5,23 @@
 //
 // Five targets:
 //   - SupervisorCore        : non-UI library; observation, triage, escalation,
-//                             intervention, storage, AnthropicClient, redaction.
-//   - SupervisorApp         : the main @main executable (Phase B+).
+//                             intervention, storage, AnthropicClient, redaction,
+//                             permission probes, onboarding state machine.
+//   - SupervisorUI          : SwiftUI/AppKit presentation layer. Depends on Core;
+//                             Core never depends on UI.
+//   - SupervisorApp         : the main @main executable. Wires Core + UI,
+//                             spawns the heartbeat companion, hosts the
+//                             PermissionMonitor and PermissionLostPopover.
 //   - SupervisorHeartbeat   : tiny companion that writes a heartbeat file
-//                             every 5s while the main app is alive. No
-//                             AnthropicClient, no file tailing, no UI.
+//                             every 5s while the main app is alive.
 //   - SupervisorStatusBar   : tiny menu-bar-only companion that reads the
 //                             heartbeat file and reports red/amber/green
 //                             health. Survives crashes of the main app.
 //   - SupervisorCoreTests   : unit tests for SupervisorCore.
 //
-// The build graph enforces "companion processes can't accidentally cost
-// money": Heartbeat and StatusBar depend on SupervisorCore but the
-// AnthropicClient module is only invoked from SupervisorApp + the Triage
-// engine. Network calls cannot originate from the companions.
+// Build-graph enforcement: Heartbeat and StatusBar depend on SupervisorCore
+// but the AnthropicClient module is only invoked from SupervisorApp + the
+// (future) Triage engine. Network calls cannot originate from the companions.
 
 import PackageDescription
 
@@ -29,6 +32,8 @@ let package = Package(
     ],
     products: [
         .library(name: "SupervisorCore", targets: ["SupervisorCore"]),
+        .library(name: "SupervisorUI", targets: ["SupervisorUI"]),
+        .executable(name: "Supervisor", targets: ["SupervisorApp"]),
         .executable(name: "SupervisorHeartbeat", targets: ["SupervisorHeartbeat"]),
         .executable(name: "SupervisorStatusBar", targets: ["SupervisorStatusBar"]),
     ],
@@ -47,6 +52,16 @@ let package = Package(
                 .product(name: "KeychainAccess", package: "KeychainAccess"),
             ],
             path: "Sources/SupervisorCore"
+        ),
+        .target(
+            name: "SupervisorUI",
+            dependencies: ["SupervisorCore"],
+            path: "Sources/SupervisorUI"
+        ),
+        .executableTarget(
+            name: "SupervisorApp",
+            dependencies: ["SupervisorCore", "SupervisorUI"],
+            path: "Sources/SupervisorApp"
         ),
         .executableTarget(
             name: "SupervisorHeartbeat",

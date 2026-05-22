@@ -11,7 +11,10 @@
 import Foundation
 import GRDB
 
-public final class SupervisorDatabase {
+public final class SupervisorDatabase: @unchecked Sendable {
+    // GRDB's DatabaseQueue serializes all access internally — safe to share
+    // across threads. @unchecked because GRDB hasn't yet annotated for
+    // Sendable; revisit if/when they do.
 
     public let queue: DatabaseQueue
 

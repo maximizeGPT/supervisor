@@ -8,7 +8,7 @@
 // can coexist on the same machine via different service names.
 
 import Foundation
-import KeychainAccess
+@preconcurrency import KeychainAccess
 
 public protocol APIKeyStore: Sendable {
     /// Stored key, or nil if not set.
@@ -19,7 +19,11 @@ public protocol APIKeyStore: Sendable {
     func delete() throws
 }
 
-public struct KeychainAPIKeyStore: APIKeyStore {
+public struct KeychainAPIKeyStore: APIKeyStore, @unchecked Sendable {
+    // KeychainAccess's `Keychain` type isn't Sendable-annotated; all of its
+    // operations are thread-safe under the hood (backed by Apple's Security
+    // framework, which is documented as such). @unchecked is the pragmatic
+    // path until KeychainAccess gains real Sendable conformance.
 
     public static let defaultService = "live.supervisor.api"
     public static let accountName = "anthropic-api-key"
