@@ -7,7 +7,7 @@
 // JSONL files.
 //
 // v0.1.0 watches every project we can see — we don't filter to a
-// specific cwd. Mohammed's machine has a single project (-Users-main),
+// specific cwd. my machine has a single project (-Users-main),
 // so the simple "all projects, all sessions" approach is fine. Multi-
 // project filtering is a v0.1.2 setting.
 

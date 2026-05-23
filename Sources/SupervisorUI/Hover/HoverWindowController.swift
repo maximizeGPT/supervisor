@@ -20,7 +20,7 @@ public final class HoverWindowController {
     /// hosting controller realizes its content. We hit that exact bug
     /// during the Checkpoint C visual smoke: the hover ended up at
     /// (1908, 2)–(2148, 42), only the leftmost 12 px on-screen. Caught
-    /// by Mohammed reporting "some bubble top right but not sure".
+    /// when I reported "some bubble top right but not sure".
     public static let panelSize = NSSize(width: 240, height: 40)
 
     /// Pixel inset from the right edge and top edge of visibleFrame.

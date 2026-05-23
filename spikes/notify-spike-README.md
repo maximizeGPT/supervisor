@@ -4,7 +4,7 @@
 
 Whether `UNUserNotificationCenter` (the modern macOS notification API)
 works for an unsigned, ad-hoc-built Supervisor.app — i.e. a v0.1.0 build
-on Mohammed's own Mac, with no Apple Developer ID, no notarization.
+on my own Mac, with no Apple Developer ID, no notarization.
 
 The realistic worry: Apple has been tightening notification entitlements
 over the last few macOS releases. If the framework refuses to even
