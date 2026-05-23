@@ -58,7 +58,7 @@ public enum TriagePrompt {
                             "properties": .object([
                                 "category": .object([
                                     "type": .string("string"),
-                                    "enum": .array([.string(HardcodedRubric.categoryName)])
+                                    "enum": .array(HardcodedRubric.allNames.map { .string($0) })
                                 ]),
                                 "severity": .object([
                                     "type": .string("string"),
@@ -172,9 +172,13 @@ public enum TriagePrompt {
 
     Call `record_triage` exactly once. If no candidate fires, call it with `candidates: []` — no other fields needed for the empty case.
 
-    # Category: \(HardcodedRubric.categoryName)
+    ## Multiple categories
 
-    \(HardcodedRubric.body)
+    More than one category may match on the same event window — for example, a `rm -rf` against `~/.ssh/known_hosts` could fire BOTH `destructive_action_pending` (the rm pattern) AND `edits_outside_worktree` (a modify outside cwd against a path outside safe-roots). In that case, return a candidate for EACH category that matches. The router downstream will pick the highest-severity action across all candidates.
+
+    # Categories
+
+    \(HardcodedRubric.allBodiesMarkdown)
     """
 
     /// Build the full Anthropic request payload.

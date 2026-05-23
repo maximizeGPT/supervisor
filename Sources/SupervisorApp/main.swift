@@ -148,7 +148,12 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         self.bus = bus
         let hoverVM = HoverViewModel(bus: bus, trace: trace)
         self.hoverVM = hoverVM
-        let hoverWindow = HoverWindowController(vm: hoverVM)
+        // v0.1.4 Gap 8: hover visibility depends on whether Supervisor
+        // is actually tailing a session. discovery is constructed later
+        // (step 6) so we read it lazily via a closure capturing self.
+        let hoverWindow = HoverWindowController(vm: hoverVM, isAnySessionActive: { [weak self] in
+            (self?.discovery?.activeSessions().isEmpty == false)
+        })
         self.hoverWindow = hoverWindow
         hoverWindow.present()
 
@@ -193,8 +198,8 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             // lines in 20s of light activity).
             switch activity {
             case .triaging:           self?.hoverVM?.triageStarted()
-            case .idle:               self?.hoverVM?.triageFinishedNoFlag()
-            case .flagged(let sev):   self?.hoverVM?.flagRaised(severity: sev)
+            case .idle:                                self?.hoverVM?.triageFinishedNoFlag()
+            case .flagged(let sev, let action):        self?.hoverVM?.flagRaised(severity: sev, action: action)
             }
         }
         engine.onDecision = { [weak self] decision in

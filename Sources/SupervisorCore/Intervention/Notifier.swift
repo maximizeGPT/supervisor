@@ -22,6 +22,38 @@ import UserNotifications
 /// aborts on missing CFBundleIdentifier).
 public protocol Notifying: Sendable {
     func post(decision: TriageDecision) async -> Notifier.Outcome
+
+    /// v0.1.4 Gap 1+2+3: post a banner whose body reflects whether the
+    /// router's pause/kill executor actually fired. Has a default
+    /// implementation that delegates to `post(decision:)` so existing
+    /// mocks keep compiling — real Notifier overrides to surface the
+    /// outcome-specific copy (pause → PID + `kill -CONT` recovery;
+    /// kill → "start a new claude invocation" follow-on).
+    func postInterventionResult(
+        decision: TriageDecision,
+        outcome: InterventionOutcome
+    ) async -> Notifier.Outcome
+}
+
+public extension Notifying {
+    func postInterventionResult(
+        decision: TriageDecision,
+        outcome: InterventionOutcome
+    ) async -> Notifier.Outcome {
+        await post(decision: decision)
+    }
+}
+
+/// What the router actually did, used by Notifier to compose the right
+/// banner body. `notifyOnly` is the default (action == .notify, or any
+/// degraded pause/kill that fell back to a banner). `pauseSucceeded` /
+/// `killSucceeded` only flow when the SIGSTOP / SIGTERM actually
+/// landed — the banner then includes the recovery information the user
+/// needs to act.
+public enum InterventionOutcome: Sendable, Equatable {
+    case notifyOnly
+    case pauseSucceeded(pid: pid_t)
+    case killSucceeded
 }
 
 public final class Notifier: Notifying, @unchecked Sendable {
@@ -91,6 +123,65 @@ public final class Notifier: Notifying, @unchecked Sendable {
     /// executed?" section of the triage prompt.
     public func body(for decision: TriageDecision) -> String {
         Self.bannerPrefix + decision.candidate.reasoningPlain
+    }
+
+    /// v0.1.4 Gap 1+2+3: outcome-aware body composer. The pause case
+    /// appends a recovery hint with the PID so the user can `kill -CONT`
+    /// without needing to look it up. The kill case appends a follow-on
+    /// pointer so the user knows the session ended and how to continue.
+    /// `notifyOnly` is identical to the v0.1.2 body shape.
+    public func body(for decision: TriageDecision, outcome: InterventionOutcome) -> String {
+        let base = Self.bannerPrefix + decision.candidate.reasoningPlain
+        switch outcome {
+        case .notifyOnly:
+            return base
+        case .pauseSucceeded(let pid):
+            return base + " Session paused. To resume: `kill -CONT \(pid)`."
+        case .killSucceeded:
+            return base + " Session killed. Start a new `claude` invocation to continue."
+        }
+    }
+
+    /// v0.1.4 Gap 1+2+3: post a banner reflecting the actual outcome
+    /// of the intervention. The router calls this after a successful
+    /// SIGSTOP / SIGTERM (and on the existing notify path) so the user
+    /// gets ONE consistent surface for "Supervisor did X" no matter
+    /// which executor handled the verdict.
+    @discardableResult
+    public func postInterventionResult(
+        decision: TriageDecision,
+        outcome: InterventionOutcome
+    ) async -> Outcome {
+        let content = UNMutableNotificationContent()
+        content.title = "Supervisor: \(decision.candidate.category)"
+        content.body = body(for: decision, outcome: outcome)
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "supervisor.flag.\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        let settings = await currentSettings()
+        do {
+            try await center.add(request)
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                trace.emit("notifier", "posted outcome=\(outcome) category=\(decision.candidate.category) severity=\(decision.candidate.severity.rawValue)")
+                return .posted
+            case .denied:
+                trace.emit("notifier", "added to Notification Center (banner suppressed) outcome=\(outcome): \(decision.candidate.reasoningPlain.prefix(80))")
+                return .skippedDeniedSilently
+            case .notDetermined:
+                trace.emit("notifier", "notification status notDetermined outcome=\(outcome)")
+                return .posted
+            @unknown default:
+                return .posted
+            }
+        } catch {
+            trace.emit("notifier", "ERROR center.add threw outcome=\(outcome): \(error)")
+            return .failed(reason: "\(error)")
+        }
     }
 
     private func currentSettings() async -> UNNotificationSettings {

@@ -202,7 +202,7 @@ public final class TriageEngine {
             if let note = candidate.asymmetryNote, !note.isEmpty {
                 trace.emit("triage", "FLAG.asymmetry session=\(call.sessionId) \(note)")
             }
-            onActivityChange?(.flagged(severity: candidate.severity))
+            onActivityChange?(.flagged(severity: candidate.severity, action: candidate.action))
             onDecision?(decision)
         }
     }

@@ -64,7 +64,7 @@ public final class InterventionRouter {
     // MARK: - Executors
 
     private func postNotify(_ decision: TriageDecision) async {
-        let outcome = await notifier.post(decision: decision)
+        let outcome = await notifier.postInterventionResult(decision: decision, outcome: .notifyOnly)
         trace.emit("router", "intervention.notify.posted outcome=\(outcome)")
     }
 
@@ -85,6 +85,13 @@ public final class InterventionRouter {
         do {
             try signalSender.send(signal, to: handle.pid)
             trace.emit("router", "intervention.\(opName).fired pid=\(handle.pid) signal=\(signal) cwd=\(cwd)")
+            // v0.1.4 Gap 1+2+3: post the outcome-aware banner so the
+            // user has a visible signal of the successful intervention
+            // and (for pause) the recovery instruction.
+            let outcome: InterventionOutcome = (signal == SIGSTOP)
+                ? .pauseSucceeded(pid: handle.pid)
+                : .killSucceeded
+            _ = await notifier.postInterventionResult(decision: decision, outcome: outcome)
         } catch let err as SignalError {
             let reason: String
             if err.isProcessGone {

@@ -23,7 +23,13 @@ final class InterventionRouterTests: XCTestCase {
     // MARK: - Mocks
 
     final class MockNotifier: Notifying, @unchecked Sendable {
-        struct Posted { let decision: TriageDecision }
+        struct Posted {
+            let decision: TriageDecision
+            /// `nil` when the router called the legacy `post(decision:)`;
+            /// set to the outcome passed when router called the v0.1.4
+            /// `postInterventionResult(decision:outcome:)`.
+            let outcome: InterventionOutcome?
+        }
         private let lock = NSLock()
         private var _calls: [Posted] = []
         var calls: [Posted] {
@@ -31,7 +37,14 @@ final class InterventionRouterTests: XCTestCase {
             return _calls
         }
         func post(decision: TriageDecision) async -> Notifier.Outcome {
-            lock.lock(); _calls.append(Posted(decision: decision)); lock.unlock()
+            lock.lock(); _calls.append(Posted(decision: decision, outcome: nil)); lock.unlock()
+            return .posted
+        }
+        func postInterventionResult(
+            decision: TriageDecision,
+            outcome: InterventionOutcome
+        ) async -> Notifier.Outcome {
+            lock.lock(); _calls.append(Posted(decision: decision, outcome: outcome)); lock.unlock()
             return .posted
         }
     }
@@ -115,22 +128,30 @@ final class InterventionRouterTests: XCTestCase {
         let (router, notifier, sender) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .notify))
         XCTAssertEqual(notifier.calls.count, 1)
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly,
+                       "notify path must post via postInterventionResult with .notifyOnly")
         XCTAssertTrue(sender.sent.isEmpty, "notify path must not send any signal")
     }
 
-    func testPauseDispatchSendsSIGSTOPToLocatedPID() async {
+    func testPauseDispatchSendsSIGSTOPAndPostsPauseBanner() async {
+        // v0.1.4 Gap 1+2+3: successful pause now ALSO posts an outcome-
+        // aware banner so the user has a visible signal + recovery info.
         let (router, notifier, sender) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertEqual(sender.sent, [.init(signal: SIGSTOP, pid: 4242)])
-        XCTAssertTrue(notifier.calls.isEmpty,
-                      "successful pause must NOT also fire a notify (the banner is the degraded path)")
+        XCTAssertEqual(notifier.calls.count, 1,
+                       "successful pause must post one outcome-aware banner")
+        XCTAssertEqual(notifier.calls.first?.outcome, .pauseSucceeded(pid: 4242),
+                       "banner outcome must carry the paused PID for the recovery copy")
     }
 
-    func testKillDispatchSendsSIGTERMToLocatedPID() async {
+    func testKillDispatchSendsSIGTERMAndPostsKillBanner() async {
         let (router, notifier, sender) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .kill))
         XCTAssertEqual(sender.sent, [.init(signal: SIGTERM, pid: 4242)])
-        XCTAssertTrue(notifier.calls.isEmpty)
+        XCTAssertEqual(notifier.calls.count, 1,
+                       "successful kill must post one outcome-aware banner")
+        XCTAssertEqual(notifier.calls.first?.outcome, .killSucceeded)
     }
 
     func testPauseLocatorNilDegradesToNotify() async {
@@ -138,6 +159,8 @@ final class InterventionRouterTests: XCTestCase {
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertTrue(sender.sent.isEmpty, "no signal sent when locator returns nil")
         XCTAssertEqual(notifier.calls.count, 1, "locator-nil must degrade to a notify banner")
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly,
+                       "degraded path must use .notifyOnly outcome (not a misleading pauseSucceeded)")
     }
 
     func testPausePermissionDeniedDegradesToNotify() async {
@@ -147,6 +170,7 @@ final class InterventionRouterTests: XCTestCase {
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertTrue(sender.sent.isEmpty, "send() threw before recording — no successful signal")
         XCTAssertEqual(notifier.calls.count, 1, "EPERM must degrade to notify")
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly)
     }
 
     func testPauseProcessGoneDegradesToNotify() async {
@@ -156,6 +180,7 @@ final class InterventionRouterTests: XCTestCase {
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertTrue(sender.sent.isEmpty)
         XCTAssertEqual(notifier.calls.count, 1, "ESRCH must degrade to notify")
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly)
     }
 
     func testPauseMissingCwdDegradesToNotifyWithoutCallingLocator() async {
@@ -197,6 +222,73 @@ final class InterventionRouterTests: XCTestCase {
         let (router, notifier, sender) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .inject))
         XCTAssertEqual(notifier.calls.count, 1, ".inject must degrade to notify in v0.1.4")
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly)
         XCTAssertTrue(sender.sent.isEmpty, ".inject must NOT send any signal")
+    }
+}
+
+// MARK: - Banner copy tests (Gap 1+2+3)
+
+/// Pure body-string assertions for the outcome-aware composer. Mirrors
+/// the NotifierTests pattern of using a shim instead of constructing a
+/// real Notifier (which crashes the xctest harness).
+final class NotifierOutcomeBodyTests: XCTestCase {
+
+    private func decision(plain: String = "Claude Code is about to delete the project dir.") -> TriageDecision {
+        TriageDecision(
+            sessionId: "s",
+            cwd: "/tmp/test",
+            candidate: TriageCandidate(
+                category: "destructive_action_pending",
+                severity: .high,
+                matchedCommand: "rm -rf /Users/main/x",
+                action: .pause,
+                reasoningPlain: plain,
+                reasoningTechnical: "tech"
+            ),
+            triggeringEvent: BashToolCallInfo(
+                sessionId: "s", command: "rm -rf /Users/main/x", description: nil,
+                toolUseId: "t1", turnUUID: "u1", ts: Date()
+            ),
+            usage: AnthropicUsage(input_tokens: 1, output_tokens: 1,
+                                   cache_creation_input_tokens: nil,
+                                   cache_read_input_tokens: nil),
+            model: "claude-haiku-4-5-20251001",
+            prePost: .preExecution
+        )
+    }
+
+    /// Body composer shim — same shape as the real `Notifier.body(for:outcome:)`,
+    /// extracted so we don't construct UNUserNotificationCenter.
+    private struct BodyShim {
+        func body(for d: TriageDecision, outcome: InterventionOutcome) -> String {
+            let base = Notifier.bannerPrefix + d.candidate.reasoningPlain
+            switch outcome {
+            case .notifyOnly:                return base
+            case .pauseSucceeded(let pid):   return base + " Session paused. To resume: `kill -CONT \(pid)`."
+            case .killSucceeded:             return base + " Session killed. Start a new `claude` invocation to continue."
+            }
+        }
+    }
+
+    func testNotifyOnlyBodyMatchesV012Shape() {
+        let s = BodyShim().body(for: decision(), outcome: .notifyOnly)
+        XCTAssertTrue(s.hasPrefix(Notifier.bannerPrefix))
+        XCTAssertFalse(s.contains("kill -CONT"))
+        XCTAssertFalse(s.contains("Start a new"))
+    }
+
+    func testPauseSucceededBodyIncludesPIDAndRecoveryString() {
+        let s = BodyShim().body(for: decision(), outcome: .pauseSucceeded(pid: 12345))
+        XCTAssertTrue(s.contains("kill -CONT 12345"),
+                      "pause banner must surface the literal kill -CONT command with the PID baked in")
+        XCTAssertTrue(s.contains("Session paused"))
+    }
+
+    func testKillSucceededBodyTellsUserToStartFreshClaude() {
+        let s = BodyShim().body(for: decision(), outcome: .killSucceeded)
+        XCTAssertTrue(s.contains("Start a new `claude` invocation"),
+                      "kill banner must direct the user to a fresh session as the recovery path")
+        XCTAssertTrue(s.contains("Session killed"))
     }
 }

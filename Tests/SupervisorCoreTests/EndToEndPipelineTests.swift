@@ -83,7 +83,9 @@ final class EndToEndPipelineTests: XCTestCase {
         // decision → flagStore.insert + Notifier copy + hoverVM.flagRaised.
         let routed = RoutedFlagSink()
         engine.onActivityChange = { activity in
-            if case .flagged(let sev) = activity { hoverVM.flagRaised(severity: sev) }
+            if case .flagged(let sev, let action) = activity {
+                hoverVM.flagRaised(severity: sev, action: action)
+            }
         }
         engine.onDecision = { decision in
             let flag = StoredFlag(
@@ -160,10 +162,11 @@ final class EndToEndPipelineTests: XCTestCase {
 
         // HoverViewModel state.
         XCTAssertEqual(hoverVM.flagCount, 1)
-        if case .flagged(let sev) = hoverVM.activity {
+        if case .flagged(let sev, let action) = hoverVM.activity {
             XCTAssertEqual(sev, .high)
+            XCTAssertEqual(action, .pause, "Haiku recommended pause; hover activity should carry that")
         } else {
-            XCTFail("hover activity should be .flagged(.high), got \(hoverVM.activity)")
+            XCTFail("hover activity should be .flagged(.high, ...), got \(hoverVM.activity)")
         }
         XCTAssertTrue(hoverVM.currentToolDescription.contains("Bash"),
                       "hover should show current tool, got: \(hoverVM.currentToolDescription)")

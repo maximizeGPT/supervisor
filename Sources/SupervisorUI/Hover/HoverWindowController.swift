@@ -5,6 +5,16 @@
 // doesn't interfere with the user's actual work).
 //
 // 240x40 sized exactly, with a 12pt offset from the menu bar / right edge.
+//
+// v0.1.4 Gap 8: the panel is only visible when a known terminal is
+// frontmost AND Supervisor is actively tailing at least one session.
+// The check runs on NSWorkspace.didActivateApplicationNotification
+// (immediate response to alt-tab) plus a 3s poll (catches the
+// session-becoming-active-without-app-switch case). The
+// `.nonactivatingPanel` styleMask + `orderFrontRegardless` keeps focus
+// with the user's frontmost app; `[.canJoinAllSpaces, .stationary,
+// .ignoresCycle]` collection behavior survives hide/show cycles
+// without losing the top-right anchor.
 
 import AppKit
 import SwiftUI
@@ -26,11 +36,35 @@ public final class HoverWindowController {
     /// Pixel inset from the right edge and top edge of visibleFrame.
     private static let edgeInset: CGFloat = 12
 
+    /// v0.1.4 Gap 8: bundle IDs we recognize as terminal emulators
+    /// where Claude Code might be running. Unknown bundle IDs are
+    /// treated as non-terminal and trigger hover hide. v0.1.5+ should
+    /// make this list user-configurable for users on terminal
+    /// emulators not in the default set (Electron-based VS Code /
+    /// Cursor integrated terminals, mosh, tmux-over-ssh on a remote).
+    /// See GH issue tracking that work.
+    public static let knownTerminalBundleIDs: Set<String> = [
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",
+        "com.mitchellh.ghostty",
+        "dev.warp.Warp-Stable",
+        "org.alacritty",
+    ]
+
     private let vm: HoverViewModel
     private let panel: NSPanel
+    private let isAnySessionActive: () -> Bool
 
-    public init(vm: HoverViewModel) {
+    private var workspaceObserver: NSObjectProtocol?
+    private var pollTimer: Timer?
+    private var currentlyVisible: Bool = false
+
+    public init(
+        vm: HoverViewModel,
+        isAnySessionActive: @escaping () -> Bool = { true }
+    ) {
         self.vm = vm
+        self.isAnySessionActive = isAnySessionActive
 
         let panel = HoverPanel(
             contentRect: NSRect(origin: .zero, size: Self.panelSize),
@@ -43,6 +77,12 @@ public final class HoverWindowController {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
+        // `.canJoinAllSpaces` keeps the panel pinned to the active
+        // Space so alt-tab → different Space + alt-tab back doesn't
+        // strand the panel on the old Space. `.stationary` prevents
+        // Mission Control / Expose from grouping the panel with app
+        // windows. `.ignoresCycle` keeps the panel out of Cmd-` /
+        // Cmd-Tab cycles.
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.isMovableByWindowBackground = false
         panel.isReleasedWhenClosed = false
@@ -52,12 +92,81 @@ public final class HoverWindowController {
     }
 
     public func present() {
-        positionTopRight()
-        panel.orderFrontRegardless()
+        // v0.1.4 Gap 8: don't unconditionally show. Hook up the
+        // visibility-deciding observer + poller, then apply once.
+        registerWorkspaceObserver()
+        startPollTimer()
+        applyVisibility()
     }
 
     public func dismiss() {
-        panel.orderOut(nil)
+        unregisterWorkspaceObserver()
+        stopPollTimer()
+        if currentlyVisible {
+            panel.orderOut(nil)
+            currentlyVisible = false
+        }
+    }
+
+    // MARK: - Visibility logic (Gap 8)
+
+    /// Compound visibility rule: show iff a recognized terminal is
+    /// frontmost AND Supervisor is tailing at least one session.
+    /// Re-applied on every workspace activation event + on a 3s poll.
+    private func applyVisibility() {
+        let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let frontmostIsTerminal = frontmostBundleID.map(Self.knownTerminalBundleIDs.contains) ?? false
+        let sessionActive = isAnySessionActive()
+        let shouldShow = frontmostIsTerminal && sessionActive
+
+        if shouldShow && !currentlyVisible {
+            positionTopRight()
+            // `.nonactivatingPanel` + `orderFrontRegardless()` shows
+            // the panel without activating Supervisor — focus stays
+            // with the user's frontmost terminal.
+            panel.orderFrontRegardless()
+            currentlyVisible = true
+        } else if !shouldShow && currentlyVisible {
+            panel.orderOut(nil)
+            currentlyVisible = false
+        }
+    }
+
+    private func registerWorkspaceObserver() {
+        guard workspaceObserver == nil else { return }
+        let ws = NSWorkspace.shared
+        workspaceObserver = ws.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // The observer queue is `.main`, so this fires on the main
+            // thread; we hop to the @MainActor context explicitly to
+            // satisfy Swift concurrency without doubling up the dispatch.
+            Task { @MainActor in self?.applyVisibility() }
+        }
+    }
+
+    private func unregisterWorkspaceObserver() {
+        if let obs = workspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+            workspaceObserver = nil
+        }
+    }
+
+    /// 3s poll catches the "session became active while my terminal was
+    /// already frontmost" case (the NSWorkspace event only fires on app
+    /// switches). Cheap — one closure tick + a string lookup.
+    private func startPollTimer() {
+        guard pollTimer == nil else { return }
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.applyVisibility() }
+        }
+    }
+
+    private func stopPollTimer() {
+        pollTimer?.invalidate()
+        pollTimer = nil
     }
 
     private func positionTopRight() {

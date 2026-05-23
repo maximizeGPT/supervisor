@@ -21,7 +21,18 @@ public struct HoverView: View {
 
     public var body: some View {
         HStack(spacing: 8) {
-            pulseDot
+            // v0.1.4 Gap 5: dot + overlay-icon sit in a ZStack so the
+            // overlay is anchored to the dot regardless of the row's
+            // other content layout.
+            ZStack {
+                pulseDot
+                if let icon = actionOverlayIcon {
+                    Image(systemName: icon)
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.white)
+                        .offset(x: 6, y: -6)
+                }
+            }
             Text(vm.sessionLabel)
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
@@ -61,14 +72,28 @@ public struct HoverView: View {
 
     private var dotColor: Color {
         switch vm.activity {
-        case .idle:                  return .green
-        case .triaging:              return .blue
-        case .flagged(let severity):
+        case .idle:                          return .green
+        case .triaging:                      return .blue
+        case .flagged(let severity, _):
             switch severity {
             case .low:     return .yellow
             case .medium:  return .orange
             case .high:    return .red
             }
+        }
+    }
+
+    /// v0.1.4 Gap 5: SF Symbol name to overlay on the dot for pause /
+    /// kill, distinguishing them from a plain notify at-a-glance. The
+    /// overlay sits in the dot's upper-right corner (offset (6, -6))
+    /// at 7pt — tight against the 8pt dot to read as part of the same
+    /// indicator. `nil` (no overlay) for idle / triaging / notify.
+    private var actionOverlayIcon: String? {
+        guard case let .flagged(_, action) = vm.activity else { return nil }
+        switch action {
+        case .pause:           return "pause.fill"
+        case .kill:            return "xmark"
+        case .inject, .notify: return nil
         }
     }
 

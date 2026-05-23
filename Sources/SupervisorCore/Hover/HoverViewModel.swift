@@ -17,7 +17,11 @@ public final class HoverViewModel: ObservableObject {
     public enum Activity: Sendable, Equatable {
         case idle
         case triaging
-        case flagged(severity: FlagSeverity)
+        /// v0.1.4 Gap 5: carries `action` alongside severity so the
+        /// hover view can render an overlay icon distinguishing pause
+        /// (pause-square) from kill (x-mark) from notify (no overlay).
+        /// Severity drives the dot color; action drives the overlay.
+        case flagged(severity: FlagSeverity, action: FlagAction)
     }
 
     // MARK: - Published surface
@@ -66,11 +70,13 @@ public final class HoverViewModel: ObservableObject {
         trace.emit("hover", "activity -> idle (no flag)")
     }
 
-    /// Called by the FlagRouter when a flag is raised.
-    public func flagRaised(severity: FlagSeverity) {
+    /// Called by the FlagRouter when a flag is raised. v0.1.4 Gap 5:
+    /// `action` is plumbed in so the overlay icon can distinguish
+    /// pause from kill from notify at a glance.
+    public func flagRaised(severity: FlagSeverity, action: FlagAction) {
         flagCount += 1
-        activity = .flagged(severity: severity)
-        trace.emit("hover", "flag raised severity=\(severity.rawValue) total=\(flagCount)")
+        activity = .flagged(severity: severity, action: action)
+        trace.emit("hover", "flag raised severity=\(severity.rawValue) action=\(action.rawValue) total=\(flagCount)")
     }
 
     /// Resets the activity dot to idle. UI calls after a flag has been

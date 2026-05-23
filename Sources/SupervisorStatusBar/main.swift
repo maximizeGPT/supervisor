@@ -124,6 +124,19 @@ final class StatusBarController: NSObject {
             menu.addItem(restart)
             menu.addItem(NSMenuItem.separator())
         }
+        // v0.1.4 Gap 4: a persistent-history surface for past flags. Until
+        // the v0.1.7 expanded panel ships, this dumps the last 20 rows
+        // from the `flags` table as pretty-printed JSON to /tmp and
+        // reveals the file in Finder. JSON over SQLite because human-
+        // readable without installing anything.
+        let recentFlags = NSMenuItem(
+            title: "Recent Flags…",
+            action: #selector(openRecentFlags),
+            keyEquivalent: ""
+        )
+        recentFlags.target = self
+        menu.addItem(recentFlags)
+
         let openLog = NSMenuItem(
             title: "Open Trace Log",
             action: #selector(openTraceLog),
@@ -184,6 +197,50 @@ final class StatusBarController: NSObject {
     @objc private func openNotifications() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!
         NSWorkspace.shared.open(url)
+    }
+
+    /// v0.1.4 Gap 4: write the last 20 `flags` rows to a pretty-printed
+    /// JSON file under /tmp and reveal it in Finder. Each invocation
+    /// gets its own file (timestamped) so repeated clicks don't
+    /// overwrite a file the user might be inspecting. The format is
+    /// `StoredFlag`'s Codable shape — every column including
+    /// reasoning_plain, reasoning_technical, asymmetry_note, and the
+    /// recommended_action — which gives the user everything the
+    /// banner had to skip.
+    @objc private func openRecentFlags() {
+        trace.emit("statusbar", "recent flags requested")
+        let db: SupervisorDatabase
+        do {
+            db = try SupervisorDatabase(path: paths.databasePath)
+        } catch {
+            trace.emit("statusbar", "ERROR open DB for recent-flags failed: \(error)")
+            return
+        }
+        let flagStore = FlagStore(database: db)
+        let flags = (try? flagStore.recent(limit: 20)) ?? []
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let data: Data
+        do {
+            data = try encoder.encode(flags)
+        } catch {
+            trace.emit("statusbar", "ERROR encode flags as JSON failed: \(error)")
+            return
+        }
+
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let path = "/tmp/supervisor-recent-flags-\(stamp).json"
+        let url = URL(fileURLWithPath: path)
+        do {
+            try data.write(to: url)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            trace.emit("statusbar", "recent flags exported \(flags.count) rows → \(path)")
+        } catch {
+            trace.emit("statusbar", "ERROR write recent flags failed: \(error)")
+        }
     }
 }
 
