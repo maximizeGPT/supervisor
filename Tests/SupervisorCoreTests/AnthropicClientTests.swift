@@ -222,7 +222,7 @@ final class AnthropicClientTests: XCTestCase {
 
     // MARK: - Live API (gated)
 
-    /// Runs only if ANTHROPIC_API_KEY is set in the env. Mohammed runs this
+    /// Runs only if ANTHROPIC_API_KEY is set in the env. I run this
     /// once during the Phase A build with his real key.
     func testLiveValidateKeyValidAndInvalid() async throws {
         guard let realKey = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"],

@@ -14,7 +14,7 @@
 //                 → Notifier copy generation
 //                 → HoverViewModel state mutation
 //
-// What it does NOT cover (those are GUI-bound, Mohammed verifies):
+// What it does NOT cover (those are GUI-bound, I verify):
 //   - Banner notification physically appearing on screen.
 //   - Hover window pixels.
 //   - Status bar icon color.

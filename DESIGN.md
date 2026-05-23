@@ -651,7 +651,7 @@ This is the seam for learning without over-engineering. v0.2 could turn user not
 
 What we explicitly DON'T do in v0.1:
 
-- Auto-suppress a category after N false positives (confusing — Mohammed loses interventions silently).
+- Auto-suppress a category after N false positives (confusing — I lose interventions silently).
 - Auto-edit `rubric.yaml` (would conflict with user edits).
 - Train any embeddings or fine-tune a model (massive scope creep).
 
@@ -681,7 +681,7 @@ Mechanism: macOS Accessibility API. Steps:
 5. Set value of focused element to the inject text (`AXValueAttribute`).
 6. Post a keyboard event for Return (`CGEvent`).
 
-Supported terminals in v0.1: **Terminal.app, iTerm2**. Both have stable AX hierarchies and are what Mohammed uses. v0.2 adds Ghostty and Warp (Ghostty's AX surface is newer; Warp uses a custom Electron renderer with a different AX shape — needs per-app probing).
+Supported terminals in v0.1: **Terminal.app, iTerm2**. Both have stable AX hierarchies and are what I use. v0.2 adds Ghostty and Warp (Ghostty's AX surface is newer; Warp uses a custom Electron renderer with a different AX shape — needs per-app probing).
 
 Claude Desktop chat input: v0.2. Reason: the chat input's AX role differs across Claude Desktop versions and the chat-vs-projects-pane disambiguation is fragile. Skipping for v0.1 means **Supervisor only supports Claude Code (CLI) sessions in v0.1, not Claude Desktop chat sessions.** Flagging this for sign-off.
 
@@ -710,7 +710,7 @@ Resumable: `kill(pid, SIGCONT)`. Supervisor's expanded panel shows a "Resume" bu
 Failure modes:
 - Wrong PID (process matches `claude` but is a different command) → safeguard: we double-check cwd before sending the signal.
 - Already-finished process → kill returns ESRCH, we log and clear the pause state.
-- SIGSTOP requires same user; `claude` running as another user (rare for Mohammed) → kill returns EPERM, we surface and fall back to inject "[supervisor] requesting pause; not authorized to stop process."
+- SIGSTOP requires same user; `claude` running as another user (rare in my setup) → kill returns EPERM, we surface and fall back to inject "[supervisor] requesting pause; not authorized to stop process."
 - Process holds an exclusive resource (e.g., a TTY lock) and other processes hang → uncommon but possible; SIGCONT recovers.
 
 Confirmation gate: default ON. The popover says "Pause this session ({sessionId short} in {cwd})? You can resume it from the panel." Auto-dismiss in 5s → cancel.
@@ -740,7 +740,7 @@ Per-(category × intervention) toggles in the settings panel. Default: all confi
 2. In the confirmation popover: "Always allow {action} for {category}" link → toggles the gate off and proceeds.
 3. CLI / config file: `~/Library/Application Support/Supervisor/confirmations.yaml` lets you bulk-edit.
 
-The gate state is persisted per session-start (so a fresh launch always re-loads). Toggling off a gate writes an `intervention_log` entry so Mohammed can audit "when did I stop confirming kills?"
+The gate state is persisted per session-start (so a fresh launch always re-loads). Toggling off a gate writes an `intervention_log` entry so I can audit "when did I stop confirming kills?"
 
 ---
 
@@ -1007,7 +1007,7 @@ Not in the DB:
 - **API key** — macOS Keychain (service name `live.supervisor.api`).
 - **Session offsets** — `sessions.jsonl_offset` column in SQLite, updated every 30s while tailing.
 
-Volume estimates (Mohammed-scale):
+Volume estimates (my workload):
 - 10 active sessions × 50 triage runs/day = 500 rows/day in `triage_runs`.
 - Maybe 30 flags/day across all sessions.
 - ~5 false_positives marked per week.
@@ -1048,7 +1048,7 @@ These are decisions in service of shipping v0.1 fast. Sign-offs from review capt
 
 7. **`LSUIElement = true` (menu-bar-only app, no dock icon).** Matches Wispr/Clicky. Settings window appears as a regular NSWindow when invoked; otherwise no app chrome.
 
-8. **Default cost cap $5/day, hard fail-soft.** When daily Anthropic spend exceeds the cap: degrade to triage-only (no escalation), notify Mohammed via hover badge, write to `interventions` log. Next day's UTC midnight resets the counter.
+8. **Default cost cap $5/day, hard fail-soft.** When daily Anthropic spend exceeds the cap: degrade to triage-only (no escalation), notify the user via hover badge, write to `interventions` log. Next day's UTC midnight resets the counter.
 
 9. **Process discovery via `sysctl kern.proc.all`.** Standard, no entitlements needed. Alternative is `libproc` (also no entitlements). Either works; I'll use whichever has the cleaner Swift wrapper.
 
@@ -1086,7 +1086,7 @@ These are decisions in service of shipping v0.1 fast. Sign-offs from review capt
 
 ## 10. Vertical build order
 
-Mohammed's guess was right; here's the slight refinement.
+My guess was right; here's the slight refinement.
 
 **v0.1.0 — minimum vertical (architecture-proof + trust-proof):**
 
@@ -1100,7 +1100,7 @@ Mohammed's guess was right; here's the slight refinement.
 8. `Notifier` only. No `InterventionRouter` dispatch, no inject/pause/kill, no confirmation gates. Copy uses pre-NEXT-action framing from section 6.5.
 9. Settings: API key + "Reset onboarding" only.
 
-End state: Mohammed grants permissions, enters his key, runs `rm -rf /tmp/foo` in a Claude Code session. Supervisor flags it within ~3s with honest copy ("Claude Code just ran `rm -rf /tmp/foo` — stop further action?"), posts a notification. If Supervisor crashes mid-session, the menu-bar companion turns red so he knows. That's the architecture proof and the trust proof in one slice.
+End state: the user grants permissions, enters their key, runs `rm -rf /tmp/foo` in a Claude Code session. Supervisor flags it within ~3s with honest copy ("Claude Code just ran `rm -rf /tmp/foo` — stop further action?"), posts a notification. If Supervisor crashes mid-session, the menu-bar companion turns red so they know. That's the architecture proof and the trust proof in one slice.
 
 **v0.1.1:** Sonnet escalation for `destructive_action_pending`. Two-stage works.
 
@@ -1156,7 +1156,7 @@ Unsupervised. Claude Code doesn't know Supervisor exists; it keeps running. On r
 
 ### 11.5 What the user can't do during a gap
 
-They can't intervene through Supervisor while Supervisor isn't running. If a destructive action lands during the gap, it lands unsupervised. Honest copy at restart: "Supervisor was down for N minutes. The following events happened while we weren't watching:" — followed by any flags raised post-hoc. Mohammed sees the timeline clearly.
+They can't intervene through Supervisor while Supervisor isn't running. If a destructive action lands during the gap, it lands unsupervised. Honest copy at restart: "Supervisor was down for N minutes. The following events happened while we weren't watching:" — followed by any flags raised post-hoc. The user sees the timeline clearly.
 
 ---
 
@@ -1172,11 +1172,11 @@ Things I'm not sure about and want to surface:
 
 - **`first_real_side_effect` category state.** Where does Supervisor remember "we've already seen a git push this session" across restarts? Answer: in the `sessions.first_side_effects_seen` column (JSON set). But that's a v0.1.X concern; in v0.1.0 we can skip this category until we have multi-session storage.
 
-- **iTerm2 multi-pane.** If Mohammed has multiple Claude Code sessions running in different iTerm2 panes of the same window, the AX-based "find the right pane" logic is non-trivial. We resolve by session cwd, but the focused pane may not be the one whose cwd matches. v0.1 falls back to notify-only when the disambiguation fails.
+- **iTerm2 multi-pane.** If the user has multiple Claude Code sessions running in different iTerm2 panes of the same window, the AX-based "find the right pane" logic is non-trivial. We resolve by session cwd, but the focused pane may not be the one whose cwd matches. v0.1 falls back to notify-only when the disambiguation fails.
 
 - **Encrypted thinking blocks are opaque.** We see *that* the model is thinking and *for how long*, but not *what* it's thinking. This matters for category 6 (`lost_the_thread`) — sometimes the thread isn't actually lost, it's just hidden in thinking. Acceptable for v0.1; surfaces as "false positives that aren't actually false." User-marking should drift the prompt toward correct behavior.
 
-- **Pricing rates change.** The eval harness hardcoded per-1M-token rates in `client.py`. I'll do the same with a `pricing.yaml` override path. Mohammed shouldn't be surprised by drift; we just need it to be one file edit, not a recompile.
+- **Pricing rates change.** The eval harness hardcoded per-1M-token rates in `client.py`. I'll do the same with a `pricing.yaml` override path. I shouldn't be surprised by drift; we just need it to be one file edit, not a recompile.
 
 ---
 

@@ -6,6 +6,39 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-23
+
+### Fixed
+- README install snippet now points at `github.com/maximizeGPT/supervisor.git`
+  (was `<owner>/supervisor.git` placeholder).
+- README Architecture section no longer attributes the two-stage triage
+  pattern to a specific internal eval harness; rephrased as "modeled on
+  the cheap-model-triage / strong-model-escalation pattern common in
+  production eval pipelines."
+- Voice corrections across `README.md`, `DESIGN.md`, code comments, and
+  test files: third-person self-references ("Mohammed verifies",
+  "Mohammed's machine", "Mohammed-scale") rewritten to first-person
+  ("I verify", "my machine", "my workload") or user-flow voice
+  ("the user grants permissions") depending on context. Maintainer
+  attribution in `CONTRIBUTING.md` keeps its name-in-parens form
+  ("I (Mohammed Wasif, [@maximizeGPT])"), which is the standard
+  open-source pattern.
+
+### Added
+- `spikes/README.md` rewritten to a what-spikes-are / why-preserved /
+  bulleted-spike-list shape, with each spike's outcome surfaced
+  on a single line and the supplementary "Re-running" and "What
+  Phase A locked in" sections kept as appendices.
+
+## [0.1.1] — *(retroactive)*
+
+### Added
+- Polish-pass infrastructure files (CONTRIBUTING, SECURITY,
+  CODE_OF_CONDUCT, ISSUE/PR templates), GitHub Actions CI workflow,
+  README badges row, architecture diagram in `docs/architecture.svg`.
+  No code changes — scaffolding only. Tagged v0.1.1 directly without
+  a backfilled changelog entry; recorded here for completeness.
+
 ## [0.1.0] — 2026-05-22
 
 First public ship — minimum vertical that proves the observation +
@@ -54,5 +87,7 @@ triage + flag pipeline against real Claude Code sessions, end to end.
   warns on first launch; right-click → Open through the "unidentified
   developer" warning.
 
-[Unreleased]: https://github.com/maximizeGPT/supervisor/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/maximizeGPT/supervisor/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/maximizeGPT/supervisor/releases/tag/v0.1.2
+[0.1.1]: https://github.com/maximizeGPT/supervisor/releases/tag/v0.1.1
 [0.1.0]: https://github.com/maximizeGPT/supervisor/releases/tag/v0.1.0

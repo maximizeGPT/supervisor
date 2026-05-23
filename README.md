@@ -31,7 +31,7 @@ These are real and shipped as-is. The roadmap section pairs each with the versio
 
 **Main-app liveness detection.** Main-app death is detected via a 30-second heartbeat freshness window. If the main app dies via SIGTERM (rather than a clean Quit from the menu bar), the heartbeat child orphans and detection fails until v0.1.1's mach-port liveness check lands.
 
-**Bring your own Anthropic API key.** Supervisor has no server component and no usage-based revenue model — every triage call goes straight from your Mac to `api.anthropic.com` with your key. At Mohammed's actual usage (~6 hours of Claude Code per day, mixed exploration and build), Haiku triage runs ~$80/month. Cost grows linearly with session activity; the in-app cost view shows your real spend. You can also set a hard daily cap that pauses triage when hit.
+**Bring your own Anthropic API key.** Supervisor has no server component and no usage-based revenue model — every triage call goes straight from your Mac to `api.anthropic.com` with your key. At my actual usage (~6 hours of Claude Code per day, mixed exploration and build), Haiku triage runs ~$80/month. Cost grows linearly with session activity; the in-app cost view shows your real spend. You can also set a hard daily cap that pauses triage when hit.
 
 **Unsigned for v0.1 MVP.** No Apple Developer ID, no notarization. macOS Gatekeeper will warn on first launch — right-click → Open through the "unidentified developer" warning. v0.1.x adds Apple Developer ID signing once the harness has dogfood miles. Until then, macOS may also invalidate the Accessibility grant after OS updates; Supervisor catches that and prompts a re-grant.
 
@@ -60,7 +60,7 @@ These are real and shipped as-is. The roadmap section pairs each with the versio
 Supervisor builds from source on macOS 13+. The build script asks for nothing beyond what Xcode Command Line Tools provide (the first `swift build` will auto-prompt to install CLT if you've never opened Xcode).
 
 ```bash
-git clone https://github.com/<owner>/supervisor.git
+git clone https://github.com/maximizeGPT/supervisor.git
 cd supervisor
 ./Scripts/build-app.sh debug
 ```
@@ -106,7 +106,7 @@ The brief version. [DESIGN.md](./DESIGN.md) has the full 1,184-line design doc �
 
 - **Two-process companion architecture.** The main `Supervisor.app` does observation, triage, intervention, UI. `SupervisorHeartbeat` writes a heartbeat file every 5 seconds. `SupervisorStatusBar` reads that file every 2 seconds and reports green/amber/red based on freshness. A crash of the main app turns the menu-bar icon red within 30 seconds — the user always has an honest health signal in their menu bar.
 - **`kqueue` JSONL tailing.** Per-session `DispatchSourceFileSystemObject` watching each active session log, with byte-offset checkpoints in SQLite so a restart resumes from exactly where it left off. Verified via Phase 0 spikes against active real-world sessions.
-- **Two-stage LLM triage** (Haiku 4.5 today; Sonnet 4.6 escalation lands v0.1.1). Forced `record_triage` tool call returns a structured verdict — severity, category, evidence UUIDs, free-text reasoning. The two-stage pattern is borrowed verbatim from the eval harness that scores Claude Code transcripts at Anthropic — Haiku triages every event, Sonnet only re-runs ambiguous medium-severity decisions where the cheap model's confidence is low.
+- **Two-stage LLM triage** (Haiku 4.5 today; Sonnet 4.6 escalation lands v0.1.1). Forced `record_triage` tool call returns a structured verdict — severity, category, evidence UUIDs, free-text reasoning. The two-stage pattern is modeled on the cheap-model-triage / strong-model-escalation pattern common in production eval pipelines — Haiku triages every event, Sonnet only re-runs ambiguous medium-severity decisions where the cheap model's confidence is low.
 - **Structured rubric.** A small fixed YAML rubric in v0.1.0; user-editable in v0.1.4. Every category has a deterministic schema (the example: `destructive_action_pending` matching `rm -rf`/`Trash`/`git reset --hard` against non-temp paths).
 - **Redaction in front of every API call.** `Redactor.swift` strips nine pattern families before any string leaves the Mac (Anthropic keys, GitHub tokens in three formats, AWS access-key + secret pairs, JWTs, URLs with embedded credentials, shell-export lines). The Anthropic client refuses to send a request without a redactor wired in — fail-closed by construction.
 
