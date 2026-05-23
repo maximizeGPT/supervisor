@@ -26,11 +26,24 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)  // menu-bar-only; no dock icon
 
 extension HeartbeatHealth {
+    /// SF-symbol fallback name. Used for amber/red since "warning triangle"
+    /// and "error octagon" carry stronger universal semantics than the
+    /// brand mark would. The healthy state uses the branded V1 symbol
+    /// (see `brandedImageName`) rather than this fallback.
     var symbolName: String {
         switch self {
         case .green: return "checkmark.circle.fill"
         case .amber: return "exclamationmark.triangle.fill"
         case .red:   return "xmark.octagon.fill"
+        }
+    }
+    /// Branded asset name in Assets.xcassets. Currently only the healthy
+    /// state has a brand-mark image; amber/red fall back to SF Symbols.
+    /// Returning nil means "use the SF Symbol".
+    var brandedImageName: String? {
+        switch self {
+        case .green: return "StatusBarIcon"
+        case .amber, .red: return nil
         }
     }
     var menuTitle: String {
@@ -40,9 +53,10 @@ extension HeartbeatHealth {
         case .red(let r): return "Supervisor: \(r)"
         }
     }
-    // SF Symbols are tinted via template image mode + accessibility tint.
-    // For unsigned dev builds we also emit a plain-text label as a robust
-    // fallback when the symbol is unavailable.
+    // Plain-text fallback when both branded asset and SF Symbol are
+    // unavailable (e.g. very early boot, or a Resources-stripped build).
+    // The button.title is always set so something visible is in the menu
+    // bar even if image rendering fails.
     var fallbackLabel: String {
         switch self {
         case .green: return "●"
@@ -69,7 +83,23 @@ final class StatusBarController: NSObject {
     private func configureButton() {
         guard let button = statusItem.button else { return }
         button.title = current.fallbackLabel
-        button.image = NSImage(systemSymbolName: current.symbolName, accessibilityDescription: "Supervisor")
+
+        // Prefer the branded V1 symbol when one is wired up for this state.
+        // Asset Catalog SVG is honored by NSImage(named:) on macOS 12+;
+        // we mark template = true so the menu-bar foreground color is
+        // applied automatically (light vs dark mode). If the asset lookup
+        // fails for any reason (resource stripped, bundle not yet loaded),
+        // fall through to the SF Symbol so we never go iconless.
+        if let assetName = current.brandedImageName,
+           let branded = Bundle.module.image(forResource: assetName) {
+            branded.isTemplate = true
+            button.image = branded
+        } else {
+            button.image = NSImage(
+                systemSymbolName: current.symbolName,
+                accessibilityDescription: "Supervisor"
+            )
+        }
         button.toolTip = current.menuTitle
     }
 
