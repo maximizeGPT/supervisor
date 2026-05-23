@@ -22,6 +22,15 @@ CONFIG="${1:-debug}"   # debug | release
 echo "[build-app] swift build --configuration $CONFIG"
 swift build --configuration "$CONFIG"
 
+# Regenerate AppIcon.icns from the 1024px brand master if stale. This
+# MUST run before any sign-adhoc.sh call — otherwise the codesign
+# signature won't cover the embedded icns and Gatekeeper (or its
+# unsigned-dev-build equivalent on first launch) will reject the bundle.
+# make-icns.sh is a no-op when the icns is already fresh, so calling it
+# every build is cheap.
+echo "[build-app] regenerating app icon"
+Scripts/make-icns.sh
+
 BIN_DIR=".build/arm64-apple-macosx/$CONFIG"
 if [[ ! -d "$BIN_DIR" ]]; then
     BIN_DIR=$(dirname "$(find .build -name SupervisorHeartbeat -type f | head -1)")
@@ -30,6 +39,7 @@ echo "[build-app] using bin dir: $BIN_DIR"
 
 OUT_DIR="build"
 mkdir -p "$OUT_DIR"
+ICNS_SRC="branding/AppIcon.icns"
 
 # ---- Generic bundler helper ---------------------------------------------
 
@@ -44,6 +54,13 @@ make_bundle() {
     mkdir -p "$out_app/Contents/MacOS"
     mkdir -p "$out_app/Contents/Resources"
 
+    # All three bundles share the same AppIcon.icns — copied in, then
+    # referenced from Info.plist via CFBundleIconFile. The .icns lives
+    # in branding/ so the source bundle layout stays icon-free; the build
+    # step injects it. Done before signing (see Scripts/make-icns.sh
+    # for the pre-sign ordering rationale).
+    cp "$ICNS_SRC" "$out_app/Contents/Resources/AppIcon.icns"
+
     cat > "$out_app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -57,6 +74,8 @@ make_bundle() {
     <string>${display_name}</string>
     <key>CFBundleExecutable</key>
     <string>${app_name}</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

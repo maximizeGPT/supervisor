@@ -71,7 +71,15 @@ let package = Package(
         .executableTarget(
             name: "SupervisorStatusBar",
             dependencies: ["SupervisorCore"],
-            path: "Sources/SupervisorStatusBar"
+            path: "Sources/SupervisorStatusBar",
+            // Brand assets: the V1 symbol ships as both raw SVG and
+            // pre-rendered @1x/@2x PNG fallbacks. Asset Catalogs would
+            // be cleaner but SPM does not always invoke actool depending
+            // on toolchain — copying plain files into Resources/ makes
+            // Bundle.module.image(forResource:) work reliably on every
+            // supported macOS target. The button code marks the loaded
+            // image as a template so menu-bar light/dark theming kicks in.
+            resources: [.process("Resources")]
         ),
         // Dev helper: writes the Anthropic key into the same Keychain
         // entry Supervisor reads, via KeychainAccess (same ACL identity).
