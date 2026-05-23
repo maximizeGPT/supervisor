@@ -15,6 +15,7 @@ import Foundation
 
 public struct TriageDecision: Sendable {
     public let sessionId: String
+    public let cwd: String?      // v0.1.4: the router needs cwd to ask the locator for a PID
     public let candidate: TriageCandidate
     public let triggeringEvent: BashToolCallInfo
     public let usage: AnthropicUsage
@@ -24,6 +25,24 @@ public struct TriageDecision: Sendable {
     public enum PrePost: Sendable {
         case preExecution     // tool_result not yet in window
         case alreadyExecuted  // tool_result present
+    }
+
+    public init(
+        sessionId: String,
+        cwd: String? = nil,
+        candidate: TriageCandidate,
+        triggeringEvent: BashToolCallInfo,
+        usage: AnthropicUsage,
+        model: String,
+        prePost: PrePost
+    ) {
+        self.sessionId = sessionId
+        self.cwd = cwd
+        self.candidate = candidate
+        self.triggeringEvent = triggeringEvent
+        self.usage = usage
+        self.model = model
+        self.prePost = prePost
     }
 }
 
@@ -35,6 +54,7 @@ public final class TriageEngine {
     private let trace: TraceLog
     private let model: String
     private let costStore: CostStore?
+    private let redactor: any Redactor
 
     /// Per-session sliding window of events.
     private var perSessionWindow: [String: [SupervisorEvent]] = [:]
@@ -59,6 +79,7 @@ public final class TriageEngine {
         model: String = Config.defaults.triageModel,
         windowSize: Int = 30,
         costStore: CostStore? = nil,
+        redactor: any Redactor = DefaultRedactor(),
         trace: TraceLog = .shared
     ) {
         self.client = client
@@ -66,6 +87,7 @@ public final class TriageEngine {
         self.model = model
         self.windowSize = windowSize
         self.costStore = costStore
+        self.redactor = redactor
         self.trace = trace
     }
 
@@ -169,13 +191,17 @@ public final class TriageEngine {
         for candidate in candidates {
             let decision = TriageDecision(
                 sessionId: call.sessionId,
+                cwd: cwd,
                 candidate: candidate,
                 triggeringEvent: call,
                 usage: response.usage,
                 model: response.model,
                 prePost: prePost
             )
-            trace.emit("triage", "FLAG session=\(call.sessionId) severity=\(candidate.severity.rawValue) reasoning=\(candidate.reasoning.prefix(120))")
+            trace.emit("triage", "FLAG session=\(call.sessionId) severity=\(candidate.severity.rawValue) action=\(candidate.action.rawValue) plain=\"\(candidate.reasoningPlain)\" tech=\"\(candidate.reasoningTechnical.prefix(200))\"")
+            if let note = candidate.asymmetryNote, !note.isEmpty {
+                trace.emit("triage", "FLAG.asymmetry session=\(call.sessionId) \(note)")
+            }
             onActivityChange?(.flagged(severity: candidate.severity))
             onDecision?(decision)
         }
@@ -215,22 +241,126 @@ public final class TriageEngine {
             else { continue }
             var out: [TriageCandidate] = []
             for raw in candidatesArr {
-                guard case let .object(c) = raw,
-                      case let .string(cat)? = c["category"],
-                      case let .string(sev)? = c["severity"],
-                      case let .string(reason)? = c["reasoning"],
-                      case let .string(cmd)? = c["matched_command"],
-                      let severity = FlagSeverity(rawValue: sev)
-                else { continue }
-                out.append(TriageCandidate(
-                    category: cat,
-                    severity: severity,
-                    reasoning: reason,
-                    matchedCommand: cmd
-                ))
+                guard case let .object(c) = raw else { continue }
+                if let candidate = parseCandidate(c) {
+                    out.append(candidate)
+                }
             }
             return out
         }
         return nil
+    }
+
+    /// Parse one candidate dict. The bare minimum to fire a flag at all is
+    /// `category` + `severity` — everything else has a defined fallback so
+    /// a slightly-broken Haiku response still produces a usable flag rather
+    /// than vanishing silently. Logs `triage.schema.malformed` whenever
+    /// any field falls back. Reasoning fields go through the Redactor
+    /// before they land on the in-memory candidate — defense in depth.
+    private func parseCandidate(_ c: [String: AnthropicJSON]) -> TriageCandidate? {
+        guard case let .string(cat)? = c["category"],
+              case let .string(sev)? = c["severity"],
+              let severity = FlagSeverity(rawValue: sev) else {
+            trace.emit("triage", "schema.malformed candidate missing category/severity raw=\(serializeForTrace(c))")
+            return nil
+        }
+
+        var malformed = false
+        var fallbackReason: [String] = []
+
+        let matchedCommand: String
+        if case let .string(cmd)? = c["matched_command"], !cmd.isEmpty {
+            matchedCommand = cmd
+        } else {
+            matchedCommand = "(missing)"
+            malformed = true
+            fallbackReason.append("matched_command")
+        }
+
+        let action: FlagAction
+        if case let .string(actStr)? = c["recommended_action"],
+           let a = FlagAction(rawValue: actStr) {
+            action = a
+        } else {
+            action = .notify
+            malformed = true
+            fallbackReason.append("recommended_action")
+        }
+
+        let reasoningPlain: String
+        let reasoningTechnical: String
+        let plainRaw: String?
+        let techRaw: String?
+        if case let .string(p)? = c["reasoning_plain"], !p.isEmpty {
+            plainRaw = p
+        } else {
+            plainRaw = nil
+            malformed = true
+            fallbackReason.append("reasoning_plain")
+        }
+        if case let .string(t)? = c["reasoning_technical"], !t.isEmpty {
+            techRaw = t
+        } else {
+            techRaw = nil
+            malformed = true
+            fallbackReason.append("reasoning_technical")
+        }
+
+        // Fallback rule (Mohammed-approved): when reasoning_plain is
+        // missing, do NOT substitute reasoning_technical into the banner —
+        // the whole point of the split is that technical text is unfit
+        // for a banner. Use a fixed string instead.
+        if let p = plainRaw {
+            reasoningPlain = redactor.redact(p)
+        } else {
+            reasoningPlain = TriagePrompt.malformedVerdictBannerText
+        }
+        if let t = techRaw {
+            reasoningTechnical = redactor.redact(t)
+        } else {
+            reasoningTechnical = ""
+        }
+
+        var asymmetryNote: String? = nil
+        if case let .string(note)? = c["asymmetry_note"], !note.isEmpty {
+            asymmetryNote = redactor.redact(note)
+        }
+
+        if malformed {
+            // Log the raw verdict (un-redacted) for debugging per Mohammed:
+            // trace log is local-only, README is honest about that.
+            trace.emit("triage", "schema.malformed fields=\(fallbackReason.joined(separator: ",")) action=\(action.rawValue) raw=\(serializeForTrace(c))")
+        }
+
+        return TriageCandidate(
+            category: cat,
+            severity: severity,
+            matchedCommand: matchedCommand,
+            action: action,
+            reasoningPlain: reasoningPlain,
+            reasoningTechnical: reasoningTechnical,
+            asymmetryNote: asymmetryNote
+        )
+    }
+
+    /// Compact-serialize the raw candidate dict for the trace log. Truncated
+    /// at 400 chars to keep the rolling log readable; full reconstruction
+    /// after the fact is rarely needed since reasoning_technical is also
+    /// stored on the StoredFlag.
+    private func serializeForTrace(_ dict: [String: AnthropicJSON]) -> String {
+        var pairs: [String] = []
+        for (k, v) in dict {
+            switch v {
+            case .string(let s):  pairs.append("\(k)=\(s.prefix(80))")
+            case .integer(let n): pairs.append("\(k)=\(n)")
+            case .double(let n):  pairs.append("\(k)=\(n)")
+            case .bool(let b):    pairs.append("\(k)=\(b)")
+            case .null:           pairs.append("\(k)=null")
+            case .array:          pairs.append("\(k)=[…]")
+            case .object:         pairs.append("\(k)={…}")
+            }
+        }
+        let joined = pairs.joined(separator: " ")
+        return String(joined.prefix(400))
     }
 }

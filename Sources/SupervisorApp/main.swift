@@ -45,6 +45,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private var triageEngine: TriageEngine?
     private var discovery: SessionDiscovery?
     private var notifier: Notifier?
+    private var router: InterventionRouter?
     private var bus: EventBus?
 
     // Permission monitor
@@ -163,9 +164,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         )
         self.anthropic = client
 
-        // 4. Notifier
+        // 4. Notifier + Intervention router (v0.1.4 Part A3)
         let notifier = Notifier(trace: trace)
         self.notifier = notifier
+        let router = InterventionRouter(
+            notifier: notifier,
+            locator: LiveProcessLocator(trace: trace),
+            signalSender: DarwinSignalSender(),
+            trace: trace
+        )
+        self.router = router
 
         // 5. Triage engine
         let engine = TriageEngine(
@@ -174,6 +182,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             model: Config.defaults.triageModel,
             windowSize: 30,
             costStore: costStore,
+            redactor: DefaultRedactor(),
             trace: trace
         )
         engine.onActivityChange = { [weak self] activity in
@@ -235,28 +244,39 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Flag routing
 
     private func handle(decision: TriageDecision) {
-        // 1. Persist to flags table.
+        // 1. Persist to flags table. v0.1.2: Haiku's recommended_action
+        // lands on flag.action; the pause/kill router (deferred) will
+        // be the actual executor of pause/kill recommendations. Until
+        // that ships, every action — including pause and kill — still
+        // surfaces as a notify banner via Notifier.post below. The
+        // banner copy makes the difference visible because Haiku writes
+        // the recommendation into reasoning_plain.
+        let candidate = decision.candidate
         let flag = StoredFlag(
             sessionId: decision.sessionId,
-            category: decision.candidate.category,
-            severity: decision.candidate.severity,
-            action: .notify,                          // v0.1.0 is notify-only
-            reasoning: decision.candidate.reasoning,
+            category: candidate.category,
+            severity: candidate.severity,
+            action: candidate.action,
+            reasoningPlain: candidate.reasoningPlain,
+            reasoningTechnical: candidate.reasoningTechnical,
+            asymmetryNote: candidate.asymmetryNote,
             evidenceUuids: [decision.triggeringEvent.toolUseId],
             haikuInputTokens: decision.usage.input_tokens,
             haikuOutputTokens: decision.usage.output_tokens
         )
         do {
             try flagStore?.insert(flag)
-            trace.emit("flag", "persisted id=\(flag.id) severity=\(flag.severity.rawValue) session=\(flag.sessionId)")
+            trace.emit("flag", "persisted id=\(flag.id) severity=\(flag.severity.rawValue) action=\(flag.action.rawValue) session=\(flag.sessionId)")
         } catch {
             trace.emit("flag", "ERROR persist failed: \(error)")
         }
 
-        // 2. Post notification.
-        Task {
-            let outcome = await notifier?.post(decision: decision)
-            trace.emit("flag", "notifier outcome: \(outcome.map { "\($0)" } ?? "(no notifier)")")
+        // 2. Dispatch via router (v0.1.4: handles notify / pause / kill;
+        //    inject queued, routed to notify for now). Router internally
+        //    handles every locator + signal failure by degrading to a
+        //    notify banner — never crashes on a bad PID or revoked perm.
+        Task { [weak self] in
+            await self?.router?.dispatch(decision: decision)
         }
 
         // 3. Hover view already updated by engine.onActivityChange.

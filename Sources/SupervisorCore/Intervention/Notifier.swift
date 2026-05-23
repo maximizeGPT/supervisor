@@ -1,10 +1,12 @@
 // Notifier.swift
 //
-// UNUserNotificationCenter wrapper with the pre-NEXT-action copy rules
-// from DESIGN.md §6.5. The honest framing:
-//
-//   - preExecution    → "Claude Code is about to <cmd> — pause?"
-//   - alreadyExecuted → "Claude Code just ran <cmd> — stop further action?"
+// UNUserNotificationCenter wrapper. v0.1.2 banner shape is a tiny composer
+// that prepends a fixed brand prefix to `reasoning_plain` — Haiku now
+// writes the full sentence (with the right pre/post tense based on
+// whether the tool already executed) so there's no copy synthesis to do
+// downstream. The prefix is "Supervisor: " and is intentionally not
+// reading from any LLM output — it gives the banner a consistent visual
+// identity even if Haiku ever produces a subject-less sentence.
 //
 // On notification-denied (Spike 2 graceful degradation), `add` still
 // succeeds and the flag lands in macOS Notification Center, just without
@@ -14,7 +16,15 @@
 import Foundation
 import UserNotifications
 
-public final class Notifier: @unchecked Sendable {
+/// Abstracts the banner-posting surface so InterventionRouter tests can
+/// inject a capturing mock instead of constructing a real Notifier
+/// (which crashes the xctest harness — UNUserNotificationCenter.current()
+/// aborts on missing CFBundleIdentifier).
+public protocol Notifying: Sendable {
+    func post(decision: TriageDecision) async -> Notifier.Outcome
+}
+
+public final class Notifier: Notifying, @unchecked Sendable {
 
     public enum Outcome: Sendable, Equatable {
         case posted
@@ -57,7 +67,7 @@ public final class Notifier: @unchecked Sendable {
                 trace.emit("notifier", "posted category=\(decision.candidate.category) severity=\(decision.candidate.severity.rawValue)")
                 return .posted
             case .denied:
-                trace.emit("notifier", "added to Notification Center (banner suppressed): \(decision.candidate.reasoning.prefix(80))")
+                trace.emit("notifier", "added to Notification Center (banner suppressed): \(decision.candidate.reasoningPlain.prefix(80))")
                 return .skippedDeniedSilently
             case .notDetermined:
                 trace.emit("notifier", "notification status notDetermined — posted but visibility uncertain")
@@ -71,18 +81,16 @@ public final class Notifier: @unchecked Sendable {
         }
     }
 
-    /// v0.1.0 body copy. Branches on whether the tool has already run.
+    /// Banner body prefix — kept as a constant so tests and callers reference
+    /// the same string and never drift. Trailing space is part of the prefix.
+    public static let bannerPrefix = "Supervisor: "
+
+    /// v0.1.2 body composer. Just the brand prefix + the plain-English
+    /// reasoning Haiku wrote. No pre/post tense synthesis here — Haiku
+    /// writes its own tense based on the "Has the command already
+    /// executed?" section of the triage prompt.
     public func body(for decision: TriageDecision) -> String {
-        let cmd = decision.candidate.matchedCommand
-        let head = cmd.split(separator: "\n").first.map(String.init) ?? cmd
-        switch decision.prePost {
-        case .preExecution:
-            // The tool hasn't returned in our window — possibly because
-            // it's a slow Bash. We can honestly use future tense.
-            return "Claude Code is about to run `\(head)`. \(decision.candidate.reasoning.prefix(160))"
-        case .alreadyExecuted:
-            return "Claude Code just ran `\(head)`. \(decision.candidate.reasoning.prefix(160)) Stop further action?"
-        }
+        Self.bannerPrefix + decision.candidate.reasoningPlain
     }
 
     private func currentSettings() async -> UNNotificationSettings {

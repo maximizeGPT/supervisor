@@ -1,23 +1,31 @@
 // NotifierTests.swift
 //
-// Verifies the copy generation. The actual notification post path can't
-// be unit-tested (UNUserNotificationCenter.current() aborts in the test
-// harness — same Spike 2 finding as PermissionCheckerTests). We test the
-// body string explicitly here; full delivery is verified at Checkpoint C.
+// Verifies the v0.1.2 banner shape: `Notifier.bannerPrefix` + Haiku's
+// `reasoning_plain`, with no copy synthesis. The actual notification
+// post path can't be unit-tested (UNUserNotificationCenter.current()
+// aborts in the test harness — same Spike 2 finding as
+// PermissionCheckerTests). Full delivery is verified at Checkpoint C.
 
 import XCTest
 @testable import SupervisorCore
 
 final class NotifierTests: XCTestCase {
 
-    private func decision(prePost: TriageDecision.PrePost, severity: FlagSeverity = .high) -> TriageDecision {
+    private func decision(
+        prePost: TriageDecision.PrePost = .preExecution,
+        severity: FlagSeverity = .high,
+        action: FlagAction = .pause,
+        reasoningPlain: String = "Claude Code is about to delete /Users/main/important and everything in it. Pausing so you can check before it runs."
+    ) -> TriageDecision {
         TriageDecision(
             sessionId: "s",
             candidate: TriageCandidate(
                 category: "destructive_action_pending",
                 severity: severity,
-                reasoning: "rm -rf targets a non-temp path.",
-                matchedCommand: "rm -rf /Users/main/important"
+                matchedCommand: "rm -rf /Users/main/important",
+                action: action,
+                reasoningPlain: reasoningPlain,
+                reasoningTechnical: "rm -rf /Users/main/important matches destructive_action_pending; outside cwd /Users/test; user did not authorize."
             ),
             triggeringEvent: BashToolCallInfo(
                 sessionId: "s",
@@ -35,77 +43,50 @@ final class NotifierTests: XCTestCase {
         )
     }
 
-    /// Notifier is constructed but never used — we only test `body(for:)`.
-    /// Constructing it without invoking `.post` doesn't touch UN runtime.
-    private func makeNotifierForCopyTest() -> Notifier? {
-        // Skip if running inside the xctest harness — UNUserNotificationCenter.current()
-        // asserts on missing CFBundleIdentifier.
-        if Bundle.main.bundleIdentifier == nil {
-            return nil
-        }
-        return Notifier()
+    func testBodyPrependsSupervisorBrandPrefix() {
+        let n = NotifierBodyOnly()
+        let str = n.body(for: decision())
+        XCTAssertTrue(str.hasPrefix(Notifier.bannerPrefix),
+                      "banner must start with the brand prefix; got: \(str)")
     }
 
-    func testPreExecutionCopyUsesAboutToFraming() {
+    func testBodyUsesReasoningPlainVerbatim() {
         let n = NotifierBodyOnly()
-        let str = n.body(for: decision(prePost: .preExecution))
-        XCTAssertTrue(str.contains("is about to"))
-        XCTAssertFalse(str.contains("just ran"))
+        let plain = "Claude Code is about to delete /Users/main/important and everything in it. Pausing so you can check before it runs."
+        let str = n.body(for: decision(reasoningPlain: plain))
+        XCTAssertEqual(str, Notifier.bannerPrefix + plain,
+                       "body should be exactly prefix + plain reasoning, no truncation or synthesis")
     }
 
-    func testAlreadyExecutedCopyUsesJustRanFraming() {
+    func testBodyDoesNotUseTechnicalReasoning() {
+        // The reasoning_technical paragraph is unfit for the banner; the
+        // body composer must never reach for it.
         let n = NotifierBodyOnly()
-        let str = n.body(for: decision(prePost: .alreadyExecuted))
-        XCTAssertTrue(str.contains("just ran"))
-        XCTAssertTrue(str.contains("Stop further action?"))
-        XCTAssertFalse(str.contains("is about to"))
+        let str = n.body(for: decision(reasoningPlain: "Plain text here."))
+        XCTAssertFalse(str.contains("matches destructive_action_pending"),
+                       "technical-style text should not appear in banner; got: \(str)")
+        XCTAssertFalse(str.contains("outside cwd"),
+                       "technical-style text should not appear in banner; got: \(str)")
     }
 
-    func testBodyIncludesCommandHead() {
+    func testBodyUsesMalformedFallbackWhenReasoningPlainIsTheFixedString() {
+        // When Haiku's verdict is malformed, the engine populates
+        // reasoning_plain with TriagePrompt.malformedVerdictBannerText.
+        // The banner should still come out coherent.
         let n = NotifierBodyOnly()
-        let str = n.body(for: decision(prePost: .alreadyExecuted))
-        XCTAssertTrue(str.contains("rm -rf /Users/main/important"))
-    }
-
-    func testBodyTruncatesLongReasoning() {
-        let n = NotifierBodyOnly()
-        let long = String(repeating: "very ", count: 200) + "long reasoning"
-        let d = TriageDecision(
-            sessionId: "s",
-            candidate: TriageCandidate(
-                category: "destructive_action_pending",
-                severity: .high,
-                reasoning: long,
-                matchedCommand: "rm -rf /Users/main/x"
-            ),
-            triggeringEvent: BashToolCallInfo(
-                sessionId: "s", command: "rm -rf /Users/main/x", description: nil,
-                toolUseId: "t1", turnUUID: "u1", ts: Date()
-            ),
-            usage: AnthropicUsage(input_tokens: 1, output_tokens: 1,
-                                   cache_creation_input_tokens: nil,
-                                   cache_read_input_tokens: nil),
-            model: "claude-haiku-4-5-20251001",
-            prePost: .alreadyExecuted
-        )
-        let str = n.body(for: d)
-        XCTAssertLessThan(str.count, 300, "body should be a notification-friendly length")
+        let str = n.body(for: decision(reasoningPlain: TriagePrompt.malformedVerdictBannerText))
+        XCTAssertEqual(str, Notifier.bannerPrefix + TriagePrompt.malformedVerdictBannerText)
+        XCTAssertTrue(str.contains("Open the panel for details"),
+                      "malformed-verdict banner must surface the panel-redirect hint")
     }
 }
 
-/// A pure-body extractor we can exercise without touching UN. Lifts the
-/// same `body(for:)` logic out of `Notifier` so tests don't need to
-/// construct a real one (which would crash the xctest harness — same
-/// Spike-2 issue).
+/// A pure-body extractor we can exercise without touching UN. Mirrors
+/// `Notifier.body(for:)` so tests don't need to construct a real Notifier
+/// (which would crash the xctest harness — same Spike-2 issue). If the
+/// real body shape changes, this shim must move with it.
 private struct NotifierBodyOnly {
     func body(for decision: TriageDecision) -> String {
-        let cmd = decision.candidate.matchedCommand
-        let head = cmd.split(separator: "\n").first.map(String.init) ?? cmd
-        switch decision.prePost {
-        case .preExecution:
-            return "Claude Code is about to run `\(head)`. \(decision.candidate.reasoning.prefix(160))"
-        case .alreadyExecuted:
-            return "Claude Code just ran `\(head)`. \(decision.candidate.reasoning.prefix(160)) Stop further action?"
-        }
+        Notifier.bannerPrefix + decision.candidate.reasoningPlain
     }
 }

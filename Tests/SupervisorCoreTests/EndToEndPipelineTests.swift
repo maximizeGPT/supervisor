@@ -90,8 +90,10 @@ final class EndToEndPipelineTests: XCTestCase {
                 sessionId: decision.sessionId,
                 category: decision.candidate.category,
                 severity: decision.candidate.severity,
-                action: .notify,
-                reasoning: decision.candidate.reasoning,
+                action: decision.candidate.action,
+                reasoningPlain: decision.candidate.reasoningPlain,
+                reasoningTechnical: decision.candidate.reasoningTechnical,
+                asymmetryNote: decision.candidate.asymmetryNote,
                 evidenceUuids: [decision.triggeringEvent.toolUseId],
                 haikuInputTokens: decision.usage.input_tokens,
                 haikuOutputTokens: decision.usage.output_tokens
@@ -147,9 +149,13 @@ final class EndToEndPipelineTests: XCTestCase {
         XCTAssertNotNil(persisted, "flag should be in SQLite")
         XCTAssertEqual(persisted?.category, "destructive_action_pending")
         XCTAssertEqual(persisted?.severity, .high)
-        XCTAssertEqual(persisted?.action, .notify)
-        XCTAssertTrue(persisted?.reasoning.contains("rm -rf") ?? false,
-                      "reasoning should reference the matched command, got: \(persisted?.reasoning ?? "(nil)")")
+        XCTAssertEqual(persisted?.action, .pause,
+                       "Haiku's recommended_action 'pause' must land on flag.action, not the v0.1.0 hardcoded .notify")
+        XCTAssertTrue(persisted?.reasoningPlain.contains("delete") ?? false,
+                      "reasoning_plain should describe the action in plain English; got: \(persisted?.reasoningPlain ?? "(nil)")")
+        XCTAssertTrue(persisted?.reasoningTechnical.contains("rubric") ?? false,
+                      "reasoning_technical should cite the rubric; got: \(persisted?.reasoningTechnical ?? "(nil)")")
+        XCTAssertNotNil(persisted?.asymmetryNote, "asymmetry note from Haiku should be persisted on the flag")
         XCTAssertGreaterThan(persisted?.haikuInputTokens ?? 0, 0)
 
         // HoverViewModel state.
@@ -163,13 +169,16 @@ final class EndToEndPipelineTests: XCTestCase {
                       "hover should show current tool, got: \(hoverVM.currentToolDescription)")
 
         // Notifier copy is exercised against the decision so we know the
-        // wire all the way to "what would the banner say" matches §6.5.
+        // wire all the way to "what would the banner say" lines up with
+        // the v0.1.2 prefix + reasoning_plain shape.
         let notifier = NotifierBodyShim()
         let bannerBody = notifier.body(for: routed.decisions[0])
-        XCTAssertTrue(bannerBody.contains("just ran") || bannerBody.contains("is about to"),
-                      "notifier body should honor pre/post framing, got: \(bannerBody)")
-        XCTAssertTrue(bannerBody.contains("rm -rf /Users/test/important"),
-                      "notifier body should include the matched command, got: \(bannerBody)")
+        XCTAssertTrue(bannerBody.hasPrefix(Notifier.bannerPrefix),
+                      "notifier body must start with the brand prefix, got: \(bannerBody)")
+        XCTAssertTrue(bannerBody.contains("delete"),
+                      "notifier body should surface the plain-English description, got: \(bannerBody)")
+        XCTAssertFalse(bannerBody.contains("rubric"),
+                       "notifier body must NOT surface technical reasoning, got: \(bannerBody)")
     }
 
     // MARK: - Mock plumbing
@@ -196,8 +205,11 @@ final class EndToEndPipelineTests: XCTestCase {
                     "candidates": [[
                         "category": "destructive_action_pending",
                         "severity": "high",
-                        "reasoning": "rm -rf targets /Users/test/important — not a known temp path, and the user's prompt didn't authorize a specific delete.",
-                        "matched_command": "rm -rf /Users/test/important"
+                        "matched_command": "rm -rf /Users/test/important",
+                        "recommended_action": "pause",
+                        "reasoning_plain": "Claude Code is about to delete /Users/test/important and everything in it. That's not a temp path, and your last prompt didn't mention deleting anything, so this looks unintended. I'm pausing the session so you can check before it runs — you can resume from the panel if it was deliberate.",
+                        "reasoning_technical": "rm -rf /Users/test/important matches the destructive_action_pending rubric clause for rm -rf against a path outside the session cwd. Severity high because the target is outside the documented temp-path allowlist (/tmp/, .pytest_cache/, node_modules/, build/, dist/) and the user prompt 'clean up please' did not authorize a specific delete.",
+                        "asymmetry_note": "If I pause and I'm wrong, you lose ~5s and a resume click; if I don't pause and I'm wrong, you lose /Users/test/important."
                     ]]
                 ]
             ]],
@@ -241,14 +253,7 @@ private final class RoutedFlagSink: @unchecked Sendable {
 
 private struct NotifierBodyShim {
     func body(for decision: TriageDecision) -> String {
-        let cmd = decision.candidate.matchedCommand
-        let head = cmd.split(separator: "\n").first.map(String.init) ?? cmd
-        switch decision.prePost {
-        case .preExecution:
-            return "Claude Code is about to run `\(head)`. \(decision.candidate.reasoning.prefix(160))"
-        case .alreadyExecuted:
-            return "Claude Code just ran `\(head)`. \(decision.candidate.reasoning.prefix(160)) Stop further action?"
-        }
+        Notifier.bannerPrefix + decision.candidate.reasoningPlain
     }
 }
 

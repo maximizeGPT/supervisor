@@ -91,6 +91,27 @@ public final class SupervisorDatabase: @unchecked Sendable {
             }
         }
 
+        // v0.1.2: split the single `reasoning` column into two fields —
+        // `reasoning_plain` for the notification banner and
+        // `reasoning_technical` for the trace log + engineer debugging.
+        // Also adds `asymmetry_note` for the optional cost-asymmetry
+        // sentence. Old rows backfill reasoning_plain from the existing
+        // reasoning text — dense but at least non-empty.
+        //
+        // macOS 13+ ships SQLite >= 3.39, so RENAME COLUMN (3.25+) is safe.
+        m.registerMigration("v2_haiku_reasoning_split") { db in
+            try db.alter(table: "flags") { t in
+                t.rename(column: "reasoning", to: "reasoning_technical")
+                t.add(column: "reasoning_plain", .text).notNull().defaults(to: "")
+                t.add(column: "asymmetry_note", .text)
+            }
+            try db.execute(sql: """
+                UPDATE flags
+                SET reasoning_plain = reasoning_technical
+                WHERE reasoning_plain = ''
+                """)
+        }
+
         return m
     }
 }

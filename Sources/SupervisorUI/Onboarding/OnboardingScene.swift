@@ -1,15 +1,33 @@
 // OnboardingScene.swift
 //
-// The SwiftUI root for the onboarding window. Picks which step view to
-// render based on the view model's current state. No logic here — every
-// branch dispatches to a child view that's a pure projection of state.
+// v0.1.3 layout — a 480×360 window split into three explicit bands:
+//
+//   Header (80pt, Paper-warm bg)     — wordmark centered at 24pt
+//   Content (fill, default bg)        — step indicator + title + step body
+//   Footer (56pt, Paper bg)           — primary button right-aligned;
+//                                       Skip left-aligned on the AX step
+//
+// Step views (KeyEntryStep, AXCheckStep, NotifCheckStep) shed their
+// primary buttons — those moved into the footer here. KeyEntryStep's
+// `key` state lifts up via a Binding<String> so the footer's primary
+// button can gate its disabled state on emptiness. AXCheckStep's
+// "Re-check now" is gone entirely (vm.tick() polls every 1.5s);
+// NotifCheckStep's "Skip" is removed per the spec ("Skip only on AX")
+// — in `.denied` the secondary "Open System Settings" still lives
+// inside the content area as a non-primary action.
 
+import AppKit
 import SwiftUI
 import SupervisorCore
 
 public struct OnboardingScene: View {
 
     @ObservedObject var vm: OnboardingViewModel
+
+    /// Lifted up from KeyEntryStep so the footer's primary button can
+    /// gate its disabled state on emptiness without coupling state into
+    /// the view model.
+    @State private var keyDraft: String = ""
 
     public init(vm: OnboardingViewModel) {
         self.vm = vm
@@ -18,11 +36,7 @@ public struct OnboardingScene: View {
     public var body: some View {
         VStack(spacing: 0) {
             header
-            Divider()
             content
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(20)
-            Divider()
             footer
         }
         .frame(width: 480, height: 360)
@@ -36,20 +50,34 @@ public struct OnboardingScene: View {
         }
     }
 
-    // MARK: - Header
+    // MARK: - Header (80pt, Paper-warm)
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Welcome to Supervisor")
-                .font(.system(size: 18, weight: .semibold))
-            Text("A native macOS app that watches Claude Code sessions and intervenes when you'd want it to.")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            StepIndicator(current: vm.state.step)
-                .padding(.top, 4)
+        ZStack {
+            BrandColor.paperWarm.color
+            wordmark
+                .frame(height: 24)
+                .accessibilityLabel("Supervisor")
         }
-        .padding(20)
+        .frame(height: 80)
+        .frame(maxWidth: .infinity)
+    }
+
+    /// SVG resource → NSImage → SwiftUI Image, with a text fallback. The
+    /// fallback prevents an empty header band if Bundle.module misses the
+    /// asset (resource-stripped build, name typo, etc.) — same defensive
+    /// shape as SupervisorStatusBar's branded glyph.
+    @ViewBuilder
+    private var wordmark: some View {
+        if let ns = Bundle.module.image(forResource: "OnboardingWordmark") {
+            Image(nsImage: ns)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            Text("Supervisor")
+                .font(BrandFont.title)
+                .foregroundStyle(BrandColor.ink.color)
+        }
     }
 
     // MARK: - Content
@@ -57,8 +85,56 @@ public struct OnboardingScene: View {
     @ViewBuilder
     private var content: some View {
         switch vm.state {
+        case .complete:
+            // Special case: the "All set" screen is centered, not a
+            // step-indicator + title + body composition. The window is
+            // typically dismissed within one render cycle of this state,
+            // but it should still look right if dismissal lags.
+            CompleteStep()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        default:
+            VStack(alignment: .leading, spacing: 10) {
+                Text(stepIndicatorText)
+                    .font(BrandFont.indicator)
+                    .tracking(1)
+                    .textCase(.uppercase)
+                    .foregroundStyle(BrandColor.mute.color)
+                Text(stepTitle)
+                    .font(BrandFont.title)
+                    .foregroundStyle(BrandColor.ink.color)
+                stepBody
+                    .padding(.top, 4)
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 16)
+            .padding(.bottom, 12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private var stepIndicatorText: String {
+        switch vm.state {
+        case .keyEntry, .keyValidating: return "Step 1 of 3"
+        case .axCheck:                  return "Step 2 of 3"
+        case .notifCheck:               return "Step 3 of 3"
+        case .complete:                 return ""
+        }
+    }
+
+    private var stepTitle: String {
+        switch vm.state {
+        case .keyEntry, .keyValidating: return "Anthropic API key"
+        case .axCheck:                  return "Accessibility access"
+        case .notifCheck:               return "Notifications"
+        case .complete:                 return "All set"
+        }
+    }
+
+    @ViewBuilder
+    private var stepBody: some View {
+        switch vm.state {
         case .keyEntry(let err):
-            KeyEntryStep(vm: vm, error: err)
+            KeyEntryStep(vm: vm, error: err, key: $keyDraft)
         case .keyValidating:
             KeyValidatingStep()
         case .axCheck(let prompted):
@@ -66,48 +142,81 @@ public struct OnboardingScene: View {
         case .notifCheck(let status):
             NotifCheckStep(vm: vm, status: status)
         case .complete:
-            CompleteStep()
+            EmptyView()   // handled by the `.complete` branch in `content`
         }
     }
 
-    // MARK: - Footer
+    // MARK: - Footer (56pt, Paper, 1pt top border in Paper-warm)
 
     private var footer: some View {
-        HStack {
-            Text("Your Anthropic key is stored in macOS Keychain. Triage and escalation calls go directly from this Mac to api.anthropic.com.")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer()
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-    }
-}
-
-// MARK: - Step indicator
-
-private struct StepIndicator: View {
-    let current: Int
-    var body: some View {
-        HStack(spacing: 8) {
-            ForEach(1...3, id: \.self) { step in
-                let isActive = step <= current && current < 4
-                Circle()
-                    .fill(isActive ? Color.accentColor : Color.secondary.opacity(0.3))
-                    .frame(width: 7, height: 7)
+        VStack(spacing: 0) {
+            Rectangle()
+                .fill(BrandColor.paperWarm.color)
+                .frame(height: 1)
+            HStack(spacing: 10) {
+                skipButton
+                Spacer()
+                primaryButton
             }
-            Text(stepLabel)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+            .padding(.horizontal, 24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(BrandColor.paper.color)
+        }
+        .frame(height: 56)
+    }
+
+    @ViewBuilder
+    private var skipButton: some View {
+        if case .axCheck = vm.state {
+            Button("Skip") {
+                Task { await vm.skipAX() }
+            }
+            .buttonStyle(.plain)
+            .font(BrandFont.button)
+            .foregroundStyle(BrandColor.mute.color)
         }
     }
-    private var stepLabel: String {
-        switch current {
-        case 1: return "Step 1 of 3: API key"
-        case 2: return "Step 2 of 3: Accessibility"
-        case 3: return "Step 3 of 3: Notifications"
-        default: return "Setup complete"
+
+    @ViewBuilder
+    private var primaryButton: some View {
+        switch vm.state {
+        case .keyEntry:
+            BrandPrimaryButton("Validate & Save") {
+                Task { await vm.submitKey(keyDraft) }
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(keyDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+
+        case .keyValidating:
+            ProgressView().controlSize(.small)
+
+        case .axCheck:
+            BrandPrimaryButton("Open System Settings") {
+                NSWorkspace.shared.open(PermissionSettingsURL.accessibility)
+                vm.promptForAX()
+            }
+            .keyboardShortcut(.defaultAction)
+
+        case .notifCheck(.notDetermined):
+            BrandPrimaryButton("Request permission") {
+                Task { await vm.requestNotifications() }
+            }
+            .keyboardShortcut(.defaultAction)
+
+        case .notifCheck(.authorized), .notifCheck(.provisional), .notifCheck(.ephemeral):
+            BrandPrimaryButton("Continue") {
+                vm.finishNotificationStep()
+            }
+            .keyboardShortcut(.defaultAction)
+
+        case .notifCheck(.denied):
+            BrandPrimaryButton("Continue anyway") {
+                vm.finishNotificationStep()
+            }
+            .keyboardShortcut(.defaultAction)
+
+        case .complete:
+            EmptyView()
         }
     }
 }

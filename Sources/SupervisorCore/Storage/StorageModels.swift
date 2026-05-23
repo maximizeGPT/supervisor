@@ -79,9 +79,11 @@ public struct StoredFlag: Codable, FetchableRecord, PersistableRecord, Sendable,
     public var ts: Date
     public var category: String
     public var severity: FlagSeverity
-    public var action: FlagAction
-    public var reasoning: String
-    public var evidenceUuids: String          // JSON-encoded array; v0.1.x small enough not to need a join table
+    public var action: FlagAction                // Haiku's recommended_action
+    public var reasoningPlain: String            // v0.1.2: banner-fit
+    public var reasoningTechnical: String        // v0.1.2: engineer-fit (renamed from `reasoning`)
+    public var asymmetryNote: String?            // v0.1.2: optional asymmetry-of-being-wrong note
+    public var evidenceUuids: String             // JSON-encoded array; v0.1.x small enough not to need a join table
     public var userResponse: FlagUserResponse?
 
     public var haikuInputTokens: Int?
@@ -96,7 +98,9 @@ public struct StoredFlag: Codable, FetchableRecord, PersistableRecord, Sendable,
         category: String,
         severity: FlagSeverity,
         action: FlagAction,
-        reasoning: String,
+        reasoningPlain: String,
+        reasoningTechnical: String,
+        asymmetryNote: String? = nil,
         evidenceUuids: [String] = [],
         userResponse: FlagUserResponse? = nil,
         haikuInputTokens: Int? = nil,
@@ -110,7 +114,9 @@ public struct StoredFlag: Codable, FetchableRecord, PersistableRecord, Sendable,
         self.category = category
         self.severity = severity
         self.action = action
-        self.reasoning = reasoning
+        self.reasoningPlain = reasoningPlain
+        self.reasoningTechnical = reasoningTechnical
+        self.asymmetryNote = asymmetryNote
         // Persist as a JSON array string. Empty array becomes "[]".
         let data = (try? JSONEncoder().encode(evidenceUuids)) ?? Data("[]".utf8)
         self.evidenceUuids = String(data: data, encoding: .utf8) ?? "[]"
@@ -137,7 +143,9 @@ public struct StoredFlag: Codable, FetchableRecord, PersistableRecord, Sendable,
         case category
         case severity
         case action
-        case reasoning
+        case reasoningPlain = "reasoning_plain"
+        case reasoningTechnical = "reasoning_technical"
+        case asymmetryNote = "asymmetry_note"
         case evidenceUuids = "evidence_uuids"
         case userResponse = "user_response"
         case haikuInputTokens = "haiku_input_tokens"

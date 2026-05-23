@@ -1,7 +1,13 @@
 // KeyEntryStep.swift
 //
-// Step 1: Anthropic API key entry. Live validation; inline error surfaces
-// next to the field on bad input without restarting onboarding.
+// Step 1 content body — Anthropic API key entry. The step indicator and
+// title now live on OnboardingScene; the primary "Validate & Save" button
+// moved to the footer. KeyEntryStep keeps the description copy, the
+// SecureField, and the inline error display.
+//
+// The `key` State lifts up to OnboardingScene as a `Binding<String>` so
+// the footer's primary button can gate its disabled state on emptiness
+// without coupling draft state into the view model.
 
 import SwiftUI
 import SupervisorCore
@@ -10,35 +16,26 @@ struct KeyEntryStep: View {
 
     @ObservedObject var vm: OnboardingViewModel
     let error: KeyEntryError?
-
-    @State private var key: String = ""
+    @Binding var key: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("1. Anthropic API key")
-                .font(.system(size: 14, weight: .semibold))
-
+        VStack(alignment: .leading, spacing: 10) {
             Text("Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. At heavy use, expect ~$80/month on your Anthropic bill (one continuous Claude Code session, all interventions enabled).")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+                .font(BrandFont.body)
+                .foregroundStyle(BrandColor.inkDeep.color)
+                .lineSpacing(6)
                 .fixedSize(horizontal: false, vertical: true)
 
             SecureField("sk-ant-...", text: $key, onCommit: submit)
                 .textFieldStyle(.roundedBorder)
+                .font(BrandFont.body)
                 .onChange(of: key) { _ in vm.clearKeyError() }
 
             if let error {
                 Text(errorMessage(error))
-                    .font(.system(size: 11))
+                    .font(BrandFont.note)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
-            }
-
-            HStack {
-                Spacer()
-                Button("Validate & Save") { submit() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
     }
@@ -65,8 +62,8 @@ struct KeyValidatingStep: View {
         VStack(spacing: 12) {
             ProgressView()
             Text("Validating with Anthropic…")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
+                .font(BrandFont.body)
+                .foregroundStyle(BrandColor.mute.color)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

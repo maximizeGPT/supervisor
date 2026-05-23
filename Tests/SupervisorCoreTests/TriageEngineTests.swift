@@ -69,7 +69,25 @@ final class TriageEngineTests: XCTestCase {
     }
 
     // Helper: a record_triage response that returns one flag.
-    private static func haikuFlagResponse(severity: String = "high") -> Data {
+    private static func haikuFlagResponse(
+        severity: String = "high",
+        action: String = "pause",
+        reasoningPlain: String = "Claude Code is about to delete /Users/main/important and everything in it. That's not a temp path, so I'm pausing the session — you can resume from the panel if it was deliberate.",
+        reasoningTechnical: String = "rm -rf /Users/main/important matches destructive_action_pending rubric clause for 'rm -rf against a path outside the session cwd /Users/test'. Severity high because the path is outside the documented temp-path allowlist; user prompt did not authorize a specific delete.",
+        asymmetryNote: String? = "If I pause and I'm wrong, you lose ~5s; if I don't pause and I'm wrong, you lose /Users/main/important.",
+        includeAllFields: Bool = true
+    ) -> Data {
+        var candidate: [String: Any] = [
+            "category": "destructive_action_pending",
+            "severity": severity,
+            "matched_command": "rm -rf /Users/main/important"
+        ]
+        if includeAllFields {
+            candidate["recommended_action"] = action
+            candidate["reasoning_plain"] = reasoningPlain
+            candidate["reasoning_technical"] = reasoningTechnical
+            if let n = asymmetryNote { candidate["asymmetry_note"] = n }
+        }
         let body: [String: Any] = [
             "id": "msg_01",
             "type": "message",
@@ -80,12 +98,7 @@ final class TriageEngineTests: XCTestCase {
                 "id": "toolu_resp",
                 "name": "record_triage",
                 "input": [
-                    "candidates": [[
-                        "category": "destructive_action_pending",
-                        "severity": severity,
-                        "reasoning": "rm -rf targets a non-temp path",
-                        "matched_command": "rm -rf /Users/main/important"
-                    ]]
+                    "candidates": [candidate]
                 ]
             ]],
             "stop_reason": "tool_use",
@@ -126,9 +139,62 @@ final class TriageEngineTests: XCTestCase {
 
         try await captured.waitFor(count: 1, within: 3.0)
         XCTAssertEqual(captured.snapshot.count, 1)
-        XCTAssertEqual(captured.snapshot.first?.candidate.severity, .high)
-        XCTAssertEqual(captured.snapshot.first?.candidate.category, "destructive_action_pending")
-        XCTAssertTrue(captured.snapshot.first?.candidate.matchedCommand.contains("rm -rf") ?? false)
+        let candidate = try XCTUnwrap(captured.snapshot.first?.candidate)
+        XCTAssertEqual(candidate.severity, .high)
+        XCTAssertEqual(candidate.category, "destructive_action_pending")
+        XCTAssertTrue(candidate.matchedCommand.contains("rm -rf"))
+        XCTAssertEqual(candidate.action, .pause)
+        XCTAssertTrue(candidate.reasoningPlain.contains("delete"),
+                      "reasoningPlain should describe the action in plain English; got: \(candidate.reasoningPlain)")
+        XCTAssertTrue(candidate.reasoningTechnical.contains("rubric"),
+                      "reasoningTechnical should cite the rubric; got: \(candidate.reasoningTechnical)")
+        XCTAssertNotNil(candidate.asymmetryNote, "asymmetry note should be passed through when present")
+    }
+
+    func testMalformedVerdictFallsBackToFixedBannerString() async throws {
+        // Haiku response missing reasoning_plain and reasoning_technical
+        // and recommended_action — i.e., a degraded verdict shape that
+        // still has category + severity + matched_command. The engine
+        // must still fire the flag, with a fixed fallback banner string
+        // and recommendedAction = .notify.
+        Self.canned["/v1/messages"] = (200, Self.haikuFlagResponse(includeAllFields: false), [:])
+        let (engine, bus, captured) = makeEngine()
+        defer { engine.stop() }
+
+        publishBashCall(bus, command: "rm -rf /Users/main/x")
+
+        try await captured.waitFor(count: 1, within: 3.0)
+        let candidate = try XCTUnwrap(captured.snapshot.first?.candidate)
+        XCTAssertEqual(candidate.action, .notify,
+                       "missing recommended_action should fall back to notify, not pause/kill")
+        XCTAssertEqual(candidate.reasoningPlain, TriagePrompt.malformedVerdictBannerText,
+                       "missing reasoning_plain should fall back to the fixed banner text, NOT to reasoning_technical")
+        XCTAssertEqual(candidate.reasoningTechnical, "",
+                       "missing reasoning_technical should leave an empty string, not a synthesized value")
+        XCTAssertNil(candidate.asymmetryNote)
+    }
+
+    func testReasoningRunsThroughRedactor() async throws {
+        // If Haiku ever invents a secret-shaped string in its reasoning,
+        // the redactor pass on the inbound text catches it before it
+        // lands on the banner or the database. This mirrors the
+        // outbound redaction the AnthropicClient already enforces — same
+        // protection, opposite direction.
+        Self.canned["/v1/messages"] = (200, Self.haikuFlagResponse(
+            reasoningPlain: "Claude Code is about to commit sk-ant-api03-LEAKED_KEY_LOOKING_VALUE to the repo, which would expose your Anthropic key.",
+            reasoningTechnical: "Bash command head matches 'git commit'; tool_use input shows .env in scope. The literal key sk-ant-api03-LEAKED_KEY_LOOKING_VALUE was in the staged diff."
+        ), [:])
+        let (engine, bus, captured) = makeEngine()
+        defer { engine.stop() }
+
+        publishBashCall(bus, command: "git commit -am 'add .env'")
+
+        try await captured.waitFor(count: 1, within: 3.0)
+        let candidate = try XCTUnwrap(captured.snapshot.first?.candidate)
+        XCTAssertFalse(candidate.reasoningPlain.contains("sk-ant-api03-LEAKED_KEY_LOOKING_VALUE"),
+                       "reasoning_plain leaked a secret-shaped string through the redactor: \(candidate.reasoningPlain)")
+        XCTAssertFalse(candidate.reasoningTechnical.contains("sk-ant-api03-LEAKED_KEY_LOOKING_VALUE"),
+                       "reasoning_technical leaked a secret-shaped string through the redactor: \(candidate.reasoningTechnical)")
     }
 
     func testAllClearProducesNoFlag() async throws {

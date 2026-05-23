@@ -20,6 +20,25 @@ final class StorageTests: XCTestCase {
         }
     }
 
+    /// v0.1.2's v2 migration: `reasoning` becomes `reasoning_technical`,
+    /// and `reasoning_plain` + `asymmetry_note` columns are added. The
+    /// rename + add + backfill all has to land in a single migration
+    /// pass so the row is consistent at every step.
+    func testV2MigrationSplitsReasoningColumns() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try db.queue.read { conn in
+            let cols = try conn.columns(in: "flags").map { $0.name }
+            XCTAssertTrue(cols.contains("reasoning_plain"),
+                          "expected reasoning_plain column after v2 migration; got: \(cols)")
+            XCTAssertTrue(cols.contains("reasoning_technical"),
+                          "expected reasoning_technical column after v2 migration; got: \(cols)")
+            XCTAssertTrue(cols.contains("asymmetry_note"),
+                          "expected asymmetry_note column after v2 migration; got: \(cols)")
+            XCTAssertFalse(cols.contains("reasoning"),
+                           "old `reasoning` column should have been renamed away; got: \(cols)")
+        }
+    }
+
     func testMigrationIsIdempotent() throws {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("supervisor-mig-test-\(UUID().uuidString).sqlite")
@@ -111,7 +130,8 @@ final class StorageTests: XCTestCase {
             category: "destructive_action_pending",
             severity: .high,
             action: .notify,
-            reasoning: "Claude Code just ran `rm -rf /tmp/foo` — stop further action?",
+            reasoningPlain: "Claude Code just ran `rm -rf /tmp/foo`. That's a temp path so this is fine, but I'm surfacing it in case it was unexpected.",
+            reasoningTechnical: "rm -rf against /tmp/foo matches the destructive_action_pending category but the path is in the explicit temp-path allowlist (clause 'Do NOT fire if: destructive command is rm against /tmp/').",
             evidenceUuids: ["evt-1", "evt-2"]
         )
         try store.insert(flag)
@@ -135,7 +155,8 @@ final class StorageTests: XCTestCase {
             category: "fabrication",
             severity: .medium,
             action: .notify,
-            reasoning: "test"
+            reasoningPlain: "test plain",
+            reasoningTechnical: "test technical"
         )
         try store.insert(flag)
         try store.markUserResponse(flagId: flag.id, response: .falsePositive)
@@ -154,7 +175,8 @@ final class StorageTests: XCTestCase {
             startedAt: Date(), lastSeenAt: Date(), jsonlPath: "/x"
         ))
         try flags.insert(StoredFlag(
-            sessionId: "s", category: "x", severity: .low, action: .notify, reasoning: ""
+            sessionId: "s", category: "x", severity: .low, action: .notify,
+            reasoningPlain: "", reasoningTechnical: ""
         ))
         XCTAssertEqual(try flags.count(sessionId: "s"), 1)
 

@@ -56,7 +56,11 @@ let package = Package(
         .target(
             name: "SupervisorUI",
             dependencies: ["SupervisorCore"],
-            path: "Sources/SupervisorUI"
+            path: "Sources/SupervisorUI",
+            // v0.1.3: onboarding wordmark + future brand assets ship
+            // through Bundle.module the same way SupervisorStatusBar's
+            // brand glyph does (see the StatusBar target below).
+            resources: [.process("Resources")]
         ),
         .executableTarget(
             name: "SupervisorApp",
@@ -89,6 +93,18 @@ let package = Package(
             name: "SupervisorDevTools",
             dependencies: ["SupervisorCore"],
             path: "Sources/SupervisorDevTools"
+        ),
+        // v0.1.4: fake-Claude harness for ProcessLocator tests. Writes
+        // realistic-shaped JSONL events to a target path at a configurable
+        // cadence, holds the fd open (or simulates the bad case where
+        // Claude open-writes-closes), and records its PID to a sidecar
+        // file so tests can verify the locator returned the right PID.
+        // Foundation-only, no SupervisorCore dependency — keeps the
+        // harness independent of the code under test.
+        .executableTarget(
+            name: "FakeClaudeCLI",
+            dependencies: [],
+            path: "Sources/FakeClaudeCLI"
         ),
         .testTarget(
             name: "SupervisorCoreTests",

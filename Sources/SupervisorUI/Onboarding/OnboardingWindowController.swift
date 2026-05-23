@@ -25,8 +25,21 @@ public final class OnboardingWindowController: NSWindowController {
 
         let host = NSHostingController(rootView: OnboardingScene(vm: vm))
         let window = NSWindow(contentViewController: host)
-        window.styleMask = [.titled, .closable]
-        window.title = "Supervisor"
+
+        // v0.1.3: hide the system title bar entirely while keeping the
+        // traffic-light controls and the drag-by-titlebar region.
+        // Literally dropping `.titled` (Mohammed's first-pass instruction)
+        // would also remove the close button and make the window
+        // un-draggable — `.titled + .fullSizeContentView` with a
+        // transparent + hidden title bar gives the cleaner result:
+        // traffic lights float over the branded 80pt header's top-left
+        // corner, and the window stays draggable through the (now
+        // invisible) title bar region.
+        window.styleMask = [.titled, .closable, .fullSizeContentView]
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.title = ""
+
         window.setContentSize(NSSize(width: 480, height: 360))
         window.center()
         window.isReleasedWhenClosed = false
