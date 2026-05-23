@@ -1,8 +1,15 @@
 <div align="center">
 
+<!-- DEMO_GIF_PLACEHOLDER: ~10s recording showing launch → rm-rf trigger → banner + hover red, target docs/demo.gif <5 MB, swap this comment for: ![Supervisor demo](./docs/demo.gif) -->
+
 ![Supervisor — Redirects Claude Code in real time.](./branding/supervisor-social-card.png)
 
 > **Redirects Claude Code in real time.**
+
+[![CI](https://github.com/maximizeGPT/supervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/maximizeGPT/supervisor/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/maximizeGPT/supervisor?include_prereleases&sort=semver)](https://github.com/maximizeGPT/supervisor/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Platform: macOS 13+](https://img.shields.io/badge/Platform-macOS%2013%2B-lightgrey)](https://www.apple.com/macos/)
 
 </div>
 
@@ -92,6 +99,8 @@ rm -rf ~/Library/Logs/Supervisor
 ```
 
 ## Architecture
+
+![Architecture diagram](./docs/architecture.svg)
 
 The brief version. [DESIGN.md](./DESIGN.md) has the full 1,184-line design doc — every decision is traceable.
 

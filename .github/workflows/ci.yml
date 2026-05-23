@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: swift build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: swift --version
+      - name: Build all targets
+        run: swift build
+
+  test:
+    name: swift test
+    runs-on: macos-14
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      # --skip-build is harmless here (swift test always builds what it
+      # needs); the flag is in the spec to match the documented developer
+      # workflow. The live-API test (testRealHaikuLiveCall) gates on
+      # ANTHROPIC_API_KEY at runtime — without the secret it self-skips,
+      # so we don't need a separate filter.
+      - name: Run unit tests
+        run: swift test --skip-build
+
+  lint:
+    name: swift-format lint
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      # swift-format ships with the Swift toolchain on macOS 14 / Xcode
+      # 16+. --strict turns style warnings into failures so CI stays
+      # honest about the style budget rather than degrading silently.
+      - name: Lint sources
+        run: swift format lint --strict --recursive Sources Tests
