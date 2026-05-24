@@ -76,6 +76,14 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
         }
 
         var matches: [ProcessHandle] = []
+        // v0.3.0 Issue #1: track the "cwd-matched but exec-unrecognized"
+        // case so a silent-nil here can be diagnosed post-mortem. If a
+        // process is in the target cwd and looks like it could be the
+        // Claude Code session but is launched as `node` / `python` /
+        // `bun` / etc. (the interpreter case), we don't have argv
+        // inspection yet (proper fix queued) but we can at least emit
+        // a loud trace tag identifying the candidate that got skipped.
+        var unrecognizedInTargetCwd: [(pid: pid_t, exec: String)] = []
         for pid in pids {
             // Never match Supervisor itself — Supervisor holds the JSONL
             // files open and could otherwise look like a candidate to an
@@ -83,10 +91,30 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
             // exclude it if Supervisor and Claude Code share a cwd.
             if pid == supervisorPID { continue }
             guard let execPath = Self.execPath(pid: pid) else { continue }
-            guard matchesExecName(execPath) else { continue }
+            let nameMatches = matchesExecName(execPath)
+            if !nameMatches {
+                // The exec name didn't match. Cheap follow-up check:
+                // was this process in the target cwd anyway? If so,
+                // it's a candidate we silently dropped — surface it.
+                if let cwd = Self.cwd(pid: pid), cwd == targetCwd {
+                    unrecognizedInTargetCwd.append((pid: pid, exec: execPath))
+                }
+                continue
+            }
             guard let cwd = Self.cwd(pid: pid) else { continue }
             guard cwd == targetCwd else { continue }
             matches.append(ProcessHandle(pid: pid, execPath: execPath, cwd: cwd))
+        }
+
+        // Surface unrecognized-but-cwd-matching candidates. This is
+        // the loud-failure trace that turns a silent locator.nil into
+        // a diagnosable "the process was there but we didn't recognize
+        // it." The router still degrades to notify (the match list is
+        // empty), but post-mortem can see what was skipped and why.
+        if matches.isEmpty && !unrecognizedInTargetCwd.isEmpty {
+            for entry in unrecognizedInTargetCwd {
+                trace.emit("locator", "locator.exec_unrecognized pid=\(entry.pid) cwd=\(targetCwd) execPath=\(entry.exec) (note: full path included so post-mortem can identify interpreter+CLI shapes like `node /usr/local/bin/claude/cli.mjs`; see Issue #1)")
+            }
         }
 
         switch matches.count {
