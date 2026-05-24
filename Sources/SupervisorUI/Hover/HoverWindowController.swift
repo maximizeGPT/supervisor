@@ -146,7 +146,11 @@ public final class HoverWindowController {
             // The observer queue is `.main`, so this fires on the main
             // thread; we hop to the @MainActor context explicitly to
             // satisfy Swift concurrency without doubling up the dispatch.
-            Task { @MainActor in self?.applyVisibility() }
+            // Local-bind self before Task so Swift 5.10 (CI) accepts the
+            // capture pattern — see HoverViewModel.swift for the long
+            // form of this comment.
+            guard let self else { return }
+            Task { @MainActor in self.applyVisibility() }
         }
     }
 
@@ -163,7 +167,8 @@ public final class HoverWindowController {
     private func startPollTimer() {
         guard pollTimer == nil else { return }
         pollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.applyVisibility() }
+            guard let self else { return }
+            Task { @MainActor in self.applyVisibility() }
         }
     }
 

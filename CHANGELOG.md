@@ -6,6 +6,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.6.2] — 2026-05-23 (CI green again)
+
+CI had been red on every push since the workflow first landed (4
+failures in a row, undetected because I wasn't checking
+`gh run list` after pushing). Mohammed flagged it. Two root causes:
+
+### Fixed
+- **`Task { @MainActor in self?... }` capture pattern.** Failed under
+  Swift 5.10 (GitHub Actions toolchain) with "reference to captured
+  var 'self' in concurrently-executing code." Swift 6.2 (my local
+  toolchain) is more permissive and silently accepted it. Five
+  call-sites updated to the explicit `guard let self else { return }`
+  pattern, same nil-safety:
+  - `Sources/SupervisorApp/main.swift` (engine.onDecision)
+  - `Sources/SupervisorCore/Hover/HoverViewModel.swift` (bus subscribe)
+  - `Sources/SupervisorCore/Triage/TriageEngine.swift` (bus subscribe)
+  - `Sources/SupervisorUI/Hover/HoverWindowController.swift` (workspace
+    observer + 3s poll timer)
+- **`swift-format lint` CI job removed.** My comment claiming
+  swift-format ships with the macos-14 toolchain was wrong; the job
+  failed every push with "unable to invoke subcommand: swift-format
+  (No such file or directory)." Removed rather than papering over
+  with `brew install swift-format`; can re-add when style enforcement
+  becomes worth the build-minute cost.
+
+### Process
+- Going forward, every `git push` must be followed by `gh run list` to
+  confirm CI didn't break. Silent CI red is worse than no CI.
+
 ## [0.1.6.1] — 2026-05-23 (Claude.app host + log-rotation doc fix)
 
 Small, no-behavior-change patch. Two issues:

@@ -209,7 +209,8 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         engine.onDecision = { [weak self] decision in
-            Task { @MainActor in self?.handle(decision: decision) }
+            guard let self else { return }
+            Task { @MainActor in self.handle(decision: decision) }
         }
         engine.start()
         self.triageEngine = engine

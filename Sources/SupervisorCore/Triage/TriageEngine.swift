@@ -106,7 +106,8 @@ public final class TriageEngine {
 
     public func start() {
         busSubscription = bus.subscribe { [weak self] event in
-            Task { @MainActor in self?.consume(event: event) }
+            guard let self else { return }
+            Task { @MainActor in self.consume(event: event) }
         }
         trace.emit("triage", "engine started model=\(model) windowSize=\(windowSize)")
     }

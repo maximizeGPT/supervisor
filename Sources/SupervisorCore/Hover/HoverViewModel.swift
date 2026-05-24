@@ -49,8 +49,14 @@ public final class HoverViewModel: ObservableObject {
     public init(bus: EventBus, trace: TraceLog = .shared) {
         self.bus = bus
         self.trace = trace
+        // Bind self locally before the Task so Swift 5.10 (CI toolchain)
+        // doesn't reject the closure as "reference to captured var 'self'
+        // in concurrently-executing code." Swift 6.2 (my local) is more
+        // permissive; CI is the source of truth. Same nil-safety as the
+        // original `self?.handle` — guard returns early on dealloc.
         self.busCancellable = bus.subscribe { [weak self] event in
-            Task { @MainActor in self?.handle(event: event) }
+            guard let self else { return }
+            Task { @MainActor in self.handle(event: event) }
         }
     }
 
