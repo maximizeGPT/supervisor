@@ -35,6 +35,15 @@ public struct ConfigPaths: Sendable {
         appSupportDir.appendingPathComponent("heartbeat.txt", isDirectory: false)
     }
 
+    /// `~/Library/Application Support/Supervisor/recovery/` — one markdown file
+    /// per pause/kill intervention, written by the router immediately before
+    /// it signals the Claude Code process. Read by the user (or the resumed /
+    /// next-launched assistant) to recover context after the intervention.
+    /// v0.1.6.
+    public var recoveryDir: URL {
+        appSupportDir.appendingPathComponent("recovery", isDirectory: true)
+    }
+
     /// `~/Library/Application Support/Supervisor/rubric.yaml` (v0.1.4+).
     public var rubricPath: URL {
         appSupportDir.appendingPathComponent("rubric.yaml", isDirectory: false)
@@ -66,5 +75,6 @@ public struct ConfigPaths: Sendable {
     public func ensureDirectoriesExist() throws {
         try FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: recoveryDir, withIntermediateDirectories: true)
     }
 }

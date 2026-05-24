@@ -21,6 +21,15 @@ public struct TriageDecision: Sendable {
     public let usage: AnthropicUsage
     public let model: String
     public let prePost: PrePost  // for the pre-NEXT-action / just-ran copy split
+    /// v0.1.6: the recent event window from TriageEngine's per-session buffer,
+    /// passed through so RecoveryDocWriter can render the "last ~10 tool calls"
+    /// section without re-parsing the JSONL or pulling from the tailer. The
+    /// triggering event itself is the last element; everything before it is
+    /// context. Empty if the window wasn't available at decision time.
+    public let recentEvents: [SupervisorEvent]
+    /// v0.1.6: the most recent user prompt in the window, surfaced separately
+    /// so the recovery doc can quote it verbatim without re-walking events.
+    public let lastUserPrompt: String?
 
     public enum PrePost: Sendable {
         case preExecution     // tool_result not yet in window
@@ -34,7 +43,9 @@ public struct TriageDecision: Sendable {
         triggeringEvent: BashToolCallInfo,
         usage: AnthropicUsage,
         model: String,
-        prePost: PrePost
+        prePost: PrePost,
+        recentEvents: [SupervisorEvent] = [],
+        lastUserPrompt: String? = nil
     ) {
         self.sessionId = sessionId
         self.cwd = cwd
@@ -43,6 +54,8 @@ public struct TriageDecision: Sendable {
         self.usage = usage
         self.model = model
         self.prePost = prePost
+        self.recentEvents = recentEvents
+        self.lastUserPrompt = lastUserPrompt
     }
 }
 
@@ -196,7 +209,9 @@ public final class TriageEngine {
                 triggeringEvent: call,
                 usage: response.usage,
                 model: response.model,
-                prePost: prePost
+                prePost: prePost,
+                recentEvents: window,
+                lastUserPrompt: userPrompt
             )
             trace.emit("triage", "FLAG session=\(call.sessionId) severity=\(candidate.severity.rawValue) action=\(candidate.action.rawValue) plain=\"\(candidate.reasoningPlain)\" tech=\"\(candidate.reasoningTechnical.prefix(200))\"")
             if let note = candidate.asymmetryNote, !note.isEmpty {

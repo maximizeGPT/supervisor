@@ -134,15 +134,18 @@ final class InterventionRouterTests: XCTestCase {
     }
 
     func testPauseDispatchSendsSIGSTOPAndPostsPauseBanner() async {
-        // v0.1.4 Gap 1+2+3: successful pause now ALSO posts an outcome-
-        // aware banner so the user has a visible signal + recovery info.
+        // v0.1.4 Gap 1+2+3 + v0.1.6 recovery doc: successful pause posts
+        // an outcome-aware banner carrying the recovery doc path.
         let (router, notifier, sender) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertEqual(sender.sent, [.init(signal: SIGSTOP, pid: 4242)])
         XCTAssertEqual(notifier.calls.count, 1,
                        "successful pause must post one outcome-aware banner")
-        XCTAssertEqual(notifier.calls.first?.outcome, .pauseSucceeded(pid: 4242),
-                       "banner outcome must carry the paused PID for the recovery copy")
+        if case let .pauseSucceeded(pid, _) = notifier.calls.first?.outcome {
+            XCTAssertEqual(pid, 4242, "banner outcome must carry the paused PID")
+        } else {
+            XCTFail("expected pauseSucceeded outcome, got \(String(describing: notifier.calls.first?.outcome))")
+        }
     }
 
     func testKillDispatchSendsSIGTERMAndPostsKillBanner() async {
@@ -151,7 +154,11 @@ final class InterventionRouterTests: XCTestCase {
         XCTAssertEqual(sender.sent, [.init(signal: SIGTERM, pid: 4242)])
         XCTAssertEqual(notifier.calls.count, 1,
                        "successful kill must post one outcome-aware banner")
-        XCTAssertEqual(notifier.calls.first?.outcome, .killSucceeded)
+        if case .killSucceeded = notifier.calls.first?.outcome {
+            // OK
+        } else {
+            XCTFail("expected killSucceeded outcome, got \(String(describing: notifier.calls.first?.outcome))")
+        }
     }
 
     func testPauseLocatorNilDegradesToNotify() async {
@@ -264,9 +271,20 @@ final class NotifierOutcomeBodyTests: XCTestCase {
         func body(for d: TriageDecision, outcome: InterventionOutcome) -> String {
             let base = Notifier.bannerPrefix + d.candidate.reasoningPlain
             switch outcome {
-            case .notifyOnly:                return base
-            case .pauseSucceeded(let pid):   return base + " Session paused. To resume: `kill -CONT \(pid)`."
-            case .killSucceeded:             return base + " Session killed. Start a new `claude` invocation to continue."
+            case .notifyOnly:
+                return base
+            case .pauseSucceeded(let pid, let path):
+                if let p = path {
+                    return base + " Session paused (PID \(pid)). Recovery: \(p.path)"
+                } else {
+                    return base + " Session paused. To resume: `kill -CONT \(pid)`."
+                }
+            case .killSucceeded(let path):
+                if let p = path {
+                    return base + " Session killed. Read recovery doc before starting new `claude`: \(p.path)"
+                } else {
+                    return base + " Session killed. Start a new `claude` invocation to continue."
+                }
             }
         }
     }
@@ -278,17 +296,35 @@ final class NotifierOutcomeBodyTests: XCTestCase {
         XCTAssertFalse(s.contains("Start a new"))
     }
 
-    func testPauseSucceededBodyIncludesPIDAndRecoveryString() {
-        let s = BodyShim().body(for: decision(), outcome: .pauseSucceeded(pid: 12345))
+    func testPauseSucceededBodyWithoutRecoveryFallsBackToKillCONT() {
+        // Recovery-doc-nil (writer failed) → banner falls back to v0.1.4 inline copy.
+        let s = BodyShim().body(for: decision(), outcome: .pauseSucceeded(pid: 12345, recoveryDocPath: nil))
         XCTAssertTrue(s.contains("kill -CONT 12345"),
-                      "pause banner must surface the literal kill -CONT command with the PID baked in")
+                      "fallback pause banner must surface the literal kill -CONT command")
         XCTAssertTrue(s.contains("Session paused"))
     }
 
-    func testKillSucceededBodyTellsUserToStartFreshClaude() {
-        let s = BodyShim().body(for: decision(), outcome: .killSucceeded)
+    func testPauseSucceededBodyWithRecoveryPointsToDoc() {
+        // Happy path (v0.1.6): banner surfaces recovery doc path with the PID.
+        let url = URL(fileURLWithPath: "/tmp/recovery/test-paused.md")
+        let s = BodyShim().body(for: decision(), outcome: .pauseSucceeded(pid: 7777, recoveryDocPath: url))
+        XCTAssertTrue(s.contains("PID 7777"), "v0.1.6 pause banner surfaces PID")
+        XCTAssertTrue(s.contains("/tmp/recovery/test-paused.md"),
+                      "v0.1.6 pause banner must surface the recovery doc path")
+    }
+
+    func testKillSucceededBodyWithoutRecoveryFallsBackToStartFreshClaude() {
+        let s = BodyShim().body(for: decision(), outcome: .killSucceeded(recoveryDocPath: nil))
         XCTAssertTrue(s.contains("Start a new `claude` invocation"),
-                      "kill banner must direct the user to a fresh session as the recovery path")
+                      "fallback kill banner must direct user to a fresh session")
         XCTAssertTrue(s.contains("Session killed"))
+    }
+
+    func testKillSucceededBodyWithRecoveryPointsToDoc() {
+        let url = URL(fileURLWithPath: "/tmp/recovery/test-killed.md")
+        let s = BodyShim().body(for: decision(), outcome: .killSucceeded(recoveryDocPath: url))
+        XCTAssertTrue(s.contains("Read recovery doc before starting new"),
+                      "v0.1.6 kill banner must tell user to read the recovery doc first")
+        XCTAssertTrue(s.contains("/tmp/recovery/test-killed.md"))
     }
 }

@@ -137,6 +137,18 @@ final class StatusBarController: NSObject {
         recentFlags.target = self
         menu.addItem(recentFlags)
 
+        // v0.1.6: every pause/kill writes a markdown handoff to
+        // ~/Library/Application Support/Supervisor/recovery/. This menu
+        // item reveals that folder in Finder so the user can browse the
+        // history of interventions and their handoff docs.
+        let openRecovery = NSMenuItem(
+            title: "Open Recovery Folder",
+            action: #selector(openRecoveryFolder),
+            keyEquivalent: ""
+        )
+        openRecovery.target = self
+        menu.addItem(openRecovery)
+
         let openLog = NSMenuItem(
             title: "Open Trace Log",
             action: #selector(openTraceLog),
@@ -192,6 +204,16 @@ final class StatusBarController: NSObject {
 
     @objc private func openTraceLog() {
         NSWorkspace.shared.open(paths.traceLogPath)
+    }
+
+    /// v0.1.6: reveal the recovery-doc directory in Finder. Creates the
+    /// directory first if it doesn't exist yet (typical on a clean install
+    /// before any pause/kill has fired), so the user doesn't see a
+    /// "folder not found" error from Finder.
+    @objc private func openRecoveryFolder() {
+        try? FileManager.default.createDirectory(at: paths.recoveryDir, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([paths.recoveryDir])
+        trace.emit("statusbar", "open recovery folder requested → \(paths.recoveryDir.path)")
     }
 
     @objc private func openNotifications() {

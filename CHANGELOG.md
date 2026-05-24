@@ -6,6 +6,94 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-05-23 (intervention recovery context)
+
+Real failure mode discovered during the (gated-off) v0.1.5 autonomous-trial
+planning: a pause or kill that fires unattended leaves no recovery context
+for the user-on-wake-up or the resumed/restarted assistant. v0.1.6 fixes
+that — every pause and kill writes a markdown handoff doc to disk
+immediately before the signal lands, with the reasoning, the recent tool
+calls, and action-specific recovery instructions.
+
+### Added
+- `RecoveryDocWriter` (Sources/SupervisorCore/Intervention/RecoveryDocWriter.swift)
+  — writes a markdown intervention-recovery doc to
+  `~/Library/Application Support/Supervisor/recovery/<ISO>-<uuid-short>-<action>.md`
+  before the router sends SIGSTOP/SIGTERM. Doc contains:
+    - **What happened**: timestamp, category, severity, the plain + technical
+      + asymmetry reasoning Haiku produced.
+    - **What Claude Code was doing**: cwd, session id, PID, user's most
+      recent prompt (truncated to 500 chars), the matched command, and the
+      last 10 tool calls from the TriageEngine's event window
+      (chronological, with timestamps).
+    - **What to do next**: action-specific.
+      - For pause: literal `kill -CONT <pid>` line, plus YES/NO/UNSURE
+        decision branches each with a ready-to-paste prompt template
+        for the resumed assistant.
+      - For kill: "session is dead, start a new `claude` in `<cwd>`" with
+        a multi-line handoff message template covering the kill reason,
+        the inferred task, progress so far (the recent tool calls), and
+        an explicit "do NOT retry `<matched_command>`" guard.
+- `ConfigPaths.recoveryDir` — `~/Library/Application Support/Supervisor/recovery/`.
+  Created on first launch by `ensureDirectoriesExist()`.
+- `RecoveryAction` enum (`.pause` / `.kill`) — passed into `RecoveryDocWriter`
+  so the action-specific recovery section can branch without re-decoding
+  the InterventionOutcome.
+- `SupervisorStatusBar` gains an **"Open Recovery Folder"** menu item that
+  reveals the recovery directory in Finder via `activateFileViewerSelecting`.
+  Creates the directory first if it doesn't exist yet so a clean install
+  doesn't show a "folder not found" error.
+
+### Changed
+- `InterventionOutcome` enum gained `recoveryDocPath: URL?` on both
+  `.pauseSucceeded` and `.killSucceeded`. The router populates it from
+  `RecoveryDocWriter.write()`; the Notifier surfaces it in the banner
+  body so the user has a single clickable path to the handoff doc.
+- **Banner copy** updated per outcome:
+  - `.pauseSucceeded` with recovery doc: `…Session paused (PID <pid>). Recovery: <path>`
+  - `.pauseSucceeded` without recovery doc (writer failed): falls back to
+    v0.1.4 inline `Session paused. To resume: \`kill -CONT <pid>\`.`
+  - `.killSucceeded` with recovery doc: `…Session killed. Read recovery doc before starting new \`claude\`: <path>`
+  - `.killSucceeded` without recovery doc: falls back to v0.1.4 inline
+    `Session killed. Start a new \`claude\` invocation to continue.`
+- `InterventionRouter` now writes the recovery doc IMMEDIATELY before
+  `signalSender.send(signal, to:)` so for kill the doc is on disk before
+  the assistant process is gone. The `intervention.<op>.fired` trace tag
+  now includes the doc path (or `nil` if the write failed).
+- `TriageDecision` plumbs `recentEvents: [SupervisorEvent]` and
+  `lastUserPrompt: String?` through from TriageEngine's evaluation window
+  so RecoveryDocWriter has the data without needing to re-parse the
+  session's JSONL or hold a separate reference to the tailer.
+
+### Retention
+- Default retention is the last 50 recovery docs. On each successful
+  write, files beyond the limit are pruned (oldest by creation date).
+  Configurable via `RecoveryDocWriter.init(retentionLimit:)`.
+
+### Tests
+- `RecoveryDocWriterTests` (+9 tests):
+  - Doc file exists synchronously by the time `write()` returns
+    (proves the router can rely on it before signaling).
+  - Filename format `<ISO8601-no-colons>-<uuid-short>-<action>.md`.
+  - All required sections present.
+  - Asymmetry section omitted when note is nil.
+  - Pause body has `kill -CONT <pid>` + YES/NO/UNSURE branches.
+  - Kill body has "start a new claude" + "do NOT retry" guard.
+  - Empty event window handled (placeholder, not crash).
+  - Window with <10 tool calls renders correctly.
+  - Retention prunes oldest beyond limit.
+- `InterventionRouterTests` updated for the new `InterventionOutcome`
+  shape (associated `recoveryDocPath: URL?`); pause/kill banner tests
+  cover both with-path and without-path (fallback) variants.
+- Total: **163 tests pass, 2 skipped** (both live-API gated).
+
+### Part B note — autonomous trial retrofit
+Mohammed's v0.1.6 spec included a Part B to retrofit recovery docs for
+the v0.1.5 autonomous-trial intervention(s). Part B was gated off
+(calibration didn't hit the 95% floor) so the trial didn't run and
+there are no intervention records to retrofit. The retrofit lands the
+session after a successful autonomous trial uses the v0.1.6 machinery.
+
 ## [0.1.5] — 2026-05-23 (rubric calibration sweep + tightening)
 
 ### Added

@@ -31,17 +31,20 @@ public final class InterventionRouter {
     private let notifier: any Notifying
     private let locator: any ProcessLocator
     private let signalSender: any SignalSender
+    private let recoveryDocWriter: RecoveryDocWriter?
     private let trace: TraceLog
 
     public init(
         notifier: any Notifying,
         locator: any ProcessLocator,
         signalSender: any SignalSender = DarwinSignalSender(),
+        recoveryDocWriter: RecoveryDocWriter? = nil,
         trace: TraceLog = .shared
     ) {
         self.notifier = notifier
         self.locator = locator
         self.signalSender = signalSender
+        self.recoveryDocWriter = recoveryDocWriter
         self.trace = trace
     }
 
@@ -82,15 +85,26 @@ public final class InterventionRouter {
             await postNotify(decision)
             return
         }
+        // v0.1.6: write the recovery doc BEFORE the signal lands. For
+        // kill especially, the assistant process is gone post-SIGTERM
+        // and we'd lose the ability to surface state. Write first; signal
+        // second. The doc reads "Supervisor fired <action>" past-tense
+        // because at the user's read-time, the signal has landed.
+        let recoveryAction: RecoveryAction = (signal == SIGSTOP) ? .pause : .kill
+        let recoveryDocPath = recoveryDocWriter?.write(
+            decision: decision,
+            action: recoveryAction,
+            pid: handle.pid
+        )
         do {
             try signalSender.send(signal, to: handle.pid)
-            trace.emit("router", "intervention.\(opName).fired pid=\(handle.pid) signal=\(signal) cwd=\(cwd)")
-            // v0.1.4 Gap 1+2+3: post the outcome-aware banner so the
-            // user has a visible signal of the successful intervention
-            // and (for pause) the recovery instruction.
+            trace.emit("router", "intervention.\(opName).fired pid=\(handle.pid) signal=\(signal) cwd=\(cwd) recoveryDoc=\(recoveryDocPath?.path ?? "nil")")
+            // v0.1.4 Gap 1+2+3 + v0.1.6: post the outcome-aware banner
+            // with the recovery doc path so the user has a visible
+            // signal + a pointer to the handoff.
             let outcome: InterventionOutcome = (signal == SIGSTOP)
-                ? .pauseSucceeded(pid: handle.pid)
-                : .killSucceeded
+                ? .pauseSucceeded(pid: handle.pid, recoveryDocPath: recoveryDocPath)
+                : .killSucceeded(recoveryDocPath: recoveryDocPath)
             _ = await notifier.postInterventionResult(decision: decision, outcome: outcome)
         } catch let err as SignalError {
             let reason: String

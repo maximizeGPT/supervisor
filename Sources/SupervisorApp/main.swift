@@ -169,13 +169,19 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         )
         self.anthropic = client
 
-        // 4. Notifier + Intervention router (v0.1.4 Part A3)
+        // 4. Notifier + Intervention router (v0.1.4 Part A3) + v0.1.6
+        // RecoveryDocWriter (writes handoff markdown before SIGSTOP/SIGTERM).
         let notifier = Notifier(trace: trace)
         self.notifier = notifier
+        let recoveryWriter = RecoveryDocWriter(
+            directory: paths.recoveryDir,
+            trace: trace
+        )
         let router = InterventionRouter(
             notifier: notifier,
             locator: LiveProcessLocator(trace: trace),
             signalSender: DarwinSignalSender(),
+            recoveryDocWriter: recoveryWriter,
             trace: trace
         )
         self.router = router

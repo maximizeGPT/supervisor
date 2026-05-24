@@ -50,10 +50,15 @@ public extension Notifying {
 /// `killSucceeded` only flow when the SIGSTOP / SIGTERM actually
 /// landed — the banner then includes the recovery information the user
 /// needs to act.
+///
+/// v0.1.6: `recoveryDocPath` is the URL where RecoveryDocWriter wrote
+/// the markdown handoff. May be nil if the doc write failed (filesystem
+/// error, etc.) — Notifier falls back to inline recovery copy in that
+/// case so the banner is never silent about how to recover.
 public enum InterventionOutcome: Sendable, Equatable {
     case notifyOnly
-    case pauseSucceeded(pid: pid_t)
-    case killSucceeded
+    case pauseSucceeded(pid: pid_t, recoveryDocPath: URL?)
+    case killSucceeded(recoveryDocPath: URL?)
 }
 
 public final class Notifier: Notifying, @unchecked Sendable {
@@ -125,20 +130,28 @@ public final class Notifier: Notifying, @unchecked Sendable {
         Self.bannerPrefix + decision.candidate.reasoningPlain
     }
 
-    /// v0.1.4 Gap 1+2+3: outcome-aware body composer. The pause case
-    /// appends a recovery hint with the PID so the user can `kill -CONT`
-    /// without needing to look it up. The kill case appends a follow-on
-    /// pointer so the user knows the session ended and how to continue.
-    /// `notifyOnly` is identical to the v0.1.2 body shape.
+    /// v0.1.4 Gap 1+2+3 + v0.1.6 recovery doc pointer: outcome-aware body
+    /// composer. Pause/kill banners include the recovery doc path so the
+    /// user can open it from Finder or `open <path>`. If the doc write
+    /// failed (path is nil), the banner falls back to v0.1.4's inline
+    /// recovery copy — never silent about how to recover.
     public func body(for decision: TriageDecision, outcome: InterventionOutcome) -> String {
         let base = Self.bannerPrefix + decision.candidate.reasoningPlain
         switch outcome {
         case .notifyOnly:
             return base
-        case .pauseSucceeded(let pid):
-            return base + " Session paused. To resume: `kill -CONT \(pid)`."
-        case .killSucceeded:
-            return base + " Session killed. Start a new `claude` invocation to continue."
+        case .pauseSucceeded(let pid, let recoveryDocPath):
+            if let path = recoveryDocPath {
+                return base + " Session paused (PID \(pid)). Recovery: \(path.path)"
+            } else {
+                return base + " Session paused. To resume: `kill -CONT \(pid)`."
+            }
+        case .killSucceeded(let recoveryDocPath):
+            if let path = recoveryDocPath {
+                return base + " Session killed. Read recovery doc before starting new `claude`: \(path.path)"
+            } else {
+                return base + " Session killed. Start a new `claude` invocation to continue."
+            }
         }
     }
 
