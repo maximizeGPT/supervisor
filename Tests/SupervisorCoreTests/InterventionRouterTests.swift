@@ -78,18 +78,21 @@ final class InterventionRouterTests: XCTestCase {
     private func makeDecision(
         action: FlagAction,
         cwd: String? = "/tmp/test-cwd",
-        sessionId: String = "s1"
+        sessionId: String = "s1",
+        suggestedInjectText: String? = nil,
+        category: String = "destructive_action_pending"
     ) -> TriageDecision {
         TriageDecision(
             sessionId: sessionId,
             cwd: cwd,
             candidate: TriageCandidate(
-                category: "destructive_action_pending",
+                category: category,
                 severity: .high,
                 matchedCommand: "rm -rf /tmp/x",
                 action: action,
                 reasoningPlain: "fake plain",
-                reasoningTechnical: "fake technical"
+                reasoningTechnical: "fake technical",
+                suggestedInjectText: suggestedInjectText
             ),
             triggeringEvent: BashToolCallInfo(
                 sessionId: sessionId,
@@ -109,23 +112,25 @@ final class InterventionRouterTests: XCTestCase {
 
     private func makeRouter(
         handle: ProcessHandle? = ProcessHandle(pid: 4242, execPath: "/path/claude", cwd: "/tmp/test-cwd"),
-        sender: CapturingSignalSender = CapturingSignalSender()
-    ) -> (router: InterventionRouter, notifier: MockNotifier, sender: CapturingSignalSender) {
+        sender: CapturingSignalSender = CapturingSignalSender(),
+        injector: MockInjector = MockInjector()
+    ) -> (router: InterventionRouter, notifier: MockNotifier, sender: CapturingSignalSender, injector: MockInjector) {
         let notifier = MockNotifier()
         let router = InterventionRouter(
             notifier: notifier,
             locator: StubLocator(handle: handle),
             signalSender: sender,
+            injector: injector,
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("router-test-\(UUID().uuidString).log"))
         )
-        return (router, notifier, sender)
+        return (router, notifier, sender, injector)
     }
 
     // MARK: - Tests
 
     func testNotifyDispatchPostsBanner_NoSignalSent() async {
-        let (router, notifier, sender) = makeRouter()
+        let (router, notifier, sender, _) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .notify))
         XCTAssertEqual(notifier.calls.count, 1)
         XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly,
@@ -136,7 +141,7 @@ final class InterventionRouterTests: XCTestCase {
     func testPauseDispatchSendsSIGSTOPAndPostsPauseBanner() async {
         // v0.1.4 Gap 1+2+3 + v0.1.6 recovery doc: successful pause posts
         // an outcome-aware banner carrying the recovery doc path.
-        let (router, notifier, sender) = makeRouter()
+        let (router, notifier, sender, _) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertEqual(sender.sent, [.init(signal: SIGSTOP, pid: 4242)])
         XCTAssertEqual(notifier.calls.count, 1,
@@ -149,7 +154,7 @@ final class InterventionRouterTests: XCTestCase {
     }
 
     func testKillDispatchSendsSIGTERMAndPostsKillBanner() async {
-        let (router, notifier, sender) = makeRouter()
+        let (router, notifier, sender, _) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .kill))
         XCTAssertEqual(sender.sent, [.init(signal: SIGTERM, pid: 4242)])
         XCTAssertEqual(notifier.calls.count, 1,
@@ -162,7 +167,7 @@ final class InterventionRouterTests: XCTestCase {
     }
 
     func testPauseLocatorNilDegradesToNotify() async {
-        let (router, notifier, sender) = makeRouter(handle: nil)
+        let (router, notifier, sender, _) = makeRouter(handle: nil)
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertTrue(sender.sent.isEmpty, "no signal sent when locator returns nil")
         XCTAssertEqual(notifier.calls.count, 1, "locator-nil must degrade to a notify banner")
@@ -173,7 +178,7 @@ final class InterventionRouterTests: XCTestCase {
     func testPausePermissionDeniedDegradesToNotify() async {
         let sender = CapturingSignalSender()
         sender.throwOnNext = SignalError(errnoValue: EPERM)
-        let (router, notifier, _) = makeRouter(sender: sender)
+        let (router, notifier, _, _) = makeRouter(sender: sender)
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertTrue(sender.sent.isEmpty, "send() threw before recording — no successful signal")
         XCTAssertEqual(notifier.calls.count, 1, "EPERM must degrade to notify")
@@ -183,7 +188,7 @@ final class InterventionRouterTests: XCTestCase {
     func testPauseProcessGoneDegradesToNotify() async {
         let sender = CapturingSignalSender()
         sender.throwOnNext = SignalError(errnoValue: ESRCH)
-        let (router, notifier, _) = makeRouter(sender: sender)
+        let (router, notifier, _, _) = makeRouter(sender: sender)
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertTrue(sender.sent.isEmpty)
         XCTAssertEqual(notifier.calls.count, 1, "ESRCH must degrade to notify")
@@ -194,7 +199,7 @@ final class InterventionRouterTests: XCTestCase {
         // Locator stub returns a non-nil handle, but the decision has no
         // cwd — router must short-circuit at the cwd check, NOT call the
         // locator, NOT send a signal, fire notify.
-        let (router, notifier, sender) = makeRouter()
+        let (router, notifier, sender, _) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .pause, cwd: nil))
         XCTAssertTrue(sender.sent.isEmpty)
         XCTAssertEqual(notifier.calls.count, 1)
@@ -204,7 +209,7 @@ final class InterventionRouterTests: XCTestCase {
         // Sender is mock; SIGSTOP to an already-stopped process is a
         // no-op on Darwin but the sender doesn't model that. The test's
         // invariant is "router doesn't crash when dispatched twice."
-        let (router, _, sender) = makeRouter()
+        let (router, _, sender, _) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .pause))
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertEqual(sender.sent, [
@@ -214,7 +219,7 @@ final class InterventionRouterTests: XCTestCase {
     }
 
     func testKillAfterPauseSendsBothSignalsInOrder() async {
-        let (router, _, sender) = makeRouter()
+        let (router, _, sender, _) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .pause))
         await router.dispatch(decision: makeDecision(action: .kill))
         XCTAssertEqual(sender.sent, [
@@ -223,14 +228,112 @@ final class InterventionRouterTests: XCTestCase {
         ])
     }
 
-    func testInjectIsRoutedToNotifyForNow() async {
-        // .inject is in the FlagAction enum but the executor is queued.
-        // Router must treat .inject as notify until the executor ships.
-        let (router, notifier, sender) = makeRouter()
-        await router.dispatch(decision: makeDecision(action: .inject))
-        XCTAssertEqual(notifier.calls.count, 1, ".inject must degrade to notify in v0.1.4")
-        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly)
-        XCTAssertTrue(sender.sent.isEmpty, ".inject must NOT send any signal")
+    // MARK: - Inject tests (v0.3.0)
+
+    func testInjectWithTextAndPIDPostsInjectSucceededBanner() async {
+        // Happy path: candidate carries inject text, locator returns a PID,
+        // mock injector accepts and returns byte count. Router must post
+        // .injectSucceeded with the same PID and byte count.
+        let injector = MockInjector()
+        injector.bytesToReturn = 42
+        let (router, notifier, sender, recorder) = makeRouter(injector: injector)
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            suggestedInjectText: "Use sysctl with cwd matching."
+        ))
+        XCTAssertEqual(recorder.calls.count, 1, "inject path must call the injector exactly once")
+        XCTAssertEqual(recorder.calls.first?.text, "Use sysctl with cwd matching.")
+        XCTAssertEqual(recorder.calls.first?.pid, 4242)
+        XCTAssertTrue(sender.sent.isEmpty, "inject path must NOT send any signal")
+        XCTAssertEqual(notifier.calls.count, 1)
+        if case let .injectSucceeded(pid, bytes) = notifier.calls.first?.outcome {
+            XCTAssertEqual(pid, 4242)
+            XCTAssertEqual(bytes, 42)
+        } else {
+            XCTFail("expected injectSucceeded outcome, got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    func testInjectWithNoSuggestedTextDegradesToPlainNotify() async {
+        // Inject action but no text — degrade to plain notify, NOT
+        // injectDegraded (because there's no intended text to surface).
+        let injector = MockInjector()
+        let (router, notifier, sender, recorder) = makeRouter(injector: injector)
+        await router.dispatch(decision: makeDecision(action: .inject, suggestedInjectText: nil))
+        XCTAssertTrue(recorder.calls.isEmpty, "injector must NOT be called when no text")
+        XCTAssertTrue(sender.sent.isEmpty)
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly,
+                       "no-text inject falls through to plain notify (nothing to surface in banner)")
+    }
+
+    func testInjectLocatorNilDegradesWithIntendedTextInBanner() async {
+        // Locator fails → inject can't run → banner must carry the
+        // intended text so the user can paste manually.
+        let injector = MockInjector()
+        let (router, notifier, sender, recorder) = makeRouter(handle: nil, injector: injector)
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            suggestedInjectText: "Answer text"
+        ))
+        XCTAssertTrue(recorder.calls.isEmpty, "injector must NOT be called when locator returns nil")
+        XCTAssertTrue(sender.sent.isEmpty)
+        XCTAssertEqual(notifier.calls.count, 1)
+        if case let .injectDegraded(intended, reason) = notifier.calls.first?.outcome {
+            XCTAssertEqual(intended, "Answer text")
+            XCTAssertEqual(reason, "locator_nil")
+        } else {
+            XCTFail("expected injectDegraded(locator_nil), got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    func testInjectNoHostingAppDegrades() async {
+        let injector = MockInjector()
+        injector.errorToThrow = .noHostingApp
+        let (router, notifier, sender, recorder) = makeRouter(injector: injector)
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            suggestedInjectText: "Answer text"
+        ))
+        XCTAssertEqual(recorder.calls.count, 1, "injector must be called before it errors")
+        XCTAssertTrue(sender.sent.isEmpty)
+        if case let .injectDegraded(_, reason) = notifier.calls.first?.outcome {
+            XCTAssertEqual(reason, "no_hosting_app")
+        } else {
+            XCTFail("expected injectDegraded(no_hosting_app), got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    func testInjectUnsupportedHostDegrades() async {
+        let injector = MockInjector()
+        injector.errorToThrow = .unsupportedHost(bundleID: "com.example.weird")
+        let (router, notifier, _, _) = makeRouter(injector: injector)
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            suggestedInjectText: "Answer text"
+        ))
+        if case let .injectDegraded(_, reason) = notifier.calls.first?.outcome {
+            XCTAssertTrue(reason.contains("unsupported_host"),
+                          "reason must encode the unsupported bundle ID for trace")
+            XCTAssertTrue(reason.contains("com.example.weird"))
+        } else {
+            XCTFail("expected injectDegraded(unsupported_host_*), got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    func testInjectMissingCwdDegradesWithoutCallingInjector() async {
+        let injector = MockInjector()
+        let (router, notifier, _, recorder) = makeRouter(injector: injector)
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            cwd: nil,
+            suggestedInjectText: "Answer text"
+        ))
+        XCTAssertTrue(recorder.calls.isEmpty, "missing cwd must not reach the injector")
+        if case let .injectDegraded(_, reason) = notifier.calls.first?.outcome {
+            XCTAssertEqual(reason, "no_cwd_on_decision")
+        } else {
+            XCTFail("expected injectDegraded(no_cwd_on_decision)")
+        }
     }
 }
 
@@ -285,6 +388,10 @@ final class NotifierOutcomeBodyTests: XCTestCase {
                 } else {
                     return base + " Session killed. Start a new `claude` invocation to continue."
                 }
+            case .injectSucceeded(let pid, let bytes):
+                return base + " Supervisor answered (PID \(pid), \(bytes) bytes injected)."
+            case .injectDegraded(let intendedText, _):
+                return base + " Supervisor would have answered: \(intendedText) Paste this into Claude Code to continue."
             }
         }
     }

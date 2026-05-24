@@ -59,6 +59,15 @@ public enum InterventionOutcome: Sendable, Equatable {
     case notifyOnly
     case pauseSucceeded(pid: pid_t, recoveryDocPath: URL?)
     case killSucceeded(recoveryDocPath: URL?)
+    /// v0.3.0: inject landed in the hosting terminal. `bytes` is the
+    /// payload size (informational). The banner just says "Supervisor
+    /// answered" — the answer text isn't repeated in the banner
+    /// because it's already in the user's terminal.
+    case injectSucceeded(pid: pid_t, bytes: Int)
+    /// v0.3.0: inject couldn't run. The banner falls back to surfacing
+    /// the intended text so the user can paste it manually. `reason`
+    /// goes into the trace, not the banner.
+    case injectDegraded(intendedText: String, reason: String)
 }
 
 public final class Notifier: Notifying, @unchecked Sendable {
@@ -152,6 +161,15 @@ public final class Notifier: Notifying, @unchecked Sendable {
             } else {
                 return base + " Session killed. Start a new `claude` invocation to continue."
             }
+        case .injectSucceeded(let pid, let bytes):
+            // The injected text is already in the user's terminal — no
+            // need to repeat it in the banner. Just acknowledge.
+            return base + " Supervisor answered (PID \(pid), \(bytes) bytes injected)."
+        case .injectDegraded(let intendedText, _):
+            // The inject path failed; surface the intended text so the
+            // user can paste it manually. Reason goes to trace, not the
+            // banner — banner stays user-facing, not diagnostic.
+            return base + " Supervisor would have answered: \(intendedText) Paste this into Claude Code to continue."
         }
     }
 

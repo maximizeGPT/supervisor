@@ -73,9 +73,16 @@ public enum TriagePrompt {
                                 "recommended_action": .object([
                                     "type": .string("string"),
                                     "enum": .array([
-                                        .string("notify"), .string("pause"), .string("kill")
+                                        .string("notify"), .string("inject"), .string("pause"), .string("kill")
                                     ]),
-                                    "description": .string("What Supervisor should do. Pick the lightest action that fits. notify = banner only; pause = SIGSTOP (recoverable); kill = SIGTERM (not recoverable).")
+                                    "description": .string("What Supervisor should do. Pick the lightest action that fits. notify = banner only; inject = type an answer into the terminal (v0.3.0+, only for user_question_pending where question_type=engineering); pause = SIGSTOP (recoverable); kill = SIGTERM (not recoverable).")
+                                ]),
+                                "question_type": .object([
+                                    "type": .string("string"),
+                                    "enum": .array([
+                                        .string("engineering"), .string("safety"), .string("taste")
+                                    ]),
+                                    "description": .string("v0.3.0: REQUIRED when category=user_question_pending; omit otherwise. engineering = answer derivable from a written document (PRINCIPLES.md, project conventions); safety = the action behind the question is destructive/irreversible; taste = depends on user values, aesthetics, naming, copy. Default to safety when uncertain between engineering and safety; default to taste when uncertain between engineering and taste.")
                                 ]),
                                 "reasoning_plain": .object([
                                     "type": .string("string"),
@@ -181,6 +188,88 @@ public enum TriagePrompt {
     \(HardcodedRubric.allBodiesMarkdown)
     """
 
+    /// v0.3.0: cheap local prefilter. Only assistant texts that look
+    /// like they might contain a question worth triaging get sent to
+    /// Haiku. Without this, every assistant turn would cost ~$0.005 in
+    /// Haiku triage calls — most of which would return empty
+    /// candidates. The patterns are intentionally generous (high recall,
+    /// low precision) — Haiku makes the final call. Net effect: a typical
+    /// 100-turn session sees 5-10 secondary triage calls, not 100.
+    public static func looksLikeQuestionToUser(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        // Bracket: explicit question mark anywhere (the most common shape).
+        if text.contains("?") {
+            return true
+        }
+        // Belt: canonical conditional-permission phrasings.
+        let phrases = [
+            "should i ", "do you want", "would you prefer", "let me know",
+            "tell me how", "shall i ", "could you confirm", "want me to ",
+            "ok to ", "okay to ", "any preference",
+        ]
+        for p in phrases where lower.contains(p) {
+            return true
+        }
+        return false
+    }
+
+    /// v0.3.0: build a triage request focused on an assistant text
+    /// (specifically, an assistant message that may contain a question
+    /// directed at the user). Uses the same record_triage tool as the
+    /// bash path so candidates flow through the same parser.
+    public static func buildAssistantQuestionRequest(
+        model: String,
+        sessionId: String,
+        cwd: String?,
+        userPrompt: String?,
+        assistantText: String,
+        recentEvents: [SupervisorEvent]
+    ) -> AnthropicMessageRequest {
+        var lines: [String] = []
+
+        lines.append("# Session working directory")
+        lines.append(cwd ?? "(unknown)")
+        lines.append("")
+        lines.append("# Most recent user prompt")
+        if let p = userPrompt, !p.isEmpty {
+            lines.append(p)
+        } else {
+            lines.append("(no recent user prompt in window)")
+        }
+        lines.append("")
+
+        lines.append("# Assistant message under review (most recent)")
+        lines.append(assistantText)
+        lines.append("")
+
+        lines.append("# Recent event window (chronological)")
+        if recentEvents.isEmpty {
+            lines.append("(no prior events)")
+        } else {
+            let fmt = ISO8601DateFormatter()
+            fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            for event in recentEvents.suffix(20) {
+                let ts = fmt.string(from: event.timestamp)
+                lines.append(eventSummaryLine(event, ts: ts))
+            }
+        }
+        lines.append("")
+        lines.append("Evaluate ONLY against the `user_question_pending` category. The bash-shaped categories (destructive_action_pending, edits_outside_worktree, prompt_injection_signature) do not apply here. Use the same record_triage tool: call it with one candidate if the assistant is asking the user a question, or with candidates=[] if not.")
+
+        let userText = lines.joined(separator: "\n")
+
+        return AnthropicMessageRequest(
+            model: model,
+            max_tokens: 1024,
+            system: systemPrompt,
+            messages: [
+                .init(role: "user", content: .string(userText))
+            ],
+            tools: [recordTriageTool],
+            tool_choice: .forced(recordTriageToolName)
+        )
+    }
+
     /// Build the full Anthropic request payload.
     public static func buildRequest(
         model: String,
@@ -273,6 +362,20 @@ public struct TriageCandidate: Sendable, Equatable {
     public let reasoningPlain: String          // banner-fit
     public let reasoningTechnical: String      // engineer-fit, formerly `reasoning`
     public let asymmetryNote: String?
+    /// v0.3.0: the text to inject when action == .inject. Populated by
+    /// the secondary Haiku answer/translate call for user_question_pending
+    /// flags (engineering questions get an answer derived from
+    /// PRINCIPLES.md; taste questions get a plain-language rewrite).
+    /// Nil/empty for any non-inject action; if nil and action is .inject,
+    /// the router degrades to notify with reason=no_inject_text.
+    public let suggestedInjectText: String?
+    /// v0.3.0: question classification when category is
+    /// `user_question_pending`. One of "engineering" / "safety" / "taste".
+    /// Nil for any other category. Drives whether the secondary call is
+    /// an answer-from-PRINCIPLES (engineering) or a plain-language
+    /// translation (taste). Safety questions don't get a secondary call
+    /// — they go straight to the user via notify.
+    public let questionType: String?
 
     public init(
         category: String,
@@ -281,7 +384,9 @@ public struct TriageCandidate: Sendable, Equatable {
         action: FlagAction,
         reasoningPlain: String,
         reasoningTechnical: String,
-        asymmetryNote: String? = nil
+        asymmetryNote: String? = nil,
+        suggestedInjectText: String? = nil,
+        questionType: String? = nil
     ) {
         self.category = category
         self.severity = severity
@@ -290,5 +395,7 @@ public struct TriageCandidate: Sendable, Equatable {
         self.reasoningPlain = reasoningPlain
         self.reasoningTechnical = reasoningTechnical
         self.asymmetryNote = asymmetryNote
+        self.suggestedInjectText = suggestedInjectText
+        self.questionType = questionType
     }
 }
