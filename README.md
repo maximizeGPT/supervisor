@@ -118,7 +118,7 @@ swift test                # 130 tests across SupervisorCore
 ./Scripts/build-app.sh    # rebuild + sign all three .app bundles
 ```
 
-The trace log at `~/Library/Logs/Supervisor/supervisor.log` is append-only and rolling (1 MiB segments). Every state transition — onboarding, AX grants, key validation, triage start/end, flag persistence, notifier outcome, heartbeat health — emits a single line with a timestamp and a tag. It's the first thing to look at when something's off.
+The trace log at `~/Library/Logs/Supervisor/supervisor.log` is append-only and rolls at 10 MB to `supervisor.log.1` (one historical segment kept). Every state transition — onboarding, AX grants, key validation, triage start/end, flag persistence, notifier outcome, heartbeat health — emits a single line with a timestamp and a tag. It's the first thing to look at when something's off.
 
 **Filing an issue.** Useful issues include:
 

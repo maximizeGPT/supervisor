@@ -111,5 +111,15 @@ let package = Package(
             dependencies: ["SupervisorCore"],
             path: "Tests/SupervisorCoreTests"
         ),
+        // v0.1.6.1: minimal UI test target so the host-app set has a
+        // regression test (com.anthropic.claudefordesktop landing here
+        // matters — it's the bundle ID that lets the hover show when the
+        // user has the Claude desktop app frontmost). Future UI tests
+        // land here too.
+        .testTarget(
+            name: "SupervisorUITests",
+            dependencies: ["SupervisorUI"],
+            path: "Tests/SupervisorUITests"
+        ),
     ]
 )

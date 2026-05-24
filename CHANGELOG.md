@@ -6,6 +6,48 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.6.1] — 2026-05-23 (Claude.app host + log-rotation doc fix)
+
+Small, no-behavior-change patch. Two issues:
+
+1. The Claude desktop app (`com.anthropic.claudefordesktop`) spawns
+   `claude` internally, so a Supervisor-watched session can be running
+   while Claude.app is frontmost — but Claude.app wasn't in the
+   hover's host-app set, so the hover stayed hidden in that case.
+2. The README claimed the trace log rolls at "1 MiB segments." The
+   actual threshold in `TraceLog.swift` has always been 10 MB. Docs
+   were wrong; code was right.
+
+### Added
+- `com.anthropic.claudefordesktop` added to the host-app set so the
+  hover shows when the user has Claude.app frontmost and a session
+  is being tailed.
+- `SupervisorUITests` target (new) with `HoverHostAppsTests` —
+  asserts every host bundle ID is present, exercises the visibility
+  predicate for the new ID, an unrelated app (Safari), and the
+  nil-bundle-ID case. Future UI tests land here too.
+
+### Changed
+- `HoverWindowController.knownTerminalBundleIDs` →
+  `claudeCodeHostApps`. The old name was wrong as of v0.1.6.1 —
+  Claude.app is a host, not a terminal. Comment now points at
+  Issue #3 (user-configurable host list) as the long-term path
+  for users on emulators not in the default set.
+- Local variable `frontmostIsTerminal` → `frontmostHostsClaudeCode`
+  in `applyVisibility()` for the same reason.
+- README log-rotation line corrected: "rolling (1 MiB segments)"
+  → "rolls at 10 MB to `supervisor.log.1` (one historical segment
+  kept)" — matches `TraceLog.swift` line 36
+  (`rotateBytes: Int = 10 * 1024 * 1024`).
+
+### Verified, not changed
+- Visibility predicate is `frontmostHostsClaudeCode && sessionActive`
+  (AND, not OR) — matches the v0.1.4 Gap 8 spec.
+- `isAnySessionActive` closure wired in `SupervisorApp/main.swift`
+  returns `(discovery?.activeSessions().isEmpty == false)` —
+  returns `true` when at least one session is active, `false`
+  otherwise. No inverted-condition bug.
+
 ## [0.1.6] — 2026-05-23 (intervention recovery context)
 
 Real failure mode discovered during the (gated-off) v0.1.5 autonomous-trial

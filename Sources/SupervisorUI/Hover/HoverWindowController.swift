@@ -36,19 +36,22 @@ public final class HoverWindowController {
     /// Pixel inset from the right edge and top edge of visibleFrame.
     private static let edgeInset: CGFloat = 12
 
-    /// v0.1.4 Gap 8: bundle IDs we recognize as terminal emulators
-    /// where Claude Code might be running. Unknown bundle IDs are
-    /// treated as non-terminal and trigger hover hide. v0.1.5+ should
-    /// make this list user-configurable for users on terminal
-    /// emulators not in the default set (Electron-based VS Code /
-    /// Cursor integrated terminals, mosh, tmux-over-ssh on a remote).
-    /// See GH issue tracking that work.
-    public static let knownTerminalBundleIDs: Set<String> = [
+    /// Apps that host a tailable Claude Code session — terminal emulators
+    /// where the `claude` CLI runs, plus the Claude desktop app which
+    /// spawns `claude` internally. Frontmost bundle IDs not in this set
+    /// are treated as non-hosting and trigger hover hide.
+    ///
+    /// Long-term path: see Issue #3 (user-configurable host-app list)
+    /// for users on emulators not in the default set — Electron-based
+    /// VS Code / Cursor integrated terminals, mosh, tmux-over-ssh on a
+    /// remote, etc. Until that ships, additions land here.
+    public static let claudeCodeHostApps: Set<String> = [
         "com.apple.Terminal",
         "com.googlecode.iterm2",
         "com.mitchellh.ghostty",
         "dev.warp.Warp-Stable",
         "org.alacritty",
+        "com.anthropic.claudefordesktop",
     ]
 
     private let vm: HoverViewModel
@@ -110,14 +113,14 @@ public final class HoverWindowController {
 
     // MARK: - Visibility logic (Gap 8)
 
-    /// Compound visibility rule: show iff a recognized terminal is
+    /// Compound visibility rule: show iff a Claude-Code-hosting app is
     /// frontmost AND Supervisor is tailing at least one session.
     /// Re-applied on every workspace activation event + on a 3s poll.
     private func applyVisibility() {
         let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        let frontmostIsTerminal = frontmostBundleID.map(Self.knownTerminalBundleIDs.contains) ?? false
+        let frontmostHostsClaudeCode = frontmostBundleID.map(Self.claudeCodeHostApps.contains) ?? false
         let sessionActive = isAnySessionActive()
-        let shouldShow = frontmostIsTerminal && sessionActive
+        let shouldShow = frontmostHostsClaudeCode && sessionActive
 
         if shouldShow && !currentlyVisible {
             positionTopRight()
