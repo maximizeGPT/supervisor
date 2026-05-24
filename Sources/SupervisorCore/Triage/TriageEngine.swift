@@ -86,6 +86,15 @@ public final class TriageEngine {
 
     private var busSubscription: AnyCancellable?
 
+    /// v0.3.0: optional secondary-call dependency. When non-nil,
+    /// user_question_pending candidates with question_type=engineering
+    /// trigger an `answerEngineering` call against PRINCIPLES.md, and
+    /// taste candidates trigger a `translateTaste` rewrite. Nil
+    /// disables the secondary calls (tests / no-PRINCIPLES installs);
+    /// the engine still fires the primary flag but the inject text
+    /// stays empty and the router degrades to notify.
+    private let questionAnswerer: QuestionAnswerer?
+
     public init(
         client: LLMClient,
         bus: EventBus,
@@ -93,6 +102,7 @@ public final class TriageEngine {
         windowSize: Int = 30,
         costStore: CostStore? = nil,
         redactor: any Redactor = DefaultRedactor(),
+        questionAnswerer: QuestionAnswerer? = nil,
         trace: TraceLog = .shared
     ) {
         self.client = client
@@ -101,6 +111,7 @@ public final class TriageEngine {
         self.windowSize = windowSize
         self.costStore = costStore
         self.redactor = redactor
+        self.questionAnswerer = questionAnswerer
         self.trace = trace
     }
 
@@ -142,6 +153,13 @@ public final class TriageEngine {
                 if info.isError {
                     Task { await self.evaluate(call: original, prePost: .alreadyExecuted) }
                 }
+            }
+        case .assistantText(let info):
+            // v0.3.0: cheap local prefilter to keep API spend bounded.
+            // Only assistant texts that look like they might contain a
+            // user-directed question get sent to the secondary triage call.
+            if TriagePrompt.looksLikeQuestionToUser(info.text) {
+                Task { await self.evaluateAssistantText(info: info) }
             }
         default:
             break
@@ -221,6 +239,185 @@ public final class TriageEngine {
             onActivityChange?(.flagged(severity: candidate.severity, action: candidate.action))
             onDecision?(decision)
         }
+    }
+
+    // MARK: - Assistant-text triage (v0.3.0)
+
+    /// Evaluate an assistant message for the `user_question_pending`
+    /// category. Triggered by the local prefilter in `consume()`. Runs
+    /// the same record_triage tool against a focused prompt; for each
+    /// candidate that fires, enriches with the secondary
+    /// QuestionAnswerer call (engineering → inject text; taste →
+    /// rewritten reasoning_plain; safety → pass through unchanged).
+    private func evaluateAssistantText(info: AssistantTextInfo) async {
+        onActivityChange?(.triaging)
+
+        let window = perSessionWindow[info.sessionId] ?? []
+        let cwd = lastSessionCWD(in: window)
+        let userPrompt = lastUserPrompt(in: window)
+
+        let request = TriagePrompt.buildAssistantQuestionRequest(
+            model: model,
+            sessionId: info.sessionId,
+            cwd: cwd,
+            userPrompt: userPrompt,
+            assistantText: info.text,
+            recentEvents: window
+        )
+
+        trace.emit("triage", "evaluating session=\(info.sessionId) assistant_text_len=\(info.text.count)")
+
+        let response: AnthropicMessageResponse
+        do {
+            response = try await client.createMessage(request)
+        } catch {
+            trace.emit("triage", "Assistant-text triage call failed: \(error)")
+            onActivityChange?(.idle)
+            return
+        }
+
+        if let costStore {
+            let cost = TokenAccounting.costUSD(model: model, usage: response.usage)
+            try? costStore.recordHaiku(
+                inputTokens: response.usage.input_tokens,
+                outputTokens: response.usage.output_tokens,
+                costUSD: cost
+            )
+        }
+
+        guard let candidates = extractCandidates(from: response) else {
+            trace.emit("triage", "Assistant-text: no record_triage call from Haiku")
+            onActivityChange?(.idle)
+            return
+        }
+        if candidates.isEmpty {
+            trace.emit("triage", "Assistant-text all-clear (prefilter hit but Haiku didn't fire)")
+            onActivityChange?(.idle)
+            return
+        }
+
+        // For each fired candidate, run the secondary call to populate
+        // suggestedInjectText (engineering) or rewrite reasoning_plain
+        // (taste). Safety passes through untouched.
+        for candidate in candidates {
+            let enriched = await enrichWithSecondaryAnswer(
+                candidate: candidate,
+                question: info.text,
+                sessionId: info.sessionId
+            )
+            // Triage flags on assistant text use the BashToolCallInfo
+            // synthetic-bridge so the existing TriageDecision struct
+            // works unchanged. The triggering "command" is the
+            // assistant's question text, truncated.
+            let pseudoTrigger = BashToolCallInfo(
+                sessionId: info.sessionId,
+                command: String(info.text.prefix(200)),
+                description: nil,
+                toolUseId: info.turnUUID,  // closest-available unique id
+                turnUUID: info.turnUUID,
+                ts: info.ts
+            )
+            let decision = TriageDecision(
+                sessionId: info.sessionId,
+                cwd: cwd,
+                candidate: enriched,
+                triggeringEvent: pseudoTrigger,
+                usage: response.usage,
+                model: response.model,
+                prePost: .preExecution,  // assistant is waiting; nothing executed yet
+                recentEvents: window,
+                lastUserPrompt: userPrompt
+            )
+            trace.emit("triage", "FLAG session=\(info.sessionId) category=\(enriched.category) severity=\(enriched.severity.rawValue) action=\(enriched.action.rawValue) question_type=\(enriched.questionType ?? "?")")
+            onActivityChange?(.flagged(severity: enriched.severity, action: enriched.action))
+            onDecision?(decision)
+        }
+    }
+
+    /// Run the secondary QuestionAnswerer call when appropriate. The
+    /// returned candidate may have suggestedInjectText populated
+    /// (engineering high/medium confidence) OR reasoning_plain rewritten
+    /// (taste, or engineering low confidence degraded to taste). Safety
+    /// candidates and non-user_question_pending categories pass through.
+    private func enrichWithSecondaryAnswer(
+        candidate: TriageCandidate,
+        question: String,
+        sessionId: String
+    ) async -> TriageCandidate {
+        guard candidate.category == "user_question_pending",
+              let answerer = questionAnswerer else {
+            return candidate
+        }
+        let qt = candidate.questionType ?? "safety"
+
+        switch qt {
+        case "engineering":
+            do {
+                let answer = try await answerer.answerEngineering(question: question)
+                if answer.confidence == .low || answer.answer.isEmpty {
+                    // Degrade: PRINCIPLES didn't have a clear answer.
+                    // Rewrite as taste and surface to user.
+                    trace.emit("triage", "engineering low-confidence; degrading to taste session=\(sessionId)")
+                    let rewrite = (try? await answerer.translateTaste(question: question))?.plainQuestion
+                        ?? candidate.reasoningPlain
+                    return reconfigure(
+                        candidate,
+                        action: .notify,
+                        reasoningPlain: rewrite
+                    )
+                }
+                return reconfigure(
+                    candidate,
+                    action: .inject,
+                    suggestedInjectText: answer.answer
+                )
+            } catch {
+                trace.emit("triage", "engineering answer call failed: \(error); degrading to notify")
+                return reconfigure(candidate, action: .notify)
+            }
+
+        case "taste":
+            do {
+                let rewrite = try await answerer.translateTaste(question: question)
+                return reconfigure(
+                    candidate,
+                    action: .notify,
+                    reasoningPlain: rewrite.plainQuestion
+                )
+            } catch {
+                trace.emit("triage", "taste translate call failed: \(error); using original")
+                return reconfigure(candidate, action: .notify)
+            }
+
+        case "safety":
+            // No secondary call. Safety questions reach the user
+            // exactly as Haiku surfaced them.
+            return reconfigure(candidate, action: .notify)
+
+        default:
+            return candidate
+        }
+    }
+
+    /// Rebuild a candidate with new field values. TriageCandidate is
+    /// immutable; this is the canonical "with" pattern.
+    private func reconfigure(
+        _ c: TriageCandidate,
+        action: FlagAction? = nil,
+        reasoningPlain: String? = nil,
+        suggestedInjectText: String? = nil
+    ) -> TriageCandidate {
+        TriageCandidate(
+            category: c.category,
+            severity: c.severity,
+            matchedCommand: c.matchedCommand,
+            action: action ?? c.action,
+            reasoningPlain: reasoningPlain ?? c.reasoningPlain,
+            reasoningTechnical: c.reasoningTechnical,
+            asymmetryNote: c.asymmetryNote,
+            suggestedInjectText: suggestedInjectText ?? c.suggestedInjectText,
+            questionType: c.questionType
+        )
     }
 
     // MARK: - Window helpers
@@ -342,6 +539,22 @@ public final class TriageEngine {
             asymmetryNote = redactor.redact(note)
         }
 
+        // v0.3.0: question_type is required when category is
+        // user_question_pending and ignored otherwise. If the category
+        // requires it and Haiku omits it, default to "safety" — that's
+        // the rubric's safer-fallback rule.
+        var questionType: String? = nil
+        if cat == "user_question_pending" {
+            if case let .string(qt)? = c["question_type"],
+               ["engineering", "safety", "taste"].contains(qt) {
+                questionType = qt
+            } else {
+                questionType = "safety"
+                malformed = true
+                fallbackReason.append("question_type")
+            }
+        }
+
         if malformed {
             // Log the raw verdict (un-redacted) for debugging per Mohammed:
             // trace log is local-only, README is honest about that.
@@ -355,7 +568,9 @@ public final class TriageEngine {
             action: action,
             reasoningPlain: reasoningPlain,
             reasoningTechnical: reasoningTechnical,
-            asymmetryNote: asymmetryNote
+            asymmetryNote: asymmetryNote,
+            suggestedInjectText: nil,  // populated by secondary call in TriageEngine.evaluate
+            questionType: questionType
         )
     }
 

@@ -198,14 +198,19 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             notifier: notifier,
             locator: LiveProcessLocator(trace: trace),
             signalSender: DarwinSignalSender(),
+            injector: CGEventInjector(trace: trace),
             recoveryDocWriter: recoveryWriter,
             trace: trace
         )
         self.router = router
 
-        // 5. Triage engine. v0.2.0: model comes from the active provider,
-        // not the legacy Config.defaults.triageModel (which is now only
-        // a fallback used by tests).
+        // 5. Triage engine. v0.2.0: model comes from the active provider.
+        // v0.3.0: optional QuestionAnswerer for the user_question_pending
+        // secondary call. Loads PRINCIPLES.md from the repo root (the
+        // running Supervisor.app's working directory at launch);
+        // gracefully no-ops if the file isn't found (degrades to
+        // user_question_pending firing as a plain notify, no inject).
+        let questionAnswerer = loadQuestionAnswerer(client: client, trace: trace)
         let engine = TriageEngine(
             client: client,
             bus: bus,
@@ -213,6 +218,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             windowSize: 30,
             costStore: costStore,
             redactor: DefaultRedactor(),
+            questionAnswerer: questionAnswerer,
             trace: trace
         )
         engine.onActivityChange = { [weak self] activity in
@@ -385,6 +391,39 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             permissionPopover?.dismiss()
         }
     }
+}
+
+// MARK: - QuestionAnswerer bootstrap helper
+
+/// Load PRINCIPLES.md from a stable location and construct a
+/// `QuestionAnswerer`. Tries (in order): the build's bundle resources,
+/// the running app's parent directory, and `/Users/main/supervisor/`
+/// (the dev path). Returns nil — silently — if the file can't be
+/// found anywhere; the engine treats nil as "no secondary call,"
+/// which degrades user_question_pending flags to plain notify
+/// without breaking the primary triage path.
+@MainActor
+private func loadQuestionAnswerer(client: LLMClient, trace: TraceLog) -> QuestionAnswerer? {
+    let candidates: [URL] = [
+        // Bundle resource (when PRINCIPLES.md ships embedded).
+        Bundle.main.url(forResource: "PRINCIPLES", withExtension: "md"),
+        // Dev path: the bundle lives at .../build/Supervisor.app — go up to repo root.
+        Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("PRINCIPLES.md"),
+        // Hard-coded dev path as last-resort fallback. This is correct on
+        // Mohammed's machine and harmless to try anywhere else (returns
+        // nil if absent).
+        URL(fileURLWithPath: "/Users/main/supervisor/PRINCIPLES.md"),
+    ].compactMap { $0 }
+
+    for url in candidates {
+        if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
+            trace.emit("app", "loaded PRINCIPLES.md for QuestionAnswerer from \(url.path) (\(text.count) chars)")
+            return QuestionAnswerer(client: client, principlesText: text, trace: trace)
+        }
+    }
+    trace.emit("app", "no PRINCIPLES.md found; QuestionAnswerer disabled — user_question_pending flags will surface as plain notify")
+    return nil
 }
 
 // MARK: - Bootstrap
