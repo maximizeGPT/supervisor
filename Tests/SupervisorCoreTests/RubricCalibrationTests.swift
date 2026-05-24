@@ -479,4 +479,148 @@ final class RubricCalibrationTests: XCTestCase {
         lines.append("_Adversarial fixtures are characterized, not pass/failed. Counts above reflect the fired/no-fire split._")
         return lines.joined(separator: "\n")
     }
+
+    // MARK: - v0.3.0 question-fixture sweep
+
+    /// Resolve a key from any provider env var, returning the matching
+    /// provider. Supports DeepSeek for the v0.3.0 question sweep so a
+    /// user without Anthropic credit can still calibrate (PRINCIPLES §9
+    /// — cost is first-class; v0.2.0 multi-provider lets calibration
+    /// run on whatever provider is configured).
+    private func resolveAnyKey() throws -> (key: String, provider: LLMProvider) {
+        guard ProcessInfo.processInfo.environment["SUPERVISOR_LIVE_API"] != nil else {
+            throw XCTSkip("set SUPERVISOR_LIVE_API=1 + (ANTHROPIC_API_KEY or DEEPSEEK_API_KEY) to run question calibration")
+        }
+        if let k = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"], !k.isEmpty {
+            return (k, .anthropic)
+        }
+        if let k = ProcessInfo.processInfo.environment["DEEPSEEK_API_KEY"], !k.isEmpty {
+            return (k, .deepseek)
+        }
+        throw XCTSkip("set ANTHROPIC_API_KEY or DEEPSEEK_API_KEY for question calibration")
+    }
+
+    func testCalibrateQuestionFixtures() async throws {
+        let (key, provider) = try resolveAnyKey()
+        let traceLog = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("q-calibration-\(UUID().uuidString).log"))
+        let client = LLMClient(provider: provider, apiKey: key, redactor: DefaultRedactor(), traceLog: traceLog)
+
+        let fixtures = QuestionFixtures.fixtures
+        let started = Date()
+        print("=== v0.3.0 QUESTION CALIBRATION SWEEP ===")
+        print("provider: \(provider.rawValue) model: \(provider.defaultTriageModel)")
+        print("fixtures: \(fixtures.count) (15 pos + 15 neg × 3 question_types)")
+        print("started: \(ISO8601DateFormatter().string(from: started))")
+
+        var fired = [String: Int]()  // questionType -> count
+        var passed = [String: Int]()
+        var falseNegatives = [String]()  // names
+        var falsePositives = [String]()
+        var wrongType = [(name: String, expected: String, got: String)]()
+        var apiErrors = [String]()
+        var totalIn = 0, totalOut = 0
+
+        for (idx, f) in fixtures.enumerated() {
+            if idx > 0 && idx % 10 == 0 {
+                print("  progress: \(idx)/\(fixtures.count) (\(falseNegatives.count) FN, \(falsePositives.count) FP, \(wrongType.count) wrongType)")
+            }
+            // Sequential pacing: 1.5s between calls to stay under
+            // Anthropic Tier 1 (50 RPM = ~1.2s floor; DeepSeek is more
+            // generous but pacing keeps the sweep deterministic).
+            if idx > 0 { try? await Task.sleep(nanoseconds: 1_500_000_000) }
+
+            let req = TriagePrompt.buildAssistantQuestionRequest(
+                model: provider.defaultTriageModel,
+                sessionId: "calib-\(idx)",
+                cwd: f.cwd,
+                userPrompt: f.userPrompt,
+                assistantText: f.assistantText,
+                recentEvents: []
+            )
+
+            do {
+                let resp = try await client.createMessage(req)
+                totalIn += resp.usage.input_tokens
+                totalOut += resp.usage.output_tokens
+
+                // Parse out the user_question_pending candidate if any.
+                var sawQuestionFlag = false
+                var classifiedAs: String? = nil
+                for block in resp.content {
+                    guard block.type == "tool_use",
+                          block.name == TriagePrompt.recordTriageToolName,
+                          case let .object(input)? = block.input,
+                          case let .array(cands)? = input["candidates"]
+                    else { continue }
+                    for c in cands {
+                        guard case let .object(d) = c,
+                              case let .string(cat)? = d["category"],
+                              cat == "user_question_pending"
+                        else { continue }
+                        sawQuestionFlag = true
+                        if case let .string(qt)? = d["question_type"] {
+                            classifiedAs = qt
+                        }
+                    }
+                }
+
+                switch (f.kind, sawQuestionFlag) {
+                case (.clearPositive, false):
+                    falseNegatives.append(f.name)
+                case (.clearNegative, true):
+                    falsePositives.append(f.name)
+                case (.clearPositive, true):
+                    if let expected = f.expectedQuestionType, classifiedAs != expected {
+                        wrongType.append((f.name, expected, classifiedAs ?? "(missing)"))
+                    } else {
+                        passed[f.expectedQuestionType ?? "?"] = (passed[f.expectedQuestionType ?? "?"] ?? 0) + 1
+                    }
+                    fired[classifiedAs ?? "?"] = (fired[classifiedAs ?? "?"] ?? 0) + 1
+                case (.clearNegative, false):
+                    passed["neg"] = (passed["neg"] ?? 0) + 1
+                case (.adversarial, _):
+                    break  // not in this corpus
+                }
+            } catch {
+                apiErrors.append("\(f.name): \(error)")
+            }
+        }
+
+        // Report
+        let elapsed = Date().timeIntervalSince(started)
+        print("")
+        print("=== RESULTS ===")
+        print("elapsed: \(Int(elapsed))s   tokens in: \(totalIn) out: \(totalOut)")
+        // Cost estimate: rough — provider-specific. Anthropic Haiku 4.5
+        // is $0.80/MTok in, $4/MTok out. DeepSeek-chat is $0.27/MTok in,
+        // $1.10/MTok out (and the model auto-routes to deepseek-v4-flash
+        // which is cheaper still).
+        let (inRate, outRate): (Double, Double) = provider == .anthropic ? (0.8, 4.0) : (0.27, 1.10)
+        let cost = (Double(totalIn) / 1_000_000) * inRate + (Double(totalOut) / 1_000_000) * outRate
+        print("estimated spend: $\(String(format: "%.4f", cost))")
+        print("")
+        for type in ["engineering", "safety", "taste"] {
+            let p = passed[type] ?? 0
+            print("\(type) positives passed: \(p)/15 (\(p * 100 / 15)%)")
+        }
+        let negPassed = passed["neg"] ?? 0
+        print("negatives passed (didn't fire): \(negPassed)/45 (\(negPassed * 100 / 45)%)")
+        print("")
+        print("false negatives: \(falseNegatives.count)")
+        for n in falseNegatives { print("  - \(n)") }
+        print("false positives: \(falsePositives.count)")
+        for n in falsePositives { print("  - \(n)") }
+        print("wrong question_type classifications: \(wrongType.count)")
+        for w in wrongType { print("  - \(w.name): expected=\(w.expected) got=\(w.got)") }
+        if !apiErrors.isEmpty {
+            print("api errors: \(apiErrors.count)")
+            for e in apiErrors.prefix(5) { print("  - \(e)") }
+        }
+
+        // The assertion is loose — this is calibration, not a binary
+        // test. A future v0.3.x can tighten the gate.
+        let totalPositivePass = ["engineering", "safety", "taste"].reduce(0) { $0 + (passed[$1] ?? 0) }
+        XCTAssertGreaterThan(totalPositivePass, 30, "expected at least 2/3 of 45 positives to fire + classify correctly")
+    }
 }
