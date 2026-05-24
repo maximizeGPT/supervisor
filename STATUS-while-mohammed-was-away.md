@@ -365,6 +365,58 @@ result becomes 35/40 (87.5%) on destructive and 33/40 (82.5%) on edits.
 Closer to but still not at 95%. The remaining gap is the model + rubric
 work above.
 
+## v0.1.8 todo — hung-write timeout for RecoveryDocWriter (filed for next session)
+
+The v0.1.6 review caught a real gap: `RecoveryDocWriter.write()` uses
+synchronous `String.write(to:atomically:encoding:)` which has no timeout.
+Common failures (permission denied, ENOSPC, missing parent dir) error
+immediately and hit the catch — fine. But pathological cases (frozen
+NFS mount, stalled encrypted-disk lock storm, FUSE filesystem driver
+hang) would block the router thread indefinitely. The SIGSTOP/SIGTERM
+would never go out. The whole intervention pipeline stalls.
+
+The fix shape:
+
+```swift
+public func write(...) -> URL? {
+    ...
+    let writeResult: Bool = await withTaskGroup(of: Bool.self) { group in
+        group.addTask {
+            do {
+                try markdown.write(to: url, atomically: true, encoding: .utf8)
+                return true
+            } catch {
+                self.trace.emit("recovery", "ERROR \(error)")
+                return false
+            }
+        }
+        group.addTask {
+            try? await Task.sleep(for: .seconds(2))
+            return false  // timeout sentinel
+        }
+        for await result in group {
+            group.cancelAll()
+            return result
+        }
+        return false
+    }
+    return writeResult ? url : nil
+}
+```
+
+The 2s timeout is plenty for a healthy local-disk write (typical
+~1ms) but ensures the router can't hang for more than 2s waiting on
+a sick filesystem. On timeout the writer returns nil; the router's
+existing fallback (`recoveryDocPath = nil` → banner uses v0.1.4
+inline copy) handles it.
+
+**Why this isn't in v0.1.6**: the synchronous-write hang is narrow
+(local SSD almost never stalls), and the fix changes the call-site
+contract from sync-with-result-by-return to async-with-result. That's
+a TriageEngine/router change too. Out of scope for the v0.1.6 ship;
+in scope for v0.1.8 which can re-architect the writer with the
+right async story.
+
 ## Honest assessment
 
 The v0.1.5 calibration didn't hit your 95% gate, but the data is
