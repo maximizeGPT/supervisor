@@ -1,11 +1,16 @@
 // OnboardingScene.swift
 //
-// v0.1.3 layout — a 480×360 window split into three explicit bands:
+// v0.1.6.3 layout — a 480×420 window split into three explicit bands:
 //
 //   Header (80pt, Paper-warm bg)     — wordmark centered at 24pt
-//   Content (fill, default bg)        — step indicator + title + step body
+//   Content (fill = 284pt, default)   — step indicator + title + step body
 //   Footer (56pt, Paper bg)           — primary button right-aligned;
 //                                       Skip left-aligned on the AX step
+//
+// Window grew from 360→420pt in v0.1.6.3: at 360pt the AX step body
+// and the Notif-denied state body both overflowed the 224pt content
+// band and clipped the footer buttons. See OnboardingWindowController
+// for the longer note.
 //
 // Step views (KeyEntryStep, AXCheckStep, NotifCheckStep) shed their
 // primary buttons — those moved into the footer here. KeyEntryStep's
@@ -39,7 +44,7 @@ public struct OnboardingScene: View {
             content
             footer
         }
-        .frame(width: 480, height: 360)
+        .frame(width: 480, height: 420)
         .task {
             // Periodic refresh while the window is up: catches out-of-band
             // AX grants in System Settings and notification status changes.

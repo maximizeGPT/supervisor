@@ -1,8 +1,13 @@
 // OnboardingWindowController.swift
 //
 // NSWindowController hosting the SwiftUI `OnboardingScene`. Sized at
-// 480x360 with no resize, no minimize, no zoom — Wispr-Flow/Clicky-style
-// fixed onboarding window.
+// 480x420 with no resize, no minimize, no zoom — Wispr-Flow/Clicky-style
+// fixed onboarding window. Height was 360pt in v0.1.3 but at that size
+// the AX step body + Notif-denied state body BOTH overflowed the 224pt
+// content band, eating into the 56pt footer and clipping the
+// "Skip"/"Open System Settings" buttons. v0.1.6.3 grows the window to
+// 420pt (content band: 284pt, +60pt headroom) to fit the body text
+// without trimming the (legitimately useful) escape-hatch copy.
 //
 // On `.complete` state, the controller fires `onCompletion` so the main
 // app can spawn the heartbeat companion and dismiss the window.
@@ -40,7 +45,7 @@ public final class OnboardingWindowController: NSWindowController {
         window.titleVisibility = .hidden
         window.title = ""
 
-        window.setContentSize(NSSize(width: 480, height: 360))
+        window.setContentSize(NSSize(width: 480, height: 420))
         window.center()
         window.isReleasedWhenClosed = false
         window.level = .normal

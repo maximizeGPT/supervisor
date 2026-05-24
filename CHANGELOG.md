@@ -6,6 +6,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.6.3] — 2026-05-23 (onboarding window grew to fit footer)
+
+Critical onboarding bug — at the spec'd 480×360, the AX step body and
+the Notif-denied state body both overflowed the 224pt content band
+and clipped the footer's Skip / Open System Settings buttons. Users
+were physically unable to complete onboarding past the AX step.
+Symptom on Mohammed's machine: heartbeat stale for 15+ minutes after
+launch because the main app never spawned its heartbeat companion
+(blocked on unreachable onboarding).
+
+### Fixed
+- Onboarding window grew 360 → 420pt. Content band is now 284pt
+  (up from 224pt), absorbing both the AX step (~236pt) and the
+  Notif-denied state (~247pt) with margin. Two files touched —
+  `OnboardingWindowController.setContentSize` and
+  `OnboardingScene` `.frame(width:height:)` — both updated atomically
+  so SwiftUI and AppKit agree on the size.
+
+### Audited, no change needed
+- `HoverView` (240×40): contents flex through `Spacer(minLength: 4)`,
+  long session labels truncate cleanly. No cutoff risk.
+- `PermissionLostPopover` (320×180): denied-AX body uses ~152pt
+  inside a 180pt window. Fits with slack.
+
 ## [0.1.6.2] — 2026-05-23 (CI green again)
 
 CI had been red on every push since the workflow first landed (4
