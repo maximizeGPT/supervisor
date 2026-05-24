@@ -4,10 +4,13 @@
 // be exhaustively unit-tested without an AppKit/SwiftUI runtime.
 //
 // Dependencies (all protocols / closures so tests inject stubs):
-//   - PermissionChecker  : probes AX / Notification / Screen Recording
-//   - APIKeyStore        : Keychain or in-memory
-//   - clientFactory      : (String) -> AnthropicClient — lets tests inject
-//                          a client wired to a MockURLProtocol
+//   - PermissionChecker     : probes AX / Notification / Screen Recording
+//   - ProviderKeyStore      : per-provider Keychain (v0.2.0+)
+//   - ActiveProviderStore   : records which provider is currently active
+//   - clientFactory         : (LLMProvider, String) -> LLMClient — lets
+//                             tests inject a client wired to a
+//                             MockURLProtocol; production builds wrap
+//                             the real LLMClient.
 //
 // The view model is an ObservableObject (Combine) so SwiftUI can bind to
 // `state`. Core imports Combine — never SwiftUI.
@@ -16,6 +19,11 @@
 // method. Every state transition flows through a named intent
 // (`submitKey`, `advancePastAX`, `recheckNotifications`, etc.), so the
 // transition graph is explicit and reviewable.
+//
+// v0.2.0: the view model gained a `selectedProvider` field. The
+// key-entry step's submitKey takes the currently-selected provider; on
+// success we also write it to the ActiveProviderStore so the triage
+// engine knows which provider to call.
 
 import Combine
 import Foundation
@@ -27,32 +35,48 @@ public final class OnboardingViewModel: ObservableObject {
 
     @Published public private(set) var state: OnboardingState
 
+    /// Which provider's key the user is currently entering. SwiftUI binds
+    /// to this for the picker in KeyEntryStep. Defaults to `.anthropic`
+    /// to preserve the v0.1.x experience for users on their first run
+    /// after upgrading.
+    @Published public var selectedProvider: LLMProvider = .anthropic
+
     // MARK: - Dependencies
 
     private let permissions: any PermissionChecker
-    private let keyStore: any APIKeyStore
-    private let clientFactory: @Sendable (String) -> AnthropicClient
+    private let keyStore: any ProviderKeyStore
+    private let activeProviderStore: any ActiveProviderStore
+    private let clientFactory: @Sendable (LLMProvider, String) -> LLMClient
     private let trace: TraceLog
 
     // MARK: - Init
 
     /// Construct a view model that resumes at the right step based on what
-    /// state is already on disk. A key already in Keychain means we skip
-    /// step 1; AX already granted means we skip step 2; both means we go
-    /// straight to step 3 (or to .complete if notifications are good too).
+    /// state is already on disk. A key already in Keychain for the active
+    /// provider means we skip step 1; AX already granted means we skip
+    /// step 2; both means we go straight to step 3 (or to .complete if
+    /// notifications are good too).
     public init(
         permissions: any PermissionChecker,
-        keyStore: any APIKeyStore,
-        clientFactory: @escaping @Sendable (String) -> AnthropicClient,
+        keyStore: any ProviderKeyStore,
+        activeProviderStore: any ActiveProviderStore,
+        clientFactory: @escaping @Sendable (LLMProvider, String) -> LLMClient,
         trace: TraceLog = .shared
     ) {
         self.permissions = permissions
         self.keyStore = keyStore
+        self.activeProviderStore = activeProviderStore
         self.clientFactory = clientFactory
         self.trace = trace
 
+        // Pick the resume provider: whatever's marked active, falling back
+        // to .anthropic for a clean install.
+        let resumeProvider = (try? activeProviderStore.read()) ?? .anthropic
+        self.selectedProvider = resumeProvider
+
         // Resume point: lets a user who already onboarded skip past steps.
-        let hasKey = (try? keyStore.read()) ?? nil != nil
+        // "Has key" means: a key exists for the resume provider.
+        let hasKey = (try? keyStore.read(resumeProvider))?.isEmpty == false
         let axOK = permissions.isAXGranted()
         switch (hasKey, axOK) {
         case (false, _):
@@ -65,13 +89,15 @@ public final class OnboardingViewModel: ObservableObject {
             // moves us forward correctly without making init async.
             self.state = .axCheck()
         }
-        trace.emit("onboarding", "viewmodel init state=\(state)")
+        trace.emit("onboarding", "viewmodel init state=\(state) provider=\(resumeProvider.rawValue)")
     }
 
     // MARK: - Intents
 
-    /// Validate the key against Anthropic, save on success, surface a
-    /// typed inline error on failure. Allows retry without leaving step 1.
+    /// Validate the key against the currently-selected provider, save on
+    /// success, surface a typed inline error on failure. Allows retry
+    /// without leaving step 1. On success also records the selected
+    /// provider as active so the triage engine picks it up.
     public func submitKey(_ raw: String) async {
         let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else {
@@ -79,20 +105,22 @@ public final class OnboardingViewModel: ObservableObject {
             return
         }
         state = .keyValidating
-        trace.emit("onboarding", "submitKey len=\(key.count)")
+        let provider = selectedProvider
+        trace.emit("onboarding", "submitKey provider=\(provider.rawValue) len=\(key.count)")
 
-        let client = clientFactory(key)
+        let client = clientFactory(provider, key)
         do {
             _ = try await client.validateKey()
-            try keyStore.write(key)
-            trace.emit("onboarding", "key validated + persisted")
+            try keyStore.write(key, for: provider)
+            try activeProviderStore.write(provider)
+            trace.emit("onboarding", "key validated + persisted provider=\(provider.rawValue)")
             state = .axCheck()
         } catch let e as AnthropicClientError {
             let mapped = Self.mapClientError(e)
-            trace.emit("onboarding", "key validation failed: \(e)")
+            trace.emit("onboarding", "key validation failed provider=\(provider.rawValue): \(e)")
             state = .keyEntry(error: mapped)
         } catch {
-            trace.emit("onboarding", "key validation unexpected: \(error)")
+            trace.emit("onboarding", "key validation unexpected provider=\(provider.rawValue): \(error)")
             state = .keyEntry(error: .unexpected(message: "\(error)"))
         }
     }

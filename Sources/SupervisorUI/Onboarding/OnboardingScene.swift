@@ -146,7 +146,11 @@ public struct OnboardingScene: View {
 
     private var stepTitle: String {
         switch vm.state {
-        case .keyEntry, .keyValidating: return "Anthropic API key"
+        case .keyEntry, .keyValidating:
+            // v0.2.0: title now reflects the selected provider so it
+            // doesn't say "Anthropic API key" when the user has DeepSeek
+            // / Moonshot / etc. picked.
+            return "\(vm.selectedProvider.displayName) API key"
         case .axCheck:                  return "Accessibility access"
         case .notifCheck:               return "Notifications"
         case .complete:                 return "All set"

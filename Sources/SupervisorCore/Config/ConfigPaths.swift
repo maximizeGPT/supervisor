@@ -59,6 +59,13 @@ public struct ConfigPaths: Sendable {
         appSupportDir.appendingPathComponent("confirmations.yaml", isDirectory: false)
     }
 
+    /// `~/Library/Application Support/Supervisor/active-provider.json` (v0.2.0+).
+    /// Tiny one-key JSON tracking which LLM provider triage should call.
+    /// Backed by `FileActiveProviderStore`.
+    public var activeProviderPath: URL {
+        appSupportDir.appendingPathComponent("active-provider.json", isDirectory: false)
+    }
+
     /// `~/Library/Logs/Supervisor/supervisor.log`
     public var traceLogPath: URL {
         logsDir.appendingPathComponent("supervisor.log", isDirectory: false)

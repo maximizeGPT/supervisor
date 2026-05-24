@@ -62,7 +62,7 @@ public struct TriageDecision: Sendable {
 @MainActor
 public final class TriageEngine {
 
-    private let client: AnthropicClient
+    private let client: LLMClient
     private let bus: EventBus
     private let trace: TraceLog
     private let model: String
@@ -87,7 +87,7 @@ public final class TriageEngine {
     private var busSubscription: AnyCancellable?
 
     public init(
-        client: AnthropicClient,
+        client: LLMClient,
         bus: EventBus,
         model: String = Config.defaults.triageModel,
         windowSize: Int = 30,

@@ -29,7 +29,8 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private let paths = ConfigPaths()
     private let trace: TraceLog
     private let permissions: any PermissionChecker
-    private let keyStore: any APIKeyStore
+    private let keyStore: any ProviderKeyStore
+    private let activeProviderStore: any ActiveProviderStore
 
     // Onboarding
     private var onboarding: OnboardingWindowController?
@@ -41,7 +42,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private var sessionStore: SessionStore?
     private var flagStore: FlagStore?
     private var costStore: CostStore?
-    private var anthropic: AnthropicClient?
+    private var llm: LLMClient?
     private var triageEngine: TriageEngine?
     private var discovery: SessionDiscovery?
     private var notifier: Notifier?
@@ -60,8 +61,13 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         try? paths.ensureDirectoriesExist()
         self.trace = TraceLog(path: paths.traceLogPath)
         self.permissions = LivePermissionChecker()
-        self.keyStore = KeychainAPIKeyStore()
+        self.keyStore = KeychainProviderKeyStore()
+        self.activeProviderStore = FileActiveProviderStore(path: paths.activeProviderPath)
         super.init()
+        // v0.2.0: one-shot migration of the v0.1.x single-key Keychain
+        // item into the per-provider layout. Idempotent — every launch
+        // after the first is a no-op.
+        migrateLegacyKeyIfPresent(keys: keyStore, active: activeProviderStore, trace: trace)
     }
 
     // MARK: - NSApplicationDelegate
@@ -69,14 +75,18 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         trace.emit("app", "applicationDidFinishLaunching pid=\(ProcessInfo.processInfo.processIdentifier)")
 
-        let hasKey: Bool = ((try? keyStore.read()) ?? nil) != nil
+        // v0.2.0: "has key" now means a key exists for whatever provider
+        // the user marked as active. Falls back to .anthropic for fresh
+        // installs so the v0.1.x logic still holds.
+        let activeProvider = (try? activeProviderStore.read()) ?? .anthropic
+        let hasKey: Bool = ((try? keyStore.read(activeProvider)) ?? nil)?.isEmpty == false
         let axOK = permissions.isAXGranted()
 
         if !hasKey || !axOK {
-            trace.emit("app", "onboarding needed (hasKey=\(hasKey) axOK=\(axOK))")
+            trace.emit("app", "onboarding needed (provider=\(activeProvider.rawValue) hasKey=\(hasKey) axOK=\(axOK))")
             presentOnboarding()
         } else {
-            trace.emit("app", "onboarding skipped; entering running state")
+            trace.emit("app", "onboarding skipped; entering running state (provider=\(activeProvider.rawValue))")
             enterRunningState(notifDegraded: false)
         }
     }
@@ -103,8 +113,10 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         let vm = OnboardingViewModel(
             permissions: permissions,
             keyStore: keyStore,
-            clientFactory: { [trace] key in
-                AnthropicClient(
+            activeProviderStore: activeProviderStore,
+            clientFactory: { [trace] provider, key in
+                LLMClient(
+                    provider: provider,
                     apiKey: key,
                     redactor: DefaultRedactor(),
                     traceLog: trace
@@ -157,17 +169,22 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         self.hoverWindow = hoverWindow
         hoverWindow.present()
 
-        // 3. Anthropic client (key required — should be present post-onboarding)
-        guard let key = (try? keyStore.read()) ?? nil else {
-            trace.emit("app", "FATAL: no API key after onboarding; aborting")
+        // 3. LLM client (key required — should be present post-onboarding).
+        // v0.2.0: provider is whatever the user picked in onboarding (or
+        // the legacy-migrated .anthropic on first run after upgrade).
+        let activeProvider = (try? activeProviderStore.read()) ?? .anthropic
+        guard let key = (try? keyStore.read(activeProvider)) ?? nil, !key.isEmpty else {
+            trace.emit("app", "FATAL: no API key for provider=\(activeProvider.rawValue) after onboarding; aborting")
             return
         }
-        let client = AnthropicClient(
+        let client = LLMClient(
+            provider: activeProvider,
             apiKey: key,
             redactor: DefaultRedactor(),
             traceLog: trace
         )
-        self.anthropic = client
+        self.llm = client
+        trace.emit("app", "LLM client ready provider=\(activeProvider.rawValue) model=\(activeProvider.defaultTriageModel)")
 
         // 4. Notifier + Intervention router (v0.1.4 Part A3) + v0.1.6
         // RecoveryDocWriter (writes handoff markdown before SIGSTOP/SIGTERM).
@@ -186,11 +203,13 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         )
         self.router = router
 
-        // 5. Triage engine
+        // 5. Triage engine. v0.2.0: model comes from the active provider,
+        // not the legacy Config.defaults.triageModel (which is now only
+        // a fallback used by tests).
         let engine = TriageEngine(
             client: client,
             bus: bus,
-            model: Config.defaults.triageModel,
+            model: activeProvider.defaultTriageModel,
             windowSize: 30,
             costStore: costStore,
             redactor: DefaultRedactor(),

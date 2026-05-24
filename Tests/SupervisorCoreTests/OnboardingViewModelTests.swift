@@ -47,16 +47,19 @@ final class OnboardingViewModelTests: XCTestCase {
 
     private func makeVM(
         permissions: StubChecker = StubChecker(),
-        keyStore: APIKeyStore = InMemoryAPIKeyStore()
-    ) -> (OnboardingViewModel, StubChecker, APIKeyStore) {
+        keyStore: ProviderKeyStore = InMemoryProviderKeyStore(),
+        activeProviderStore: ActiveProviderStore = InMemoryActiveProviderStore()
+    ) -> (OnboardingViewModel, StubChecker, ProviderKeyStore) {
         let session = mockSession()
         let trace = TraceLog(path: FileManager.default.temporaryDirectory
             .appendingPathComponent("supervisor-onboarding-\(UUID().uuidString).log"))
         let vm = OnboardingViewModel(
             permissions: permissions,
             keyStore: keyStore,
-            clientFactory: { key in
-                AnthropicClient(
+            activeProviderStore: activeProviderStore,
+            clientFactory: { provider, key in
+                LLMClient(
+                    provider: provider,
                     apiKey: key,
                     redactor: DefaultRedactor(),
                     baseURL: URL(string: "https://mock.anthropic.test")!,
@@ -86,8 +89,8 @@ final class OnboardingViewModelTests: XCTestCase {
     }
 
     func testInitWithKeyAndNoAXStartsAtAXCheck() throws {
-        let store = InMemoryAPIKeyStore()
-        try store.write("sk-ant-existing")
+        let store = InMemoryProviderKeyStore()
+        try store.write("sk-ant-existing", for: .anthropic)
         let checker = StubChecker()
         checker.ax = false
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
@@ -97,8 +100,8 @@ final class OnboardingViewModelTests: XCTestCase {
     func testInitWithKeyAndAXStartsAtAXCheckPendingRefresh() throws {
         // We don't synchronously check notifications in init (it's async);
         // we start at axCheck and let the view's first tick advance us.
-        let store = InMemoryAPIKeyStore()
-        try store.write("sk-ant-existing")
+        let store = InMemoryProviderKeyStore()
+        try store.write("sk-ant-existing", for: .anthropic)
         let checker = StubChecker()
         checker.ax = true
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
@@ -112,7 +115,7 @@ final class OnboardingViewModelTests: XCTestCase {
         let (vm, _, store) = makeVM()
         await vm.submitKey("sk-ant-real-shape-key-1234567890")
         XCTAssertEqual(vm.state, .axCheck())
-        XCTAssertEqual(try store.read(), "sk-ant-real-shape-key-1234567890")
+        XCTAssertEqual(try store.read(.anthropic), "sk-ant-real-shape-key-1234567890")
     }
 
     func testSubmitInvalidKeySurfacesInlineError() async {
@@ -188,7 +191,7 @@ final class OnboardingViewModelTests: XCTestCase {
         Self.canned["/v1/messages"] = (200, Self.validResponse, [:])
         await vm.submitKey("sk-ant-good-key-with-real-shape-1234")
         XCTAssertEqual(vm.state, .axCheck())
-        XCTAssertEqual(try store.read(), "sk-ant-good-key-with-real-shape-1234")
+        XCTAssertEqual(try store.read(.anthropic), "sk-ant-good-key-with-real-shape-1234")
     }
 
     // MARK: - AX step
@@ -197,8 +200,8 @@ final class OnboardingViewModelTests: XCTestCase {
         let checker = StubChecker()
         checker.ax = false
         let (vm, _, _) = makeVM(permissions: checker, keyStore: {
-            let s = InMemoryAPIKeyStore()
-            try? s.write("sk-ant-x")
+            let s = InMemoryProviderKeyStore()
+            try? s.write("sk-ant-x", for: .anthropic)
             return s
         }())
         XCTAssertEqual(vm.state, .axCheck())
@@ -212,8 +215,8 @@ final class OnboardingViewModelTests: XCTestCase {
         let checker = StubChecker()
         checker.ax = false
         checker.notif = .authorized
-        let store = InMemoryAPIKeyStore()
-        try? store.write("sk-ant-x")
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
         XCTAssertEqual(vm.state, .axCheck())
 
@@ -232,8 +235,8 @@ final class OnboardingViewModelTests: XCTestCase {
         let checker = StubChecker()
         checker.ax = true
         checker.notif = .authorized
-        let store = InMemoryAPIKeyStore()
-        try? store.write("sk-ant-x")
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
 
         await vm.recheckAX()
@@ -247,8 +250,8 @@ final class OnboardingViewModelTests: XCTestCase {
         let checker = StubChecker()
         checker.ax = true
         checker.notif = .denied
-        let store = InMemoryAPIKeyStore()
-        try? store.write("sk-ant-x")
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
 
         await vm.recheckAX()
@@ -260,8 +263,8 @@ final class OnboardingViewModelTests: XCTestCase {
         let checker = StubChecker()
         checker.ax = true
         checker.notif = .provisional
-        let store = InMemoryAPIKeyStore()
-        try? store.write("sk-ant-x")
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
 
         await vm.recheckAX()
@@ -275,8 +278,8 @@ final class OnboardingViewModelTests: XCTestCase {
         checker.ax = true
         checker.notif = .denied  // status after request reflects what macOS now says
         checker.requestNotifResult = .failure(NSError(domain: "UNErrorDomain", code: 1))
-        let store = InMemoryAPIKeyStore()
-        try? store.write("sk-ant-x")
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
 
         await vm.recheckAX()

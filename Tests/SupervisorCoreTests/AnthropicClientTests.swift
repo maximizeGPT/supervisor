@@ -30,8 +30,8 @@ final class AnthropicClientTests: XCTestCase {
         Self.canned.removeAll()
     }
 
-    private func makeClient(session: URLSession? = nil) -> AnthropicClient {
-        AnthropicClient(
+    private func makeClient(session: URLSession? = nil) -> LLMClient {
+        LLMClient(provider: .anthropic, 
             apiKey: "sk-ant-test-key",
             redactor: DefaultRedactor(),
             baseURL: URL(string: "https://mock.anthropic.test")!,
@@ -231,7 +231,7 @@ final class AnthropicClientTests: XCTestCase {
         }
 
         // Real key → must succeed.
-        let realClient = AnthropicClient(
+        let realClient = LLMClient(provider: .anthropic, 
             apiKey: realKey,
             redactor: DefaultRedactor(),
             traceLog: TraceLog(path: FileManager.default.temporaryDirectory
@@ -244,7 +244,7 @@ final class AnthropicClientTests: XCTestCase {
         }
 
         // Bogus key → must throw .invalidKey.
-        let bogusClient = AnthropicClient(
+        let bogusClient = LLMClient(provider: .anthropic, 
             apiKey: "sk-ant-invalid_test_key_should_fail_hard",
             redactor: DefaultRedactor(),
             traceLog: TraceLog(path: FileManager.default.temporaryDirectory

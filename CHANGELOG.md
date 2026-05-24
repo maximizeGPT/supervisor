@@ -6,6 +6,110 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-23 (multi-provider — Anthropic + DeepSeek + Moonshot + MiniMax + Qwen-HF)
+
+Supervisor was Anthropic-only through v0.1.x. v0.2.0 adds full
+multi-provider support so users without (or who've burned through)
+their Anthropic credit can keep running the system. Five providers
+ship in this release: Anthropic, DeepSeek, Moonshot (Kimi), MiniMax,
+and Qwen via the Hugging Face router.
+
+Live-verified end-to-end against DeepSeek's real API — onboarding
+picked DeepSeek, validated the key, persisted it under its own
+Keychain slot, and onboarding advanced to step 2 with one round-trip
+through the OpenAI → Anthropic translation layer (5 input tokens,
+1 output token, ~$0.000005 spent).
+
+### Added
+- `LLMProvider` enum (`Sources/SupervisorCore/LLMClient/LLMProvider.swift`)
+  — declares per-provider base URL, default triage model, auth header
+  (`x-api-key` for Anthropic, `Authorization: Bearer` for everyone
+  else), placeholder text for the SecureField, and Keychain service
+  name. One-arm-per-provider switch statements throughout.
+- `LLMClient` (`Sources/SupervisorCore/LLMClient/LLMClient.swift`) —
+  replaces `AnthropicClient`. Dispatches by `provider.apiShape`:
+  Anthropic path is preserved verbatim from v0.1.x; OpenAI-compat
+  path (DeepSeek / Moonshot / MiniMax / Qwen-HF) translates the
+  canonical `AnthropicMessageRequest` to OpenAI chat.completions
+  format, POSTs, and translates the response back so the rest of
+  the triage pipeline doesn't know which provider was on the other
+  end.
+- `ProviderKeyStore` protocol + `KeychainProviderKeyStore` +
+  `InMemoryProviderKeyStore` (`Sources/SupervisorCore/LLMClient/ProviderKeyStore.swift`)
+  — per-provider Keychain storage so users can have multiple
+  providers configured at once and switch without re-entering.
+- `ActiveProviderStore` protocol + `FileActiveProviderStore` +
+  `InMemoryActiveProviderStore` — small JSON file at
+  `~/Library/Application Support/Supervisor/active-provider.json`
+  recording which provider triage should call.
+- `migrateLegacyKeyIfPresent(keys:active:trace:)` — one-shot,
+  idempotent migration from the v0.1.x single-key Keychain layout
+  (`live.supervisor.api`) into the per-provider slots. Runs on
+  every launch; no-ops once migrated.
+- Onboarding step 1 gained a **provider picker**
+  (`KeyEntryStep.swift`) — a `.menu` Picker bound to
+  `vm.selectedProvider`. Selecting a provider updates the title
+  (`<Provider> API key`), the SecureField placeholder
+  (`sk-ant-...` / `sk-...` / `hf_...` etc.), and a provider-specific
+  cost-expectation line in the intro copy.
+- 15 new tests in `LLMClientProviderTests.swift`:
+  - Every provider has a unique Keychain service and a non-empty
+    default model
+  - Anthropic uses `x-api-key`; everyone else uses Bearer
+  - Anthropic is the only `.anthropic` apiShape
+  - Request translation: system → first message, content blocks
+    concatenate, forced tool_choice becomes OpenAI function form
+  - Response translation: tool_calls → tool_use blocks, malformed
+    JSON arguments collapse to `.null`, plain text content becomes
+    a text block, no-choices throws
+  - End-to-end mock: DeepSeek 200 with `tool_calls` decodes as
+    a populated `AnthropicMessageResponse` with the right input
+    token count
+  - Anthropic path still sends `x-api-key`; DeepSeek path sends
+    `Authorization: Bearer` and never `x-api-key`
+
+### Changed
+- `OnboardingViewModel` (`Sources/SupervisorCore/Onboarding/OnboardingViewModel.swift`)
+  — replaces `APIKeyStore` with `ProviderKeyStore` + adds
+  `ActiveProviderStore` and a `@Published selectedProvider`. The
+  `clientFactory` closure now takes `(LLMProvider, String)`. On
+  `submitKey` success, the active provider is recorded so triage
+  uses the right one.
+- `SupervisorApp/main.swift` — initializes the ProviderKeyStore +
+  ActiveProviderStore, runs the legacy-migration on boot, and
+  constructs the `LLMClient` for whichever provider is active
+  (defaulting to `.anthropic` for compatibility with the v0.1.x
+  flow). Triage now uses `activeProvider.defaultTriageModel` instead
+  of the legacy `Config.defaults.triageModel`.
+- `TriageEngine.client` is typed `LLMClient` (was `AnthropicClient`).
+  Internal API is identical; no other change.
+- All existing `AnthropicClient(...)` test constructions migrated to
+  `LLMClient(provider: .anthropic, ...)` (mechanical, 4 test files
+  touched).
+
+### Removed
+- `Sources/SupervisorCore/AnthropicClient/AnthropicClient.swift` —
+  replaced by `LLMClient`. The folder is kept for `APIModels.swift`,
+  `Errors.swift`, and `TokenAccounting.swift` (those types are the
+  canonical internal request/response shapes and stay).
+
+### Migration notes
+- Users upgrading from v0.1.x: nothing to do. The legacy-key migration
+  copies your existing Anthropic key into the per-provider slot, marks
+  Anthropic active, and deletes the old slot. Your next launch goes
+  straight to the running state, same as before.
+- Users wanting to switch providers: in onboarding (or after deleting
+  the keychain item via SupervisorDevTools), pick a different
+  provider from the dropdown and paste its key.
+
+### Live-verified, 183 tests pass
+- Anthropic path: unchanged from v0.1.6.4; still validates against
+  `https://api.anthropic.com/v1/messages`
+- DeepSeek path: tested with the production key against
+  `https://api.deepseek.com/v1/chat/completions`; validateKey OK,
+  onboarding advanced, key persisted under
+  `live.supervisor.api.deepseek`
+
 ## [0.1.6.4] — 2026-05-23 (onboarding readability — dark mode + mute contrast)
 
 Two readability bugs surfaced during a live computer-use walkthrough

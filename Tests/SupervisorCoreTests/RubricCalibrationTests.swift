@@ -27,10 +27,10 @@ final class RubricCalibrationTests: XCTestCase {
         return key
     }
 
-    private func makeClient(key: String) -> AnthropicClient {
+    private func makeClient(key: String) -> LLMClient {
         let traceLog = TraceLog(path: FileManager.default.temporaryDirectory
             .appendingPathComponent("calibration-\(UUID().uuidString).log"))
-        return AnthropicClient(apiKey: key, redactor: DefaultRedactor(), traceLog: traceLog)
+        return LLMClient(provider: .anthropic, apiKey: key, redactor: DefaultRedactor(), traceLog: traceLog)
     }
 
     // MARK: - Event-window construction
@@ -108,7 +108,7 @@ final class RubricCalibrationTests: XCTestCase {
     /// to avoid an unbounded loop if Anthropic's quota is genuinely exhausted.
     /// Non-rate-limit errors fail immediately — no point retrying a
     /// decoding failure or a permission error.
-    private func runOne(_ f: CalibrationFixture, client: AnthropicClient) async -> RunResult {
+    private func runOne(_ f: CalibrationFixture, client: LLMClient) async -> RunResult {
         let input = buildInput(for: f)
         let request = TriagePrompt.buildRequest(model: "claude-haiku-4-5-20251001", input: input)
 

@@ -28,7 +28,7 @@ final class TriageEngineTests: XCTestCase {
     private func makeEngine() -> (TriageEngine, EventBus, CapturedDecisions) {
         let bus = EventBus(trace: TraceLog(path: FileManager.default.temporaryDirectory
             .appendingPathComponent("triage-tests-\(UUID().uuidString).log")))
-        let client = AnthropicClient(
+        let client = LLMClient(provider: .anthropic, 
             apiKey: "sk-ant-test",
             redactor: DefaultRedactor(),
             baseURL: URL(string: "https://mock.anthropic.test")!,

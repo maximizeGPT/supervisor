@@ -60,7 +60,7 @@ final class EndToEndPipelineTests: XCTestCase {
 
         // Canned Haiku response: one flag, high severity.
         Self.canned["/v1/messages"] = (200, Self.haikuFlag(), [:])
-        let client = AnthropicClient(
+        let client = LLMClient(provider: .anthropic, 
             apiKey: "sk-ant-fixture",
             redactor: DefaultRedactor(),
             baseURL: URL(string: "https://mock.anthropic.test")!,
