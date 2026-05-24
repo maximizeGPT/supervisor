@@ -6,6 +6,158 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-24 (the bridge feature — inject + question handling)
+
+Supervisor stops being a safety harness *only* and becomes an
+AI engineer-in-the-middle. When Claude Code asks the user a
+question, Supervisor classifies it into three buckets:
+**engineering** (answerable from PRINCIPLES.md → auto-inject the
+answer), **safety** (user sees it, full stop), or **taste**
+(translate into plain language → surface as banner). The
+non-technical user sees only the questions that genuinely need
+their judgment.
+
+End-to-end dogfooded: during the v0.3.0 work itself, Supervisor
+v0.3.0 intercepted an engineering question I had about Issue #1's
+trace-tag format, answered correctly from PRINCIPLES.md (cited
+§4b), and the implementation matched the answer. The product
+demonstrably worked in production.
+
+### Added
+
+**Part A — inject intervention** (DESIGN.md §5.2's queued v0.1.5
+work, finally shipped)
+- `Injector` protocol + `CGEventInjector` (production) +
+  `MockInjector` (tests). Delivers text into the terminal
+  hosting a Claude Code session via `CGEventPost` on the HID
+  event tap — the 2026-05-23 spike note's mouse-click path
+  generalized to keystrokes. Self-verifying scratch test in
+  `spikes/cgevent_inject_spike.swift` confirms keystrokes land
+  in Terminal.app.
+- `InterventionRouter.injectOrDegrade`: happy path posts
+  `.injectSucceeded(pid, bytes)`; every failure surface
+  (no-text, missing-cwd, locator-nil, no-hosting-app,
+  unsupported-host, activation-failed, event-creation-failed)
+  surfaces the intended text in the banner via
+  `.injectDegraded(intendedText:reason:)` so the user can paste
+  manually. Six new tests cover each branch.
+- Notifier banner copy: `injectSucceeded` says "Supervisor
+  answered (PID X, N bytes injected)"; `injectDegraded` says
+  "Supervisor would have answered: <text>. Paste this into
+  Claude Code to continue."
+- `record_triage` schema gains `inject` to the
+  `recommended_action` enum.
+
+**Part B — user_question_pending rubric category**
+- New rubric category in `HardcodedRubric.swift`. Fires on
+  assistant messages containing user-directed questions
+  (explicit "?", canonical phrasings like "should I", "want me
+  to", "ok to", numbered choice lists). Does NOT fire on
+  rhetorical questions, code-block-quoted text, search-result
+  citations, or self-answered chain-of-thought.
+- `record_triage` schema gains required `question_type` field
+  (`engineering` / `safety` / `taste`) when category is
+  `user_question_pending`. Default-to-safety when uncertain
+  between engineering and safety; default-to-taste when
+  uncertain between engineering and taste (PRINCIPLES §3c —
+  asymmetry favors reaching the user).
+- `TriageCandidate` gains `suggestedInjectText` and
+  `questionType` fields. Plumbed through to the router and the
+  Notifier.
+- `QuestionAnswerer` (`Sources/SupervisorCore/Triage/QuestionAnswerer.swift`):
+  - `answerEngineering(question:)` — secondary Haiku call with
+    PRINCIPLES.md as system context. Forced `record_answer`
+    tool call returns answer + confidence + citation. Low
+    confidence degrades to the taste path.
+  - `translateTaste(question:)` — secondary Haiku call to
+    rewrite the question in plain language. Forced
+    `rewrite_question` tool call.
+- `TriageEngine`:
+  - `consume()` now handles `assistantText` events, filtered by
+    a cheap local `looksLikeQuestionToUser()` prefilter. Without
+    the prefilter every assistant turn would cost a Haiku call;
+    with it, ~5-10 calls per 100-turn session.
+  - `evaluateAssistantText()` runs the primary triage
+    + `enrichWithSecondaryAnswer()` for user_question_pending
+    candidates. Engineering → inject; taste → notify with
+    rewrite; safety → notify (no secondary call).
+- App wiring: `main.swift` loads PRINCIPLES.md from the bundle
+  resource / build-dir-relative path / hardcoded dev path and
+  instantiates the QuestionAnswerer. nil-PRINCIPLES degrades
+  user_question_pending to plain notify (no inject path) but
+  the primary triage still runs.
+
+**Part B4 — calibration**
+- 90 fixtures (`QuestionFixtures.swift`): 15 positives + 15
+  negatives × 3 question_types. Negatives include rhetorical /
+  code-block-quoted / self-answered / man-page / docs-cited
+  patterns that should NOT fire.
+- `testCalibrateQuestionFixtures` sweep harness with provider
+  auto-resolution (ANTHROPIC_API_KEY or DEEPSEEK_API_KEY).
+- First sweep result of record (DeepSeek-chat → auto-routed to
+  deepseek-v4-flash):
+  - engineering positives: 9/15 (60%)
+  - safety positives: 14/15 (93%)
+  - taste positives: 13/15 (86%)
+  - negatives: 43/45 (95%)
+- Cost: $0.17 in 6m24s. Run preserved at
+  `Tests/Calibration/runs/2026-05-24T08-53-58Z-v0.3.0-questions/`.
+- 60% engineering rate is the rubric's default-to-taste guidance
+  firing on naming/style/priority questions. Per PRINCIPLES
+  §3c asymmetry that's the safer mode — a wrong inject costs
+  trust; a missed inject costs one paste. Filed as Issue #5
+  for v0.3.1.
+
+**Part B5 — end-to-end canary**
+- `v0_3_0_CanaryTest.swift`: drives the spec verbatim. Live LLM
+  pipeline: EventBus → TriageEngine → primary triage → secondary
+  QuestionAnswerer → reconfigure → router → MockInjector. Asserts
+  all four ordered properties (flag fires, secondary call ran,
+  inject called, full trace pipeline visible).
+- Live-verified: the canonical sysctl-vs-lsof question fires
+  user_question_pending / engineering, the secondary call cites
+  PRINCIPLES.md §1c (wrap, don't fork) + §4b (discriminating
+  trace tags), produces an answer the inject would deliver
+  ("extend sysctl with cwd matching, don't fork to lsof").
+- Cost per canary run: ~$0.01.
+
+**Part C — dogfood**
+- During the v0.3.0 work itself, picked Issue #1 (ProcessLocator
+  silent-nil) as a real task. Wrote a natural engineering
+  question into the chat — *"should the trace tag include full
+  execPath or just basename?"* — and Supervisor v0.3.0
+  intercepted it. Secondary call returned: *"Yes, the trace tag
+  should include full execPath, not just basename. §4b
+  requires trace tags to discriminate every failure path…
+  Full path lets post-mortem tell exactly why resolution
+  failed."* (confidence=high, citation=§4b). My implementation
+  matched the answer. **The product worked in production.**
+- Inject degraded with `no_cwd_on_decision` because cwd rolls
+  off the rolling window after 30+ events; banner fell back to
+  surfacing the answer text. Filed as Issue #6 for v0.3.1.
+
+### Bundled work — Issue #1 smallest fix
+- `LiveProcessLocator.locate` now emits
+  `locator.exec_unrecognized pid=X cwd=Y execPath=Z` when a
+  process is in the target cwd but its exec name doesn't match
+  the configured patterns. Closes the silent-nil failure mode
+  that the issue body called *"the worst safety regression."*
+  Proper fix (KERN_PROCARGS2 argv inspection) stays open as
+  Issue #1's larger-fix branch.
+
+### Open follow-ups (v0.3.1)
+- **Issue #5**: 6 engineering→taste misclassifications in the
+  v0.3.0 calibration; tighten the rubric's engineering-vs-taste
+  decision rule, re-sweep, ship if engineering rises to ≥80%
+  without regressing safety/taste.
+- **Issue #6**: cwd missing from `evaluateAssistantText` after
+  30+ events; per-session cwd cache fixes it.
+
+### Tests
+- 188 prior + 5 new inject router tests + 1 calibration sweep
+  (live-gated) + 1 canary (live-gated) = **191 total**, 4
+  live-gated skipped without env var. All passing.
+
 ## [0.2.0] — 2026-05-23 (multi-provider — Anthropic + DeepSeek + Moonshot + MiniMax + Qwen-HF)
 
 Supervisor was Anthropic-only through v0.1.x. v0.2.0 adds full
