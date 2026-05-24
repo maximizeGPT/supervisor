@@ -10,29 +10,26 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: swift build
+  build-and-test:
+    name: swift build + test
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - name: Show toolchain
         run: swift --version
+      # Single job (not two with `needs:`) because each GH Actions job
+      # runs on a fresh runner — splitting `swift build` and `swift test
+      # --skip-build` across jobs strands the .build artifacts and
+      # `--skip-build` fails with "No test bundle found." Doing both
+      # here lets `swift test` reuse the freshly-built artifacts.
       - name: Build all targets
         run: swift build
-
-  test:
-    name: swift test
-    runs-on: macos-14
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-      # --skip-build is harmless here (swift test always builds what it
-      # needs); the flag is in the spec to match the documented developer
-      # workflow. The live-API test (testRealHaikuLiveCall) gates on
-      # ANTHROPIC_API_KEY at runtime — without the secret it self-skips,
-      # so we don't need a separate filter.
+      # `swift test` builds whatever the test bundle needs on top of
+      # what `swift build` already produced. The live-API test
+      # (testRealHaikuLiveCall) gates on ANTHROPIC_API_KEY at runtime —
+      # without the secret it self-skips, so we don't need a filter.
       - name: Run unit tests
-        run: swift test --skip-build
+        run: swift test
 
   # Lint job removed in v0.1.6.2: swift-format isn't actually shipped
   # with the macos-14 GitHub Actions Swift toolchain (my earlier comment
