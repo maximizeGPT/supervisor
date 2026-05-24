@@ -26,6 +26,7 @@
 // matters because Supervisor holds Claude Code's JSONL files open too,
 // so a naive lsof-based approach would surface it as a candidate.
 
+import AppKit
 import Darwin
 import Foundation
 
@@ -119,6 +120,22 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
 
         switch matches.count {
         case 0:
+            // v0.3.1: Claude.app fallback. The CLI-style locator
+            // (exec name + cwd match) misses Claude.app because:
+            //   1) Claude.app's binary is `Claude` (capital), not in
+            //      the patterns set
+            //   2) Claude.app's cwd is `/`, not the session's cwd
+            // For users on the Claude desktop app (added to
+            // claudeCodeHostApps in v0.1.6.1), inject still needs to
+            // resolve to a PID — and Claude.app's PID is the right
+            // target because CGEventInjector posts to that app
+            // frontmost. Surfaced by v0.3.1 dogfood when the question-
+            // pipeline answer hit `intervention.inject.degraded
+            // reason=locator_nil` despite cwd resolving correctly.
+            if let claudeAppPID = Self.findClaudeDesktopAppPID() {
+                trace.emit("locator", "locator.claude_app_fallback pid=\(claudeAppPID) targetCwd=\(targetCwd) note=cli-locator missed; using Claude.app NSRunningApplication PID for inject delivery")
+                return ProcessHandle(pid: claudeAppPID, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+            }
             trace.emit("locator", "locator.not_found targetCwd=\(targetCwd) patterns=\(execNamePatterns.joined(separator: ","))")
             return nil
         case 1:
@@ -130,6 +147,27 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
             trace.emit("locator", "locator.ambiguous targetCwd=\(targetCwd) pids=\(pidList)")
             return nil
         }
+    }
+
+    // MARK: - Claude.app fallback (v0.3.1)
+
+    /// Returns the PID of the running `com.anthropic.claudefordesktop`
+    /// instance if any. Used as the locator's fallback when the
+    /// CLI-style cwd-match misses (typical for users running their
+    /// Claude Code session inside Claude.app, where the binary is
+    /// `Claude` and cwd is `/`). Returns nil if Claude.app isn't
+    /// running.
+    private static func findClaudeDesktopAppPID() -> pid_t? {
+        // NSRunningApplication lookup is cheap and bundle-id-keyed.
+        // Filters down to the single Claude.app instance regardless
+        // of how many helper processes Electron spawns.
+        let claudeBundleID = "com.anthropic.claudefordesktop"
+        for app in NSWorkspace.shared.runningApplications {
+            if app.bundleIdentifier == claudeBundleID {
+                return app.processIdentifier
+            }
+        }
+        return nil
     }
 
     // MARK: - Pattern matching
