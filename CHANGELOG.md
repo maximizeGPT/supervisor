@@ -6,6 +6,107 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-24 (the complete product — inject fires end-to-end)
+
+v0.3.0 was the architecture; v0.3.1 is the product. Closes the
+two gaps that prevented v0.3.0's inject path from firing for
+real users: cwd plumbing through long sessions (Issue #6) and
+engineering-classification hedging (Issue #5). Plus a third gap
+surfaced during the dogfood: ProcessLocator missing Claude.app's
+binary entirely.
+
+End-to-end verified during the v0.3.1 work itself. While
+implementing Issue #3 (terminals config), I asked a real
+engineering question in chat — *"For the hover host-apps config,
+should the YAML structure be a top-level `hostApps:` key or
+nested under a `hover:` block?"* — and Supervisor v0.3.1
+intercepted, classified engineering, answered from PRINCIPLES.md
+(cited §1c + §5), and **injected 251 bytes into Claude.app
+(PID 8789) via CGEventPost**. Trace shows the full pipeline.
+**This is the moment the complete product worked.**
+
+### Fixed
+
+**Issue #6 — per-session cwd cache** (`TriageEngine.swift`)
+- `evaluateAssistantText` now resolves cwd via window → cache →
+  nil-with-discriminating-trace. The cache is populated on every
+  `sessionStart` event so cwd survives the 30-event window
+  rotation that broke the v0.3.0 dogfood inject.
+- New trace tag `assistant_text.no_cwd_session_start_not_seen`
+  fires when both window and cache miss — the real edge case is
+  Supervisor starting mid-session.
+- When cwd is unresolvable AND the candidate action is `.inject`,
+  the engine downgrades to `.notify` IN-PLACE (with the answer
+  text promoted into the banner) so the router never emits the
+  misleading `intervention.inject.degraded
+  reason=no_cwd_on_decision` tag.
+- Two new tests cover both branches: cache-hit resolves cwd after
+  window roll, cache-miss emits the new trace tag and downgrades.
+
+**Issue #5 — engineering vs taste rubric tightening**
+(`HardcodedRubric.swift` + 1 fixture correction)
+- Discovery harness (`testDiscoveryV031EngineeringMisclassifications`)
+  re-ran the 6 v0.3.0-failed engineering fixtures verbatim and
+  categorized the failures: 3 were v0.3.0 variance (now classify
+  correctly); 2 were rubric hedging (Haiku classified engineering
+  then second-guessed to notify); 1 was fixture-wrong
+  (prioritization IS values-shaped).
+- Rubric change: action mapping for engineering is now
+  **non-negotiable**. *"The uncertainty principle applies to
+  question_type classification, NOT to action mapping that
+  follows from it. Once you've decided question_type, the
+  action is mechanical — do not second-guess it."* Added an
+  anti-hedge note: *"Picking notify for engineering questions
+  means the user has to paste the answer manually — that's the
+  failure mode this category exists to avoid."*
+- Fixture correction: `eng.pos.09.test-coverage`
+  (prioritization across three areas) → replaced with
+  `eng.pos.09.design-doc-defaults` (a true design-doc-derivable
+  question).
+
+**ProcessLocator Claude.app fallback** (`ProcessLocator.swift`)
+- Dogfood-surfaced gap: my Claude session runs as
+  `/Applications/Claude.app/Contents/MacOS/Claude` — exec
+  basename `Claude` (capital), cwd `/`. The CLI locator (case-
+  sensitive exact basename + cwd match) misses both criteria.
+- Fix: when the CLI-style cwd-match returns 0 candidates, fall
+  back to NSWorkspace lookup for the
+  `com.anthropic.claudefordesktop` bundle. Returns Claude.app's
+  PID; CGEventInjector handles delivery via activate + CGEventPost.
+- New trace tag `locator.claude_app_fallback` discriminates this
+  path from CLI-style matches. Filed Issue #1's larger
+  KERN_PROCARGS2 fix as still-open for the
+  non-Claude.app interpreter cases.
+
+### Calibration
+
+v0.3.1 sweep result of record (DeepSeek, 90 fixtures, $0.18, 6m11s,
+preserved at `Tests/Calibration/runs/2026-05-24T17-11-41Z-v0.3.1-questions/`):
+
+| question_type | v0.3.0 | **v0.3.1** | Delta |
+|---|---|---|---|
+| engineering positives | 9/15 (60%) | **12/15 (80%)** | **+20%** |
+| safety positives | 14/15 (93%) | **15/15 (100%)** | +7% |
+| taste positives | 13/15 (86%) | **15/15 (100%)** | +14% |
+| **all positives** | 36/45 (80%) | **42/45 (93%)** | **+13%** |
+| negatives (no-fire) | 43/45 (95%) | 42/45 (93%) | -2% |
+
+### Tests
+
+192 prior + 2 new engine cwd-cache tests + 0 net regressions =
+**194 total / 4 live-gated skipped / 0 failures.**
+
+### Pending follow-ups
+- 3 remaining engineering wrong-type classifications
+  (`eng.pos.04`, `eng.pos.06`, `eng.pos.13`) — v0.3.0/v0.3.1
+  variance, filed as v0.3.2 if they persist across runs.
+- 1 new false positive (`taste.neg.02.self-answered-naming`) —
+  rhetorical-question detection edge case.
+- Issue #1's KERN_PROCARGS2 argv inspection still open for the
+  generic `node /path/to/cli.mjs` case (Claude.app fallback
+  covers the most common shape; interpreter-launched custom
+  Claude Code distributions still degrade silently).
+
 ## [0.3.0] — 2026-05-24 (the bridge feature — inject + question handling)
 
 Supervisor stops being a safety harness *only* and becomes an
