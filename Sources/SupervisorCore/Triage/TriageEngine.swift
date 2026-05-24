@@ -77,6 +77,16 @@ public final class TriageEngine {
     /// can be matched to its parent call without re-scanning the window.
     private var bashCalls: [String: BashToolCallInfo] = [:]
 
+    /// v0.3.1 (Issue #6): per-session cwd cache. Populated on every
+    /// `sessionStart` event and consulted by `evaluateAssistantText`
+    /// when the rolling window has rolled past the sessionStart and
+    /// `lastSessionCWD(in:)` would return nil. Without this cache, an
+    /// assistant question that arrives after 30+ session events
+    /// degrades the inject path with `no_cwd_on_decision` — exactly
+    /// the v0.3.0 dogfood bug. State map (not the rolling window) is
+    /// the right shape because cwd is session-stable.
+    private var sessionCwd: [String: String] = [:]
+
     /// Hook for HoverViewModel — called whenever a triage call starts /
     /// finishes / produces a flag, so the dot color reflects state.
     public var onActivityChange: ((HoverViewModel.Activity) -> Void)?
@@ -141,6 +151,10 @@ public final class TriageEngine {
         perSessionWindow[sessionId] = window
 
         switch event {
+        case .sessionStart(let info):
+            // v0.3.1: cache cwd so it's available to assistantText
+            // evaluations even after sessionStart rolls off the window.
+            sessionCwd[info.sessionId] = info.cwd
         case .bashToolCall(let info):
             bashCalls[info.toolUseId] = info
             Task { await self.evaluate(call: info, prePost: .preExecution) }
@@ -253,7 +267,32 @@ public final class TriageEngine {
         onActivityChange?(.triaging)
 
         let window = perSessionWindow[info.sessionId] ?? []
-        let cwd = lastSessionCWD(in: window)
+        // v0.3.1 (Issue #6): cwd resolution flow — window first
+        // (cheap, doesn't require state), then per-session cache
+        // (covers the after-30+-events case from the v0.3.0 dogfood),
+        // then nil with a discriminating trace tag (the
+        // session-start-never-seen edge case). Without this fallback,
+        // every long-running session's inject path degrades to
+        // notify because lastSessionCWD only sees events still in the
+        // rolling window.
+        let cwdFromWindow = lastSessionCWD(in: window)
+        let cwdFromCache = sessionCwd[info.sessionId]
+        let cwd = cwdFromWindow ?? cwdFromCache
+        if cwd == nil {
+            // The discriminating trace tag: we tried both sources and
+            // came up empty. This means SessionStart was never seen
+            // for this session (real edge case: Supervisor started
+            // mid-session, or the JSONL is missing its lead-in lines).
+            // We continue with cwd=nil; the engine downgrades any
+            // .inject candidate to .notify below so the user still
+            // gets a banner.
+            trace.emit("triage", "assistant_text.no_cwd_session_start_not_seen session=\(info.sessionId)")
+        } else if cwdFromWindow == nil {
+            // Cache hit. Informational — useful for diagnosis when
+            // someone wonders why a sessionStart isn't in the trace
+            // right before a flag fires.
+            trace.emit("triage", "assistant_text.cwd_from_cache session=\(info.sessionId) cwd=\(cwd ?? "?")")
+        }
         let userPrompt = lastUserPrompt(in: window)
 
         let request = TriagePrompt.buildAssistantQuestionRequest(
@@ -300,11 +339,32 @@ public final class TriageEngine {
         // suggestedInjectText (engineering) or rewrite reasoning_plain
         // (taste). Safety passes through untouched.
         for candidate in candidates {
-            let enriched = await enrichWithSecondaryAnswer(
+            var enriched = await enrichWithSecondaryAnswer(
                 candidate: candidate,
                 question: info.text,
                 sessionId: info.sessionId
             )
+            // v0.3.1 (Issue #6): if cwd is unresolvable, the inject
+            // path can't run (locator needs cwd → PID). Downgrade
+            // .inject to .notify with the answer text moved into the
+            // banner. This keeps the user informed without the router
+            // ever emitting the misleading
+            // `intervention.inject.degraded reason=no_cwd_on_decision`
+            // tag — the engine-level
+            // `assistant_text.no_cwd_session_start_not_seen` tag
+            // already discriminates the cause.
+            if cwd == nil && enriched.action == .inject {
+                let answer = enriched.suggestedInjectText ?? ""
+                trace.emit("triage", "downgrade .inject → .notify session=\(info.sessionId) reason=no_cwd_in_engine answer_bytes=\(answer.utf8.count)")
+                enriched = reconfigure(
+                    enriched,
+                    action: .notify,
+                    // Promote the answer into the banner. Keep the original
+                    // reasoning as a prefix so the user sees both context
+                    // and answer.
+                    reasoningPlain: "[Answer from PRINCIPLES.md] \(answer)"
+                )
+            }
             // Triage flags on assistant text use the BashToolCallInfo
             // synthetic-bridge so the existing TriageDecision struct
             // works unchanged. The triggering "command" is the

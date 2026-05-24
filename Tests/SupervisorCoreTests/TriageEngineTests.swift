@@ -233,6 +233,151 @@ final class TriageEngineTests: XCTestCase {
         XCTAssertEqual(captured.snapshot.first?.prePost, .preExecution)
     }
 
+    // MARK: - v0.3.1 Issue #6: per-session cwd cache
+
+    /// Helper: a record_triage response that fires user_question_pending
+    /// with question_type=engineering + action=inject. Used to drive the
+    /// cwd-resolution path through the engine's downgrade logic.
+    private static func haikuQuestionFlagResponse(action: String = "inject") -> Data {
+        let candidate: [String: Any] = [
+            "category": "user_question_pending",
+            "severity": "medium",
+            "matched_command": "Should I use sysctl or lsof?",
+            "recommended_action": action,
+            "reasoning_plain": "Claude Code asked the user a question about PID discovery.",
+            "reasoning_technical": "user_question_pending fired on assistant text containing a choice between two engineering approaches.",
+            "question_type": "engineering",
+        ]
+        let body: [String: Any] = [
+            "id": "msg_question",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-haiku-4-5-20251001",
+            "content": [[
+                "type": "tool_use",
+                "id": "toolu_question",
+                "name": "record_triage",
+                "input": ["candidates": [candidate]]
+            ]],
+            "stop_reason": "tool_use",
+            "stop_sequence": NSNull(),
+            "usage": ["input_tokens": 500, "output_tokens": 80]
+        ]
+        return try! JSONSerialization.data(withJSONObject: body)
+    }
+
+    /// Cache-HIT path: sessionStart was observed, the window has rolled
+    /// past it (many events), then assistantText fires a question.
+    /// Engine should resolve cwd from `sessionCwd` and emit a decision
+    /// with cwd populated + action=.inject.
+    func testAssistantTextResolvesCwdFromSessionCacheAfterWindowRoll() async throws {
+        Self.canned["/v1/messages"] = (200, Self.haikuQuestionFlagResponse(), [:])
+        let (engine, bus, captured) = makeEngine()
+        defer { engine.stop() }
+
+        let sessionId = "s-cache-hit"
+        let knownCwd = "/Users/main/test-project"
+
+        // 1. Publish sessionStart — engine caches cwd.
+        bus.publish(.sessionStart(.init(
+            sessionId: sessionId, cwd: knownCwd, gitBranch: "main",
+            projectHash: "-tmp", jsonlPath: "/tmp/x.jsonl", ts: Date()
+        )))
+
+        // 2. Fill the window past 30 events so sessionStart rolls off.
+        //    Using bashToolResult events (non-triage-triggering) to
+        //    pad without driving primary triage calls.
+        for i in 0..<35 {
+            bus.publish(.bashToolResult(.init(
+                sessionId: sessionId, toolUseId: "fill-\(i)",
+                output: "pad event \(i)", isError: false, ts: Date()
+            )))
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // 3. Fire the assistantText event. Prefilter passes ("?")
+        bus.publish(.assistantText(.init(
+            sessionId: sessionId,
+            text: "Should I use sysctl or lsof for the PID lookup?",
+            turnUUID: "u-q1",
+            ts: Date()
+        )))
+
+        try await captured.waitFor(count: 1, within: 5.0)
+        let decision = captured.snapshot.first!
+        XCTAssertEqual(decision.candidate.category, "user_question_pending")
+        XCTAssertEqual(decision.cwd, knownCwd,
+                       "cache hit must populate decision.cwd from sessionCwd[sessionId] even though the window has rolled past sessionStart")
+        // Without a QuestionAnswerer wired in, the action stays whatever
+        // Haiku returned. We requested .inject in the canned response.
+        XCTAssertEqual(decision.candidate.action, .inject,
+                       "cwd resolved → action remains .inject (no engine downgrade)")
+    }
+
+    /// Cache-MISS path: sessionStart was NEVER observed for this
+    /// session. assistantText fires. Engine emits the new
+    /// `assistant_text.no_cwd_session_start_not_seen` trace tag AND
+    /// downgrades the .inject candidate to .notify so the router
+    /// never emits the misleading `no_cwd_on_decision` reason.
+    func testAssistantTextDowngradesToNotifyWhenCwdUnresolvable() async throws {
+        Self.canned["/v1/messages"] = (200, Self.haikuQuestionFlagResponse(), [:])
+        let traceURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("triage-cache-miss-\(UUID().uuidString).log")
+        let trace = TraceLog(path: traceURL)
+        let bus = EventBus(trace: trace)
+        let client = LLMClient(provider: .anthropic,
+            apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: mockSession(),
+            traceLog: trace
+        )
+        let engine = TriageEngine(
+            client: client,
+            bus: bus,
+            model: "claude-haiku-4-5-20251001",
+            windowSize: 30,
+            costStore: nil,
+            trace: trace
+        )
+        let captured = CapturedDecisions()
+        engine.onDecision = { d in captured.append(d) }
+        engine.start()
+        defer { engine.stop() }
+
+        let sessionId = "s-no-session-start"
+
+        // NO sessionStart published. assistantText fires cold.
+        bus.publish(.assistantText(.init(
+            sessionId: sessionId,
+            text: "Should I use sysctl or lsof for the PID lookup?",
+            turnUUID: "u-q1",
+            ts: Date()
+        )))
+
+        try await captured.waitFor(count: 1, within: 5.0)
+        let decision = captured.snapshot.first!
+        XCTAssertNil(decision.cwd, "no source for cwd → decision.cwd is nil")
+        // The engine's downgrade kicks in.
+        XCTAssertEqual(decision.candidate.action, .notify,
+                       "cwd unresolvable + Haiku said .inject → engine downgrades to .notify")
+
+        // Trace assertions: new tag fires; old router degraded-inject
+        // tag does NOT fire (because the action was downgraded before
+        // the router saw it).
+        let traceText = (try? String(contentsOf: traceURL, encoding: .utf8)) ?? ""
+        XCTAssertTrue(traceText.contains("assistant_text.no_cwd_session_start_not_seen"),
+                      "engine must emit the discriminating cache-miss trace tag")
+        XCTAssertTrue(traceText.contains("downgrade .inject → .notify"),
+                      "engine must trace the downgrade decision")
+        // The router-level no_cwd_on_decision tag fires for inject-action
+        // decisions with no cwd. By downgrading BEFORE the router sees
+        // the decision, the router never emits that tag — the cause is
+        // already discriminated at the engine level.
+        XCTAssertFalse(traceText.contains("intervention.inject.degraded reason=no_cwd_on_decision"),
+                       "router degradation tag must NOT fire — engine handled the case upstream")
+    }
+
     func testWindowsRetainContextForFollowupQueries() async throws {
         // First call: all-clear. Second call: flag. The window should still
         // include the first call's events when evaluating the second, so
