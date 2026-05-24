@@ -6,6 +6,42 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.6.4] — 2026-05-23 (onboarding readability — dark mode + mute contrast)
+
+Two readability bugs surfaced during a live computer-use walkthrough
+of the full onboarding flow (every screen, every state) after
+v0.1.6.3 fixed the cutoff. Both bugs would have been invisible to
+anyone testing in light mode only.
+
+### Fixed
+- **Onboarding locked to light mode.** The brand palette
+  (ink/inkDeep/mute on paper/paperWarm) was designed for a light
+  surface. In dark mode the content band had no explicit background
+  and inherited macOS dark gray, so `inkDeep` body copy and `mute`
+  notes were nearly invisible against the dark backdrop. Added
+  `.preferredColorScheme(.light)` to `OnboardingScene` so the
+  window always renders against the paper palette regardless of the
+  system theme. Belt + suspenders: also wrapped the content area in
+  a ZStack with an explicit `BrandColor.paper.color` background.
+- **`BrandColor.mute` darkened #A6A6A2 → #6E6E68.** Old tone was
+  ~2.5:1 contrast on paper background — WCAG-AA fail for body
+  copy. The "Skip is fine…" body note and the "Skip" button label
+  in the footer were both using `mute` and were essentially unreadable.
+  New tone is ~5.3:1 (AA-compliant). The deemphasized feel is
+  preserved because `ink` (#0E0F11) is far darker; the difference
+  is in absolute legibility, not relative weight.
+
+### Verified end-to-end via live UI walkthrough
+- Step 1 key entry: empty state, populated state, validation error
+  state (real Anthropic 401 with a fake key) — all render cleanly,
+  button enable/disable on field emptiness works.
+- Step 2 AX: both Skip and Open System Settings buttons clearly
+  visible (cutoff verified gone post-v0.1.6.3), mute text readable
+  post-this-version.
+- Step 3 Notifications: status line readable with green check.
+- Complete: window auto-dismisses, heartbeat companion spawns,
+  status bar transitions to GREEN (`health -> Supervisor: running`).
+
 ## [0.1.6.3] — 2026-05-23 (onboarding window grew to fit footer)
 
 Critical onboarding bug — at the spec'd 480×360, the AX step body and

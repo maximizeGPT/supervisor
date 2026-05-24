@@ -45,6 +45,15 @@ public struct OnboardingScene: View {
             footer
         }
         .frame(width: 480, height: 420)
+        // v0.1.6.4: lock the onboarding window into light mode. The brand
+        // palette (inkDeep, mute, paper, paperWarm) was designed for a
+        // light "paper" background; in dark mode the content band had no
+        // explicit background and inherited the system dark gray, making
+        // inkDeep body text and mute notes nearly invisible. Forcing
+        // .light here keeps the header/content/footer visually unified
+        // and makes the SecureField + buttons render against the
+        // expected light surface.
+        .preferredColorScheme(.light)
         .task {
             // Periodic refresh while the window is up: catches out-of-band
             // AX grants in System Settings and notification status changes.
@@ -89,32 +98,41 @@ public struct OnboardingScene: View {
 
     @ViewBuilder
     private var content: some View {
-        switch vm.state {
-        case .complete:
-            // Special case: the "All set" screen is centered, not a
-            // step-indicator + title + body composition. The window is
-            // typically dismissed within one render cycle of this state,
-            // but it should still look right if dismissal lags.
-            CompleteStep()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        default:
-            VStack(alignment: .leading, spacing: 10) {
-                Text(stepIndicatorText)
-                    .font(BrandFont.indicator)
-                    .tracking(1)
-                    .textCase(.uppercase)
-                    .foregroundStyle(BrandColor.mute.color)
-                Text(stepTitle)
-                    .font(BrandFont.title)
-                    .foregroundStyle(BrandColor.ink.color)
-                stepBody
-                    .padding(.top, 4)
+        // Wrap in a ZStack with an explicit Paper background so the
+        // content band doesn't fall through to the window's default
+        // background (belt + suspenders with .preferredColorScheme(.light)
+        // on the parent — works even if a future SwiftUI build ignores
+        // the colorScheme hint on borderless-content-view windows).
+        ZStack {
+            BrandColor.paper.color
+            switch vm.state {
+            case .complete:
+                // Special case: the "All set" screen is centered, not a
+                // step-indicator + title + body composition. The window is
+                // typically dismissed within one render cycle of this state,
+                // but it should still look right if dismissal lags.
+                CompleteStep()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            default:
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(stepIndicatorText)
+                        .font(BrandFont.indicator)
+                        .tracking(1)
+                        .textCase(.uppercase)
+                        .foregroundStyle(BrandColor.mute.color)
+                    Text(stepTitle)
+                        .font(BrandFont.title)
+                        .foregroundStyle(BrandColor.ink.color)
+                    stepBody
+                        .padding(.top, 4)
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 16)
+                .padding(.bottom, 12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            .padding(.horizontal, 24)
-            .padding(.top, 16)
-            .padding(.bottom, 12)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var stepIndicatorText: String {

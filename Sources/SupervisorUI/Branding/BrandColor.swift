@@ -16,7 +16,16 @@ public enum BrandColor: String, Sendable, CaseIterable {
     case inkDeep     // #1A1B1E — body copy emphasis
     case paperWarm   // #EDEDEB — secondary surface, dividers
     case signal      // #2D7A4E — brand green; the only accent in onboarding
-    case mute        // #A6A6A2 — secondary text, deemphasis
+    case mute        // #6E6E68 — secondary text, deemphasis (darkened
+                     // from #A6A6A2 in v0.1.6.4: original tone was ~2.5:1
+                     // contrast on paper background, WCAG-AA fail; the
+                     // "Skip is fine…" body note and the "Skip" button
+                     // label both used this token and were nearly
+                     // invisible. New tone is ~5.3:1, AA-compliant for
+                     // body copy. Still reads as deemphasized because
+                     // ink is far darker (#0E0F11) and the tracking+
+                     // uppercase on "STEP N OF 3" still carries its
+                     // weight without needing extra-light gray.
 
     public var color: Color {
         switch self {
@@ -25,7 +34,7 @@ public enum BrandColor: String, Sendable, CaseIterable {
         case .inkDeep:   return Color(red: 0x1A / 255, green: 0x1B / 255, blue: 0x1E / 255)
         case .paperWarm: return Color(red: 0xED / 255, green: 0xED / 255, blue: 0xEB / 255)
         case .signal:    return Color(red: 0x2D / 255, green: 0x7A / 255, blue: 0x4E / 255)
-        case .mute:      return Color(red: 0xA6 / 255, green: 0xA6 / 255, blue: 0xA2 / 255)
+        case .mute:      return Color(red: 0x6E / 255, green: 0x6E / 255, blue: 0x68 / 255)
         }
     }
 }
