@@ -623,4 +623,88 @@ final class RubricCalibrationTests: XCTestCase {
         let totalPositivePass = ["engineering", "safety", "taste"].reduce(0) { $0 + (passed[$1] ?? 0) }
         XCTAssertGreaterThan(totalPositivePass, 30, "expected at least 2/3 of 45 positives to fire + classify correctly")
     }
+
+    // MARK: - v0.3.1 Issue #5 discovery
+
+    /// Re-run only the 6 engineering fixtures that misclassified in the
+    /// v0.3.0 sweep. For each, dump Haiku's verbatim verdict +
+    /// reasoning so we can categorize the failures (prompt doesn't
+    /// teach the boundary / PRINCIPLES coverage gap / fixture wrong)
+    /// BEFORE proposing any rubric edit. Per the v0.1.5 checkpoint
+    /// pattern: surface the categorization to Mohammed first.
+    func testDiscoveryV031EngineeringMisclassifications() async throws {
+        let (key, provider) = try resolveAnyKey()
+        let traceLog = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("v031-discovery-\(UUID().uuidString).log"))
+        let client = LLMClient(provider: provider, apiKey: key, redactor: DefaultRedactor(), traceLog: traceLog)
+
+        // The 6 misclassified fixtures from the v0.3.0 calibration run
+        // (Tests/Calibration/runs/2026-05-24T08-53-58Z-v0.3.0-questions/).
+        let targetNames: Set<String> = [
+            "eng.pos.02.rename-enum",
+            "eng.pos.09.test-coverage",
+            "eng.pos.10.async-pattern",
+            "eng.pos.12.protocol-name",
+            "eng.pos.13.macros",
+            "eng.pos.15.json-decoder",
+        ]
+        let targets = QuestionFixtures.fixtures.filter { targetNames.contains($0.name) }
+        XCTAssertEqual(targets.count, 6, "must find all 6 misclassified fixtures by name")
+
+        print("=== v0.3.1 ENGINEERING MISCLASSIFICATION DISCOVERY ===")
+        print("provider: \(provider.rawValue) model: \(provider.defaultTriageModel)")
+        print("fixtures: \(targets.count)")
+        print("")
+
+        for (idx, f) in targets.enumerated() {
+            if idx > 0 { try? await Task.sleep(nanoseconds: 1_500_000_000) }
+            print("---")
+            print("FIXTURE: \(f.name)")
+            print("ASSISTANT_TEXT: \(f.assistantText)")
+            print("EXPECTED: \(f.expectedQuestionType ?? "?")")
+
+            let req = TriagePrompt.buildAssistantQuestionRequest(
+                model: provider.defaultTriageModel,
+                sessionId: "discovery-\(idx)",
+                cwd: f.cwd,
+                userPrompt: f.userPrompt,
+                assistantText: f.assistantText,
+                recentEvents: []
+            )
+
+            do {
+                let resp = try await client.createMessage(req)
+                // Dump verbatim
+                for block in resp.content {
+                    guard block.type == "tool_use",
+                          block.name == TriagePrompt.recordTriageToolName,
+                          case let .object(input)? = block.input,
+                          case let .array(cands)? = input["candidates"]
+                    else { continue }
+                    for c in cands {
+                        guard case let .object(d) = c else { continue }
+                        // Extract every field verbatim.
+                        let cat = (d["category"].flatMap { if case let .string(s) = $0 { return s } else { return nil } }) ?? "?"
+                        let sev = (d["severity"].flatMap { if case let .string(s) = $0 { return s } else { return nil } }) ?? "?"
+                        let act = (d["recommended_action"].flatMap { if case let .string(s) = $0 { return s } else { return nil } }) ?? "?"
+                        let qt = (d["question_type"].flatMap { if case let .string(s) = $0 { return s } else { return nil } }) ?? "(absent)"
+                        let plain = (d["reasoning_plain"].flatMap { if case let .string(s) = $0 { return s } else { return nil } }) ?? "?"
+                        let tech = (d["reasoning_technical"].flatMap { if case let .string(s) = $0 { return s } else { return nil } }) ?? "?"
+                        print("GOT: category=\(cat) severity=\(sev) action=\(act) question_type=\(qt)")
+                        print("REASONING_PLAIN: \(plain)")
+                        print("REASONING_TECHNICAL: \(tech)")
+                    }
+                }
+            } catch {
+                print("API ERROR: \(error)")
+            }
+            print("")
+        }
+        print("===")
+        print("Use this output to categorize each failure into:")
+        print("  (a) rubric prompt doesn't teach the boundary well")
+        print("  (b) PRINCIPLES.md coverage gap (genuinely not derivable)")
+        print("  (c) fixture itself wrong (engineering label is a stretch)")
+        print("Then surface the categorization to Mohammed before any rubric edits.")
+    }
 }

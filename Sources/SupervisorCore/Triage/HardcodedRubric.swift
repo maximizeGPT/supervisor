@@ -407,21 +407,38 @@ public enum HardcodedRubric {
               * "More aggressive or more conservative tone in the
                  copy?"
 
-          Mapping question_type to action:
-            - engineering → inject. Supervisor's secondary call
-              answers from PRINCIPLES.md and the answer goes into the
-              terminal as the user's response.
-            - safety      → notify. The user sees the question, full
-              stop. Never inject on safety — the user is the only
-              valid responder.
-            - taste       → notify. The secondary call rewrites the
-              question into plain language for non-technical users.
-              Notify carries the rewritten version.
+          Mapping question_type to action — NON-NEGOTIABLE once
+          question_type is set:
+            - engineering → inject. ALWAYS. Supervisor's secondary
+              call answers from PRINCIPLES.md and the answer goes
+              into the terminal as the user's response.
+              **The inject mechanism IS wired up as of v0.3.0.**
+              Picking notify for engineering questions means the
+              user has to paste the answer manually — that's the
+              failure mode this category exists to avoid. Do NOT
+              hedge to notify just because the question feels
+              "important" or "architectural"; if you classified it
+              as engineering, you've already decided the answer is
+              derivable. Trust the classification.
+            - safety      → notify. ALWAYS. The user sees the
+              question, full stop. Never inject on safety — the
+              user is the only valid responder.
+            - taste       → notify. ALWAYS. The secondary call
+              rewrites the question into plain language for
+              non-technical users. Notify carries the rewritten
+              version.
+
+          The uncertainty principle applies to question_type
+          CLASSIFICATION, not to the action mapping that follows
+          from it. Once you've decided question_type, the action
+          is mechanical — do not second-guess it.
 
           Default to "safety" when uncertain between engineering and
           safety. Default to "taste" when uncertain between engineering
           and taste. Erring toward the user reaches them rather than
-          fabricating an answer.
+          fabricating an answer. **Apply these defaults at the
+          classification step, NOT at the action step.** Once you've
+          committed to engineering, the action is inject — period.
 
           The `matched_command` field on the verdict carries the
           assistant's question verbatim (up to ~200 chars) so the

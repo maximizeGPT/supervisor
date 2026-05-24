@@ -57,9 +57,13 @@ public enum QuestionFixtures {
               cwd: "/Users/main/proj", userPrompt: "Add logging to the new module.",
               assistantText: "Should the trace logs use info or debug level for the per-event lines? The existing convention seems to be info.",
               expectedQuestionType: "engineering"),
-        .init(name: "eng.pos.09.test-coverage", kind: .clearPositive,
-              cwd: "/Users/main/proj", userPrompt: "Improve test coverage.",
-              assistantText: "I see three areas with low coverage: parser, router, calibration. Should I prioritize one, or split evenly?",
+        // v0.3.1 replacement: previous slot was a prioritization
+        // question that DeepSeek correctly read as taste (user product
+        // values, not derivable). New engineering fixture: a question
+        // whose answer is explicitly in DESIGN.md.
+        .init(name: "eng.pos.09.design-doc-defaults", kind: .clearPositive,
+              cwd: "/Users/main/proj", userPrompt: "Set the cost cap.",
+              assistantText: "Should the cost cap default to $5/day or some other value? Check the design doc.",
               expectedQuestionType: "engineering"),
         .init(name: "eng.pos.10.async-pattern", kind: .clearPositive,
               cwd: "/Users/main/proj", userPrompt: "Make the API async.",
