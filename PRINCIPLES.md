@@ -15,18 +15,50 @@ and file an issue — don't guess.
 
 - **v1** (`autonomous-20260524T080753Z`): foundation — 13 sections
   grounded in v0.1.x → v0.2.0 evidence.
-- **v2** (current): budget envelope (§9e) + STATUS-vs-reality diff
-  in the opener + carve-out for fixture corrections (§6f) +
-  commit granularity (§1e). Edits proposed in the
+- **v2**: budget envelope (§9e) + STATUS-vs-reality diff in the
+  opener + carve-out for fixture corrections (§6f) + commit
+  granularity (§1e). Edits proposed in the
   `autonomous-20260524T080753Z` meta-post-mortem and approved
   by Mohammed.
+- **v3** (current): gap-finding-rate as top-level metric + two
+  classification-philosophy additions (§2e per-path prompt
+  isolation, §5a-prime terminology overlap is not safety).
+  Edits proposed in the `autonomous-20260525T084118Z`
+  meta-post-mortem and approved by Mohammed.
 
-The gap-finding rate is the metric for this manual: each
-autonomous trial should identify fewer gaps than the last. v1
-identified five gaps in its first trial; v2 closes those five.
-When a trial identifies zero, the manual is comprehensive enough
-for the framing — Supervisor catches what the user can't answer,
-including what the autonomous Claude Code can't decide.
+---
+
+## 0. The gap-finding metric (top-level framing)
+
+Each autonomous trial identifies PRINCIPLES gaps in its
+meta-post-mortem. The count over time is the manual's most
+useful single quality signal:
+
+```
+v1 trial → 5 gaps  (foundational structure)
+v2 trial → 2 gaps  (calibration tuning)
+v3 trial → ?       (target: 0–1)
+```
+
+When a trial hits 0, the manual is comprehensive enough that
+Supervisor + a fresh Claude Code session can ship work without
+the user in the chat. That's the success state — the framing
+Mohammed has been building toward: *"Supervisor catches what
+the user can't answer, including what the autonomous Claude
+Code can't decide."*
+
+The trend is the signal, not any individual count. v1's 5 gaps
+were foundational absences (budget envelope, STATUS-decay
+discipline, etc.); v2's 2 gaps are calibration tuning surfaces
+(prompt classification edge cases). Smaller-surface gaps are
+expected as the manual matures. A trial that finds **larger**
+gaps than the previous one is a regression signal — either the
+manual lost discipline or a new architecture layer (the
+secondary-call paths, future inject mechanisms) opened a new
+class of question PRINCIPLES needs to answer.
+
+The first thing every autonomous-session meta-post-mortem should
+do is report its gap count against the running trend.
 
 ---
 
@@ -120,6 +152,25 @@ lands in the trace log (one dense paragraph). `asymmetry_note`
 lands in the recovery doc when present. Haiku is taught to pick
 its register. Test what each register looks like; reject prompt
 edits that let one register bleed into the other.
+
+**2e. Per-path prompt isolation.** When multiple triage paths
+exist (bash, assistant-text, future), each path's prompt MUST
+explicitly enumerate the categories it evaluates against and
+explicitly exclude the others. Path-shared category lists are
+a footgun — Haiku will pattern-match category names that appear
+in the focal command/text, regardless of whether the category
+applies to that path. Surfaced during the
+`autonomous-20260525T084118Z` trial when a bash command whose
+regex grep pattern literally contained `user_question_pending`
+triggered a false positive in that category, because the bash
+triage prompt enumerated ALL rubric categories including
+ones meant only for assistant-text. The asymmetry is the bug:
+the assistant-text path already uses a focused prompt
+(*"evaluate ONLY against user_question_pending"*); the bash
+path should be symmetric and explicitly omit
+user_question_pending. Filed as Issue #7 against v0.3.3; the
+PRINCIPLES note documents the philosophy regardless of which
+release closes the specific bug.
 
 ---
 
@@ -258,6 +309,25 @@ the Notif-denied state body trim worth the readability hit?" is
 borderline values. "Is the window 360 or 420 px?" is borderline
 engineering. The cheap fallback is `AskUserQuestion` with two
 options and a one-line rationale on each.
+
+**5a-prime. Terminology overlap is not a safety signal.** The
+rubric's *"default to safety when uncertain between engineering
+and safety"* heuristic applies to questions whose **action** is
+destructive, irreversible, or modifies the user's environment
+non-trivially — not to questions whose **vocabulary** happens
+to brush against safety-shaped terms. A question using words
+like *"interpreter"* (which interpreters to support in argv
+inspection), *"process"* (which processes to enumerate),
+*"signal"* (which signal the router sends) is engineering when
+the asked-about action is code organization, not when the
+action is execution-against-a-real-process. Surfaced during
+the `autonomous-20260525T084118Z` trial when a multi-question
+message about JS-runtime interpreters + argv markers + trace
+tags classified as safety because *"interpreter"* and
+*"process"* read as risk-shaped in isolation. The classification
+gate is the action, not the vocabulary; the post-classification
+mapping (engineering → inject) is unchanged by this note —
+v0.3.1's tightening of that mapping stands.
 
 **5b. Don't invent options. Surface the actual trade-off.** If
 the choice is "ship v0.2 with full abstraction or just Deepseek,"
