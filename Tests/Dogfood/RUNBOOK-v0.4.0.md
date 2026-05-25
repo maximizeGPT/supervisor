@@ -69,16 +69,45 @@ rm -rf "$DEST"
 mv "$TMP" "$DEST"
 ```
 
-Quit any running Supervisor in the menu bar (`pkill Supervisor`
-if needed), then launch:
+Quit any running Supervisor in the menu bar (`pkill -f
+"/Applications/Supervisor.app"` if needed).
+
+**⚠️ macOS will revoke Accessibility (and Notifications)
+permissions from the new binary** because the binary's
+signature changed. The previous Accessibility grant was
+attached to the old binary's hash, not to the bundle path. If
+you skip this step, the new Supervisor will wedge in the
+onboarding window with `axOK=false` immediately on launch
+(verified during the 2026-05-25 22:46 UTC autonomous trial —
+see META-POSTMORTEM).
+
+Before re-launching:
+
+1. Open System Settings → Privacy & Security → Accessibility.
+2. Remove the existing `Supervisor.app` entry (select it,
+   click the `−` button).
+3. Same for Privacy & Security → Notifications (remove the
+   `Supervisor` entry if present).
+
+Then launch:
 
 ```bash
 open -a Supervisor
 ```
 
-The menu-bar icon should appear. Open the Console.app and
-filter on `~/Library/Logs/Supervisor/supervisor.log` to watch
-the trace live.
+The menu-bar icon should appear. macOS will prompt for
+Accessibility on first inject attempt; click "Open System
+Settings" and re-add Supervisor.app from the `+` button. Same
+flow for Notifications when the first banner tries to post.
+
+A cleaner long-term fix is to codesign the new binary with
+`codesign --preserve-metadata=identifier,entitlements ...`
+during the install (filed for v0.4.x), but for this dogfood
+the manual re-grant is the path.
+
+Once granted, open the Console.app and filter on
+`~/Library/Logs/Supervisor/supervisor.log` to watch the trace
+live.
 
 ## Step 3 — Verify the dispatch wiring is loaded
 

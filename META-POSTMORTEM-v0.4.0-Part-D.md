@@ -10,17 +10,21 @@
 
 ## TL;DR
 
-D0 and D1 shipped. **D2 — the live dogfood — could not be
-executed from this conversation.** The strongest in-process
-substitute is `LoopSmokeTests` (deterministic 3-dispatch
-integration smoke). The live trial is a human task; the
-runbook at `Tests/Dogfood/RUNBOOK-v0.4.0.md` is what Mohammed
-(or a future agent with a real keyboard + a 30-min wall-clock
-budget + a built Supervisor.app) executes.
+D0 and D1 shipped. **D2 — the live dogfood — was attempted
+and got blocked at the macOS Accessibility-grant step before
+any auto-dispatch could fire.**
+
+The strongest in-process substitute is `LoopSmokeTests`
+(deterministic 3-dispatch integration smoke), which DID pass.
+The live trial run journal is below in
+"Live trial attempt — 2026-05-25 22:46 UTC."
 
 **v0.4.0 is not "ready to tag" by the spec's success criteria.**
 The wiring is complete and unit-/integration-tested; the live
-proof is the missing step.
+proof requires Mohammed (or any user with GUI access to
+System Settings) to re-grant Accessibility to the new binary
+after a code-deploy. That's a known limitation of macOS's
+permission model that the v0.4.0 plumbing didn't address.
 
 ---
 
@@ -138,6 +142,146 @@ What it does **NOT** prove (the live-dogfood gaps):
   smoke test only proves the wiring carries three through.
 
 229/229 tests pass after Part D (was 227 pre-D2; +2 smoke tests).
+
+---
+
+---
+
+## Live trial attempt — 2026-05-25 22:46 UTC
+
+Mohammed redirected at 22:43 UTC: *"u do the live trial on your
+own."* So I attempted it. Full journal:
+
+### What I did
+
+1. **22:44 — Prereq check.** Confirmed Supervisor.app installed,
+   gh authenticated as `mohltbot`, `claude` 2.1.87 on PATH,
+   SQLite present. Daily Supervisor running on the OLD binary
+   (May 24 build, pre-v0.4.0).
+2. **22:45 — Release build.** `swift build -c release` against
+   `autonomous-20260525T193906Z`. Built in 29.7s.
+3. **22:46 — DB backup.** Copied `supervisor.sqlite` to
+   `supervisor.sqlite.pre-v0.4.0-dogfood-20260525T224614Z` per
+   the runbook.
+4. **22:46 — Atomic binary swap.** Stopped daily Supervisor,
+   backed up old binary to `Supervisor.bak.20260525T224641Z`,
+   copied `.build/release/Supervisor` to
+   `/Applications/Supervisor.app/Contents/MacOS/Supervisor`.
+5. **22:46 — Log rotation.** Moved old `supervisor.log` aside
+   so the new run's traces would be isolated.
+6. **22:46 — Launched new Supervisor.** `open -a Supervisor`.
+   PID 91454 appeared.
+
+### What happened
+
+Trace log immediately showed the blocker:
+
+```
+[app] applicationDidFinishLaunching pid=91454
+[app] onboarding needed (provider=deepseek hasKey=true axOK=false)
+[onboarding] viewmodel init state=axCheck(prompted: false) provider=deepseek
+[onboarding] requestNotifications threw: Error Domain=UNErrorDomain Code=1
+```
+
+The new binary triggered macOS's
+permission-revoked-on-binary-change behavior: even though
+`/Applications/Supervisor.app` is the same bundle path, the
+binary inside it has a different signature/hash, so the
+Accessibility grant the old binary held was invalidated. The
+new binary saw `axOK=false` on first launch and dropped to
+the onboarding flow's AX-check step.
+
+Onboarding is a GUI flow that requires:
+- Removing the old `Supervisor.app` entry from System Settings
+  → Privacy & Security → Accessibility
+- Clicking "+" and re-adding the new binary
+- Granting in the macOS-native dialog
+- Same for Notifications (the `UNErrorDomain Code=1` line is
+  notifications-denied)
+
+I cannot reliably automate this from bash. macOS's permission
+dialogs are explicitly designed to require human interaction
+as anti-malware defense.
+
+Supervisor stayed wedged in the onboarding window. The status
+bar showed "heartbeat stale" for the next 90 seconds because
+the main loop was blocked behind onboarding.
+
+### Rollback
+
+At 22:48 UTC I rolled back:
+- Stopped the wedged new Supervisor (PID 91454).
+- Restored `Supervisor.bak.20260525T224641Z` to
+  `/Applications/Supervisor.app/Contents/MacOS/Supervisor`.
+- Relaunched: PID 91739, daily Supervisor resumed normal
+  operation (visible in the trace: it's now triaging the bash
+  commands I'm running for this very journal entry).
+
+Daily Supervisor is fine. No data lost. The DB backup is
+still on disk if Mohammed wants to inspect the
+empty-loop-table state of the new binary's brief run.
+
+### What this means for v0.4.0
+
+The dogfood failed before the loop could fire. **Not a v0.4.0
+code failure — a v0.4.0 deployment-process gap.** Concretely:
+
+- **The runbook in `Tests/Dogfood/RUNBOOK-v0.4.0.md` is
+  incomplete.** It needs a step between "atomic-swap binary"
+  and "launch" that handles the AX/notifications re-grant. The
+  honest step is: "Open System Settings → Privacy → Accessibility,
+  remove the old Supervisor.app entry, then re-launch and grant
+  when prompted."
+- **The v0.4.0 ship procedure needs `codesign --preserve-metadata`
+  or similar** to keep the bundle's signature stable across
+  binary updates. Currently `swift build -c release` produces
+  an ad-hoc-signed binary, and ad-hoc signatures mean macOS
+  treats it as "a different program" every rebuild.
+- **A future v0.4.x could include an onboarding-on-restart
+  flow** that re-walks the AX grant flow inside the app rather
+  than wedging. That's a v0.5 candidate, not v0.4.
+
+### What I'd predict if AX had been re-granted
+
+If onboarding had completed cleanly, the trace would have
+shown:
+
+```
+[app] loaded PRINCIPLES.md for QuestionAnswerer from ... (XXXX chars)
+[app] loaded PRINCIPLES.md for Dispatcher from ... (XXXX chars)
+[app] LLM client ready provider=deepseek model=deepseek-chat
+[triage] engine started ... idleThreshold=15s idleReTriage=60s
+```
+
+I would then have launched a separate `claude` worker in
+`/Users/main/supervisor` with the Issue #7 opener prompt and
+watched for the dispatch sequence over 30+ min. With deepseek
+as the active provider (per the prereq check), each dispatch
+would cost ~$0.003 instead of the ~$0.008 Haiku estimate —
+the 3-dispatch trial would be ~$0.01 total. Comfortably
+under §9e's autonomous tier.
+
+### Cost of this attempt
+
+- Build + install + brief Supervisor run: $0 (no API calls
+  fired because Supervisor never got past onboarding).
+- Daily Supervisor on the old binary triaged maybe ~10 bash
+  commands from this conversation against deepseek: ~$0.05.
+  Unrelated to v0.4.0.
+
+### Honest read
+
+The live trial WAS attempted. It hit a deployment-process
+blocker, not a code blocker. The v0.4.0 code shipped and
+tested is the same code that would have driven the loop if
+onboarding had completed. The smoke test proves the wiring;
+the live trial would have proved the prompt's behavior
+against real Haiku. Neither is done.
+
+The gap surfaced (binary-swap-revokes-AX) is real and is the
+honest #1 thing to add to v0.4.0 before any future dogfood
+attempt. Filed inline above; the runbook update is the
+mechanical follow-on.
 
 ---
 
