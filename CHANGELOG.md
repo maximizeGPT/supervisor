@@ -6,6 +6,91 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-25 (process discovery hardened — Issue #1 closes)
+
+Closes GH Issue #1 ("ProcessLocator silently returns nil when Claude
+Code launches as 'node'"). The original issue's two acceptance
+shapes — loud-failure trace tag (option B) and KERN_PROCARGS2 argv
+inspection (option A) — both land. Together with the Claude.app
+fallback shipped in v0.3.1, Supervisor's PID resolution now covers
+all three shapes Claude Code commonly launches as: the bare
+`claude` / `claude-code` CLI binary (v0.1.4), Claude.app's bundled
+`Claude` (v0.3.1), and `node /usr/local/bin/claude/cli.mjs`-style
+interpreter launches (v0.3.2 — this release).
+
+Verified end-to-end by the v0.3.2 autonomous trial itself.
+Supervisor caught + correctly classified + injected the answer
+to two engineering questions Mohlt asked in chat while writing
+this release. Trace excerpts in
+`trial-notes.md` on branch `autonomous-20260525T084118Z`.
+
+### Added
+
+**`LiveProcessLocator` — KERN_PROCARGS2 argv inspection**
+(`Sources/SupervisorCore/Intervention/ProcessLocator.swift`)
+
+When the exec basename is a JS-runtime interpreter (`node`,
+`bun`, `deno`) for a process whose cwd matches the target, the
+locator reads argv via `sysctl(KERN_PROCARGS2)` and promotes
+the candidate to a match if argv contains any of these markers:
+`cli.mjs`, `cli.js`, `@anthropic-ai/claude-code`,
+`claude-code-cli`. Substring search across joined argv (the cwd
+filter already constrains the candidate set, so generous
+substring matching can't false-positive outside the target cwd).
+
+New trace tag `locator.found_via_argv` discriminates the
+argv-rescue match from cwd+exec-name matches (per §4b — every
+failure path needs a discriminating trace tag, and the inverse
+holds for every success path that took a different code route).
+
+**Tests**
+- `testReadProcessArgvReturnsCurrentProcessArgv` — KERN_PROCARGS2
+  sysctl + argv parser against the current process. Pure mechanism
+  check; doesn't depend on `node` being installed.
+- `testArgvContainsClaudeCodeMarker` — matcher coverage across all
+  four documented markers + three negative cases (unrelated argvs).
+- `testInterpreterBasenamesIsTheCommittedSet` — locks down the
+  interpreter set to `{node, bun, deno}`. A future PR adding
+  `python` or `ruby` without a corresponding marker entry +
+  CHANGELOG note is caught by the lock-down.
+- `testLocatorEmitsExecUnrecognizedWhenCwdMatchesButExecDoesNot` —
+  closes Issue #1's missing acceptance criterion test for the
+  loud-failure trace tag that shipped in v0.3.0.
+
+### Fixed
+
+- `testLocatorReturnsNilWhenNoMatchingProcess` — was written before
+  the v0.3.1 Claude.app fallback and asserted strict nil. On dev
+  machines with Claude.app running, the fallback returns its PID.
+  Updated to accept either nil OR a Claude.app PID (both correct
+  per design).
+
+### Closed
+
+- **Issue #1** — both option A (KERN_PROCARGS2 argv inspection) and
+  option B (loud-failure trace tag) acceptance criteria met. Test
+  fixture per the issue body lands. CHANGELOG note here.
+- **Issue #5** (closed during STATUS-vs-reality diff at session
+  start) — engineering→taste calibration tightening shipped in
+  v0.3.1; GH issue had stayed open. Closeout comment added.
+- **Issue #6** (closed during STATUS-vs-reality diff at session
+  start) — per-session cwd cache shipped in v0.3.1; GH issue had
+  stayed open. Closeout comment added.
+
+### Filed
+
+- **Issue #7** — bash triage shouldn't surface user_question_pending
+  as a candidate category. Surfaced during the trial when a grep
+  command containing the literal string `user_question_pending`
+  triggered a false positive in that category. Smallest fix sized
+  in the issue body (filter the category out of bash-path prompt
+  building).
+
+### Tests
+
+197 pass / 5 skipped / 0 failures (was 194/4 in v0.3.1). All five
+skipped are live-API gated (`SUPERVISOR_LIVE_API=1` env).
+
 ## [0.3.1] — 2026-05-24 (the complete product — inject fires end-to-end)
 
 v0.3.0 was the architecture; v0.3.1 is the product. Closes the
