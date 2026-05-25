@@ -112,6 +112,44 @@ public final class SupervisorDatabase: @unchecked Sendable {
                 """)
         }
 
+        // v0.4.0 Part C: continuous loop dispatch ledger. Every time the
+        // Dispatcher returns a result (ready / lowConfidence / error),
+        // the LoopController writes a row here. Used for: (a) the
+        // 3-consecutive-low hard-stop check, (b) the
+        // prior_dispatches_considered counter passed to the next
+        // Dispatcher call, (c) post-mortem inspection of a loop run
+        // ("what did the dispatcher decide and when").
+        //
+        // `task_proposal_head` stores the first ~200 chars of the
+        // proposal so the trace is queryable without bloating the row
+        // — the full text is on the corresponding StoredFlag if needed.
+        // `response_shape` is one of ready | lowConfidence | error so
+        // a SQL count(*) WHERE response_shape='lowConfidence' GROUPed
+        // by recent rows answers "are we approaching the 3-consecutive-
+        // low hard stop."
+        m.registerMigration("v3_loop_dispatches") { db in
+            try db.create(table: "loop_dispatches") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("session_id", .text).notNull()
+                    .references("sessions", onDelete: .cascade)
+                t.column("ts", .datetime).notNull()
+                t.column("response_shape", .text).notNull()           // ready | lowConfidence | error
+                t.column("confidence", .text)                         // high | medium | low (nil for non-ready)
+                t.column("selected_path", .text)                      // continue_branch | transition_to_issue | low_confidence_no_action
+                t.column("selected_issue_number", .integer)
+                t.column("task_proposal_head", .text).notNull().defaults(to: "")
+                t.column("justification", .text).notNull().defaults(to: "")
+                t.column("prior_dispatches_considered", .integer).notNull().defaults(to: 0)
+                t.column("haiku_input_tokens", .integer)
+                t.column("haiku_output_tokens", .integer)
+            }
+            try db.create(
+                index: "loop_dispatches_by_session_ts",
+                on: "loop_dispatches",
+                columns: ["session_id", "ts"]
+            )
+        }
+
         return m
     }
 }
