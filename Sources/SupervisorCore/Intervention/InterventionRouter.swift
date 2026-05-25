@@ -58,6 +58,14 @@ public final class InterventionRouter {
             await postNotify(decision)
         case .inject:
             await injectOrDegrade(decision)
+        case .continue:
+            // v0.4.0 Part A: the rubric can fire `worker_idle_post_completion`
+            // with action=continue, but Part B (the dispatcher that constructs
+            // the next-task prompt + CGEventPosts it) is the next session's
+            // work. Degrade to notify so the idle state surfaces to the user
+            // as a banner. Part B replaces this with the real dispatcher.
+            trace.emit("router", "intervention.continue.degraded reason=dispatcher_not_wired_in_part_a session=\(decision.sessionId)")
+            await postNotify(decision)
         case .pause:
             await signalOrDegrade(decision, signal: SIGSTOP, opName: "pause")
         case .kill:

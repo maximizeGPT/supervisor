@@ -35,7 +35,7 @@ public struct RubricCategory: Sendable, Equatable {
 public enum HardcodedRubric {
 
     public static var categories: [RubricCategory] {
-        [destructiveActionPending, editsOutsideWorktree, promptInjectionSignature, userQuestionPending]
+        [destructiveActionPending, editsOutsideWorktree, promptInjectionSignature, userQuestionPending, workerIdlePostCompletion]
     }
 
     /// All category names — used to populate the `record_triage` schema's
@@ -446,6 +446,98 @@ public enum HardcodedRubric {
           The `reasoning_plain` field carries one short sentence about
           why the question fired (e.g., "Claude Code asked the user
           to choose between sysctl and lsof.").
+        """
+    )
+
+    // MARK: - Category 5: worker_idle_post_completion (v0.4.0)
+
+    public static let workerIdlePostCompletion = RubricCategory(
+        name: "worker_idle_post_completion",
+        body: """
+        Fire ONLY if ALL of the following hold:
+          - The session's most recent assistant message is
+            stop-shaped. A stop-shaped message contains any of:
+              * "done", "complete", "ready for next"
+              * "what's next", "let me know", "ready when you are"
+              * "shipped", "ship it", "all tests pass"
+              * an explicit `stop_reason: end_turn` in the JSONL
+                with no follow-up tool_use in the same turn
+            (Substring search for these phrases is intentional —
+             specific signatures over abstract behavior per §11b.)
+          - At least 15 seconds have elapsed since that stop-shaped
+            event, with NO new events in the session JSONL during
+            that window. (The idle threshold is configurable;
+            default 15s. The engine fires this rubric eval on a
+            1Hz timer when the threshold trips, not on every
+            event — see §6 calibration / cost discipline.)
+          - The session is on an `autonomous-*` branch. Sessions
+            on `main` or other branches are user-driven; don't
+            dispatch over the user.
+          - No `user_question_pending` flag is pending for this
+            session in the recent window. (The user-question
+            pipeline is already handling that case via inject or
+            banner.)
+          - No user message in the session's last N seconds
+            (default 30s). A user actively engaged is a signal
+            not to dispatch.
+
+        Do NOT fire if ANY of the following hold:
+          - The session is on a non-autonomous branch. The user
+            is driving this session manually; the loop has no
+            mandate to dispatch.
+          - The session JSONL is still emitting events (worker
+            is mid-task, not idle).
+          - A `user_question_pending` candidate fired in the same
+            window. Let that pipeline run first.
+          - The user's last message was within 30 seconds. The
+            user is engaged.
+          - The session's recent context shows the worker hit a
+            hard-stop condition from PRINCIPLES.md §12 (kill
+            fired, 75-min budget elapsed for a normal autonomous
+            session, etc.). Hard stops stop the loop too.
+
+        Severity rule:
+          - ALWAYS medium. worker_idle_post_completion is by
+            definition a non-destructive observation: the worker
+            is paused waiting for a next task, not racing toward
+            a destructive action. Severity is medium so the flag
+            persists in the panel for diagnostic review but never
+            crosses the high-severity threshold that drives pause
+            or kill.
+
+        Action rule (REQUIRES the secondary call to populate
+        next_task_proposal + confidence — see v0.4.0 Part B):
+          - HIGH confidence next-task pick → `continue`.
+            Supervisor types the proposed prompt into the worker's
+            input via the v0.3.1 inject mechanism. The worker
+            picks it up as a new task.
+          - MEDIUM confidence → `notify`. Banner surfaces the
+            proposal so the user can review and dispatch manually
+            if they agree.
+          - LOW confidence → `notify`. Banner says "worker is idle
+            and Supervisor couldn't pick a high-confidence next
+            task — please dispatch manually or stop the loop."
+            Per §7d, this is the surface-to-user path.
+
+        Asymmetry note guidance (always present for this
+        category): "If I dispatch and the next task is wrong, X
+        hours of compute + Y dollars + potential drift. If I
+        don't dispatch and the worker is idle, the user finds
+        the idle state via banner and dispatches manually."
+        The asymmetry HEAVILY favors not-dispatching for ambiguous
+        cases — that's why MEDIUM and LOW confidence default to
+        notify, not continue.
+
+        The `matched_command` field on the verdict carries the
+        stop-shaped phrase that triggered the eval (e.g.,
+        "ready for next task" or "stop_reason: end_turn").
+        The `reasoning_plain` field carries one short sentence
+        about why idle was detected (e.g., "Worker said 'ship
+        it' 22 seconds ago, no new events since.").
+        The `next_task_proposal` field is populated by the
+        secondary call in v0.4.0 Part B — for v0.4.0 Part A
+        (this release), this field stays nil and the action
+        defaults to `notify` regardless of confidence.
         """
     )
 }

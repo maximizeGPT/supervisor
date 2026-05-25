@@ -87,6 +87,71 @@ public final class TriageEngine {
     /// the right shape because cwd is session-stable.
     private var sessionCwd: [String: String] = [:]
 
+    /// v0.4.0 (Part A): per-session git branch cache. Same shape as
+    /// `sessionCwd` and populated alongside it on `sessionStart`. The
+    /// idle-evaluation request includes branch so the rubric body can
+    /// apply the don't-fire-on-non-autonomous-branch condition.
+    private var sessionBranch: [String: String] = [:]
+
+    /// v0.4.0 (Part A): per-session idle-detection state. Maintained on
+    /// every `consume` call; consumed by the 1Hz timer in
+    /// `checkIdleStates()`.
+    private var idleStates: [String: SessionIdleState] = [:]
+
+    /// Per-session idle state — the small ledger the timer walks.
+    /// Updated on every event for the session; the timer reads it once
+    /// per tick.
+    struct SessionIdleState {
+        /// Timestamp of the last consumed event for this session. The
+        /// "is the session idle?" check is `now - lastEventTs ≥
+        /// idleThresholdSeconds`.
+        var lastEventTs: Date
+        /// Timestamp at which a stop-shaped event was most recently
+        /// detected for this session. `nil` means we have not seen a
+        /// stop-shape yet; without one, idle detection does not fire.
+        /// Reset to `nil` when a tool_use or non-stop assistant message
+        /// arrives (the worker is no longer post-completion).
+        var lastStopShapedTs: Date?
+        /// The substring that matched ED-3's phrase list (or "end_turn"
+        /// when the JSONL annotation triggered the detection). Carried
+        /// into the triage request as `matched_command` per the rubric
+        /// body's "matched_command carries the stop-shaped phrase" rule.
+        var lastStopShapedPhrase: String?
+        /// Timestamp of the most recent userPrompt event. The rubric
+        /// body checks for a recent-user-message don't-fire condition;
+        /// the engine surfaces it as a signal but does not gate on it.
+        var lastUserMsgTs: Date?
+        /// Timestamp of the most recent idle-evaluation triage call for
+        /// this session. Used to de-duplicate: once we've asked the
+        /// rubric and it returned no-fire, don't re-ask every tick.
+        /// Cleared when a new event arrives (the world has changed).
+        var lastIdleTriageTs: Date?
+    }
+
+    /// v0.4.0 (Part A): seconds of silence after a stop-shaped event
+    /// before the timer triggers an idle-evaluation triage call. Default
+    /// 15s per the spec; tests override to keep runs short.
+    private let idleThresholdSeconds: TimeInterval
+
+    /// v0.4.0 (Part A): minimum seconds between consecutive idle-evaluation
+    /// triage calls for the same session, to keep API spend bounded. A
+    /// non-firing session pings every `idleReTriageIntervalSeconds`
+    /// rather than every tick.
+    private let idleReTriageIntervalSeconds: TimeInterval
+
+    /// v0.4.0 (Part A): tick interval for the idle-check loop. 1Hz in
+    /// production per ED-2; tests can crank it lower.
+    private let idleCheckIntervalSeconds: TimeInterval
+
+    /// v0.4.0 (Part A): injected clock for the idle check so tests can
+    /// drive time deterministically without `Task.sleep`. Production
+    /// uses `Date.init`.
+    private let now: @MainActor () -> Date
+
+    /// v0.4.0 (Part A): handle to the running idle-check task; cancelled
+    /// on `stop()`.
+    private var idleCheckTask: Task<Void, Never>?
+
     /// Hook for HoverViewModel — called whenever a triage call starts /
     /// finishes / produces a flag, so the dot color reflects state.
     public var onActivityChange: ((HoverViewModel.Activity) -> Void)?
@@ -113,6 +178,10 @@ public final class TriageEngine {
         costStore: CostStore? = nil,
         redactor: any Redactor = DefaultRedactor(),
         questionAnswerer: QuestionAnswerer? = nil,
+        idleThresholdSeconds: TimeInterval = 15,
+        idleReTriageIntervalSeconds: TimeInterval = 60,
+        idleCheckIntervalSeconds: TimeInterval = 1,
+        now: @escaping @MainActor () -> Date = { Date() },
         trace: TraceLog = .shared
     ) {
         self.client = client
@@ -122,6 +191,10 @@ public final class TriageEngine {
         self.costStore = costStore
         self.redactor = redactor
         self.questionAnswerer = questionAnswerer
+        self.idleThresholdSeconds = idleThresholdSeconds
+        self.idleReTriageIntervalSeconds = idleReTriageIntervalSeconds
+        self.idleCheckIntervalSeconds = idleCheckIntervalSeconds
+        self.now = now
         self.trace = trace
     }
 
@@ -130,12 +203,15 @@ public final class TriageEngine {
             guard let self else { return }
             Task { @MainActor in self.consume(event: event) }
         }
-        trace.emit("triage", "engine started model=\(model) windowSize=\(windowSize)")
+        startIdleCheckLoop()
+        trace.emit("triage", "engine started model=\(model) windowSize=\(windowSize) idleThreshold=\(idleThresholdSeconds)s idleReTriage=\(idleReTriageIntervalSeconds)s")
     }
 
     public func stop() {
         busSubscription?.cancel()
         busSubscription = nil
+        idleCheckTask?.cancel()
+        idleCheckTask = nil
         trace.emit("triage", "engine stopped")
     }
 
@@ -150,11 +226,20 @@ public final class TriageEngine {
         }
         perSessionWindow[sessionId] = window
 
+        // v0.4.0 Part A: maintain per-session idle state on every event,
+        // regardless of type. The timer reads this state once per tick.
+        updateIdleState(for: event)
+
         switch event {
         case .sessionStart(let info):
             // v0.3.1: cache cwd so it's available to assistantText
             // evaluations even after sessionStart rolls off the window.
             sessionCwd[info.sessionId] = info.cwd
+            // v0.4.0 Part A: cache branch alongside cwd — idle
+            // evaluation needs branch as a don't-fire signal.
+            if let branch = info.gitBranch {
+                sessionBranch[info.sessionId] = branch
+            }
         case .bashToolCall(let info):
             bashCalls[info.toolUseId] = info
             Task { await self.evaluate(call: info, prePost: .preExecution) }
@@ -177,6 +262,232 @@ public final class TriageEngine {
             }
         default:
             break
+        }
+    }
+
+    // MARK: - v0.4.0 Part A: idle detection
+
+    /// Mutate per-session idle state in response to an incoming event.
+    /// Called for EVERY event; the cost is a dict lookup + a few field
+    /// assignments. ED-2: state is per-session; ED-3: stop-shape detection
+    /// is substring-based on assistant text.
+    private func updateIdleState(for event: SupervisorEvent) {
+        let sessionId = event.sessionId
+        let ts = event.timestamp
+        var state = idleStates[sessionId] ?? SessionIdleState(
+            lastEventTs: ts,
+            lastStopShapedTs: nil,
+            lastStopShapedPhrase: nil,
+            lastUserMsgTs: nil,
+            lastIdleTriageTs: nil
+        )
+        state.lastEventTs = ts
+        // Any new event invalidates a prior idle-triage gate: the world
+        // has changed since the rubric last said "no fire," so let the
+        // timer re-ask if conditions hold.
+        state.lastIdleTriageTs = nil
+
+        switch event {
+        case .userPrompt:
+            state.lastUserMsgTs = ts
+            // User just spoke; the worker is no longer post-completion-idle
+            // by definition. Clear stop-shape so we don't re-fire until a
+            // new stop-shaped assistant message arrives.
+            state.lastStopShapedTs = nil
+            state.lastStopShapedPhrase = nil
+        case .assistantText(let info):
+            if let phrase = Self.detectStopShape(in: info.text) {
+                state.lastStopShapedTs = ts
+                state.lastStopShapedPhrase = phrase
+            }
+            // An assistantText without a stop-shape DOES NOT clear the
+            // prior stop-shape — multi-paragraph completions can have a
+            // stop-shape early followed by additional context. The
+            // worker stays "post-completion" until a tool_use lands.
+        case .bashToolCall:
+            // Tool call means the worker is actively working again;
+            // clear any prior stop-shape.
+            state.lastStopShapedTs = nil
+            state.lastStopShapedPhrase = nil
+        default:
+            break
+        }
+
+        idleStates[sessionId] = state
+    }
+
+    /// ED-3: detect a stop-shaped phrase in an assistant message body.
+    /// Substring search per PRINCIPLES.md §11b "specific signatures over
+    /// abstract behavior." Case-insensitive. Returns the matched phrase
+    /// (carried to the triage request as `matched_command`) or nil if
+    /// no stop-shape was found.
+    static func detectStopShape(in text: String) -> String? {
+        let lower = text.lowercased()
+        // Phrases from ED-3, ordered roughly by specificity. First match
+        // wins; the order is for trace-log readability rather than
+        // correctness (any match suffices to enter the idle ladder).
+        let phrases = [
+            "ready for next",
+            "what's next",
+            "let me know if",
+            "let me know",
+            "ship it",
+            "all done",
+            "complete",
+            "done",
+        ]
+        for p in phrases where lower.contains(p) {
+            return p
+        }
+        return nil
+    }
+
+    /// Spin up the 1Hz idle-check loop. The loop runs on `@MainActor` so
+    /// it can read and mutate `idleStates` without synchronization
+    /// primitives. Cancelled by `stop()`.
+    private func startIdleCheckLoop() {
+        idleCheckTask?.cancel()
+        let interval = idleCheckIntervalSeconds
+        idleCheckTask = Task { @MainActor [weak self] in
+            // Convert seconds → nanoseconds once.
+            let nanos = UInt64(interval * 1_000_000_000)
+            while !Task.isCancelled {
+                self?.checkIdleStates()
+                try? await Task.sleep(nanoseconds: nanos)
+            }
+        }
+    }
+
+    /// Walk every session's idle state. For each session where (a) a
+    /// stop-shape has been seen AND (b) `idleThresholdSeconds` of silence
+    /// have passed since the last event AND (c) the re-triage gate is
+    /// open, dispatch an idle-evaluation triage call. The rubric body
+    /// applies the remaining don't-fire conditions (branch, pending
+    /// question, recent user message) per ED-4.
+    ///
+    /// Internal-visible (not private) so tests can drive ticks directly
+    /// instead of waiting on the timer.
+    func checkIdleStates() {
+        let nowTs = now()
+        for (sessionId, state) in idleStates {
+            guard let stopTs = state.lastStopShapedTs else { continue }
+            let silenceElapsed = nowTs.timeIntervalSince(state.lastEventTs)
+            guard silenceElapsed >= idleThresholdSeconds else { continue }
+
+            // Re-triage gate: if we already asked Haiku since the last
+            // event change, wait `idleReTriageIntervalSeconds` before
+            // asking again. `lastIdleTriageTs` is cleared by
+            // `updateIdleState` when a new event arrives.
+            if let lastTriage = state.lastIdleTriageTs {
+                let sinceLast = nowTs.timeIntervalSince(lastTriage)
+                if sinceLast < idleReTriageIntervalSeconds { continue }
+            }
+
+            // Stamp the triage timestamp BEFORE the async call lands so
+            // a slow Haiku response doesn't let the next tick fire a
+            // duplicate. The same-tick stamp is also used by tests to
+            // assert "we dispatched a call for this session."
+            var updated = state
+            updated.lastIdleTriageTs = nowTs
+            idleStates[sessionId] = updated
+
+            trace.emit("triage", "idle.tick session=\(sessionId) silence=\(Int(silenceElapsed))s stop_phrase=\(state.lastStopShapedPhrase ?? "?") stop_age=\(Int(nowTs.timeIntervalSince(stopTs)))s")
+
+            Task { await self.evaluateIdle(sessionId: sessionId) }
+        }
+    }
+
+    /// Build an idle-evaluation triage request for one session and
+    /// process the response. Parallel structure to `evaluate(call:)` and
+    /// `evaluateAssistantText(info:)` — the same record_triage tool path,
+    /// just scoped to the worker_idle_post_completion category.
+    private func evaluateIdle(sessionId: String) async {
+        onActivityChange?(.triaging)
+
+        let window = perSessionWindow[sessionId] ?? []
+        // cwd + branch via the same window-then-cache fallback as
+        // evaluateAssistantText. The branch cache is the primary source
+        // since sessionStart almost always rolls off the 30-event window
+        // before the worker is idle.
+        let cwd = lastSessionCWD(in: window) ?? sessionCwd[sessionId]
+        let branch = lastSessionBranch(in: window) ?? sessionBranch[sessionId]
+        let userPrompt = lastUserPrompt(in: window)
+
+        let state = idleStates[sessionId]
+        let stopPhrase = state?.lastStopShapedPhrase
+        let secondsSinceLastEvent = state.map { now().timeIntervalSince($0.lastEventTs) } ?? 0
+
+        let request = TriagePrompt.buildIdleEvaluationRequest(
+            model: model,
+            sessionId: sessionId,
+            cwd: cwd,
+            gitBranch: branch,
+            userPrompt: userPrompt,
+            stopShapedPhrase: stopPhrase,
+            secondsSinceLastEvent: secondsSinceLastEvent,
+            recentEvents: window
+        )
+
+        trace.emit("triage", "evaluating idle session=\(sessionId) branch=\(branch ?? "?") stop_phrase=\(stopPhrase ?? "?") silence=\(Int(secondsSinceLastEvent))s")
+
+        let response: AnthropicMessageResponse
+        do {
+            response = try await client.createMessage(request)
+        } catch {
+            trace.emit("triage", "Idle triage call failed: \(error)")
+            onActivityChange?(.idle)
+            return
+        }
+
+        if let costStore {
+            let cost = TokenAccounting.costUSD(model: model, usage: response.usage)
+            try? costStore.recordHaiku(
+                inputTokens: response.usage.input_tokens,
+                outputTokens: response.usage.output_tokens,
+                costUSD: cost
+            )
+        }
+
+        guard let candidates = extractCandidates(from: response) else {
+            trace.emit("triage", "Idle triage: no record_triage call from Haiku session=\(sessionId)")
+            onActivityChange?(.idle)
+            return
+        }
+        if candidates.isEmpty {
+            trace.emit("triage", "Idle triage all-clear session=\(sessionId) (rubric don't-fire condition held)")
+            onActivityChange?(.idle)
+            return
+        }
+
+        // Idle flags use the synthetic-trigger bridge so they flow
+        // through the existing TriageDecision plumbing. The
+        // "triggering event" is the stop-shaped assistant message:
+        // we synthesize a BashToolCallInfo whose command field carries
+        // the matched stop-phrase so the trace log and recovery doc
+        // show what we were reacting to.
+        let pseudoTrigger = BashToolCallInfo(
+            sessionId: sessionId,
+            command: "(idle) stop-shape: \(stopPhrase ?? "end_turn")",
+            description: "Synthetic trigger for worker_idle_post_completion.",
+            toolUseId: "idle-\(UUID().uuidString)",
+            turnUUID: "idle-\(UUID().uuidString)",
+            ts: now()
+        )
+        for candidate in candidates {
+            let decision = TriageDecision(
+                sessionId: sessionId,
+                cwd: cwd,
+                candidate: candidate,
+                triggeringEvent: pseudoTrigger,
+                usage: response.usage,
+                model: response.model,
+                prePost: .preExecution,
+                recentEvents: window,
+                lastUserPrompt: userPrompt
+            )
+            trace.emit("triage", "FLAG session=\(sessionId) category=\(candidate.category) severity=\(candidate.severity.rawValue) action=\(candidate.action.rawValue) confidence=\(candidate.confidence ?? "?") next_task=\"\(candidate.nextTaskProposal?.prefix(120) ?? "")\"")
+            onActivityChange?(.flagged(severity: candidate.severity, action: candidate.action))
+            onDecision?(decision)
         }
     }
 
@@ -476,7 +787,9 @@ public final class TriageEngine {
             reasoningTechnical: c.reasoningTechnical,
             asymmetryNote: c.asymmetryNote,
             suggestedInjectText: suggestedInjectText ?? c.suggestedInjectText,
-            questionType: c.questionType
+            questionType: c.questionType,
+            nextTaskProposal: c.nextTaskProposal,
+            confidence: c.confidence
         )
     }
 
@@ -485,6 +798,15 @@ public final class TriageEngine {
     private func lastSessionCWD(in window: [SupervisorEvent]) -> String? {
         for event in window.reversed() {
             if case .sessionStart(let i) = event { return i.cwd }
+        }
+        return nil
+    }
+
+    /// v0.4.0 (Part A): like `lastSessionCWD` but pulls `gitBranch`.
+    /// Falls back to `sessionBranch` cache at the call site.
+    private func lastSessionBranch(in window: [SupervisorEvent]) -> String? {
+        for event in window.reversed() {
+            if case .sessionStart(let i) = event { return i.gitBranch }
         }
         return nil
     }
@@ -615,6 +937,33 @@ public final class TriageEngine {
             }
         }
 
+        // v0.4.0: confidence + next_task_proposal are required when
+        // category is worker_idle_post_completion and ignored otherwise.
+        // If confidence is missing/invalid, default to "low" — that's the
+        // safer-fallback rule (low → notify, no auto-dispatch). If
+        // next_task_proposal is missing, leave nil; Part B's dispatcher
+        // populates the prompt body anyway. In Part A the primary call
+        // may leave next_task_proposal empty intentionally (the dispatcher
+        // isn't wired up yet) so its absence is NOT logged as malformed.
+        var confidence: String? = nil
+        var nextTaskProposal: String? = nil
+        if cat == "worker_idle_post_completion" {
+            if case let .string(conf)? = c["confidence"],
+               ["high", "medium", "low"].contains(conf) {
+                confidence = conf
+            } else {
+                confidence = "low"
+                malformed = true
+                fallbackReason.append("confidence")
+            }
+            if case let .string(prop)? = c["next_task_proposal"], !prop.isEmpty {
+                nextTaskProposal = redactor.redact(prop)
+            }
+            // Intentionally NOT marking malformed when next_task_proposal
+            // is absent — Part A ships without the dispatcher; Part B
+            // populates it.
+        }
+
         if malformed {
             // Log the raw verdict (un-redacted) for debugging per Mohammed:
             // trace log is local-only, README is honest about that.
@@ -630,7 +979,9 @@ public final class TriageEngine {
             reasoningTechnical: reasoningTechnical,
             asymmetryNote: asymmetryNote,
             suggestedInjectText: nil,  // populated by secondary call in TriageEngine.evaluate
-            questionType: questionType
+            questionType: questionType,
+            nextTaskProposal: nextTaskProposal,
+            confidence: confidence
         )
     }
 

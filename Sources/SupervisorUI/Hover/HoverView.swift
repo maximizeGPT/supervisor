@@ -91,9 +91,9 @@ public struct HoverView: View {
     private var actionOverlayIcon: String? {
         guard case let .flagged(_, action) = vm.activity else { return nil }
         switch action {
-        case .pause:           return "pause.fill"
-        case .kill:            return "xmark"
-        case .inject, .notify: return nil
+        case .pause:                      return "pause.fill"
+        case .kill:                       return "xmark"
+        case .inject, .notify, .continue: return nil
         }
     }
 

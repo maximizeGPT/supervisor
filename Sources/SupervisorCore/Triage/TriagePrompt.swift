@@ -73,9 +73,9 @@ public enum TriagePrompt {
                                 "recommended_action": .object([
                                     "type": .string("string"),
                                     "enum": .array([
-                                        .string("notify"), .string("inject"), .string("pause"), .string("kill")
+                                        .string("notify"), .string("inject"), .string("continue"), .string("pause"), .string("kill")
                                     ]),
-                                    "description": .string("What Supervisor should do. Pick the lightest action that fits. notify = banner only; inject = type an answer into the terminal (v0.3.0+, only for user_question_pending where question_type=engineering); pause = SIGSTOP (recoverable); kill = SIGTERM (not recoverable).")
+                                    "description": .string("What Supervisor should do. Pick the lightest action that fits. notify = banner only; inject = type an answer into the terminal (v0.3.0+, only for user_question_pending where question_type=engineering); continue = type a NEW TASK PROMPT into the worker's input (v0.4.0+, only for worker_idle_post_completion with confidence=high); pause = SIGSTOP (recoverable); kill = SIGTERM (not recoverable).")
                                 ]),
                                 "question_type": .object([
                                     "type": .string("string"),
@@ -83,6 +83,17 @@ public enum TriagePrompt {
                                         .string("engineering"), .string("safety"), .string("taste")
                                     ]),
                                     "description": .string("v0.3.0: REQUIRED when category=user_question_pending; omit otherwise. engineering = answer derivable from a written document (PRINCIPLES.md, project conventions); safety = the action behind the question is destructive/irreversible; taste = depends on user values, aesthetics, naming, copy. Default to safety when uncertain between engineering and safety; default to taste when uncertain between engineering and taste.")
+                                ]),
+                                "confidence": .object([
+                                    "type": .string("string"),
+                                    "enum": .array([
+                                        .string("high"), .string("medium"), .string("low")
+                                    ]),
+                                    "description": .string("v0.4.0: REQUIRED when category=worker_idle_post_completion; omit otherwise. high = clear next task derivable from open issues / STATUS.md / current branch context → auto-dispatch via continue; medium = a plausible next task but ambiguous about which → propose-and-wait via notify; low = no clear next task → surface the idle state to the user via notify without dispatching. Per PRINCIPLES §9e budget envelope, only high confidence auto-dispatches.")
+                                ]),
+                                "next_task_proposal": .object([
+                                    "type": .string("string"),
+                                    "description": .string("v0.4.0: REQUIRED when category=worker_idle_post_completion; omit otherwise. One-sentence description of the next task this idle worker should pick up. The actual prompt body is constructed later by Part B's dispatcher (a secondary Haiku call). In Part A this is the seed: 'pick up Issue #7', 'continue refactor of TriageEngine', etc. Stays nil in v0.4.0 Part A's primary call when the dispatcher is not yet wired up — populated by Part B.")
                                 ]),
                                 "reasoning_plain": .object([
                                     "type": .string("string"),
@@ -270,6 +281,75 @@ public enum TriagePrompt {
         )
     }
 
+    /// v0.4.0 Part A: build a triage request focused on the
+    /// `worker_idle_post_completion` category. Called by the
+    /// TriageEngine's timer-driven idle check when (a) a stop-shaped
+    /// event was seen, AND (b) ≥N seconds of silence have passed since.
+    /// The rubric body assesses the don't-fire conditions (non-autonomous
+    /// branch, pending user_question_pending, recent user message,
+    /// hard-stop preconditions) — the engine just feeds the candidate
+    /// for evaluation per ED-4 (safety defers to the rubric).
+    public static func buildIdleEvaluationRequest(
+        model: String,
+        sessionId: String,
+        cwd: String?,
+        gitBranch: String?,
+        userPrompt: String?,
+        stopShapedPhrase: String?,
+        secondsSinceLastEvent: TimeInterval,
+        recentEvents: [SupervisorEvent]
+    ) -> AnthropicMessageRequest {
+        var lines: [String] = []
+
+        lines.append("# Session working directory")
+        lines.append(cwd ?? "(unknown)")
+        lines.append("")
+
+        lines.append("# Session git branch")
+        lines.append(gitBranch ?? "(unknown)")
+        lines.append("")
+
+        lines.append("# Most recent user prompt")
+        if let p = userPrompt, !p.isEmpty {
+            lines.append(p)
+        } else {
+            lines.append("(no recent user prompt in window)")
+        }
+        lines.append("")
+
+        lines.append("# Idle-check signals")
+        lines.append("stop_shaped_phrase_matched: \(stopShapedPhrase ?? "(none — timer fired on stop_reason=end_turn alone)")")
+        lines.append("seconds_since_last_event: \(Int(secondsSinceLastEvent))")
+        lines.append("")
+
+        lines.append("# Recent event window (chronological)")
+        if recentEvents.isEmpty {
+            lines.append("(no prior events)")
+        } else {
+            let fmt = ISO8601DateFormatter()
+            fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            for event in recentEvents.suffix(20) {
+                let ts = fmt.string(from: event.timestamp)
+                lines.append(eventSummaryLine(event, ts: ts))
+            }
+        }
+        lines.append("")
+        lines.append("Evaluate ONLY against the `worker_idle_post_completion` category. The bash-shaped categories (destructive_action_pending, edits_outside_worktree, prompt_injection_signature) and user_question_pending do not apply here. Per the rubric body, fire ONLY if the don't-fire conditions are clear (autonomous branch, no pending user question, no recent user message, stop-shape genuine). Use the same record_triage tool: call it with one candidate if the session is idle post-completion on an autonomous branch, or with candidates=[] if any don't-fire condition holds. When firing, set `confidence` based on how clear the next task is from open issues / STATUS.md / current branch context (high → auto-dispatch; medium → propose-and-wait; low → surface without dispatching) and provide a one-sentence `next_task_proposal`.")
+
+        let userText = lines.joined(separator: "\n")
+
+        return AnthropicMessageRequest(
+            model: model,
+            max_tokens: 1024,
+            system: systemPrompt,
+            messages: [
+                .init(role: "user", content: .string(userText))
+            ],
+            tools: [recordTriageTool],
+            tool_choice: .forced(recordTriageToolName)
+        )
+    }
+
     /// Build the full Anthropic request payload.
     public static func buildRequest(
         model: String,
@@ -376,6 +456,19 @@ public struct TriageCandidate: Sendable, Equatable {
     /// translation (taste). Safety questions don't get a secondary call
     /// — they go straight to the user via notify.
     public let questionType: String?
+    /// v0.4.0: one-sentence description of the next task to pick up when
+    /// category is `worker_idle_post_completion`. The seed for Part B's
+    /// dispatcher to build the actual prompt body. Stays nil in Part A's
+    /// primary triage call (the dispatcher isn't wired up yet) — once
+    /// Part B ships, it's populated by the secondary Haiku call.
+    /// Nil for any other category.
+    public let nextTaskProposal: String?
+    /// v0.4.0: confidence classification when category is
+    /// `worker_idle_post_completion`. One of "high" / "medium" / "low".
+    /// Nil for any other category. Drives dispatch behavior per §9e:
+    /// high → continue (auto-dispatch); medium → notify (propose-and-wait);
+    /// low → notify (surface idle state, no dispatch).
+    public let confidence: String?
 
     public init(
         category: String,
@@ -386,7 +479,9 @@ public struct TriageCandidate: Sendable, Equatable {
         reasoningTechnical: String,
         asymmetryNote: String? = nil,
         suggestedInjectText: String? = nil,
-        questionType: String? = nil
+        questionType: String? = nil,
+        nextTaskProposal: String? = nil,
+        confidence: String? = nil
     ) {
         self.category = category
         self.severity = severity
@@ -397,5 +492,7 @@ public struct TriageCandidate: Sendable, Equatable {
         self.asymmetryNote = asymmetryNote
         self.suggestedInjectText = suggestedInjectText
         self.questionType = questionType
+        self.nextTaskProposal = nextTaskProposal
+        self.confidence = confidence
     }
 }

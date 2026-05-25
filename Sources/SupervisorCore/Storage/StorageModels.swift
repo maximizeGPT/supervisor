@@ -14,7 +14,18 @@ public enum FlagSeverity: String, Codable, Sendable, CaseIterable {
 }
 
 public enum FlagAction: String, Codable, Sendable, CaseIterable {
-    case notify, inject, pause, kill
+    // Action ladder per PRINCIPLES.md §3d, lightest → heaviest:
+    //   - notify:   banner only; user decides
+    //   - inject:   types ≤200 chars (engineering-answer or rewritten taste
+    //               question) into the worker's input
+    //   - continue: types a NEW TASK PROMPT (multi-paragraph) into the
+    //               worker's input when the worker is idle post-completion.
+    //               Heavier than inject because it triggers hours of
+    //               follow-on work; lighter than pause because it doesn't
+    //               stop the session. v0.4.0+.
+    //   - pause:    SIGSTOP — freezes the worker; recoverable
+    //   - kill:     SIGTERM — terminates the worker; not recoverable
+    case notify, inject, `continue`, pause, kill
 }
 
 public enum FlagUserResponse: String, Codable, Sendable, CaseIterable {
