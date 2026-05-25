@@ -20,11 +20,17 @@ and file an issue — don't guess.
   granularity (§1e). Edits proposed in the
   `autonomous-20260524T080753Z` meta-post-mortem and approved
   by Mohammed.
-- **v3** (current): gap-finding-rate as top-level metric + two
+- **v3**: gap-finding-rate as top-level metric + two
   classification-philosophy additions (§2e per-path prompt
   isolation, §5a-prime terminology overlap is not safety).
   Edits proposed in the `autonomous-20260525T084118Z`
   meta-post-mortem and approved by Mohammed.
+- **v3.5** (current): §12.5 "Loop hard stops" — additional
+  hard-stop conditions that apply when the v0.4.0 continuous
+  dispatch loop is active (Parts B+C+D shipped). Single-session
+  §12 stops still apply; §12.5 extends them with loop-scoped
+  triggers. Edit proposed before the v0.4.0 Part D dogfood so
+  the dogfood can reference the manual's account of the stops.
 
 ---
 
@@ -622,6 +628,83 @@ file an issue, not improvise:
 5. **Calibration regresses by >10% from the v0.1.5 baseline.**
    That's a "rubric change is wrong" signal, not a "iterate
    the rubric" signal.
+
+---
+
+## 12.5. Loop hard stops (extends §12)
+
+§12 covers the single-session hard stops — the conditions
+under which one autonomous Claude Code session must stop,
+journal, and end. v0.4.0 introduces a continuous dispatch
+loop: idle worker → Dispatcher picks the next task → CGEventPost
+types the prompt into Claude Code → worker resumes → idle
+again. The loop runs across multiple session-equivalents and
+needs its own hard stops, on top of the §12 ones for each
+individual session it spawns.
+
+When the loop is active (Dispatcher + LoopController + the
+`loop_dispatches` SQLite table are all wired and the engine
+is observing an autonomous branch), the following hard stops
+apply in addition to §12:
+
+1. **A real kill fires against the loop's current worker** (not
+   just a notify or pause — an actual SIGTERM/SIGKILL by the
+   Supervisor router). The loop stops immediately. There is no
+   process to dispatch into. State persists in `loop_dispatches`
+   so the post-mortem can reconstruct what the dispatcher had
+   been picking up to that point. (Engine call:
+   `loopController.stop(sessionId:, reason: .killFired)`.)
+
+2. **4 hours of wall-clock elapsed** since the loop began
+   (anchored to the LoopController's `loopStartedAt`). The
+   single-session §12 cap is 75 minutes; the loop runs across
+   multiple session-equivalents and gets a longer outer budget,
+   but bounded. After 4 hours the loop has either shipped
+   something or it's improvising; either way, the right move
+   is to surface to the user. Default threshold is
+   `LoopController.defaultMaxLoopDuration = 4 * 60 * 60`.
+
+3. **3 consecutive dispatches at low confidence.** When the
+   Dispatcher's picks are improvising — three returns in a
+   row at `.lowConfidence` (or `.error`, which is functionally
+   equivalent: "couldn't ground a decision") — the manual has
+   a coverage gap or the work queue has run out of grounded
+   tasks. Either way, the loop stops; the dispatcher won't
+   improve by dispatching more. Default threshold is
+   `LoopController.defaultConsecutiveLowThreshold = 3`.
+
+4. **User sends a message to the running Claude Code
+   session.** The loop pauses immediately; the human is taking
+   over. Pause is clearable: when the worker emits its next
+   `bashToolCall` (autonomous work resumed), the loop
+   re-engages. Pause is NOT cleared by `assistantText` alone —
+   that could be the worker responding to the user rather than
+   resuming autonomous work. (Engine call:
+   `loopController.notePause(sessionId:, reason: .userMessage)`.)
+
+5. **Dispatcher proposes a task that requires a values call.**
+   Rather than dispatching, banner-surface the proposal for
+   the user to evaluate. This is the propose-and-wait path —
+   confidence is medium, action is `.continue`, but the router
+   does NOT inject; it posts a banner with the proposal and
+   the dispatcher's justification. The user decides whether
+   the proposal lands as a real task. (See PRINCIPLES §5 —
+   values defer to the user.)
+
+The split between §12 and §12.5 matters because a single-session
+session can end without the loop ending (the loop spawns a new
+session and continues). Conversely, a loop hard-stop ends the
+loop but doesn't necessarily end any single session — the
+current worker is left alive, the user picks up from where the
+loop stopped.
+
+**On post-mortem inspection**, the `loop_dispatches` table is
+the source of truth for which §12.5 trigger fired. A row's
+`response_shape` ("ready" | "lowConfidence" | "error") + the
+sequence of recent rows lets a future session reconstruct: did
+the dispatcher try to keep going on weak signals (consecutive
+low), did it lose context after a user takeover (paused-then-
+resumed pattern), or did it run cleanly to a real ship.
 
 ---
 
