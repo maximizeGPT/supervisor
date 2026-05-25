@@ -313,3 +313,204 @@ it. Without an async drain in `setUp`/`tearDown`, the static
 - About to commit per Mohammed's chat instruction: 2 commits
   (impl + tests separated; impl interleaved across schema +
   timer too tightly to split cleanly per §1e judgment call).
+
+---
+
+# Part B — dispatch (continuing on the same branch)
+
+Started: 2026-05-25 20:44 UTC. Continuing v0.4.0 build on
+branch `autonomous-20260525T193906Z` per Mohammed's "extend
+Part A" instruction. Hard stop: 21:59 UTC (75 min from now)
+or any §12 trigger.
+
+## Reads (this session)
+
+- PRINCIPLES.md v3 (re-read — still §1e, §2c, §3a, §6, §9e
+  govern the plan).
+- AUTONOMOUS_SESSION_PROMPT.md v2.
+- QuestionAnswerer.swift (the pattern to mirror — same
+  Sendable + tool-forced shape).
+- InterventionRouter.swift (the .continue case to replace).
+- Notifier.swift (the InterventionOutcome cases to extend).
+- TriageEngine.swift evaluateIdle (where the Dispatcher hooks in).
+
+## STATUS-vs-reality diff
+
+- STATUS docs aren't relevant here — Mohammed's chat spec IS
+  the STATUS for v0.4.0. Part A shipped; Part B is the next
+  filed unit.
+
+## Pre-flight engineering decisions
+
+- **ED-5. Dispatcher REPLACES candidate fields, not augments.**
+  The primary triage call (record_triage) may populate
+  next_task_proposal/confidence, but Part A intentionally
+  left them nil/low; the rubric body's job is "is this idle"
+  (yes/no), not "what should we dispatch." The Dispatcher's
+  job is the latter. After the Dispatcher returns, the engine
+  builds a NEW TriageCandidate via reconfigure() with the
+  authoritative values + action set per confidence (high →
+  .continue, medium/low → .notify). One source of truth: the
+  Dispatcher.
+- **ED-6. gh + git fetchers degrade silently to empty arrays.**
+  10s timeout each, in-memory caches (60s for issues, 30s for
+  commits — issues change rarely, commits per-session-burst).
+  If either fails (gh not installed, network down, not in a
+  repo), Dispatcher still runs — with empty arrays as
+  context. The Dispatcher prompt is taught to lower confidence
+  when context is thin, so degradation surfaces as
+  medium/low rather than wrong dispatches.
+- **ED-7. Inject path for .continue reuses the .inject
+  pattern in InterventionRouter** (locator → CGEventPost →
+  Injector). Same error surface (InjectError → discriminating
+  trace tags). Banner shape differs: .inject succeeded says
+  "Supervisor answered"; .continue says "Supervisor
+  dispatched: <first 80 chars>...". New InterventionOutcome
+  cases.
+- **ED-8. Two-call cost.** Dispatcher adds a second Haiku
+  call per idle-fire. Estimated 4-6k tokens input (PRINCIPLES
+  + session window + issues + commits) + ~500 tokens output
+  → ~$0.005-0.008 per dispatch at Haiku 4.5 rates. Comfortably
+  under §9e's $0.50 autonomous envelope; logged via the
+  existing CostStore.recordHaiku path.
+
+## Plan
+
+### Candidate 1 — Part B (dispatcher) — picked
+
+- **Source**: Mohammed's chat spec (this session).
+- **Smallest fix**: Dispatcher.swift + IssueFetcher + BranchFetcher
+  + router wiring + 6 tests. ~700 LOC.
+- **Proper fix**: same as smallest. The smallest fix IS the fix.
+- **Estimated scope**: 55-65 min (B1-B7); STOP at B8.
+- **Dependencies**: gh CLI + git on PATH (degrade if absent).
+  PRINCIPLES.md (already loaded via loadQuestionAnswerer pattern).
+- **Why now**: Part A is half-product; Part B is the dispatch
+  layer that closes the loop. Without it .continue degrades
+  to notify, which is what we already have today via plain
+  notify on idle. Part B is what makes v0.4.0 a product.
+
+#### Pick
+
+Going with Candidate 1. No alternatives — Mohammed scoped
+this session as Part B.
+
+## Log
+
+### B1 — Dispatcher module (done)
+
+- `Sources/SupervisorCore/Triage/Dispatcher.swift`. Mirrors
+  QuestionAnswerer's shape: takes LLMClient + principlesText +
+  optional fetchers; exposes `dispatch(context:)` (pure) and
+  `dispatchForIdleSession(...)` (does its own concurrent fetches).
+- Result types: `DispatchResult.ready(prompt, just, conf, path,
+  issueN?) | .lowConfidence(reason) | .error(reason)`.
+- `Dispatching` protocol on top so the engine can take a mock in
+  tests.
+- Defensive normalization in dispatch(context:) — Haiku-returned
+  confidence=.low OR selected_path=low_confidence_no_action both
+  collapse to `.lowConfidence` regardless of prompt text. The
+  router never sees a half-confidence proposal.
+
+### B2 — issue/commit fetchers (done)
+
+- `Sources/SupervisorCore/Triage/DispatchFetchers.swift`.
+- `IssueFetching` + `BranchCommitFetching` protocols.
+- `GitHubIssueFetcher` actor: shells out to `gh issue list --json
+  ... --limit 50 --state open`, parses JSON, 60s cache per cwd.
+- `GitBranchCommitFetcher` actor: shells out to `git log
+  main..<branch> --pretty=format:%H%x00%s%x00%b%x1E --no-merges`,
+  parses, 30s cache per (cwd, branch).
+- Shared `runProcess` helper: 10s hard timeout via TaskGroup
+  race; subprocess terminated on timeout; FetcherError discriminates
+  toolNotInstalled / nonZeroExit / timedOut / parseFailure.
+- Trace tags per spec: `dispatch gh issues fetched count=... latency=...ms`,
+  `dispatch git commits fetched count=... latency=...ms`.
+
+### B3 / B4 — prompt + schema (done)
+
+- System prompt explicitly enumerates PATH 1 (continue_branch),
+  PATH 2 (transition_to_issue), low_confidence_no_action;
+  hard-constraints (§1d "file an issue, don't build the feature
+  now"); the next_task_proposal voice rules (autonomous opener
+  shape, §11 voice, §12 hard-stop reminder, 200-600 words).
+- record_dispatch tool schema forced via tool_choice. Fields:
+  next_task_proposal, justification, confidence (enum), selected_path
+  (enum), selected_issue_number (required when path=transition).
+- Parser defensive: missing required → nil → engine maps to .error.
+
+### B5 — router wiring (done)
+
+- `Sources/SupervisorCore/Intervention/InterventionRouter.swift`.
+- Replaced the Part A "degrade to notify" with `routeContinue` +
+  `continueHighInjectOrDegrade` + `continueDegradeToMedium`.
+- New InterventionOutcome cases in Notifier.swift:
+  - `.continueFired(pid, bytes, promptHead)` — high-confidence
+    inject succeeded; banner shows first 80 chars.
+  - `.continueProposedMedium(proposal, justification)` —
+    medium-confidence or high+locator-fail; banner shows full
+    proposal so user pastes.
+  - `.continueLowConfidence(reasoning)` — low-confidence banner
+    with dispatcher's reason.
+- Banner bodies wired in Notifier.body(for:outcome:).
+- High-confidence with locator failure degrades to .continueProposedMedium
+  (NOT .continueLowConfidence — we still have the proposal text).
+- High-confidence with empty proposal degrades to .continueLowConfidence
+  (defensive — Dispatcher contract guarantees prompt-on-high but
+  belt-and-suspenders).
+
+### B6 — engine wiring (done)
+
+- `TriageEngine` takes `dispatcher: (any Dispatching)?` constructor
+  param (parallel to questionAnswerer).
+- `evaluateIdle` calls `dispatchAndRemap` AFTER the rubric fires
+  a worker_idle_post_completion candidate. The Dispatcher's
+  result REPLACES the candidate's nextTaskProposal + confidence
+  + asymmetryNote (carries the dispatcher justification); action
+  is set to .continue for ready/lowConfidence (router branches
+  on confidence) and .notify on .error (fall back to plain idle
+  notify).
+- `reconfigure` extended with `Optional<...>?` sentinel pattern
+  so callers can distinguish "leave alone" from "blank out the
+  field" — needed because low-confidence dispatches must blank
+  any rubric-set proposal text.
+
+### B7 — tests (done)
+
+- `Tests/SupervisorCoreTests/DispatcherTests.swift` (6 tests):
+  - testDispatcherReturnsReadyOnHighConfidence — spec test 1
+    prerequisite.
+  - testDispatcherNormalizesLowConfidenceToLowConfidenceResult —
+    spec test 2 prerequisite.
+  - testDispatcherProceedsWithEmptyIssuesWhenFetcherThrows —
+    spec test 4 (gh failure).
+  - testDispatcherTransitionPathPopulatesIssueNumber — spec test 6.
+  - testDispatcherReturnsErrorOnMalformedResponse — defensive.
+  - testSystemPromptCarriesCoreConstraints — §2c "prompt is code"
+    snapshot test catches drift on key voice/content invariants.
+- `Tests/SupervisorCoreTests/ContinueInterventionTests.swift`
+  (7 tests):
+  - testContinueHighConfidenceInjectsProposal — spec test 1.
+  - testContinueMediumConfidenceProposesViaBanner — spec test 3.
+  - testContinueLowConfidenceShowsReasoningBanner — spec test 2.
+  - testContinueHighConfidenceDegradesToMediumOnLocatorFailure —
+    spec test 5.
+  - testContinueHighConfidenceWithoutProposalDegradesToLowConfidence
+    — defensive (Dispatcher contract violation).
+  - testContinueHighConfidenceTruncatesBannerHeadButInjectsFullProposal
+    — banner-head truncation while preserving full inject payload.
+
+### Build / tests
+
+- `swift build` — clean.
+- `swift test` — 215 / 215 pass (was 203 in Part A; +12 from
+  Part B). 5 LIVE_API canaries still skipped, unrelated.
+
+### B8 checkpoint pending
+
+- Holding before commits / push / Part C+D.
+- Surface the system prompt + record_dispatch schema + example
+  next-prompts to Mohammed for approval.
+- Per the spec: "the prompt IS the product" (§2c) — same
+  checkpoint pattern as the v0.1.2 OnboardingScene review.
+
