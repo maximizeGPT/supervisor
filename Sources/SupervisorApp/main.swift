@@ -42,6 +42,8 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private var sessionStore: SessionStore?
     private var flagStore: FlagStore?
     private var costStore: CostStore?
+    private var loopDispatchStore: LoopDispatchStore?
+    private var loopController: LoopController?
     private var llm: LLMClient?
     private var triageEngine: TriageEngine?
     private var discovery: SessionDiscovery?
@@ -149,6 +151,10 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             self.sessionStore = SessionStore(database: db)
             self.flagStore = FlagStore(database: db)
             self.costStore = CostStore(database: db)
+            // v0.4.0 Part C/D: continuous-loop dispatch ledger lives in
+            // the same SQLite DB. Migration v3 (loop_dispatches table)
+            // ran during the SupervisorDatabase init above.
+            self.loopDispatchStore = LoopDispatchStore(database: db)
             trace.emit("app", "storage opened at \(paths.databasePath.path)")
         } catch {
             trace.emit("app", "FATAL: storage open failed: \(error)")
@@ -206,11 +212,21 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
         // 5. Triage engine. v0.2.0: model comes from the active provider.
         // v0.3.0: optional QuestionAnswerer for the user_question_pending
-        // secondary call. Loads PRINCIPLES.md from the repo root (the
-        // running Supervisor.app's working directory at launch);
-        // gracefully no-ops if the file isn't found (degrades to
-        // user_question_pending firing as a plain notify, no inject).
+        // secondary call. v0.4.0: optional Dispatcher + LoopController
+        // + LoopDispatchStore for the worker_idle_post_completion
+        // dispatch loop. Both PRINCIPLES.md-loading paths use the
+        // three-candidate-URL pattern; if the file isn't found the
+        // corresponding component stays nil and the engine degrades
+        // (QuestionAnswerer nil → plain notify on user_question_pending;
+        // Dispatcher nil → plain notify on worker_idle_post_completion).
         let questionAnswerer = loadQuestionAnswerer(client: client, trace: trace)
+        let dispatcher = loadDispatcher(client: client, trace: trace)
+        // LoopController is always constructed (loop hard stops are
+        // pure logic — no external deps). LoopDispatchStore was set up
+        // in step 1 above. Both are passed into the engine; tests
+        // bypass them by passing nil.
+        let loopController = LoopController(trace: trace)
+        self.loopController = loopController
         let engine = TriageEngine(
             client: client,
             bus: bus,
@@ -219,6 +235,9 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             costStore: costStore,
             redactor: DefaultRedactor(),
             questionAnswerer: questionAnswerer,
+            dispatcher: dispatcher,
+            loopController: loopController,
+            loopStore: loopDispatchStore,
             trace: trace
         )
         engine.onActivityChange = { [weak self] activity in
@@ -423,6 +442,41 @@ private func loadQuestionAnswerer(client: LLMClient, trace: TraceLog) -> Questio
         }
     }
     trace.emit("app", "no PRINCIPLES.md found; QuestionAnswerer disabled — user_question_pending flags will surface as plain notify")
+    return nil
+}
+
+/// v0.4.0 Part D: construct the Dispatcher used by the worker-idle
+/// dispatch loop. Same three-candidate-URL pattern as
+/// loadQuestionAnswerer — PRINCIPLES.md is the dispatch contract;
+/// without it the Dispatcher would be guessing per §1d.
+///
+/// Two real GH/git fetchers attached: GitHubIssueFetcher (60s
+/// per-cwd cache) + GitBranchCommitFetcher (30s per-(cwd, branch)
+/// cache). Both degrade silently to empty arrays on shell-out
+/// failure — Dispatcher MUST work without gh per the v0.4.0 Part B
+/// spec.
+@MainActor
+private func loadDispatcher(client: LLMClient, trace: TraceLog) -> Dispatcher? {
+    let candidates: [URL] = [
+        Bundle.main.url(forResource: "PRINCIPLES", withExtension: "md"),
+        Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("PRINCIPLES.md"),
+        URL(fileURLWithPath: "/Users/main/supervisor/PRINCIPLES.md"),
+    ].compactMap { $0 }
+
+    for url in candidates {
+        if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
+            trace.emit("app", "loaded PRINCIPLES.md for Dispatcher from \(url.path) (\(text.count) chars)")
+            return Dispatcher(
+                client: client,
+                principlesText: text,
+                issueFetcher: GitHubIssueFetcher(trace: trace),
+                commitFetcher: GitBranchCommitFetcher(trace: trace),
+                trace: trace
+            )
+        }
+    }
+    trace.emit("app", "no PRINCIPLES.md found; Dispatcher disabled — worker_idle_post_completion flags will surface as plain notify (no auto-dispatch)")
     return nil
 }
 
