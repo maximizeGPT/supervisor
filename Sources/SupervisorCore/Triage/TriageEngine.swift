@@ -170,6 +170,17 @@ public final class TriageEngine {
     /// stays empty and the router degrades to notify.
     private let questionAnswerer: QuestionAnswerer?
 
+    /// v0.4.0 Part B: optional dispatcher dependency. When non-nil,
+    /// worker_idle_post_completion candidates trigger a second-stage
+    /// `dispatchForIdleSession` call against PRINCIPLES.md + the open
+    /// issue queue + the branch's commits, and the dispatcher's
+    /// next_task_proposal + confidence REPLACE the candidate's
+    /// corresponding fields before the router runs. Nil disables the
+    /// dispatcher (tests / no-PRINCIPLES installs); the candidate
+    /// flows through with whatever the rubric returned (Part A
+    /// defaults: confidence=low, no proposal).
+    private let dispatcher: (any Dispatching)?
+
     public init(
         client: LLMClient,
         bus: EventBus,
@@ -178,6 +189,7 @@ public final class TriageEngine {
         costStore: CostStore? = nil,
         redactor: any Redactor = DefaultRedactor(),
         questionAnswerer: QuestionAnswerer? = nil,
+        dispatcher: (any Dispatching)? = nil,
         idleThresholdSeconds: TimeInterval = 15,
         idleReTriageIntervalSeconds: TimeInterval = 60,
         idleCheckIntervalSeconds: TimeInterval = 1,
@@ -191,6 +203,7 @@ public final class TriageEngine {
         self.costStore = costStore
         self.redactor = redactor
         self.questionAnswerer = questionAnswerer
+        self.dispatcher = dispatcher
         self.idleThresholdSeconds = idleThresholdSeconds
         self.idleReTriageIntervalSeconds = idleReTriageIntervalSeconds
         self.idleCheckIntervalSeconds = idleCheckIntervalSeconds
@@ -474,10 +487,32 @@ public final class TriageEngine {
             ts: now()
         )
         for candidate in candidates {
+            // v0.4.0 Part B: if a Dispatcher is wired AND this is a
+            // worker_idle_post_completion fire, run the second-stage
+            // dispatch call to produce the actual next_task_proposal
+            // + confidence. The dispatcher's result REPLACES the
+            // rubric's fields (which Part A intentionally left as
+            // nil/low). On any non-idle category, OR when dispatcher
+            // is nil, the candidate flows through unchanged.
+            let finalCandidate: TriageCandidate
+            if candidate.category == "worker_idle_post_completion",
+               let dispatcher = self.dispatcher {
+                finalCandidate = await dispatchAndRemap(
+                    candidate: candidate,
+                    dispatcher: dispatcher,
+                    sessionId: sessionId,
+                    cwd: cwd,
+                    branch: branch,
+                    window: window
+                )
+            } else {
+                finalCandidate = candidate
+            }
+
             let decision = TriageDecision(
                 sessionId: sessionId,
                 cwd: cwd,
-                candidate: candidate,
+                candidate: finalCandidate,
                 triggeringEvent: pseudoTrigger,
                 usage: response.usage,
                 model: response.model,
@@ -485,9 +520,89 @@ public final class TriageEngine {
                 recentEvents: window,
                 lastUserPrompt: userPrompt
             )
-            trace.emit("triage", "FLAG session=\(sessionId) category=\(candidate.category) severity=\(candidate.severity.rawValue) action=\(candidate.action.rawValue) confidence=\(candidate.confidence ?? "?") next_task=\"\(candidate.nextTaskProposal?.prefix(120) ?? "")\"")
-            onActivityChange?(.flagged(severity: candidate.severity, action: candidate.action))
+            trace.emit("triage", "FLAG session=\(sessionId) category=\(finalCandidate.category) severity=\(finalCandidate.severity.rawValue) action=\(finalCandidate.action.rawValue) confidence=\(finalCandidate.confidence ?? "?") next_task=\"\(finalCandidate.nextTaskProposal?.prefix(120) ?? "")\"")
+            onActivityChange?(.flagged(severity: finalCandidate.severity, action: finalCandidate.action))
             onDecision?(decision)
+        }
+    }
+
+    /// v0.4.0 Part B: run the dispatcher and rewrite the candidate's
+    /// next_task_proposal + confidence + action + asymmetryNote per
+    /// the dispatcher's verdict. The mapping is:
+    ///   .ready(.high)     → action=.continue, confidence=high, proposal=prompt, asymmetry=just
+    ///   .ready(.medium)   → action=.continue, confidence=medium, proposal=prompt, asymmetry=just
+    ///                       (router demotes to a propose-and-wait banner)
+    ///   .lowConfidence    → action=.continue, confidence=low,  proposal=nil,   asymmetry=reason
+    ///                       (router demotes to a notify-with-reason banner)
+    ///   .error            → action=.notify, confidence=low, proposal=nil, asymmetry=<err>
+    ///                       (engine falls back to a plain idle notify)
+    private func dispatchAndRemap(
+        candidate: TriageCandidate,
+        dispatcher: any Dispatching,
+        sessionId: String,
+        cwd: String?,
+        branch: String?,
+        window: [SupervisorEvent]
+    ) async -> TriageCandidate {
+        trace.emit("dispatch", "start session=\(sessionId) branch=\(branch ?? "?")")
+        let result = await dispatcher.dispatchForIdleSession(
+            sessionUUID: sessionId,
+            cwd: cwd,
+            gitBranch: branch,
+            lastNTurns: window
+        )
+        switch result {
+        case let .ready(prompt, justification, .high, _, _, _):
+            return reconfigure(
+                candidate,
+                action: .continue,
+                asymmetryNote: redactor.redact(justification),
+                suggestedInjectText: nil,
+                nextTaskProposal: redactor.redact(prompt),
+                confidence: "high"
+            )
+        case let .ready(prompt, justification, .medium, _, _, _):
+            return reconfigure(
+                candidate,
+                action: .continue,
+                asymmetryNote: redactor.redact(justification),
+                suggestedInjectText: nil,
+                nextTaskProposal: redactor.redact(prompt),
+                confidence: "medium"
+            )
+        case let .ready(_, justification, .low, _, _, _):
+            return reconfigure(
+                candidate,
+                action: .continue,
+                asymmetryNote: redactor.redact(justification),
+                suggestedInjectText: nil,
+                nextTaskProposal: nil,
+                confidence: "low"
+            )
+        case let .lowConfidence(reasoning):
+            return reconfigure(
+                candidate,
+                action: .continue,
+                asymmetryNote: redactor.redact(reasoning),
+                suggestedInjectText: nil,
+                nextTaskProposal: nil,
+                confidence: "low"
+            )
+        case let .error(reasoning):
+            // Dispatcher errored — fall back to a plain idle notify.
+            // Action goes to .notify (the router's .continue branch
+            // would have nothing to dispatch); the candidate keeps
+            // the rubric's reasoning_plain but gets a diagnostic
+            // asymmetry note so the trace records why we degraded.
+            trace.emit("dispatch", "dispatcher error → degrading to plain notify reason=\"\(reasoning.prefix(160))\"")
+            return reconfigure(
+                candidate,
+                action: .notify,
+                asymmetryNote: redactor.redact("Dispatcher error: \(reasoning)"),
+                suggestedInjectText: nil,
+                nextTaskProposal: nil,
+                confidence: "low"
+            )
         }
     }
 
@@ -772,11 +887,21 @@ public final class TriageEngine {
 
     /// Rebuild a candidate with new field values. TriageCandidate is
     /// immutable; this is the canonical "with" pattern.
+    ///
+    /// `nilOverride` sentinel pattern: passing an `Optional<...>?` lets
+    /// the caller distinguish "leave field alone" (parameter omitted →
+    /// outer Optional is nil) from "set field to nil" (parameter
+    /// explicitly passed as `.some(nil)`). v0.4.0 Part B needs this
+    /// for nextTaskProposal — low-confidence dispatches must blank the
+    /// proposal even if the rubric set one.
     private func reconfigure(
         _ c: TriageCandidate,
         action: FlagAction? = nil,
         reasoningPlain: String? = nil,
-        suggestedInjectText: String? = nil
+        asymmetryNote: String? = nil,
+        suggestedInjectText: String?? = nil,
+        nextTaskProposal: String?? = nil,
+        confidence: String?? = nil
     ) -> TriageCandidate {
         TriageCandidate(
             category: c.category,
@@ -785,11 +910,11 @@ public final class TriageEngine {
             action: action ?? c.action,
             reasoningPlain: reasoningPlain ?? c.reasoningPlain,
             reasoningTechnical: c.reasoningTechnical,
-            asymmetryNote: c.asymmetryNote,
+            asymmetryNote: asymmetryNote ?? c.asymmetryNote,
             suggestedInjectText: suggestedInjectText ?? c.suggestedInjectText,
             questionType: c.questionType,
-            nextTaskProposal: c.nextTaskProposal,
-            confidence: c.confidence
+            nextTaskProposal: nextTaskProposal ?? c.nextTaskProposal,
+            confidence: confidence ?? c.confidence
         )
     }
 

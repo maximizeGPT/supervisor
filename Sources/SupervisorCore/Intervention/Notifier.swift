@@ -68,6 +68,20 @@ public enum InterventionOutcome: Sendable, Equatable {
     /// the intended text so the user can paste it manually. `reason`
     /// goes into the trace, not the banner.
     case injectDegraded(intendedText: String, reason: String)
+    /// v0.4.0 Part B: continue dispatched. CGEventPost typed the
+    /// dispatcher's next_task_proposal into Claude Code. `promptHead`
+    /// is the first ~80 chars so the banner can show what got sent.
+    case continueFired(pid: pid_t, bytes: Int, promptHead: String)
+    /// v0.4.0 Part B: dispatcher returned medium confidence — surface
+    /// the proposal to the user via banner rather than injecting it.
+    /// `proposal` is the next_task_proposal text; the banner invites
+    /// the user to paste it themselves.
+    case continueProposedMedium(proposal: String, justification: String)
+    /// v0.4.0 Part B: dispatcher returned low confidence — supervisor
+    /// saw the idle state but couldn't pick a next task. `reasoning`
+    /// is the dispatcher's justification (lands in the banner so the
+    /// user knows WHY supervisor went quiet).
+    case continueLowConfidence(reasoning: String)
 }
 
 public final class Notifier: Notifying, @unchecked Sendable {
@@ -170,6 +184,22 @@ public final class Notifier: Notifying, @unchecked Sendable {
             // user can paste it manually. Reason goes to trace, not the
             // banner — banner stays user-facing, not diagnostic.
             return base + " Supervisor would have answered: \(intendedText) Paste this into Claude Code to continue."
+        case .continueFired(let pid, _, let promptHead):
+            // The autonomous loop dispatched — show what got typed so
+            // the user can read along. PID + bytes go to the trace; the
+            // banner stays user-facing.
+            return base + " Supervisor dispatched: \(promptHead)\(promptHead.count >= 80 ? "..." : "") (PID \(pid))"
+        case .continueProposedMedium(let proposal, _):
+            // Propose-and-wait: medium-confidence dispatch is surfaced
+            // for the user to copy/paste, NOT auto-injected. The full
+            // proposal text goes in the banner; justification lives in
+            // the trace.
+            return base + " Supervisor proposes: \(proposal) Paste this into Claude Code to continue, or write your own."
+        case .continueLowConfidence(let reasoning):
+            // Low-confidence dispatch: surface the idle state with the
+            // dispatcher's reason so the user knows WHY supervisor went
+            // quiet rather than just hanging.
+            return base + " Supervisor saw idle but couldn't confidently dispatch — pick the next task yourself. Reason: \(reasoning)"
         }
     }
 

@@ -392,6 +392,12 @@ final class NotifierOutcomeBodyTests: XCTestCase {
                 return base + " Supervisor answered (PID \(pid), \(bytes) bytes injected)."
             case .injectDegraded(let intendedText, _):
                 return base + " Supervisor would have answered: \(intendedText) Paste this into Claude Code to continue."
+            case .continueFired(let pid, _, let promptHead):
+                return base + " Supervisor dispatched: \(promptHead)\(promptHead.count >= 80 ? "..." : "") (PID \(pid))"
+            case .continueProposedMedium(let proposal, _):
+                return base + " Supervisor proposes: \(proposal) Paste this into Claude Code to continue, or write your own."
+            case .continueLowConfidence(let reasoning):
+                return base + " Supervisor saw idle but couldn't confidently dispatch — pick the next task yourself. Reason: \(reasoning)"
             }
         }
     }
