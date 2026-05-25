@@ -210,10 +210,20 @@ final class ProcessLocatorTests: XCTestCase {
 
     func testLocatorReturnsNilWhenNoMatchingProcess() throws {
         // No fake claude launched. Locator queried for a cwd with no
-        // matching process should return nil and log locator.not_found.
+        // matching process either:
+        //   - returns nil (logs locator.not_found), OR
+        //   - returns Claude.app's PID via the v0.3.1 fallback if
+        //     Claude.app is running on the test machine.
+        // Both outcomes are correct per the locator's design — the
+        // fallback was added precisely so the inject path doesn't
+        // degrade on Claude.app-hosted sessions. The test asserts
+        // the result is EITHER nil OR a Claude.app PID; nothing else.
         let locator = LiveProcessLocator(execNamePatterns: ["FakeClaudeCLI"])
         let handle = locator.locate(targetCwd: "/var/folders/no/such/path/exists-\(UUID().uuidString)")
-        XCTAssertNil(handle)
+        if let h = handle {
+            XCTAssertTrue(h.execPath.contains("Claude") || h.execPath.contains("claude"),
+                          "if any handle returns from a not-found cwd, it must be the Claude.app fallback (v0.3.1); got \(h.execPath)")
+        }
     }
 
     // MARK: - Exec-name filter
@@ -265,6 +275,67 @@ final class ProcessLocatorTests: XCTestCase {
     /// test machine (v0.3.1 fallback). That doesn't invalidate the
     /// test — the trace tag is emitted BEFORE the fallback runs and
     /// the assertion targets the tag, not the return value.
+    // MARK: - Issue #1 option A — KERN_PROCARGS2 argv inspection
+
+    /// Verifies the argv-marker rescue path. `LiveProcessLocator.readProcessArgv`
+    /// is the integration surface; calling it on this test's own PID
+    /// returns argv that includes the test runner. We verify the
+    /// **mechanism** (sysctl + parsing) by calling it on a known PID
+    /// (the current process) and asserting the returned argv contains
+    /// something we can predict — argv[0] always exists and is the
+    /// executable.
+    ///
+    /// We deliberately don't test against a `node /path/to/cli.mjs`
+    /// shape because spawning Node inside the test runner is fragile
+    /// (Node may not be installed in CI). The argvContainsClaudeCodeMarker
+    /// matcher is exercised in `testArgvContainsClaudeCodeMarker` below
+    /// against synthetic argv arrays.
+    func testReadProcessArgvReturnsCurrentProcessArgv() throws {
+        let myPid = getpid()
+        guard let argv = LiveProcessLocator.readProcessArgv(pid: myPid) else {
+            XCTFail("KERN_PROCARGS2 sysctl must succeed for the current process; got nil")
+            return
+        }
+        XCTAssertGreaterThan(argv.count, 0, "argv must be non-empty")
+        // argv[0] is the test binary path; basename should contain
+        // something like "xctest" or the SwiftPM test bundle name.
+        XCTAssertFalse(argv[0].isEmpty, "argv[0] must be non-empty")
+    }
+
+    /// Test the marker-matching predicate directly against synthetic
+    /// argv arrays. Covers all 4 documented markers + the no-match case.
+    /// Pure logic — no process spawning, fast, deterministic.
+    func testArgvContainsClaudeCodeMarker() {
+        // Positive cases — each marker matches in isolation.
+        XCTAssertTrue(LiveProcessLocator.argvContainsClaudeCodeMarker(
+            ["node", "/usr/local/bin/claude/cli.mjs"]))
+        XCTAssertTrue(LiveProcessLocator.argvContainsClaudeCodeMarker(
+            ["node", "/usr/local/share/claude-code-cli/index.js"]))
+        XCTAssertTrue(LiveProcessLocator.argvContainsClaudeCodeMarker(
+            ["bun", "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/dist/cli.js"]))
+        XCTAssertTrue(LiveProcessLocator.argvContainsClaudeCodeMarker(
+            ["deno", "run", "--allow-all", "/some/path/cli.js"]))
+
+        // Negative cases — unrelated argvs must not match.
+        XCTAssertFalse(LiveProcessLocator.argvContainsClaudeCodeMarker(
+            ["node", "/Users/main/projects/myapp/server.js"]))
+        XCTAssertFalse(LiveProcessLocator.argvContainsClaudeCodeMarker(
+            ["python", "-m", "myproject.cli"]))
+        XCTAssertFalse(LiveProcessLocator.argvContainsClaudeCodeMarker([]))
+    }
+
+    /// Asserts the interpreter basename set is the v0.3.2-committed
+    /// list. Locks the set down so a future PR adding `python` or
+    /// `ruby` without rationale (Claude Code isn't those distributions)
+    /// is caught.
+    func testInterpreterBasenamesIsTheCommittedSet() {
+        XCTAssertEqual(
+            LiveProcessLocator.interpreterBasenames,
+            Set(["node", "bun", "deno"]),
+            "Adding interpreters here requires a corresponding entry in claudeCodeArgvMarkers + a CHANGELOG note"
+        )
+    }
+
     func testLocatorEmitsExecUnrecognizedWhenCwdMatchesButExecDoesNot() throws {
         let binary = try fakeClaudeBinary()
         let dir = try makeTempDir("exec-unrec")

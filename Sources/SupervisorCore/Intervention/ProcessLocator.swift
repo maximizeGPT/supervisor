@@ -80,10 +80,14 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
         // v0.3.0 Issue #1: track the "cwd-matched but exec-unrecognized"
         // case so a silent-nil here can be diagnosed post-mortem. If a
         // process is in the target cwd and looks like it could be the
-        // Claude Code session but is launched as `node` / `python` /
-        // `bun` / etc. (the interpreter case), we don't have argv
-        // inspection yet (proper fix queued) but we can at least emit
-        // a loud trace tag identifying the candidate that got skipped.
+        // Claude Code session but is launched as `node` / `bun` / etc.
+        // (the interpreter case), we emit a loud trace tag identifying
+        // the candidate that got skipped.
+        //
+        // v0.3.2 Issue #1: KERN_PROCARGS2 argv inspection lifts this
+        // from "trace only" to actual recovery — when the exec basename
+        // looks like a JS-runtime interpreter, we scan argv for Claude
+        // Code markers and promote the candidate to a match if found.
         var unrecognizedInTargetCwd: [(pid: pid_t, exec: String)] = []
         for pid in pids {
             // Never match Supervisor itself — Supervisor holds the JSONL
@@ -96,10 +100,26 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
             if !nameMatches {
                 // The exec name didn't match. Cheap follow-up check:
                 // was this process in the target cwd anyway? If so,
-                // it's a candidate we silently dropped — surface it.
-                if let cwd = Self.cwd(pid: pid), cwd == targetCwd {
-                    unrecognizedInTargetCwd.append((pid: pid, exec: execPath))
+                // it's a candidate we'd otherwise silently drop.
+                guard let cwd = Self.cwd(pid: pid), cwd == targetCwd else {
+                    continue
                 }
+                // v0.3.2: before deciding the candidate is unrecognized,
+                // check if the exec basename is a JS-runtime interpreter
+                // AND argv contains a Claude Code marker. If so, accept
+                // the match. This covers the `node /usr/local/bin/claude/cli.mjs`
+                // shape that the Claude.app fallback doesn't catch.
+                let execBase = (execPath as NSString).lastPathComponent
+                if Self.interpreterBasenames.contains(execBase),
+                   let argv = Self.readProcessArgv(pid: pid),
+                   Self.argvContainsClaudeCodeMarker(argv)
+                {
+                    trace.emit("locator", "locator.found_via_argv pid=\(pid) cwd=\(targetCwd) exec=\(execPath) markers_found_in_argv")
+                    matches.append(ProcessHandle(pid: pid, execPath: execPath, cwd: cwd))
+                    continue
+                }
+                // No argv-marker rescue. Surface as unrecognized.
+                unrecognizedInTargetCwd.append((pid: pid, exec: execPath))
                 continue
             }
             guard let cwd = Self.cwd(pid: pid) else { continue }
@@ -168,6 +188,116 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    // MARK: - KERN_PROCARGS2 argv inspection (v0.3.2 Issue #1)
+
+    /// JS-runtime interpreter basenames that plausibly host Claude Code.
+    /// Skipped: python, ruby, perl — Claude Code isn't distributed as
+    /// those. If a new distribution shape appears, extend this set and
+    /// add a corresponding marker to `claudeCodeArgvMarkers`.
+    internal static let interpreterBasenames: Set<String> = [
+        "node", "bun", "deno",
+    ]
+
+    /// Substrings that, when present in any joined argv, identify the
+    /// process as Claude Code. Substring search is intentionally
+    /// generous because the cwd filter has already constrained
+    /// candidates — a false-positive substring match outside the
+    /// target cwd never reaches this code path.
+    internal static let claudeCodeArgvMarkers: [String] = [
+        "cli.mjs",
+        "cli.js",
+        "@anthropic-ai/claude-code",
+        "claude-code-cli",
+    ]
+
+    /// Returns the argv of the process via `sysctl(KERN_PROCARGS2)`.
+    /// Each element of the returned array is one argv string. Returns
+    /// nil if sysctl fails (process gone, EPERM, etc.) — caller treats
+    /// nil as "no argv-marker match" without raising an error.
+    ///
+    /// KERN_PROCARGS2 layout:
+    ///   [4 bytes: argc as Int32]
+    ///   [execPath null-terminated string + alignment padding]
+    ///   [argc null-terminated argv strings]
+    ///   [envp null-terminated env strings]
+    ///
+    /// We only need argv, so we parse argc + execPath + argv-count
+    /// strings and stop. Bounded by `kern.argmax` (defaults to ~1 MB
+    /// on macOS); we pre-fetch the system limit to size the buffer.
+    internal static func readProcessArgv(pid: pid_t) -> [String]? {
+        // Step 1: get kern.argmax (the upper bound on argv+envp size
+        // per process). This is the maximum buffer we'd ever need.
+        var argmaxMib: [Int32] = [CTL_KERN, KERN_ARGMAX]
+        var argmax: Int32 = 0
+        var argmaxSize = MemoryLayout<Int32>.size
+        if sysctl(&argmaxMib, 2, &argmax, &argmaxSize, nil, 0) != 0 || argmax <= 0 {
+            // Fallback to a reasonable default if kern.argmax is unreadable.
+            argmax = 1 << 20  // 1 MB
+        }
+
+        // Step 2: KERN_PROCARGS2 sysctl for this PID.
+        var argsMib: [Int32] = [CTL_KERN, KERN_PROCARGS2, Int32(pid)]
+        var bufferSize = Int(argmax)
+        var buffer = [CChar](repeating: 0, count: bufferSize)
+        let rc = buffer.withUnsafeMutableBufferPointer { ptr -> Int32 in
+            sysctl(&argsMib, 3, ptr.baseAddress, &bufferSize, nil, 0)
+        }
+        if rc != 0 {
+            return nil
+        }
+        // bufferSize now contains the actual byte count written.
+        if bufferSize < MemoryLayout<Int32>.size {
+            return nil
+        }
+
+        // Step 3: parse. Layout per `man sysctl` + Darwin kernel source.
+        return buffer.withUnsafeBufferPointer { ptr -> [String]? in
+            guard let base = ptr.baseAddress else { return nil }
+            // First 4 bytes: argc as native Int32.
+            let argc: Int32 = base.withMemoryRebound(to: Int32.self, capacity: 1) { $0.pointee }
+            guard argc > 0 else { return nil }
+
+            // Cursor advances through the buffer. Start past argc (4 bytes).
+            var cursor = 4
+            let end = bufferSize
+
+            // Skip the executable path (null-terminated).
+            while cursor < end && base[cursor] != 0 { cursor += 1 }
+            // Skip any padding (null bytes between execPath and argv[0]).
+            while cursor < end && base[cursor] == 0 { cursor += 1 }
+
+            // Read argc null-terminated argv strings.
+            var argv: [String] = []
+            argv.reserveCapacity(Int(argc))
+            for _ in 0..<argc {
+                guard cursor < end else { break }
+                let startOfArg = cursor
+                while cursor < end && base[cursor] != 0 { cursor += 1 }
+                // Build a String from the byte range [startOfArg, cursor).
+                let bytesPtr = base.advanced(by: startOfArg)
+                let arg = String(cString: bytesPtr)
+                argv.append(arg)
+                // Skip the null terminator and advance to next.
+                cursor += 1
+            }
+            return argv.isEmpty ? nil : argv
+        }
+    }
+
+    /// True if any element of argv contains any of the Claude Code
+    /// markers. Substring search across joined argv handles both
+    /// per-arg-basename matches (`cli.mjs` as argv[1]) and path-form
+    /// matches (`/usr/local/bin/claude/cli.mjs` as argv[1]).
+    internal static func argvContainsClaudeCodeMarker(_ argv: [String]) -> Bool {
+        let joined = argv.joined(separator: " ")
+        for marker in claudeCodeArgvMarkers {
+            if joined.contains(marker) {
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: - Pattern matching
