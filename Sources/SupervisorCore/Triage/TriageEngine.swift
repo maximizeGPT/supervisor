@@ -181,6 +181,22 @@ public final class TriageEngine {
     /// defaults: confidence=low, no proposal).
     private let dispatcher: (any Dispatching)?
 
+    /// v0.4.0 Part C: optional loop controller dependency. When
+    /// non-nil, the engine checks `canDispatch` before calling the
+    /// Dispatcher, records every result via `recordDispatch`, and
+    /// notes pauses on userPrompt + user_question_pending events.
+    /// Nil disables loop control (Part A/B behavior: dispatch every
+    /// idle fire without the consecutive-low / 4-hour / paused
+    /// guards). Use the LoopController in production; tests inject
+    /// nil OR a custom-clock instance.
+    private let loopController: LoopController?
+
+    /// v0.4.0 Part C: optional store for the `loop_dispatches` table.
+    /// When non-nil, the engine writes a row on every Dispatcher
+    /// result (parallel to recordDispatch's in-memory update).
+    /// Nil disables persistence (tests without a SupervisorDatabase).
+    private let loopStore: LoopDispatchStore?
+
     public init(
         client: LLMClient,
         bus: EventBus,
@@ -190,6 +206,8 @@ public final class TriageEngine {
         redactor: any Redactor = DefaultRedactor(),
         questionAnswerer: QuestionAnswerer? = nil,
         dispatcher: (any Dispatching)? = nil,
+        loopController: LoopController? = nil,
+        loopStore: LoopDispatchStore? = nil,
         idleThresholdSeconds: TimeInterval = 15,
         idleReTriageIntervalSeconds: TimeInterval = 60,
         idleCheckIntervalSeconds: TimeInterval = 1,
@@ -204,6 +222,8 @@ public final class TriageEngine {
         self.redactor = redactor
         self.questionAnswerer = questionAnswerer
         self.dispatcher = dispatcher
+        self.loopController = loopController
+        self.loopStore = loopStore
         self.idleThresholdSeconds = idleThresholdSeconds
         self.idleReTriageIntervalSeconds = idleReTriageIntervalSeconds
         self.idleCheckIntervalSeconds = idleCheckIntervalSeconds
@@ -253,8 +273,22 @@ public final class TriageEngine {
             if let branch = info.gitBranch {
                 sessionBranch[info.sessionId] = branch
             }
+        case .userPrompt(let info):
+            // v0.4.0 Part C: user message → loop pauses. The human
+            // took the wheel; the autonomous loop holds until the
+            // worker signals it's back to autonomous work (next
+            // bashToolCall clears the pause).
+            if let lc = loopController {
+                Task { await lc.notePause(sessionId: info.sessionId, reason: .userMessage) }
+            }
         case .bashToolCall(let info):
             bashCalls[info.toolUseId] = info
+            // v0.4.0 Part C: worker emitted a tool_use → autonomous
+            // work resumed. Clear any prior loop-pause so the next
+            // idle fire can dispatch normally.
+            if let lc = loopController {
+                Task { await lc.clearPause(sessionId: info.sessionId) }
+            }
             Task { await self.evaluate(call: info, prePost: .preExecution) }
         case .bashToolResult(let info):
             if let original = bashCalls[info.toolUseId] {
@@ -487,24 +521,62 @@ public final class TriageEngine {
             ts: now()
         )
         for candidate in candidates {
-            // v0.4.0 Part B: if a Dispatcher is wired AND this is a
-            // worker_idle_post_completion fire, run the second-stage
-            // dispatch call to produce the actual next_task_proposal
-            // + confidence. The dispatcher's result REPLACES the
-            // rubric's fields (which Part A intentionally left as
-            // nil/low). On any non-idle category, OR when dispatcher
-            // is nil, the candidate flows through unchanged.
+            // v0.4.0 Part B + C: if a Dispatcher is wired AND this
+            // is a worker_idle_post_completion fire, consult the
+            // LoopController FIRST (Part C: paused / stopped / 4hr
+            // budget / 3-consecutive-low gate). On .proceed, run the
+            // Dispatcher; the result REPLACES the rubric's fields
+            // and gets recorded in `loop_dispatches`. On .paused /
+            // .stopped, skip the Dispatcher entirely and surface
+            // the loop state via a degraded candidate (action=.notify
+            // with the reason in reasoning_plain).
+            //
+            // On any non-idle category, OR when dispatcher is nil,
+            // the candidate flows through unchanged — Loop control
+            // is scoped to the worker_idle_post_completion category.
             let finalCandidate: TriageCandidate
             if candidate.category == "worker_idle_post_completion",
                let dispatcher = self.dispatcher {
-                finalCandidate = await dispatchAndRemap(
-                    candidate: candidate,
-                    dispatcher: dispatcher,
-                    sessionId: sessionId,
-                    cwd: cwd,
-                    branch: branch,
-                    window: window
-                )
+                let loopDecision: LoopDecision
+                if let lc = loopController {
+                    loopDecision = await lc.canDispatch(sessionId: sessionId)
+                } else {
+                    loopDecision = .proceed(priorDispatchesConsidered: 0)
+                }
+                switch loopDecision {
+                case let .proceed(priorCount):
+                    finalCandidate = await dispatchAndRemap(
+                        candidate: candidate,
+                        dispatcher: dispatcher,
+                        sessionId: sessionId,
+                        cwd: cwd,
+                        branch: branch,
+                        window: window,
+                        priorDispatchesConsidered: priorCount
+                    )
+                case let .paused(reason):
+                    trace.emit("loop", "skip dispatch session=\(sessionId) state=paused reason=\(reason)")
+                    finalCandidate = reconfigure(
+                        candidate,
+                        action: .notify,
+                        reasoningPlain: "Supervisor saw the worker go idle, but the loop is paused (\(reason)). Resume by sending the worker a new task yourself.",
+                        asymmetryNote: "Loop paused: \(reason)",
+                        suggestedInjectText: nil,
+                        nextTaskProposal: nil,
+                        confidence: "low"
+                    )
+                case let .stopped(reason):
+                    trace.emit("loop", "skip dispatch session=\(sessionId) state=stopped reason=\(reason)")
+                    finalCandidate = reconfigure(
+                        candidate,
+                        action: .notify,
+                        reasoningPlain: "Supervisor's autonomous loop has stopped (\(reason)). No further dispatches will fire for this session.",
+                        asymmetryNote: "Loop stopped: \(reason)",
+                        suggestedInjectText: nil,
+                        nextTaskProposal: nil,
+                        confidence: "low"
+                    )
+                }
             } else {
                 finalCandidate = candidate
             }
@@ -542,15 +614,38 @@ public final class TriageEngine {
         sessionId: String,
         cwd: String?,
         branch: String?,
-        window: [SupervisorEvent]
+        window: [SupervisorEvent],
+        priorDispatchesConsidered: Int
     ) async -> TriageCandidate {
-        trace.emit("dispatch", "start session=\(sessionId) branch=\(branch ?? "?")")
+        trace.emit("dispatch", "start session=\(sessionId) branch=\(branch ?? "?") prior=\(priorDispatchesConsidered)")
         let result = await dispatcher.dispatchForIdleSession(
             sessionUUID: sessionId,
             cwd: cwd,
             gitBranch: branch,
-            lastNTurns: window
+            lastNTurns: window,
+            priorDispatchesConsidered: priorDispatchesConsidered
         )
+
+        // v0.4.0 Part C: persist + record for the loop control. Both
+        // the in-memory LoopController and the loop_dispatches SQLite
+        // table get updated. Errors from the SQLite write are logged
+        // but non-fatal — the dispatch path continues so the user
+        // still sees the banner/inject outcome.
+        if let lc = loopController {
+            await lc.recordDispatch(sessionId: sessionId, result: result)
+        }
+        if let store = loopStore {
+            do {
+                try store.insert(Self.storedLoopDispatchRow(
+                    sessionId: sessionId,
+                    result: result,
+                    priorDispatchesConsidered: priorDispatchesConsidered,
+                    ts: now()
+                ))
+            } catch {
+                trace.emit("loop", "persist ERROR session=\(sessionId) error=\(error)")
+            }
+        }
         switch result {
         case let .ready(prompt, justification, .high, _, _, _):
             return reconfigure(
@@ -882,6 +977,56 @@ public final class TriageEngine {
 
         default:
             return candidate
+        }
+    }
+
+    /// v0.4.0 Part C: serialize one DispatchResult into a row for the
+    /// `loop_dispatches` table. Static + nonisolated so tests (and any
+    /// background-actor caller) can invoke it without going through
+    /// the main-actor engine.
+    nonisolated static func storedLoopDispatchRow(
+        sessionId: String,
+        result: DispatchResult,
+        priorDispatchesConsidered: Int,
+        ts: Date
+    ) -> StoredLoopDispatch {
+        switch result {
+        case let .ready(prompt, justification, conf, path, issueN, _):
+            return StoredLoopDispatch(
+                sessionId: sessionId,
+                ts: ts,
+                responseShape: "ready",
+                confidence: conf.rawValue,
+                selectedPath: path.rawValue,
+                selectedIssueNumber: issueN,
+                taskProposalHead: String(prompt.prefix(200)),
+                justification: justification,
+                priorDispatchesConsidered: priorDispatchesConsidered
+            )
+        case let .lowConfidence(reasoning):
+            return StoredLoopDispatch(
+                sessionId: sessionId,
+                ts: ts,
+                responseShape: "lowConfidence",
+                confidence: "low",
+                selectedPath: SelectedPath.lowConfidenceNoAction.rawValue,
+                selectedIssueNumber: nil,
+                taskProposalHead: "",
+                justification: reasoning,
+                priorDispatchesConsidered: priorDispatchesConsidered
+            )
+        case let .error(reasoning):
+            return StoredLoopDispatch(
+                sessionId: sessionId,
+                ts: ts,
+                responseShape: "error",
+                confidence: nil,
+                selectedPath: nil,
+                selectedIssueNumber: nil,
+                taskProposalHead: "",
+                justification: reasoning,
+                priorDispatchesConsidered: priorDispatchesConsidered
+            )
         }
     }
 
