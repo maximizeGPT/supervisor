@@ -828,3 +828,32 @@ section 9e. No rubric/prompt content changes that affect Haiku's
 verdicts -- the category bodies are unchanged; we're just scoping
 which bodies each path sees.
 
+### Stop hook firing #1
+
+The v0.4.0-hook dispatch-loop Stop hook fired after the Issue #8
+commit. Dispatch ID from hook log: first dispatch in this run
+(prior_dispatches_considered=0).
+
+**Proposal**: Execute the physical-world live trial (RUNBOOK steps
+1-8) — build release binary, atomic-swap to /Applications,
+manage AX permissions, launch Supervisor.app + worker, observe
+>=3 high-confidence dispatches.
+
+**Evaluation**: Proposal was directionally correct — the live trial
+IS the remaining gap per the meta-post-mortem. However, the
+proposal requires physical macOS GUI interaction (System Settings
+for AX permissions, launching/observing multiple concurrent apps)
+that an autonomous Claude Code session cannot perform. Steps 3-7
+all require a human at the keyboard.
+
+**Decision**: Non-actionable for this session. The hook correctly
+identified what's next but incorrectly assessed that an autonomous
+session can execute it. This is a good signal — the Dispatcher's
+task-selection logic works (it grounded the proposal in
+PRINCIPLES section 6d/6e and the meta-post-mortem), but it needs a
+"requires_human_presence" gate that prevents proposing
+physical-world operations to an autonomous session.
+
+**Filed for Mohammed**: The live trial remains the sole blocker for
+v0.4.0 tagging. The autonomous branch is code-complete.
+
