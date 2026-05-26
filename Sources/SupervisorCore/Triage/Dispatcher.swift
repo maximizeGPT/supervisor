@@ -348,7 +348,7 @@ public final class Dispatcher: Dispatching, Sendable {
     public func dispatch(context: SessionContext) async -> DispatchResult {
         let req = AnthropicMessageRequest(
             model: client.provider.defaultTriageModel,
-            max_tokens: 1024,
+            max_tokens: 4096,
             system: Self.systemPrompt,
             messages: [
                 .init(role: "user", content: .string(Self.userMessage(
@@ -370,11 +370,19 @@ public final class Dispatcher: Dispatching, Sendable {
             return .error(reasoning: "Haiku call failed: \(error)")
         }
 
-        trace.emit("dispatch", "haiku returned model=\(resp.model) input=\(resp.usage.input_tokens) output=\(resp.usage.output_tokens)")
+        trace.emit("dispatch", "haiku returned model=\(resp.model) input=\(resp.usage.input_tokens) output=\(resp.usage.output_tokens) stop_reason=\(resp.stop_reason ?? "(nil)")")
 
         guard let parsed = Self.parseDispatchResult(from: resp) else {
-            trace.emit("dispatch", "ERROR parse failed; degrading to low-confidence")
-            return .error(reasoning: "Dispatcher did not return a parseable record_dispatch call.")
+            // Diagnostic: dump content block types + first 300 chars of any
+            // tool_use input so we can see truncated JSON from max_tokens hits.
+            let contentSummary = resp.content.map { "\($0.type):\($0.name ?? "-")" }.joined(separator: ", ")
+            let rawHead = resp.content.first.flatMap { block -> String? in
+                guard let input = block.input else { return nil }
+                let s = String(describing: input)
+                return String(s.prefix(300))
+            } ?? "(no input)"
+            trace.emit("dispatch", "ERROR parse failed stop_reason=\(resp.stop_reason ?? "(nil)") content=[\(contentSummary)] input_head=\"\(rawHead)\"")
+            return .error(reasoning: "Dispatcher did not return a parseable record_dispatch call. stop_reason=\(resp.stop_reason ?? "(nil)")")
         }
 
         // Defensive: if the model returned confidence=.low OR

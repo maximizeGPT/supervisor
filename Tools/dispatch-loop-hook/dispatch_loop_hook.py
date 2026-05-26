@@ -442,7 +442,7 @@ def call_dispatcher(
     tool call. Returns the parsed tool-call arguments dict, or None."""
     body = {
         "model": cfg["deepseek_model"],
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -477,16 +477,37 @@ def _parse_dispatcher_response(raw: str) -> dict[str, Any] | None:
     Returns None on any parse failure."""
     try:
         obj = json.loads(raw)
+    except Exception as e:
+        log(f"deepseek_parse_error error={e} RAW_RESPONSE total_bytes={len(raw)} head=\"{raw[:300]}\"")
+        return None
+    try:
         choice = (obj.get("choices") or [{}])[0]
+        finish_reason = choice.get("finish_reason", "(missing)")
         msg = choice.get("message") or {}
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
-            log("deepseek_no_tool_call")
+            log(f"deepseek_no_tool_call finish_reason={finish_reason}")
             return None
         args_raw = tool_calls[0].get("function", {}).get("arguments", "")
-        return json.loads(args_raw)
+        result = json.loads(args_raw)
+        # Log finish_reason on success too, so we can see how close to
+        # the ceiling real dispatches run.
+        usage = obj.get("usage") or {}
+        log(f"PARSE_OK finish_reason={finish_reason} output_tokens={usage.get('completion_tokens', '?')} args_bytes={len(args_raw)}")
+        return result
     except Exception as e:
-        log(f"deepseek_parse_error error={e}")
+        # args_raw parse failure — likely truncated JSON from max_tokens hit.
+        finish_reason = "(unknown)"
+        try:
+            finish_reason = (obj.get("choices") or [{}])[0].get("finish_reason", "(missing)")
+        except Exception:
+            pass
+        args_head = ""
+        try:
+            args_head = (obj.get("choices") or [{}])[0].get("message", {}).get("tool_calls", [{}])[0].get("function", {}).get("arguments", "")[:300]
+        except Exception:
+            pass
+        log(f"deepseek_parse_error error={e} finish_reason={finish_reason} RAW_RESPONSE args_head=\"{args_head}\" total_bytes={len(raw)}")
         return None
 
 

@@ -235,6 +235,7 @@ class TestParseDispatcherResponse(unittest.TestCase):
     def test_truncated_arguments_returns_none(self):
         raw = json.dumps({
             "choices": [{
+                "finish_reason": "length",
                 "message": {
                     "tool_calls": [{
                         "function": {
@@ -247,6 +248,95 @@ class TestParseDispatcherResponse(unittest.TestCase):
         })
         result = hook._parse_dispatcher_response(raw)
         self.assertIsNone(result)
+
+    def test_truncated_args_logs_finish_reason_and_raw_head(self):
+        """When args_raw is truncated JSON (max_tokens hit), the log
+        must include finish_reason and the first 300 chars of args."""
+        log_lines = []
+        truncated_args = '{"next_task_proposal": "Pick up Issue #9. Do the AX investigation per'
+
+        raw = json.dumps({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "record_dispatch",
+                            "arguments": truncated_args
+                        }
+                    }]
+                }
+            }],
+            "usage": {"completion_tokens": 1024, "prompt_tokens": 5000}
+        })
+
+        with patch.object(hook, 'log', side_effect=lambda msg: log_lines.append(msg)):
+            result = hook._parse_dispatcher_response(raw)
+
+        self.assertIsNone(result)
+        # Find the parse error log line
+        error_lines = [l for l in log_lines if "deepseek_parse_error" in l]
+        self.assertEqual(len(error_lines), 1)
+        line = error_lines[0]
+        self.assertIn("finish_reason=length", line)
+        self.assertIn("RAW_RESPONSE", line)
+        self.assertIn("Pick up Issue #9", line)
+
+    def test_no_tool_call_logs_finish_reason(self):
+        """When no tool_calls in response (e.g. refusal or length),
+        finish_reason must appear in the log."""
+        log_lines = []
+
+        raw = json.dumps({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": "I apologize, but I cannot"
+                }
+            }]
+        })
+
+        with patch.object(hook, 'log', side_effect=lambda msg: log_lines.append(msg)):
+            result = hook._parse_dispatcher_response(raw)
+
+        self.assertIsNone(result)
+        no_tool_lines = [l for l in log_lines if "deepseek_no_tool_call" in l]
+        self.assertEqual(len(no_tool_lines), 1)
+        self.assertIn("finish_reason=length", no_tool_lines[0])
+
+    def test_success_logs_parse_ok_with_tokens(self):
+        """Successful parse must log PARSE_OK with finish_reason
+        and output_tokens for ceiling monitoring."""
+        log_lines = []
+
+        raw = json.dumps({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "record_dispatch",
+                            "arguments": json.dumps({
+                                "next_task_proposal": "Do X.",
+                                "justification": "Because Y.",
+                                "confidence": "high",
+                                "selected_path": "continue_branch",
+                            })
+                        }
+                    }]
+                }
+            }],
+            "usage": {"completion_tokens": 487, "prompt_tokens": 5000}
+        })
+
+        with patch.object(hook, 'log', side_effect=lambda msg: log_lines.append(msg)):
+            result = hook._parse_dispatcher_response(raw)
+
+        self.assertIsNotNone(result)
+        ok_lines = [l for l in log_lines if "PARSE_OK" in l]
+        self.assertEqual(len(ok_lines), 1)
+        self.assertIn("finish_reason=stop", ok_lines[0])
+        self.assertIn("output_tokens=487", ok_lines[0])
 
 
 if __name__ == "__main__":
