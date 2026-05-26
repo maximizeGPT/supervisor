@@ -348,7 +348,7 @@ public final class Dispatcher: Dispatching, Sendable {
     public func dispatch(context: SessionContext) async -> DispatchResult {
         let req = AnthropicMessageRequest(
             model: client.provider.defaultTriageModel,
-            max_tokens: 4096,
+            max_tokens: 8192,
             system: Self.systemPrompt,
             messages: [
                 .init(role: "user", content: .string(Self.userMessage(
@@ -490,7 +490,7 @@ public final class Dispatcher: Dispatching, Sendable {
       - References PRINCIPLES sections by number when grounding decisions (e.g. "per §1d file an issue if scope grows").
       - Names a clear acceptance criterion: what does "done" look like for this task.
       - Includes a hard-stop reminder ("75 min cap; stop and write the post-mortem if you hit it").
-      - 200-600 words. Long enough to be unambiguous; short enough to read in one screen.
+      - 150-300 words. The proposal is a pointer to work, not a full briefing — the worker reads PRINCIPLES.md anyway. Shorter proposals produce more reliable structured output and reduce truncation risk.
       - **Cite specific file paths or function names when the work touches code (not just module names).** Examples in this prompt do this — `TriagePrompt.swift`'s `allBodiesMarkdown`, `main.swift`'s `loadQuestionAnswerer` pattern. Match that specificity. A worker that sees "edit the rubric file" has to go searching; a worker that sees "edit `HardcodedRubric.swift`'s `categories` array" can act immediately.
       - No marketing language (PRINCIPLES §11a). No emojis (§11e).
 
@@ -529,17 +529,15 @@ public final class Dispatcher: Dispatching, Sendable {
     selected_issue_number: 7
     confidence: high
     next_task_proposal:
-      Pick up Issue #7 — bash cross-category bleed. The bug: a bash command whose grep regex literally contains the substring `user_question_pending` is firing the user_question_pending rubric category, even though that category is meant only for the assistant-text triage path. This is the §2e per-path prompt isolation gap PRINCIPLES v3 documents.
+      Pick up Issue #7 — bash cross-category bleed. A bash command whose grep regex contains `user_question_pending` is firing that category, but it's meant only for the assistant-text path. This is the §2e per-path prompt isolation gap.
 
-      Done looks like: the bash triage path explicitly enumerates the categories it evaluates against (destructive_action_pending, edits_outside_worktree, prompt_injection_signature) and explicitly EXCLUDES user_question_pending + worker_idle_post_completion. The assistant-text path already uses a focused prompt with that pattern (it says "Evaluate ONLY against the user_question_pending category" in `TriagePrompt.swift`'s `buildAssistantQuestionRequest`); make the bash path symmetric.
+      Fix: in `TriagePrompt.swift`, restrict the bash `buildRequest` path to bash-relevant categories only (destructive_action_pending, edits_outside_worktree, prompt_injection_signature) via a per-path whitelist on `HardcodedRubric`. The assistant-text path already does this — make bash symmetric.
 
-      The fix lives in `Sources/SupervisorCore/Triage/TriagePrompt.swift`: the bash `buildRequest` path concatenates `HardcodedRubric.allBodiesMarkdown` (every category) into the system prompt. Restrict it to the bash-relevant categories — either via a per-path category whitelist on `HardcodedRubric`, or via a focused-prompt scope sentence at the end of the user message (the cheaper fix).
+      Done looks like: bash triage explicitly excludes user_question_pending + worker_idle_post_completion. Add 2-3 fixtures for literal category-name-in-regex bash commands, run a targeted sweep (~30 fixtures, ~$0.10 under §9e), confirm the false positive is gone without regressing bash positives.
 
-      Acceptance: a calibration fixture for the literal `user_question_pending` regex bash command no longer fires that category. Add 2-3 such fixtures to `Tests/SupervisorCoreTests/CalibrationFixtures/destructive/`, run a targeted sweep (~30 fixtures, ~$0.10 — under §9e), and confirm the false positive is gone without regressing other bash positives.
-
-      Reference PRINCIPLES §2e (per-path prompt isolation — the asymmetry IS the bug), §6f (fixture corrections that align tests with reproducible behavior ship without full sweeps), and §1d (file follow-on issues for anything the cheap fix doesn't reach). Hard-stop: 75 min per §12. If the calibration sweep regresses >10% from baseline, do not ship — that's the §12 calibration-regression hard stop.
+      Per §2e, §6f, §1d. Hard-stop: 75 min per §12; calibration regression >10% from baseline = do not ship.
     justification:
-      Issue #7 has clear scope grounded in PRINCIPLES §2e (the per-path-isolation gap is documented in the manual itself); the work touches one file (`TriagePrompt.swift`) plus a small fixture addition; no values calls needed. Small enough to ship in one session.
+      Issue #7 has clear scope grounded in §2e; touches `TriagePrompt.swift` plus a small fixture addition. Small enough to ship in one session.
     ```
 
     ## Example 3 — PATH 1 (continue_branch), MEDIUM confidence
@@ -549,17 +547,13 @@ public final class Dispatcher: Dispatching, Sendable {
     confidence: medium
     selected_issue_number: (omit)
     next_task_proposal:
-      Pick the v0.4.0 CHANGELOG entry as the next follow-on, OR pick the Part C session prep — both are plausible after Part B shipped. I'm picking the CHANGELOG because it's the smaller of the two and grounds the user's review when they next look at the branch.
+      Write the v0.4.0 CHANGELOG entry. Parts A + B are on the autonomous branch but neither is merged to main — the entry needs an "In progress" header covering: `worker_idle_post_completion` rubric category, dispatcher two-call architecture, `.continue` action in the ladder, and deferred Parts C + D with §1d framing.
 
-      The CHANGELOG entry for v0.4.0 needs an "In progress" header (Parts A + B are on the autonomous branch but neither is merged to main). Body should cover: the new `worker_idle_post_completion` rubric category, the dispatcher's two-call architecture (`record_triage` decides "is this idle"; `record_dispatch` decides "what to do about it"), the `.continue` intervention action between `inject` and `pause` in the ladder, and the deferred Parts C + D (loop control + dogfood) — including the §1d framing that we're shipping the vertical slice and filing the rest, not half-building four parts.
+      Done looks like: new section in `CHANGELOG.md` with 5-8 bullets. Mirror the v0.3.0/v0.3.1 entry voice — first-person, specific signatures (not "robust idle detection" but "1Hz polling + 8-phrase stop-shape match"). Entry reads as half-product-with-clear-deferral, not finished release.
 
-      Done looks like: a new section in `CHANGELOG.md` under "## In progress" with v0.4.0 as the header and 5-8 bullets covering what's on the autonomous branch. Mirror the voice of the v0.3.0 and v0.3.1 entries (already in the file) — first-person, specific signatures (not "robust idle detection" but "1Hz polling against last-event timestamps; stop-shape detection via case-insensitive substring match on an 8-phrase list").
-
-      Acceptance: the CHANGELOG renders correctly on GitHub (verify with `gh pr view` or `git log -p CHANGELOG.md`); the entry reads as a half-product-with-clear-deferral, not as a finished release; Parts C and D are named with their session-scope estimates.
-
-      Reference PRINCIPLES §1a (vertical slice — ship the fewer features that work), §4c (STATUS docs list what didn't ship alongside what did), §11 (voice: first-person, specific signatures, no marketing). Hard-stop: 75 min per §12. If the CHANGELOG entry triggers a clarification about Part C/D scope, file that as an issue rather than redesigning here.
+      Per §1a (vertical slice), §4c (list what didn't ship), §11 (voice). Hard-stop: 75 min per §12.
     justification:
-      Both the CHANGELOG entry and the Part C session prep are plausible follow-ons; the CHANGELOG is smaller and grounds review per §4c. Medium because the path is taste-shaped (which of two reasonable follow-ons), not because the work itself is unclear.
+      Both the CHANGELOG and Part C prep are plausible follow-ons; CHANGELOG is smaller and grounds review per §4c. Medium because taste-shaped (which of two reasonable follow-ons).
     ```
 
     ## Example 4 — LOW confidence (`low_confidence_no_action`)
@@ -687,7 +681,7 @@ public final class Dispatcher: Dispatching, Sendable {
                 "properties": .object([
                     "next_task_proposal": .object([
                         "type": .string("string"),
-                        "description": .string("The actual prompt to type into Claude Code's input. 200-600 words, written in the autonomous opener's voice — first-person, direct, references PRINCIPLES sections by number, names acceptance criteria, includes a hard-stop reminder. Empty string when selected_path=low_confidence_no_action.")
+                        "description": .string("The actual prompt to type into Claude Code's input. 150-300 words, written in the autonomous opener's voice — first-person, direct, references PRINCIPLES sections by number, names acceptance criteria, includes a hard-stop reminder. Empty string when selected_path=low_confidence_no_action.")
                     ]),
                     "justification": .object([
                         "type": .string("string"),

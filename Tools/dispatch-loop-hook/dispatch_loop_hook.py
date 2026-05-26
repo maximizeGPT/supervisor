@@ -442,7 +442,7 @@ def call_dispatcher(
     tool call. Returns the parsed tool-call arguments dict, or None."""
     body = {
         "model": cfg["deepseek_model"],
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -683,7 +683,7 @@ def main() -> None:
         # the hook (not from Mohammed). The autonomous opener tone is
         # already inside `proposal`; the prefix just labels the source.
         prefixed = (
-            "[dispatch-loop-hook v0.4.0 — auto-dispatched by Stop hook; "
+            "[dispatch-loop-hook v0.4.1 — auto-dispatched by Stop hook; "
             f"justification: {justification.strip()}]\n\n{proposal.strip()}"
         )
         emit_block(prefixed)
