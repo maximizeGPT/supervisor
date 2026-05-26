@@ -34,9 +34,34 @@ keep working without a human in the chat.*
 - Accessibility permission granted to the Supervisor.app
   binary (CGEventPost requires it for the inject path; the
   onboarding flow walks through this).
-- An open Issue #7 (or any sized issue) in the
-  `maximizeGPT/supervisor` repo. Dogfood targets Issue #7
-  ("bash cross-category bleed" — §2e gap).
+- At least one open issue in `maximizeGPT/supervisor`. Issue #9
+  (inject tab-targeting) is sized for this purpose. If no issues
+  are open, the Dispatcher will return `low_confidence_no_action`
+  on the transition_to_issue path — which is correct behavior
+  but won't exercise the full dispatch pipeline.
+
+## Pre-flight checks (v0.4.1-hook)
+
+Before starting, verify these v0.4.1-hook fixes are present on
+the branch:
+
+```bash
+# JSON parse retry:
+grep -c "RETRY_PARSE_ERROR" Tools/dispatch-loop-hook/dispatch_loop_hook.py
+# Should print 3+ (the retry logic + log lines)
+
+# requires_human_presence gate:
+grep -c "requires_human_presence" Tools/dispatch-loop-hook/dispatch_loop_hook.py
+# Should print 3+ (schema + gate check + log line)
+
+# Swift side:
+grep -c "requiresHumanPresence" Sources/SupervisorCore/Triage/Dispatcher.swift
+# Should print 5+ (enum field + parser + schema + prompt)
+
+# Tests pass:
+swift test 2>&1 | tail -3
+# Should show 245+ pass, 0 failures
+```
 
 ## Step 1 — Backup the SQLite DB
 
@@ -137,37 +162,28 @@ claude
 **You type ONE prompt into the worker terminal. After that, the
 keyboard does not touch this window.**
 
-The opener:
+The opener prompt should be a real, sized task from the open
+issue queue. Check `gh issue list --state open` and pick the
+smallest scoped issue. Example (adapt to whatever's open):
 
 ```
 You are a Claude Code session operating Supervisor autonomously
 while Mohammed is away. Hard stop 75min per PRINCIPLES §12.
 
-Pick up Issue #7 — bash cross-category bleed. PRINCIPLES.md
-§2e documents this gap: the bash triage path concatenates ALL
-rubric categories into its prompt, including ones meant only
-for the assistant-text path. Fix the asymmetry.
+Pick up Issue #9 — inject tab-targeting investigation.
+Research whether AXUIElement can target a specific Claude.app
+tab when multiple tabs are open. Read Injector.swift's inject
+flow (lines 96-100: activate + CGEventPost) and investigate
+Claude.app's accessibility tree.
 
-Done looks like: TriagePrompt.swift's buildRequest path
-explicitly enumerates bash-relevant categories
-(destructive_action_pending, edits_outside_worktree,
-prompt_injection_signature) and explicitly excludes
-user_question_pending + worker_idle_post_completion. Mirror
-the assistant-text path's focused-prompt pattern from
-buildAssistantQuestionRequest.
+Done looks like: a trial-notes.md entry documenting what
+Claude.app exposes via AXUIElement (tab elements? window
+titles with session context? nothing useful?) and a
+recommendation: implement targeted inject OR document
+single-window-mode as the v0.4.x workaround.
 
-Acceptance: a calibration fixture with the literal regex
-"user_question_pending" in a bash command no longer fires
-that category. Add 2-3 such fixtures to
-Tests/SupervisorCoreTests/CalibrationFixtures/destructive/,
-run a targeted sweep (~30 fixtures, ~$0.10 — under §9e),
-and confirm no regression on existing positives.
-
-Reference PRINCIPLES §2e, §6f (fixture corrections ship
-without full sweeps), §1d (file follow-on issues for
-anything the cheap fix doesn't reach). When done, write a
-short CHANGELOG entry under "In progress" for v0.4.0 + Issue
-#7.
+Reference PRINCIPLES §7c (get the facts, don't guess),
+§1d (file follow-on issues for anything that's not immediate).
 
 Stop and write the post-mortem at 75min if not done.
 ```
@@ -176,7 +192,40 @@ Hit Enter. Then walk away from this terminal. Don't switch
 windows back to it. The trace log + the SQLite DB are the
 only places you read state from.
 
-## Step 5 — Watch the trace log
+## Step 5 — The 30-minute observation protocol
+
+The dogfood runs for 30 minutes of uninterrupted wall-clock time.
+Set a timer. During this window:
+
+- **Do NOT type into the worker terminal.** Not even to fix a typo
+  or unstick something. If you feel the urge, note it in
+  trial-notes.md — the urge itself is data about a Dispatcher gap.
+- **Do NOT switch focus to the worker's window.** Supervisor tracks
+  whether user messages appear; switching focus and accidentally
+  pressing a key would trigger the §12.5 user-message pause.
+- **Monitor ONLY through the trace log and SQLite queries** (from a
+  separate terminal window).
+- **Capture each dispatch cycle in trial-notes.md as it happens**:
+  timestamp, confidence, selected_path, proposal head (first 80
+  chars), whether the inject succeeded.
+
+### What to capture in trial-notes.md
+
+For each dispatch cycle observed in the trace:
+
+```
+### Dispatch #N — HH:MM UTC
+- confidence: high/medium/low
+- path: continue_branch/transition_to_issue/low_confidence_no_action
+- proposal head: "<first 80 chars>"
+- inject outcome: fired (pid=X, bytes=Y) / degraded / gate_fail
+- worker response: started working / error / no visible response
+```
+
+At 30 minutes (or when the loop stops), read the SQLite table
+and paste the full row set into trial-notes.md.
+
+## Step 5b — Watch the trace log
 
 From a separate window:
 
@@ -239,10 +288,14 @@ ls -lt "$SESS_DIR" | head -3
 
 Per the v0.4.0 Part D spec, the success criteria are:
 
-1. ≥3 successful auto-dispatches, all high-confidence
-2. Issue #7 completes OR loop stops at a defensible point
-3. Zero keyboard touches against the worker
-4. Honest characterization of each dispatch + gaps surfaced
+1. ≥3 successful high-confidence auto-dispatches (inject fired,
+   worker started working on each proposal)
+2. The worker completes at least one task end-to-end without
+   keyboard intervention (commit + tests passing)
+3. Zero keyboard touches against the worker terminal
+4. No false requires_human_presence gates on terminal-executable
+   tasks (v0.4.1-hook gate must only fire on genuine GUI tasks)
+5. Honest characterization of each dispatch + gaps surfaced
 
 The meta-post-mortem template lives at
 `META-POSTMORTEM-v0.4.0-Part-D-template.md`. Copy it to
