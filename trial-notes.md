@@ -901,3 +901,48 @@ Started: 2026-05-25 21:05 UTC.
 
 $0 API spend. Pure code + prompt changes, no calibration sweep.
 
+### Task 2 -- Issue #1 (skipped)
+
+Issue #1 is already CLOSED. The interpreter basenames set already
+includes `["node", "bun", "deno"]` at ProcessLocator.swift line 199.
+The `testInterpreterBasenamesIsTheCommittedSet` test at line 331
+locks down exactly this set. The `testArgvContainsClaudeCodeMarker`
+test already covers bun and deno positive cases. The session prompt's
+description ("Locator still doesn't handle interpreters beyond
+`node`") was stale information.
+
+### Task 3 -- inject precision (filed as Issue #9)
+
+Investigation: CGEventPost is inherently frontmost-window-targeted.
+Tab targeting would require:
+1. Enumerating tabs via AXUIElement
+2. Matching by window title or session attribute
+3. Focusing the target tab before inject
+
+Claude.app is Electron — its AX tree varies by version. No standard
+API maps a PID to a specific tab. Filed as Issue #9 with the
+investigation findings, three possible unblocking paths, and the
+current workaround (single-window mode for dispatch-loop
+reliability). Per §1d: file the issue, don't build the feature now.
+
+### Task 4 -- runbook update (done)
+
+Updated Tests/Dogfood/RUNBOOK-v0.4.0.md:
+- Added v0.4.1-hook pre-flight checks section
+- Updated prereqs (Issue #7 is closed; point to Issue #9 or any
+  open issue instead)
+- Added 30-minute observation protocol with per-dispatch capture
+  template for trial-notes.md
+- Updated opener prompt to reference current open issues
+- Added success criterion for requires_human_presence gate accuracy
+- Renamed Step 5 numbering to accommodate new observation protocol
+
+### Build / tests (final)
+
+- `swift test` -- 245 / 245 pass. 5 LIVE_API canaries skipped.
+- `python3 -m unittest` -- 7 / 7 pass (hook tests).
+
+### Budget summary
+
+- $0 API spend this session. All work is pure code + prompt changes.
+
