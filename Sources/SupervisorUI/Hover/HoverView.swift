@@ -93,7 +93,7 @@ public struct HoverView: View {
         switch action {
         case .pause:                      return "pause.fill"
         case .kill:                       return "xmark"
-        case .inject, .notify, .continue: return nil
+        case .inject, .notify, .continue, .selfExtend: return nil
         }
     }
 

@@ -73,7 +73,7 @@ public enum TriagePrompt {
                                 "recommended_action": .object([
                                     "type": .string("string"),
                                     "enum": .array([
-                                        .string("notify"), .string("inject"), .string("continue"), .string("pause"), .string("kill")
+                                        .string("notify"), .string("inject"), .string("continue"), .string("selfExtend"), .string("pause"), .string("kill")
                                     ]),
                                     "description": .string("What Supervisor should do. Pick the lightest action that fits. notify = banner only; inject = type an answer into the terminal (v0.3.0+, only for user_question_pending where question_type=engineering); continue = type a NEW TASK PROMPT into the worker's input (v0.4.0+, only for worker_idle_post_completion with confidence=high); pause = SIGSTOP (recoverable); kill = SIGTERM (not recoverable).")
                                 ]),

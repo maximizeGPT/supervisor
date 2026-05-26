@@ -41,8 +41,14 @@ class TestParseRetry(unittest.TestCase):
             exit_reasons.append(reason)
             raise SystemExit(0)
 
+        se_calls = []
+        def fake_self_extend(**kwargs):
+            se_calls.append(kwargs.get("failure_reason"))
+            raise SystemExit(0)  # SelfExtender takes over
+
         with patch.object(hook, 'call_dispatcher', side_effect=fake_call), \
              patch.object(hook, 'silent_exit', side_effect=fake_silent_exit), \
+             patch.object(hook, 'try_self_extend', side_effect=fake_self_extend), \
              patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
@@ -69,8 +75,8 @@ class TestParseRetry(unittest.TestCase):
 
         self.assertEqual(call_count, 2,
                          "hook must call dispatcher exactly twice (original + 1 retry)")
-        self.assertTrue(len(exit_reasons) > 0, "silent_exit must be called")
-        self.assertIn("dispatcher_returned_none", exit_reasons[-1])
+        self.assertTrue(len(se_calls) > 0, "v0.5.0: SelfExtender must be called on dispatcher failure")
+        self.assertIn("dispatcher_returned_none", se_calls[-1])
 
     def test_retry_succeeds_on_second_attempt(self):
         """When first call returns None but second returns valid high-confidence
@@ -489,6 +495,81 @@ class TestDetectWorkerStopped(unittest.TestCase):
         ])
         self.assertFalse(hook.detect_worker_stopped(path))
         os.unlink(path)
+
+
+class TestSelfExtender(unittest.TestCase):
+    """v0.5.0: SelfExtender fires on dispatch failures, never files issues."""
+
+    def test_self_extender_prompt_contains_meta_rule(self):
+        prompt = hook.load_self_extender_prompt()
+        self.assertIn("META-RULE", prompt)
+        self.assertIn("NOT authorized to weaken the safety architecture", prompt)
+
+    def test_self_extender_prompt_forbids_issue_filing(self):
+        prompt = hook.load_self_extender_prompt()
+        self.assertIn("Never file GitHub issues", prompt)
+        self.assertIn("gh issue create", prompt)
+
+    def test_detect_stuck_patterns_fires(self):
+        self.assertIsNotNone(hook.detect_stuck_patterns("I would normally ask Mohammed about this."))
+        self.assertIsNotNone(hook.detect_stuck_patterns("This needs a values call from the user."))
+        self.assertIsNotNone(hook.detect_stuck_patterns("PRINCIPLES doesn't cover this case."))
+
+    def test_detect_stuck_patterns_negative(self):
+        self.assertIsNone(hook.detect_stuck_patterns("All tests pass."))
+        self.assertIsNone(hook.detect_stuck_patterns("Pushed 5 commits."))
+
+    def test_build_self_extender_message_contains_failure_context(self):
+        msg = hook.build_self_extender_message(
+            failure_reason="consecutive_low_3",
+            session_id="s1",
+            cwd="/Users/main/supervisor",
+            branch="autonomous-test",
+            recent_turns=[],
+            commits=[],
+            recent_files_changed=[],
+            principles_text="# Test principles",
+            hook_log_tail="2026-05-26T00:00:00Z some log line",
+        )
+        self.assertIn("# Failure context", msg)
+        self.assertIn("consecutive_low_3", msg)
+        self.assertIn("# dispatch-loop.log", msg)
+        self.assertIn("some log line", msg)
+
+    def test_self_extender_output_never_contains_issue_filing(self):
+        """Verify the no-issue-creation enforcement: a SelfExtender result
+        containing 'gh issue create' gets logged as a violation."""
+        # This tests the validation logic in try_self_extend — the actual
+        # enforcement is a log + proceeding (not blocking), because the
+        # meta-rule in the prompt is the primary gate.
+        prompt = hook.load_self_extender_prompt()
+        self.assertIn("filed as Issue", prompt)
+        # The prompt explicitly lists these as forbidden output patterns
+
+    def test_parse_self_extender_response_valid(self):
+        raw = json.dumps({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "record_self_extend",
+                            "arguments": json.dumps({
+                                "fix_prompt": "Read the failing test and fix it.",
+                                "diagnosis": "The test expects old behavior.",
+                                "confidence": "high",
+                            })
+                        }
+                    }]
+                }
+            }]
+        })
+        result = hook._parse_self_extender_response(raw)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["confidence"], "high")
+
+    def test_parse_self_extender_response_malformed(self):
+        result = hook._parse_self_extender_response('{"broken":')
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

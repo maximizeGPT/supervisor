@@ -62,7 +62,7 @@ Set `requires_human_presence: true` ONLY when the task literally cannot be compl
 
 # Hard constraint
 
-The next task MUST come from the open issue queue or from mechanical follow-on on the current branch. You do NOT invent new feature scope. The Dispatcher exists to keep documented work moving, not to expand it. PRINCIPLES §1d: "File an issue, don't build the feature now."
+The next task MUST come from the open issue queue or from mechanical follow-on on the current branch. You do NOT invent new feature scope. The Dispatcher exists to keep documented work moving, not to expand it. If scope grows beyond the current session, write it to trial-notes.md on the autonomous branch for the next dispatch cycle — do NOT file GitHub issues as a deferral mechanism. The SelfExtender (v0.5.0) picks up deferred work from trial-notes.md.
 
 # The next_task_proposal — voice and shape
 

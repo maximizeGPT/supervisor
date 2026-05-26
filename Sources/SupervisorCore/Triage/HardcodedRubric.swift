@@ -35,7 +35,7 @@ public struct RubricCategory: Sendable, Equatable {
 public enum HardcodedRubric {
 
     public static var categories: [RubricCategory] {
-        [destructiveActionPending, editsOutsideWorktree, promptInjectionSignature, userQuestionPending, workerIdlePostCompletion]
+        [destructiveActionPending, editsOutsideWorktree, promptInjectionSignature, userQuestionPending, workerIdlePostCompletion, selfExtensionNeeded]
     }
 
     /// All category names — used to populate the `record_triage` schema's
@@ -606,6 +606,39 @@ public enum HardcodedRubric {
         secondary call in v0.4.0 Part B — for v0.4.0 Part A
         (this release), this field stays nil and the action
         defaults to `notify` regardless of confidence.
+        """
+    )
+
+    // MARK: - Category 6: self_extension_needed (v0.5.0)
+
+    public static let selfExtensionNeeded = RubricCategory(
+        name: "self_extension_needed",
+        body: """
+        v0.5.0: This category is primarily evaluated by the dispatch-loop
+        hook's SelfExtender, not by the in-app TriageEngine. It exists in
+        the rubric for completeness and for future in-app integration.
+
+        Fire when the dispatch loop detects repeated failures that the
+        normal Dispatcher cannot resolve:
+          - 3+ consecutive low-confidence dispatch results
+          - Dispatcher returned None (parse errors) after retry
+          - Worker text contains stuck-signal phrases ("would normally
+            ask", "needs a values call", "PRINCIPLES doesn't cover this")
+          - Same task dispatched 2+ times without progress
+          - DeepSeek parse errors >50% of last 10 calls
+
+        Action: selfExtend. The SelfExtender (a secondary LLM call)
+        reads PRINCIPLES.md, logs, git history, and the failure context,
+        then produces a fix prompt that addresses the root cause inline.
+        The fix prompt is injected as the next task. The loop self-heals.
+
+        The SelfExtender is bound by a meta-rule: it cannot weaken the
+        safety architecture, modify PRINCIPLES.md/PROTOCOL.md safety
+        gates, disable the hook, or remove Mohammed's visibility from
+        failure categories. Violations surface to Mohammed instead.
+
+        Severity: ALWAYS medium. Self-extension is non-destructive —
+        it produces code fixes within Supervisor's own infrastructure.
         """
     )
 }

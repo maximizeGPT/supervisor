@@ -68,6 +68,11 @@ public final class InterventionRouter {
             //   medium → notify with the proposal text (propose-and-wait)
             //   low    → notify with the reasoning (supervisor can't pick)
             await routeContinue(decision)
+        case .selfExtend:
+            // v0.5.0: SelfExtender is primarily hook-driven. In-app, degrade
+            // to notify — the hook handles the actual self-extension logic.
+            trace.emit("router", "intervention.selfExtend.degrade_to_notify reason=in_app_not_implemented")
+            await postNotify(decision)
         case .pause:
             await signalOrDegrade(decision, signal: SIGSTOP, opName: "pause")
         case .kill:

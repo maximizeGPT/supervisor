@@ -25,7 +25,11 @@ public enum FlagAction: String, Codable, Sendable, CaseIterable {
     //               stop the session. v0.4.0+.
     //   - pause:    SIGSTOP — freezes the worker; recoverable
     //   - kill:     SIGTERM — terminates the worker; not recoverable
-    case notify, inject, `continue`, pause, kill
+    //   - selfExtend: v0.5.0. SelfExtender diagnoses dispatch failures
+    //                 and produces a fix prompt. Heavier than continue
+    //                 (it modifies Supervisor's own infrastructure) but
+    //                 lighter than pause (the session stays alive).
+    case notify, inject, `continue`, selfExtend, pause, kill
 }
 
 public enum FlagUserResponse: String, Codable, Sendable, CaseIterable {

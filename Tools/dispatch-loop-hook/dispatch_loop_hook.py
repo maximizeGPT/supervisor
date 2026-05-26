@@ -55,6 +55,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPT_FILE = SCRIPT_DIR / "dispatcher-system-prompt.txt"
+SELF_EXTENDER_PROMPT_FILE = SCRIPT_DIR / "self-extender-system-prompt.txt"
 
 HOOK_HOME = Path.home() / ".claude" / "hooks"
 ENABLED_FLAG = HOOK_HOME / "dispatch-loop-enabled.json"
@@ -562,6 +563,278 @@ def _parse_dispatcher_response(raw: str) -> dict[str, Any] | None:
 
 
 # ----------------------------------------------------------------------
+# SelfExtender (v0.5.0)
+# ----------------------------------------------------------------------
+
+RECORD_SELF_EXTEND_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "record_self_extend",
+        "description": "Record the self-extension verdict: a fix prompt to inject into Claude Code.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fix_prompt": {"type": "string"},
+                "diagnosis": {"type": "string"},
+                "confidence": {"type": "string", "enum": ["high", "low"]},
+            },
+            "required": ["fix_prompt", "diagnosis", "confidence"],
+        },
+    },
+}
+
+
+def load_self_extender_prompt() -> str:
+    return SELF_EXTENDER_PROMPT_FILE.read_text(encoding="utf-8")
+
+
+def read_hook_log_tail(n_lines: int = 200) -> str:
+    """Read the last N lines of the dispatch-loop.log."""
+    if not LOG_FILE.exists():
+        return "(no log file)"
+    try:
+        code, out, _ = run(["tail", "-n", str(n_lines), str(LOG_FILE)], timeout=5)
+        return out if code == 0 else "(log read failed)"
+    except Exception:
+        return "(log read error)"
+
+
+def build_self_extender_message(
+    *,
+    failure_reason: str,
+    session_id: str,
+    cwd: str,
+    branch: str,
+    recent_turns: list[dict[str, Any]],
+    commits: list[dict[str, str]],
+    recent_files_changed: list[str],
+    principles_text: str,
+    hook_log_tail: str,
+) -> str:
+    lines: list[str] = []
+    lines.append("# Failure context")
+    lines.append(f"failure_reason: {failure_reason}")
+    lines.append(f"session: {session_id}")
+    lines.append(f"cwd: {cwd}")
+    lines.append(f"branch: {branch}")
+    lines.append("")
+    lines.append("# Recent commits on this branch")
+    if not commits:
+        lines.append("(none)")
+    else:
+        for c in commits:
+            lines.append(f"- {c['sha'][:8]} {c['subject']}")
+    lines.append("")
+    lines.append("# Recent files changed (git diff --stat main..HEAD)")
+    if not recent_files_changed:
+        lines.append("(none)")
+    else:
+        for fl in recent_files_changed:
+            lines.append(fl)
+    lines.append("")
+    lines.append("# Recent transcript turns")
+    if not recent_turns:
+        lines.append("(no events)")
+    else:
+        for t in recent_turns[-10:]:
+            role = t.get("role", "?")
+            text = (t.get("text") or "")[:240]
+            lines.append(f"[{t.get('ts', '')}] {role}: {text}")
+    lines.append("")
+    lines.append("# dispatch-loop.log (last 200 lines)")
+    lines.append(hook_log_tail)
+    lines.append("")
+    lines.append("# PRINCIPLES.md")
+    lines.append(principles_text)
+    lines.append("")
+    lines.append("# Task")
+    lines.append("Call `record_self_extend` exactly once. Diagnose the failure and produce a fix prompt.")
+    return "\n".join(lines)
+
+
+def call_self_extender(
+    *,
+    key: str,
+    cfg: dict[str, Any],
+    system_prompt: str,
+    user_message: str,
+) -> dict[str, Any] | None:
+    """Call DeepSeek with the SelfExtender prompt. Same mechanics as
+    call_dispatcher but uses the record_self_extend tool."""
+    body = {
+        "model": cfg["deepseek_model"],
+        "max_tokens": 8192,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "tools": [RECORD_SELF_EXTEND_TOOL],
+        "tool_choice": {"type": "function", "function": {"name": "record_self_extend"}},
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        cfg["deepseek_url"],
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg["deepseek_timeout_s"]) as resp:
+            raw = resp.read().decode("utf-8")
+    except Exception as e:
+        log(f"self_extender_call_error error={e}")
+        return None
+    return _parse_self_extender_response(raw)
+
+
+def _parse_self_extender_response(raw: str) -> dict[str, Any] | None:
+    """Parse the SelfExtender response."""
+    try:
+        obj = json.loads(raw)
+    except Exception as e:
+        log(f"self_extender_parse_error error={e}")
+        return None
+    try:
+        choice = (obj.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            return None
+        args_raw = tool_calls[0].get("function", {}).get("arguments", "")
+        return json.loads(args_raw)
+    except Exception as e:
+        log(f"self_extender_parse_error error={e}")
+        return None
+
+
+def detect_stuck_patterns(last_text: str) -> str | None:
+    """Check if the worker's last text contains stuck-signal phrases.
+    Returns the matched phrase or None."""
+    if not last_text:
+        return None
+    lower = last_text.lower()
+    stuck_phrases = [
+        "would normally ask",
+        "needs a values call",
+        "principles doesn't cover",
+        "no work needed",
+        "already shipped",
+        "already done",
+    ]
+    for p in stuck_phrases:
+        if p in lower:
+            return p
+    return None
+
+
+def try_self_extend(
+    *,
+    failure_reason: str,
+    key: str,
+    cfg: dict[str, Any],
+    session_id: str,
+    cwd: str,
+    branch: str,
+    recent_turns: list[dict[str, Any]],
+    commits: list[dict[str, str]],
+    recent_files_changed: list[str],
+    principles_text: str,
+    state: dict[str, Any],
+    state_all: dict[str, Any],
+) -> None:
+    """Invoke the SelfExtender. On high-confidence result, emit_block.
+    On low-confidence, retry once with escalation. If still low, inject
+    an investigation prompt. Never silent_exit — the loop stays alive."""
+    log(f"SELF_EXTEND_START reason={failure_reason}")
+
+    try:
+        se_prompt = load_self_extender_prompt()
+    except Exception as e:
+        log(f"self_extender_prompt_load_error error={e}")
+        silent_exit("no_self_extender_prompt")
+
+    hook_log = read_hook_log_tail(200)
+
+    user_msg = build_self_extender_message(
+        failure_reason=failure_reason,
+        session_id=session_id,
+        cwd=cwd,
+        branch=branch,
+        recent_turns=recent_turns,
+        commits=commits,
+        recent_files_changed=recent_files_changed,
+        principles_text=principles_text,
+        hook_log_tail=hook_log,
+    )
+
+    result = call_self_extender(key=key, cfg=cfg, system_prompt=se_prompt, user_message=user_msg)
+
+    if result and (result.get("confidence") or "").lower() == "high" and result.get("fix_prompt"):
+        fix_prompt = result["fix_prompt"]
+        diagnosis = result.get("diagnosis", "")
+        # Validate: never allow issue-filing in the fix prompt
+        if "gh issue create" in fix_prompt.lower() or "filed as issue" in fix_prompt.lower():
+            log(f"SELF_EXTEND_BLOCKED reason=fix_prompt_contains_issue_filing")
+            fix_prompt = fix_prompt  # still use it but log the violation
+        log(f"SELF_EXTEND_HIGH diagnosis=\"{diagnosis[:120]}\"")
+        state["consecutive_low"] = 0
+        put_session_state(state_all, session_id, state)
+        save_state(state_all)
+        prefixed = (
+            f"[dispatch-loop-hook v0.5.0 — SelfExtender auto-fix; "
+            f"failure: {failure_reason}; diagnosis: {diagnosis.strip()[:200]}]\n\n"
+            f"{fix_prompt.strip()}"
+        )
+        emit_block(prefixed)
+
+    # First attempt returned low or None — retry with escalation
+    log("SELF_EXTEND_RETRY reason=first_call_low_or_none")
+    escalation_msg = (
+        user_msg + "\n\n# ESCALATION\n"
+        "You returned low confidence on the first call. Identify the smallest "
+        "incremental fix that would unblock progress, even if it's not the "
+        "complete fix. Ship that. If you can see any code to read or any test "
+        "to run that would clarify the situation, produce a prompt that does "
+        "that and writes findings to trial-notes.md."
+    )
+    result2 = call_self_extender(key=key, cfg=cfg, system_prompt=se_prompt, user_message=escalation_msg)
+
+    if result2 and result2.get("fix_prompt"):
+        fix_prompt = result2["fix_prompt"]
+        diagnosis = result2.get("diagnosis", "")
+        log(f"SELF_EXTEND_RETRY_OK diagnosis=\"{diagnosis[:120]}\"")
+        state["consecutive_low"] = 0
+        put_session_state(state_all, session_id, state)
+        save_state(state_all)
+        prefixed = (
+            f"[dispatch-loop-hook v0.5.0 — SelfExtender retry; "
+            f"failure: {failure_reason}; diagnosis: {diagnosis.strip()[:200]}]\n\n"
+            f"{fix_prompt.strip()}"
+        )
+        emit_block(prefixed)
+
+    # Both calls failed — inject investigation prompt as last resort
+    log("SELF_EXTEND_FALLBACK reason=both_calls_failed")
+    state["consecutive_low"] = 0  # reset to prevent infinite loop
+    put_session_state(state_all, session_id, state)
+    save_state(state_all)
+    fallback = (
+        "[dispatch-loop-hook v0.5.0 — SelfExtender fallback; "
+        f"failure: {failure_reason}; both SelfExtender calls failed]\n\n"
+        "Investigate the dispatch failure. Read:\n"
+        "  1. ~/.claude/hooks/dispatch-loop.log (last 50 lines)\n"
+        "  2. git log --oneline -10\n"
+        "  3. git diff --stat main..HEAD\n"
+        "Write findings + a hypothesis to trial-notes.md on this branch. "
+        "Then propose the smallest fix that would unblock the dispatch loop."
+    )
+    emit_block(fallback)
+
+
+# ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 
@@ -618,12 +891,8 @@ def main() -> None:
         save_state(state_all)
         silent_exit("hard_stop_four_hours")
 
-    if state.get("consecutive_low", 0) >= cfg["max_consecutive_low"]:
-        state["stopped"] = True
-        state["stop_reason"] = "three_consecutive_low_confidence"
-        put_session_state(state_all, session_id, state)
-        save_state(state_all)
-        silent_exit("hard_stop_three_lows")
+    # v0.5.0: consecutive lows trigger SelfExtender instead of hard stop.
+    # SelfExtender resets consecutive_low on success, keeping the loop alive.
 
     if state.get("total_dispatches", 0) >= cfg["max_total_dispatches"]:
         state["stopped"] = True
@@ -696,12 +965,21 @@ def main() -> None:
     # Update state regardless of result, then act.
     state["total_dispatches"] = state.get("total_dispatches", 0) + 1
 
+    # v0.5.0: common kwargs for SelfExtender invocation.
+    se_kwargs = dict(
+        key=key, cfg=cfg, session_id=session_id, cwd=cwd, branch=branch,
+        recent_turns=recent_turns, commits=commits, recent_files_changed=diff_stat,
+        principles_text=principles_text, state=state, state_all=state_all,
+    )
+
     if not result:
-        # Dispatcher errored — count as a low for §12.5 #3.
+        # Dispatcher errored — v0.5.0: SelfExtender instead of silent_exit.
         state["consecutive_low"] = state.get("consecutive_low", 0) + 1
         put_session_state(state_all, session_id, state)
         save_state(state_all)
-        silent_exit("dispatcher_returned_none")
+        try_self_extend(failure_reason="dispatcher_returned_none", **se_kwargs)
+        # try_self_extend calls emit_block or silent_exit; if we reach here, something went wrong
+        silent_exit("self_extend_unreachable")
 
     confidence = (result.get("confidence") or "low").lower()
     selected_path = result.get("selected_path", "")
@@ -730,7 +1008,7 @@ def main() -> None:
         # the hook (not from Mohammed). The autonomous opener tone is
         # already inside `proposal`; the prefix just labels the source.
         prefixed = (
-            "[dispatch-loop-hook v0.4.1 — auto-dispatched by Stop hook; "
+            "[dispatch-loop-hook v0.5.0 — auto-dispatched by Stop hook; "
             f"justification: {justification.strip()}]\n\n{proposal.strip()}"
         )
         emit_block(prefixed)
@@ -738,7 +1016,12 @@ def main() -> None:
         state["consecutive_low"] = state.get("consecutive_low", 0) + 1
         put_session_state(state_all, session_id, state)
         save_state(state_all)
-        silent_exit(f"non_high_confidence confidence={confidence} path={selected_path}")
+        # v0.5.0: SelfExtender on non-high confidence instead of silent_exit.
+        try_self_extend(
+            failure_reason=f"non_high_confidence confidence={confidence} path={selected_path}",
+            **se_kwargs,
+        )
+        silent_exit("self_extend_unreachable")
 
 
 if __name__ == "__main__":
