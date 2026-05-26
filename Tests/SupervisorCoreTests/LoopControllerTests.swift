@@ -30,14 +30,16 @@ final class LoopControllerTests: XCTestCase {
     private func makeController(
         clock: ClockHolder,
         consecutiveLowThreshold: Int = LoopController.defaultConsecutiveLowThreshold,
-        maxLoopDuration: TimeInterval = LoopController.defaultMaxLoopDuration
+        maxLoopDuration: TimeInterval = LoopController.defaultMaxLoopDuration,
+        loopStore: LoopDispatchStore? = nil
     ) -> LoopController {
         LoopController(
             maxLoopDuration: maxLoopDuration,
             consecutiveLowThreshold: consecutiveLowThreshold,
             now: { clock.now },
             trace: TraceLog(path: FileManager.default.temporaryDirectory
-                .appendingPathComponent("loop-tests-\(UUID().uuidString).log"))
+                .appendingPathComponent("loop-tests-\(UUID().uuidString).log")),
+            loopStore: loopStore
         )
     }
 
@@ -216,6 +218,63 @@ final class LoopControllerTests: XCTestCase {
         XCTAssertNil(err.confidence)
         XCTAssertNil(err.selectedPath)
         XCTAssertEqual(err.justification, "Haiku 503")
+    }
+
+    func testSeedOnRestartPicksUpTotalFromStore() async throws {
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("loop-seed-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+        let db = try SupervisorDatabase(path: tmpURL)
+        let store = LoopDispatchStore(database: db)
+
+        // Insert a session row (FK) and 5 dispatch rows.
+        let session = StoredSession(
+            id: "s-seed",
+            projectHash: "-tmp",
+            cwd: "/tmp",
+            startedAt: Date(),
+            lastSeenAt: Date(),
+            jsonlPath: "/tmp/x.jsonl"
+        )
+        try await db.queue.write { conn in try session.insert(conn) }
+        for i in 0..<5 {
+            try store.insert(StoredLoopDispatch(
+                sessionId: "s-seed",
+                ts: Date().addingTimeInterval(Double(i)),
+                responseShape: "ready",
+                confidence: "high",
+                selectedPath: "continue_branch",
+                taskProposalHead: "dispatch \(i)"
+            ))
+        }
+
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock, loopStore: store)
+
+        let decision = await lc.canDispatch(sessionId: "s-seed")
+        guard case let .proceed(prior) = decision else {
+            return XCTFail("expected .proceed, got \(decision)")
+        }
+        XCTAssertEqual(prior, 5,
+                       "seeded controller must report 5 prior dispatches from store")
+    }
+
+    func testUnstoredSessionReturnZeroEvenWithStore() async throws {
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("loop-noseed-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+        let db = try SupervisorDatabase(path: tmpURL)
+        let store = LoopDispatchStore(database: db)
+
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock, loopStore: store)
+
+        let decision = await lc.canDispatch(sessionId: "s-new")
+        guard case let .proceed(prior) = decision else {
+            return XCTFail("expected .proceed, got \(decision)")
+        }
+        XCTAssertEqual(prior, 0,
+                       "session with no store rows must report zero")
     }
 
     /// Loop_dispatches table actually exists after migration v3 — a

@@ -104,17 +104,26 @@ public actor LoopController {
     private let consecutiveLowThreshold: Int
     private let trace: TraceLog
     private let now: @Sendable () -> Date
+    private let seedCount: ((String) -> Int)?
 
     public init(
         maxLoopDuration: TimeInterval = LoopController.defaultMaxLoopDuration,
         consecutiveLowThreshold: Int = LoopController.defaultConsecutiveLowThreshold,
         now: @escaping @Sendable () -> Date = { Date() },
-        trace: TraceLog = .shared
+        trace: TraceLog = .shared,
+        loopStore: LoopDispatchStore? = nil
     ) {
         self.maxLoopDuration = maxLoopDuration
         self.consecutiveLowThreshold = consecutiveLowThreshold
         self.trace = trace
         self.now = now
+        if let store = loopStore {
+            self.seedCount = { sessionId in
+                (try? store.count(sessionId: sessionId)) ?? 0
+            }
+        } else {
+            self.seedCount = nil
+        }
     }
 
     // MARK: - Engine-facing API
@@ -130,15 +139,24 @@ public actor LoopController {
     /// know when the human started the worker.
     public func canDispatch(sessionId: String) -> LoopDecision {
         let nowTs = now()
-        var state = sessions[sessionId] ?? SessionState(
-            loopStartedAt: nowTs,
-            consecutiveLowCount: 0,
-            totalDispatches: 0,
-            paused: false,
-            pauseReason: nil,
-            stopped: false,
-            stopReason: nil
-        )
+        var state: SessionState
+        if let existing = sessions[sessionId] {
+            state = existing
+        } else {
+            let seeded = seedCount?(sessionId) ?? 0
+            state = SessionState(
+                loopStartedAt: nowTs,
+                consecutiveLowCount: 0,
+                totalDispatches: seeded,
+                paused: false,
+                pauseReason: nil,
+                stopped: false,
+                stopReason: nil
+            )
+            if seeded > 0 {
+                trace.emit("loop", "SEEDED session=\(sessionId) totalDispatches=\(seeded) from store")
+            }
+        }
 
         // .stopped sticks. Check it before anything else.
         if state.stopped {
@@ -180,7 +198,7 @@ public actor LoopController {
         var state = sessions[sessionId] ?? SessionState(
             loopStartedAt: nowTs,
             consecutiveLowCount: 0,
-            totalDispatches: 0,
+            totalDispatches: seedCount?(sessionId) ?? 0,
             paused: false,
             pauseReason: nil,
             stopped: false,
@@ -223,7 +241,7 @@ public actor LoopController {
         var state = sessions[sessionId] ?? SessionState(
             loopStartedAt: now(),
             consecutiveLowCount: 0,
-            totalDispatches: 0,
+            totalDispatches: seedCount?(sessionId) ?? 0,
             paused: false,
             pauseReason: nil,
             stopped: false,
@@ -256,7 +274,7 @@ public actor LoopController {
         var state = sessions[sessionId] ?? SessionState(
             loopStartedAt: now(),
             consecutiveLowCount: 0,
-            totalDispatches: 0,
+            totalDispatches: seedCount?(sessionId) ?? 0,
             paused: false,
             pauseReason: nil,
             stopped: false,
