@@ -114,6 +114,20 @@ of AX permissions and is active on this branch.
 
 ### Fixed
 
+**Issue #9 — inject tab targeting** (`Injector.swift`,
+`InterventionRouter.swift`, `TriageEngine.swift`)
+- `Injector.inject()` gains `targetWindowTitle: String?`. When
+  non-nil, `CGEventInjector` uses AXUIElement to enumerate the
+  hosting app's windows (`kAXWindowsAttribute`), find the one whose
+  title contains the target substring, and raise it
+  (`kAXRaiseAction`) before posting keystrokes. Falls back to the
+  frontmost window when nil or when no title matches.
+- `TriageDecision` gains `branch: String?`, populated from the
+  engine's `sessionBranch` cache. The router passes it as the
+  window title hint on both `.inject` and `.continue` paths.
+- 2 tests in `ContinueInterventionTests`: branch flows to
+  injector as `targetWindowTitle`; nil branch passes nil.
+
 **Issue #7 — bash cross-category isolation** (`HardcodedRubric.swift`,
 `TriagePrompt.swift`)
 - The bash triage path's system prompt now includes only the three
