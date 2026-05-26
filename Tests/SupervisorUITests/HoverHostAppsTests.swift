@@ -1,6 +1,6 @@
 // HoverHostAppsTests.swift — v0.1.6.1.
 //
-// Regression coverage for `HoverWindowController.claudeCodeHostApps`:
+// Regression coverage for `HoverWindowController.defaultHostApps`:
 // the set of bundle IDs that count as "Claude Code might be running here,
 // show the hover if a session is active."
 //
@@ -11,6 +11,7 @@
 // the wrong answer for a bundle ID, hover behavior breaks.
 
 import XCTest
+@testable import SupervisorCore
 @testable import SupervisorUI
 
 @MainActor
@@ -29,7 +30,7 @@ final class HoverHostAppsTests: XCTestCase {
         ]
         for id in expected {
             XCTAssertTrue(
-                HoverWindowController.claudeCodeHostApps.contains(id),
+                HoverWindowController.defaultHostApps.contains(id),
                 "\(id) must remain in claudeCodeHostApps — removing it breaks the hover for users on that terminal"
             )
         }
@@ -40,7 +41,7 @@ final class HoverHostAppsTests: XCTestCase {
     /// way they would in a terminal.
     func testClaudeDesktopBundleIDIsPresent() {
         XCTAssertTrue(
-            HoverWindowController.claudeCodeHostApps.contains("com.anthropic.claudefordesktop"),
+            HoverWindowController.defaultHostApps.contains("com.anthropic.claudefordesktop"),
             "com.anthropic.claudefordesktop must be in claudeCodeHostApps as of v0.1.6.1"
         )
     }
@@ -52,7 +53,7 @@ final class HoverHostAppsTests: XCTestCase {
     /// a function) gets caught here, not in the field.
     func testPredicateReturnsTrueForClaudeDesktop() {
         let bundleID: String? = "com.anthropic.claudefordesktop"
-        let isHost = bundleID.map(HoverWindowController.claudeCodeHostApps.contains) ?? false
+        let isHost = bundleID.map(HoverWindowController.defaultHostApps.contains) ?? false
         XCTAssertTrue(isHost,
                       "the visibility predicate must return true for the Claude desktop bundle ID")
     }
@@ -62,7 +63,7 @@ final class HoverHostAppsTests: XCTestCase {
     /// accidentally short-circuits the predicate to always-true.
     func testPredicateReturnsFalseForUnrelatedApp() {
         let bundleID: String? = "com.apple.Safari"
-        let isHost = bundleID.map(HoverWindowController.claudeCodeHostApps.contains) ?? false
+        let isHost = bundleID.map(HoverWindowController.defaultHostApps.contains) ?? false
         XCTAssertFalse(isHost,
                        "Safari is not a Claude Code host app; predicate must return false")
     }
@@ -72,8 +73,42 @@ final class HoverHostAppsTests: XCTestCase {
     /// `false`, not crash and not show the hover.
     func testPredicateReturnsFalseForNilBundleID() {
         let bundleID: String? = nil
-        let isHost = bundleID.map(HoverWindowController.claudeCodeHostApps.contains) ?? false
+        let isHost = bundleID.map(HoverWindowController.defaultHostApps.contains) ?? false
         XCTAssertFalse(isHost,
                        "nil bundle ID must collapse to false (hover hidden), not crash")
+    }
+
+    /// Issue #3: user-configured additional host apps are merged with
+    /// defaults at init time.
+    func testAdditionalHostAppsMergedAtInit() {
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("hover-test-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(bus: bus, trace: trace)
+        let controller = HoverWindowController(
+            vm: vm,
+            additionalHostApps: ["com.microsoft.VSCode"]
+        )
+        XCTAssertTrue(controller.claudeCodeHostApps.contains("com.microsoft.VSCode"),
+                      "user-added bundle ID must appear in claudeCodeHostApps")
+        XCTAssertTrue(controller.claudeCodeHostApps.contains("com.apple.Terminal"),
+                      "defaults must be preserved after merge")
+    }
+
+    /// Issue #3: mergeUserConfig updates the live set and preserves defaults.
+    func testMergeUserConfigUpdatesLiveSet() {
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("hover-test-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(bus: bus, trace: trace)
+        let controller = HoverWindowController(vm: vm)
+        XCTAssertFalse(controller.claudeCodeHostApps.contains("com.jetbrains.intellij"))
+
+        controller.mergeUserConfig(additionalHostApps: ["com.jetbrains.intellij"])
+
+        XCTAssertTrue(controller.claudeCodeHostApps.contains("com.jetbrains.intellij"),
+                      "live set must include the newly-merged bundle ID")
+        XCTAssertTrue(controller.claudeCodeHostApps.contains("com.apple.Terminal"),
+                      "defaults must survive the merge")
     }
 }

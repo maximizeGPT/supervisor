@@ -36,16 +36,13 @@ public final class HoverWindowController {
     /// Pixel inset from the right edge and top edge of visibleFrame.
     private static let edgeInset: CGFloat = 12
 
-    /// Apps that host a tailable Claude Code session — terminal emulators
-    /// where the `claude` CLI runs, plus the Claude desktop app which
-    /// spawns `claude` internally. Frontmost bundle IDs not in this set
-    /// are treated as non-hosting and trigger hover hide.
-    ///
-    /// Long-term path: see Issue #3 (user-configurable host-app list)
-    /// for users on emulators not in the default set — Electron-based
-    /// VS Code / Cursor integrated terminals, mosh, tmux-over-ssh on a
-    /// remote, etc. Until that ships, additions land here.
-    public static let claudeCodeHostApps: Set<String> = [
+    /// Default apps that host a tailable Claude Code session — terminal
+    /// emulators where the `claude` CLI runs, plus the Claude desktop app
+    /// which spawns `claude` internally. Users can add more via
+    /// `~/Library/Application Support/Supervisor/config.yaml` under
+    /// `hover.known_terminals` (Issue #3). The defaults here are the
+    /// floor; user entries are merged additively.
+    public static let defaultHostApps: Set<String> = [
         "com.apple.Terminal",
         "com.googlecode.iterm2",
         "com.mitchellh.ghostty",
@@ -53,6 +50,9 @@ public final class HoverWindowController {
         "org.alacritty",
         "com.anthropic.claudefordesktop",
     ]
+
+    /// Live set: defaults + user config. Updated by `mergeUserConfig`.
+    public private(set) var claudeCodeHostApps: Set<String>
 
     private let vm: HoverViewModel
     private let panel: NSPanel
@@ -64,10 +64,12 @@ public final class HoverWindowController {
 
     public init(
         vm: HoverViewModel,
-        isAnySessionActive: @escaping () -> Bool = { true }
+        isAnySessionActive: @escaping () -> Bool = { true },
+        additionalHostApps: [String] = []
     ) {
         self.vm = vm
         self.isAnySessionActive = isAnySessionActive
+        self.claudeCodeHostApps = Self.defaultHostApps.union(additionalHostApps)
 
         let panel = HoverPanel(
             contentRect: NSRect(origin: .zero, size: Self.panelSize),
@@ -94,6 +96,14 @@ public final class HoverWindowController {
         self.panel = panel
     }
 
+    /// Merge user config into the live host-apps set. Called by
+    /// ConfigWatcher on file change. Additive: defaults are always
+    /// included; user entries are unioned on top.
+    public func mergeUserConfig(additionalHostApps: [String]) {
+        claudeCodeHostApps = Self.defaultHostApps.union(additionalHostApps)
+        applyVisibility()
+    }
+
     public func present() {
         // v0.1.4 Gap 8: don't unconditionally show. Hook up the
         // visibility-deciding observer + poller, then apply once.
@@ -118,7 +128,7 @@ public final class HoverWindowController {
     /// Re-applied on every workspace activation event + on a 3s poll.
     private func applyVisibility() {
         let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        let frontmostHostsClaudeCode = frontmostBundleID.map(Self.claudeCodeHostApps.contains) ?? false
+        let frontmostHostsClaudeCode = frontmostBundleID.map(claudeCodeHostApps.contains) ?? false
         let sessionActive = isAnySessionActive()
         let shouldShow = frontmostHostsClaudeCode && sessionActive
 
