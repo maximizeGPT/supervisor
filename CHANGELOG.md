@@ -140,6 +140,26 @@ of AX permissions and is active on this branch.
   added to `HardcodedRubric`.
 - 7 tests in `PathIsolationSymmetryTests`.
 
+**v0.4.1-hook — dispatch reliability** (`dispatch_loop_hook.py`,
+`Dispatcher.swift`)
+- **JSON parse error retry**: when DeepSeek returns malformed JSON
+  (unterminated strings, truncated responses), the hook retries the
+  request once before silent-exiting. Capped at one retry — no
+  indefinite loops. Logged as `RETRY_PARSE_ERROR`.
+- **`requires_human_presence` gate**: new boolean field on
+  `record_dispatch`. When the Dispatcher's proposed task requires
+  macOS GUI interaction (launching apps, AX permission grants,
+  physical-world trials), it sets `requires_human_presence: true`.
+  The hook silent-exits with `GATE_FAIL reason=requires_human_presence`;
+  the in-app router degrades to `.notify` so the proposal surfaces
+  as a banner. Prevents the specific failure from 2026-05-25 where
+  the hook proposed a live trial an autonomous session couldn't
+  execute.
+- Prompt teaching added to both `dispatcher-system-prompt.txt` and
+  `Dispatcher.swift`'s `systemPrompt`.
+- 7 Python tests in `test_dispatch_loop_hook.py`; 3 new Swift tests
+  in `DispatcherTests.swift`.
+
 ### Known limitations
 
 - **AX-permission-revoke blocker**: CGEventPost injection requires
@@ -158,10 +178,11 @@ of AX permissions and is active on this branch.
 
 ### Tests
 
-242 pass / 5 skipped / 0 failures (was 197 in v0.3.2). The 45 new
-tests cover idle detection (6), dispatch decisions (13), loop
+245 pass / 5 skipped / 0 failures (was 197 in v0.3.2). The 48 new
+tests cover idle detection (6), dispatch decisions (16), loop
 control (10), per-path prompt isolation (12), and production
-wiring (4). All five skipped are live-API gated.
+wiring (4). Plus 7 Python tests for the hook. All five skipped
+are live-API gated.
 
 ## [0.3.2] — 2026-05-25 (process discovery hardened — Issue #1 closes)
 
