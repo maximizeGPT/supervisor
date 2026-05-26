@@ -339,5 +339,68 @@ class TestParseDispatcherResponse(unittest.TestCase):
         self.assertIn("output_tokens=487", ok_lines[0])
 
 
+class TestStopShapePhrases(unittest.TestCase):
+    """Gate-4 stop-shape detection: each phrase must fire, negatives must not."""
+
+    # -- Original 8 phrases (regression) --
+    def test_original_ready_for_next(self):
+        self.assertEqual(hook.has_stop_shape("Ready for next task."), "ready for next")
+
+    def test_original_done(self):
+        self.assertEqual(hook.has_stop_shape("I'm done with the refactor."), "done")
+
+    def test_original_complete(self):
+        self.assertEqual(hook.has_stop_shape("Migration complete."), "complete")
+
+    # -- New phrases --
+    def test_pushed(self):
+        self.assertEqual(hook.has_stop_shape("5 commits pushed."), "pushed")
+
+    def test_shipped(self):
+        self.assertEqual(hook.has_stop_shape("v0.4.2 shipped."), "shipped")
+
+    def test_blocked_on(self):
+        self.assertEqual(hook.has_stop_shape("Blocked on AX permissions."), "blocked on")
+
+    def test_open_issues_remaining(self):
+        self.assertEqual(hook.has_stop_shape("3 open issues remaining."), "open issues remaining")
+
+    def test_tests_pass(self):
+        self.assertEqual(hook.has_stop_shape("All tests pass."), "tests pass")
+
+    def test_tests_passing(self):
+        self.assertEqual(hook.has_stop_shape("Tests passing on CI."), "tests passing")
+
+    def test_no_further_action(self):
+        self.assertEqual(hook.has_stop_shape("No further action needed."), "no further action")
+
+    def test_no_remaining(self):
+        self.assertEqual(hook.has_stop_shape("No remaining work on this branch."), "no remaining")
+
+    def test_session_summary(self):
+        self.assertEqual(hook.has_stop_shape("Session summary: 4 issues closed."), "session summary")
+
+    # -- Negative cases --
+    def test_tests_alone_does_not_fire(self):
+        self.assertIsNone(hook.has_stop_shape("I ran the tests and found failures."))
+
+    def test_push_without_ed_does_not_fire(self):
+        # "push" is not "pushed"
+        self.assertIsNone(hook.has_stop_shape("Let me push the changes next."))
+
+    def test_block_without_on_does_not_fire(self):
+        # "blocked" alone is not "blocked on"
+        self.assertIsNone(hook.has_stop_shape("The PR was blocked by review."))
+
+    def test_empty_string(self):
+        self.assertIsNone(hook.has_stop_shape(""))
+
+    def test_none_input(self):
+        self.assertIsNone(hook.has_stop_shape(None))
+
+    def test_case_insensitive(self):
+        self.assertEqual(hook.has_stop_shape("ALL TESTS PASS ON MAIN"), "tests pass")
+
+
 if __name__ == "__main__":
     unittest.main()

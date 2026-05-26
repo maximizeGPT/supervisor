@@ -89,6 +89,15 @@ STOP_SHAPE_PHRASES = [
     "all done",
     "complete",
     "done",
+    "pushed",
+    "shipped",
+    "blocked on",
+    "open issues remaining",
+    "tests passing",
+    "tests pass",
+    "no further action",
+    "no remaining",
+    "session summary",
 ]
 
 

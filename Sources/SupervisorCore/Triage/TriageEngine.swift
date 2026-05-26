@@ -385,6 +385,15 @@ public final class TriageEngine {
             "all done",
             "complete",
             "done",
+            "pushed",
+            "shipped",
+            "blocked on",
+            "open issues remaining",
+            "tests passing",
+            "tests pass",
+            "no further action",
+            "no remaining",
+            "session summary",
         ]
         for p in phrases where lower.contains(p) {
             return p

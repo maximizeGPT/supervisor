@@ -440,3 +440,66 @@ private final class TriageMockURLProtocol: URLProtocol {
     }
     override func stopLoading() {}
 }
+
+// MARK: - detectStopShape unit tests
+
+@MainActor
+final class DetectStopShapeTests: XCTestCase {
+
+    // -- Original phrases (regression) --
+    func testOriginalReadyForNext() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "Ready for next task."), "ready for next")
+    }
+    func testOriginalDone() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "I'm done with the refactor."), "done")
+    }
+    func testOriginalComplete() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "Migration complete."), "complete")
+    }
+
+    // -- New phrases --
+    func testPushed() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "5 commits pushed."), "pushed")
+    }
+    func testShipped() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "v0.4.2 shipped."), "shipped")
+    }
+    func testBlockedOn() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "Blocked on AX permissions."), "blocked on")
+    }
+    func testOpenIssuesRemaining() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "3 open issues remaining."), "open issues remaining")
+    }
+    func testTestsPass() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "All tests pass."), "tests pass")
+    }
+    func testTestsPassing() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "Tests passing on CI."), "tests passing")
+    }
+    func testNoFurtherAction() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "No further action needed."), "no further action")
+    }
+    func testNoRemaining() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "No remaining work on this branch."), "no remaining")
+    }
+    func testSessionSummary() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "Session summary: 4 issues closed."), "session summary")
+    }
+
+    // -- Negative cases --
+    func testTestsAloneDoesNotFire() {
+        XCTAssertNil(TriageEngine.detectStopShape(in: "I ran the tests and found failures."))
+    }
+    func testPushWithoutEdDoesNotFire() {
+        XCTAssertNil(TriageEngine.detectStopShape(in: "Let me push the changes next."))
+    }
+    func testBlockWithoutOnDoesNotFire() {
+        XCTAssertNil(TriageEngine.detectStopShape(in: "The PR was blocked by review."))
+    }
+    func testEmptyString() {
+        XCTAssertNil(TriageEngine.detectStopShape(in: ""))
+    }
+    func testCaseInsensitive() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "ALL TESTS PASS ON MAIN"), "tests pass")
+    }
+}
