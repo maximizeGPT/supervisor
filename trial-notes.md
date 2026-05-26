@@ -857,3 +857,47 @@ physical-world operations to an autonomous session.
 **Filed for Mohammed**: The live trial remains the sole blocker for
 v0.4.0 tagging. The autonomous branch is code-complete.
 
+---
+
+# Task 1 -- v0.4.1-hook reliability (continuing on the same branch)
+
+Started: 2026-05-25 21:05 UTC.
+
+## Log
+
+### 1a -- JSON parse error retry (done)
+
+- Extracted `_parse_dispatcher_response` helper from `call_dispatcher`
+  for testability.
+- Added retry logic in `main()`: if first `call_dispatcher` returns
+  None, retry once with the same prompt. Logged as RETRY_PARSE_ERROR
+  with attempt number and outcome. Capped at one retry.
+
+### 1b -- requires_human_presence gate (done)
+
+- Added `requires_human_presence` boolean to `RECORD_DISPATCH_TOOL`
+  schema in both Python and Swift.
+- Added gate section to `dispatcher-system-prompt.txt` teaching the
+  model to set the flag for GUI-interaction tasks.
+- Python hook: checks `requires_human_presence` after parsing result;
+  silent-exits with GATE_FAIL reason.
+- Swift Dispatcher: added field to `DispatchResult.ready`, parser
+  reads `.bool` from tool input, defaults to false when absent.
+- Swift engine `dispatchAndRemap`: `requiresHumanPresence=true`
+  degrades to `.notify` with trace tag.
+- Updated all pattern matches on `.ready` across LoopController,
+  LoopSmokeTests, DispatcherTests, LoopControllerTests.
+
+### Tests (done)
+
+- Python: 7 tests in `test_dispatch_loop_hook.py` -- retry (2),
+  requires_human_presence gate (2), parse helper (3). All pass.
+- Swift: 3 new tests in DispatcherTests -- parser reads
+  requires_human_presence=true, defaults to false, system prompt
+  teaches the gate.
+- 245/245 Swift tests pass (was 242). 7/7 Python tests pass.
+
+### Budget decision
+
+$0 API spend. Pure code + prompt changes, no calibration sweep.
+
