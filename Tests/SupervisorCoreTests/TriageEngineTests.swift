@@ -441,89 +441,47 @@ private final class TriageMockURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
-// MARK: - detectStopShape unit tests
+// MARK: - detectWorkerStopped unit tests
 
 @MainActor
-final class DetectStopShapeTests: XCTestCase {
+final class DetectWorkerStoppedTests: XCTestCase {
 
-    // -- Original phrases (regression) --
-    func testOriginalReadyForNext() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "Ready for next task."), "ready for next")
-    }
-    func testOriginalDone() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "I'm done with the refactor."), "done")
-    }
-    func testOriginalComplete() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "Migration complete."), "complete")
-    }
+    private let now = Date()
 
-    // -- New phrases --
-    func testPushed() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "5 commits pushed."), "pushed")
-    }
-    func testShipped() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "v0.4.2 shipped."), "shipped")
-    }
-    func testBlockedOn() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "Blocked on AX permissions."), "blocked on")
-    }
-    func testOpenIssuesRemaining() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "3 open issues remaining."), "open issues remaining")
-    }
-    func testTestsPass() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "All tests pass."), "tests pass")
-    }
-    func testTestsPassing() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "Tests passing on CI."), "tests passing")
-    }
-    func testNoFurtherAction() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "No further action needed."), "no further action")
-    }
-    func testNoRemaining() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "No remaining work on this branch."), "no remaining")
-    }
-    func testSessionSummary() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "Session summary: 4 issues closed."), "session summary")
-    }
-    func testNoWorkNeeded() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "No work needed here."), "no work needed")
-    }
-    func testAlreadyShipped() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "That feature was already shipped."), "already shipped")
-    }
-    func testAlreadyDone() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "The migration is already done."), "already done")
-    }
-    func testAllTestsGreen() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "All tests green after the fix."), "all tests green")
-    }
-    func testTestsGreen() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "Tests green on CI."), "tests green")
-    }
-    func testHallucinated() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "The dispatcher hallucinated an asymmetry."), "hallucinated")
-    }
-    func testDoesntExist() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "The gap doesn't exist in the codebase."), "doesn't exist")
-    }
-    func testNoAsymmetry() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "There is no asymmetry to fix."), "no asymmetry")
+    func testGatePassesWhenAssistantEndsWithTextOnly() {
+        let events: [SupervisorEvent] = [
+            .userPrompt(.init(sessionId: "s1", text: "do the thing", ts: now)),
+            .assistantText(.init(sessionId: "s1", text: "All tests pass. Pushed.", turnUUID: "u1", ts: now)),
+        ]
+        XCTAssertTrue(TriageEngine.detectWorkerStopped(in: events))
     }
 
-    // -- Negative cases --
-    func testTestsAloneDoesNotFire() {
-        XCTAssertNil(TriageEngine.detectStopShape(in: "I ran the tests and found failures."))
+    func testGateBlocksWhenAssistantEndsWithToolUse() {
+        let events: [SupervisorEvent] = [
+            .userPrompt(.init(sessionId: "s1", text: "do the thing", ts: now)),
+            .assistantText(.init(sessionId: "s1", text: "Running tests now.", turnUUID: "u1", ts: now)),
+            .bashToolCall(.init(sessionId: "s1", command: "swift test", description: nil, toolUseId: "t1", turnUUID: "u1", ts: now)),
+        ]
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: events))
     }
-    func testPushWithoutEdDoesNotFire() {
-        XCTAssertNil(TriageEngine.detectStopShape(in: "Let me push the changes next."))
+
+    func testGateBlocksWhenLastBlockIsToolUseAfterText() {
+        let events: [SupervisorEvent] = [
+            .assistantText(.init(sessionId: "s1", text: "Let me check.", turnUUID: "u1", ts: now)),
+            .assistantText(.init(sessionId: "s1", text: "Looking at the file.", turnUUID: "u2", ts: now)),
+            .bashToolCall(.init(sessionId: "s1", command: "cat /tmp/x", description: nil, toolUseId: "t2", turnUUID: "u2", ts: now)),
+        ]
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: events))
     }
-    func testBlockWithoutOnDoesNotFire() {
-        XCTAssertNil(TriageEngine.detectStopShape(in: "The PR was blocked by review."))
+
+    func testGateHandlesEmptyWindowGracefully() {
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: []))
     }
-    func testEmptyString() {
-        XCTAssertNil(TriageEngine.detectStopShape(in: ""))
-    }
-    func testCaseInsensitive() {
-        XCTAssertEqual(TriageEngine.detectStopShape(in: "ALL TESTS PASS ON MAIN"), "tests pass")
+
+    func testGateHandlesNoAssistantMessagesGracefully() {
+        let events: [SupervisorEvent] = [
+            .userPrompt(.init(sessionId: "s1", text: "hello", ts: now)),
+        ]
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: events))
     }
 }

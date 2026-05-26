@@ -11,6 +11,7 @@ Covers:
 """
 
 import json
+import os
 import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
@@ -45,9 +46,11 @@ class TestParseRetry(unittest.TestCase):
              patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
+             patch.object(hook, 'detect_worker_stopped', return_value=True), \
              patch.object(hook, 'read_recent_turns', return_value=[
                  {"role": "assistant", "text": "All done. Ready for next task.", "ts": ""}
              ]), \
+             patch.object(hook, 'fetch_diff_stat', return_value=[]), \
              patch.object(hook, 'current_branch', return_value="autonomous-test"), \
              patch.object(hook, 'fetch_issues', return_value=[]), \
              patch.object(hook, 'fetch_commits', return_value=[]), \
@@ -91,9 +94,11 @@ class TestParseRetry(unittest.TestCase):
              patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
+             patch.object(hook, 'detect_worker_stopped', return_value=True), \
              patch.object(hook, 'read_recent_turns', return_value=[
                  {"role": "assistant", "text": "All done.", "ts": ""}
              ]), \
+             patch.object(hook, 'fetch_diff_stat', return_value=[]), \
              patch.object(hook, 'current_branch', return_value="autonomous-test"), \
              patch.object(hook, 'fetch_issues', return_value=[]), \
              patch.object(hook, 'fetch_commits', return_value=[]), \
@@ -140,9 +145,11 @@ class TestRequiresHumanPresenceGate(unittest.TestCase):
              patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
+             patch.object(hook, 'detect_worker_stopped', return_value=True), \
              patch.object(hook, 'read_recent_turns', return_value=[
                  {"role": "assistant", "text": "All done.", "ts": ""}
              ]), \
+             patch.object(hook, 'fetch_diff_stat', return_value=[]), \
              patch.object(hook, 'current_branch', return_value="autonomous-test"), \
              patch.object(hook, 'fetch_issues', return_value=[]), \
              patch.object(hook, 'fetch_commits', return_value=[]), \
@@ -181,9 +188,11 @@ class TestRequiresHumanPresenceGate(unittest.TestCase):
              patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
+             patch.object(hook, 'detect_worker_stopped', return_value=True), \
              patch.object(hook, 'read_recent_turns', return_value=[
                  {"role": "assistant", "text": "All done.", "ts": ""}
              ]), \
+             patch.object(hook, 'fetch_diff_stat', return_value=[]), \
              patch.object(hook, 'current_branch', return_value="autonomous-test"), \
              patch.object(hook, 'fetch_issues', return_value=[]), \
              patch.object(hook, 'fetch_commits', return_value=[]), \
@@ -422,91 +431,64 @@ class TestSystemPromptContainsDiffStatGuidance(unittest.TestCase):
         self.assertIn("Before inferring partial completion", prompt)
 
 
-class TestStopShapePhrases(unittest.TestCase):
-    """Gate-4 stop-shape detection: each phrase must fire, negatives must not."""
+class TestDetectWorkerStopped(unittest.TestCase):
+    """Gate 4 replacement: detect worker stopped via absence of tool_use blocks."""
 
-    # -- Original 8 phrases (regression) --
-    def test_original_ready_for_next(self):
-        self.assertEqual(hook.has_stop_shape("Ready for next task."), "ready for next")
+    def _write_jsonl(self, lines: list[dict]) -> str:
+        import tempfile
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+        for obj in lines:
+            f.write(json.dumps(obj) + "\n")
+        f.close()
+        return f.name
 
-    def test_original_done(self):
-        self.assertEqual(hook.has_stop_shape("I'm done with the refactor."), "done")
+    def test_gate_passes_when_assistant_ends_with_text_only(self):
+        path = self._write_jsonl([
+            {"type": "user", "message": {"content": "do the thing"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "All tests pass. Pushed."}
+            ]}},
+        ])
+        self.assertTrue(hook.detect_worker_stopped(path))
+        os.unlink(path)
 
-    def test_original_complete(self):
-        self.assertEqual(hook.has_stop_shape("Migration complete."), "complete")
+    def test_gate_blocks_when_assistant_ends_with_tool_use(self):
+        path = self._write_jsonl([
+            {"type": "user", "message": {"content": "do the thing"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Running tests now."},
+                {"type": "tool_use", "name": "Bash", "id": "t1", "input": {"command": "swift test"}},
+            ]}},
+        ])
+        self.assertFalse(hook.detect_worker_stopped(path))
+        os.unlink(path)
 
-    # -- New phrases --
-    def test_pushed(self):
-        self.assertEqual(hook.has_stop_shape("5 commits pushed."), "pushed")
+    def test_gate_blocks_when_last_block_is_tool_use_after_text(self):
+        path = self._write_jsonl([
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Let me check that."},
+            ]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Looking at the file."},
+                {"type": "tool_use", "name": "Read", "id": "t2", "input": {"file_path": "/tmp/x"}},
+            ]}},
+        ])
+        self.assertFalse(hook.detect_worker_stopped(path))
+        os.unlink(path)
 
-    def test_shipped(self):
-        self.assertEqual(hook.has_stop_shape("v0.4.2 shipped."), "shipped")
+    def test_gate_handles_empty_transcript_gracefully(self):
+        import tempfile
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+        f.close()
+        self.assertFalse(hook.detect_worker_stopped(f.name))
+        os.unlink(f.name)
 
-    def test_blocked_on(self):
-        self.assertEqual(hook.has_stop_shape("Blocked on AX permissions."), "blocked on")
-
-    def test_open_issues_remaining(self):
-        self.assertEqual(hook.has_stop_shape("3 open issues remaining."), "open issues remaining")
-
-    def test_tests_pass(self):
-        self.assertEqual(hook.has_stop_shape("All tests pass."), "tests pass")
-
-    def test_tests_passing(self):
-        self.assertEqual(hook.has_stop_shape("Tests passing on CI."), "tests passing")
-
-    def test_no_further_action(self):
-        self.assertEqual(hook.has_stop_shape("No further action needed."), "no further action")
-
-    def test_no_remaining(self):
-        self.assertEqual(hook.has_stop_shape("No remaining work on this branch."), "no remaining")
-
-    def test_session_summary(self):
-        self.assertEqual(hook.has_stop_shape("Session summary: 4 issues closed."), "session summary")
-
-    def test_no_work_needed(self):
-        self.assertEqual(hook.has_stop_shape("No work needed here."), "no work needed")
-
-    def test_already_shipped(self):
-        self.assertEqual(hook.has_stop_shape("That feature was already shipped."), "already shipped")
-
-    def test_already_done(self):
-        self.assertEqual(hook.has_stop_shape("The migration is already done."), "already done")
-
-    def test_all_tests_green(self):
-        self.assertEqual(hook.has_stop_shape("All tests green after the fix."), "all tests green")
-
-    def test_tests_green(self):
-        self.assertEqual(hook.has_stop_shape("Tests green on CI."), "tests green")
-
-    def test_hallucinated(self):
-        self.assertEqual(hook.has_stop_shape("The dispatcher hallucinated an asymmetry."), "hallucinated")
-
-    def test_doesnt_exist(self):
-        self.assertEqual(hook.has_stop_shape("The gap doesn't exist in the codebase."), "doesn't exist")
-
-    def test_no_asymmetry(self):
-        self.assertEqual(hook.has_stop_shape("There is no asymmetry to fix."), "no asymmetry")
-
-    # -- Negative cases --
-    def test_tests_alone_does_not_fire(self):
-        self.assertIsNone(hook.has_stop_shape("I ran the tests and found failures."))
-
-    def test_push_without_ed_does_not_fire(self):
-        # "push" is not "pushed"
-        self.assertIsNone(hook.has_stop_shape("Let me push the changes next."))
-
-    def test_block_without_on_does_not_fire(self):
-        # "blocked" alone is not "blocked on"
-        self.assertIsNone(hook.has_stop_shape("The PR was blocked by review."))
-
-    def test_empty_string(self):
-        self.assertIsNone(hook.has_stop_shape(""))
-
-    def test_none_input(self):
-        self.assertIsNone(hook.has_stop_shape(None))
-
-    def test_case_insensitive(self):
-        self.assertEqual(hook.has_stop_shape("ALL TESTS PASS ON MAIN"), "tests pass")
+    def test_gate_handles_no_assistant_messages_gracefully(self):
+        path = self._write_jsonl([
+            {"type": "user", "message": {"content": "hello"}},
+        ])
+        self.assertFalse(hook.detect_worker_stopped(path))
+        os.unlink(path)
 
 
 if __name__ == "__main__":

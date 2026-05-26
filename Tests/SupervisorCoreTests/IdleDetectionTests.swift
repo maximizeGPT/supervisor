@@ -392,34 +392,26 @@ final class IdleDetectionTests: XCTestCase {
                        "but the engine MUST have asked the rubric — branch-name is a rubric-body responsibility, not an engine gate (ED-4)")
     }
 
-    // MARK: - detectStopShape unit coverage
+    // MARK: - detectWorkerStopped unit coverage
 
-    func testDetectStopShapeMatchesEachED3Phrase() {
-        let positives = [
-            "All done — ready for next.",
-            "What's next?",
-            "Let me know if you need anything else.",
-            "Let me know what you'd like to do next.",
-            "Looks great — ship it.",
-            "All done.",
-            "I'm complete with this task.",
-            "Done with the refactor.",
+    func testDetectWorkerStoppedReturnsTrueForTextOnlyAssistant() {
+        let events: [SupervisorEvent] = [
+            .userPrompt(.init(sessionId: "s1", text: "do the thing", ts: Date())),
+            .assistantText(.init(sessionId: "s1", text: "All done.", turnUUID: "u1", ts: Date())),
         ]
-        for text in positives {
-            XCTAssertNotNil(TriageEngine.detectStopShape(in: text),
-                            "expected stop-shape in: \(text)")
-        }
+        XCTAssertTrue(TriageEngine.detectWorkerStopped(in: events))
+    }
 
-        let negatives = [
-            "Running the tests now.",
-            "Editing the file as requested.",
-            "Here's the plan: step 1, step 2, step 3.",
-            "Looking up the docs.",
+    func testDetectWorkerStoppedReturnsFalseWhenToolCallFollows() {
+        let events: [SupervisorEvent] = [
+            .assistantText(.init(sessionId: "s1", text: "Running tests.", turnUUID: "u1", ts: Date())),
+            .bashToolCall(.init(sessionId: "s1", command: "swift test", description: nil, toolUseId: "t1", turnUUID: "u1", ts: Date())),
         ]
-        for text in negatives {
-            XCTAssertNil(TriageEngine.detectStopShape(in: text),
-                         "expected no stop-shape in: \(text)")
-        }
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: events))
+    }
+
+    func testDetectWorkerStoppedReturnsFalseForEmptyWindow() {
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: []))
     }
 }
 

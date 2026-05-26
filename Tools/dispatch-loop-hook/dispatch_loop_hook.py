@@ -78,35 +78,6 @@ DEFAULTS = {
     "recent_assistant_chars": 2000,
 }
 
-# ED-3 stop-shape phrase list, mirrored from
-# Sources/SupervisorCore/Triage/TriageEngine.swift detectStopShape.
-STOP_SHAPE_PHRASES = [
-    "ready for next",
-    "what's next",
-    "let me know if",
-    "let me know",
-    "ship it",
-    "already done",
-    "all done",
-    "complete",
-    "done",
-    "pushed",
-    "already shipped",
-    "shipped",
-    "blocked on",
-    "open issues remaining",
-    "tests passing",
-    "tests pass",
-    "no further action",
-    "no remaining",
-    "session summary",
-    "no work needed",
-    "all tests green",
-    "tests green",
-    "hallucinated",
-    "doesn't exist",
-    "no asymmetry",
-]
 
 
 # ----------------------------------------------------------------------
@@ -281,15 +252,43 @@ def read_recent_turns(transcript_path: str, n: int) -> list[dict[str, Any]]:
         return []
 
 
-def has_stop_shape(text: str) -> str | None:
-    """Return the first matching phrase, or None."""
-    if not text:
-        return None
-    lower = text.lower()
-    for p in STOP_SHAPE_PHRASES:
-        if p in lower:
-            return p
-    return None
+def detect_worker_stopped(transcript_path: str) -> bool:
+    """Return True if the most recent assistant message in the JSONL has
+    zero tool_use blocks — i.e., the worker stopped doing work. Returns
+    False if the last assistant turn contains any tool_use, or if the
+    transcript is empty / unreadable."""
+    if not transcript_path or not Path(transcript_path).exists():
+        return False
+    try:
+        # Read the tail of the JSONL — enough to find the last assistant msg.
+        code, tail, _ = run(["tail", "-n", "60", transcript_path], timeout=5)
+        if code != 0:
+            return False
+        # Walk backwards to find the last assistant message.
+        last_assistant_content = None
+        for line in reversed(tail.splitlines()):
+            try:
+                evt = json.loads(line)
+            except Exception:
+                continue
+            if evt.get("type") != "assistant":
+                continue
+            msg = evt.get("message") or {}
+            content = msg.get("content")
+            if content is not None:
+                last_assistant_content = content
+                break
+        if last_assistant_content is None:
+            return False
+        # Check if any content block is tool_use.
+        if isinstance(last_assistant_content, list):
+            for block in last_assistant_content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    return False
+        return True
+    except Exception as e:
+        log(f"detect_worker_stopped error={e}")
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -595,16 +594,11 @@ def main() -> None:
     if not branch.startswith(cfg["branch_prefix"]):
         silent_exit(f"non_autonomous_branch branch={branch}")
 
-    # Gate: last assistant turn must contain a stop-shape phrase.
+    # Gate: last assistant turn must have no tool_use blocks (worker stopped).
+    if not detect_worker_stopped(transcript_path):
+        silent_exit("worker_still_working")
+
     recent_turns = read_recent_turns(transcript_path, cfg["transcript_last_n_turns"])
-    last_assistant = next(
-        (t for t in reversed(recent_turns) if t.get("role") == "assistant"),
-        None,
-    )
-    last_text = (last_assistant or {}).get("text", "")
-    stop_phrase = has_stop_shape(last_text[-cfg["recent_assistant_chars"]:] if last_text else "")
-    if not stop_phrase:
-        silent_exit("no_stop_shape")
 
     # Load state, apply loop hard stops.
     state_all = load_state()
@@ -657,7 +651,7 @@ def main() -> None:
     diff_stat = fetch_diff_stat(cwd, branch, cfg["git_log_timeout_s"])
     prior_count = state.get("total_dispatches", 0)
 
-    log(f"DISPATCH_PREPARE session={session_id} stop_phrase=\"{stop_phrase}\" "
+    log(f"DISPATCH_PREPARE session={session_id} worker_idle_signal=no_tool_use "
         f"prior={prior_count} issues={len(issues)} commits={len(commits)}")
 
     # Read API key.

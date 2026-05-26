@@ -319,8 +319,9 @@ public final class TriageEngine {
 
     /// Mutate per-session idle state in response to an incoming event.
     /// Called for EVERY event; the cost is a dict lookup + a few field
-    /// assignments. ED-2: state is per-session; ED-3: stop-shape detection
-    /// is substring-based on assistant text.
+    /// assignments. ED-2: state is per-session. Worker-stopped detection:
+    /// any assistantText marks the worker as stopped; any bashToolCall
+    /// clears it (worker is actively working).
     private func updateIdleState(for event: SupervisorEvent) {
         let sessionId = event.sessionId
         let ts = event.timestamp
@@ -345,15 +346,11 @@ public final class TriageEngine {
             // new stop-shaped assistant message arrives.
             state.lastStopShapedTs = nil
             state.lastStopShapedPhrase = nil
-        case .assistantText(let info):
-            if let phrase = Self.detectStopShape(in: info.text) {
-                state.lastStopShapedTs = ts
-                state.lastStopShapedPhrase = phrase
-            }
-            // An assistantText without a stop-shape DOES NOT clear the
-            // prior stop-shape — multi-paragraph completions can have a
-            // stop-shape early followed by additional context. The
-            // worker stays "post-completion" until a tool_use lands.
+        case .assistantText:
+            // Any assistantText with no subsequent tool_use means the
+            // worker stopped. Always mark as stopped; bashToolCall clears.
+            state.lastStopShapedTs = ts
+            state.lastStopShapedPhrase = "no_tool_use"
         case .bashToolCall:
             // Tool call means the worker is actively working again;
             // clear any prior stop-shape.
@@ -366,47 +363,24 @@ public final class TriageEngine {
         idleStates[sessionId] = state
     }
 
-    /// ED-3: detect a stop-shaped phrase in an assistant message body.
-    /// Substring search per PRINCIPLES.md §11b "specific signatures over
-    /// abstract behavior." Case-insensitive. Returns the matched phrase
-    /// (carried to the triage request as `matched_command`) or nil if
-    /// no stop-shape was found.
-    static func detectStopShape(in text: String) -> String? {
-        let lower = text.lowercased()
-        // Phrases from ED-3, ordered roughly by specificity. First match
-        // wins; the order is for trace-log readability rather than
-        // correctness (any match suffices to enter the idle ladder).
-        let phrases = [
-            "ready for next",
-            "what's next",
-            "let me know if",
-            "let me know",
-            "ship it",
-            "already done",
-            "all done",
-            "complete",
-            "done",
-            "pushed",
-            "already shipped",
-            "shipped",
-            "blocked on",
-            "open issues remaining",
-            "tests passing",
-            "tests pass",
-            "no further action",
-            "no remaining",
-            "session summary",
-            "no work needed",
-            "all tests green",
-            "tests green",
-            "hallucinated",
-            "doesn't exist",
-            "no asymmetry",
-        ]
-        for p in phrases where lower.contains(p) {
-            return p
+    /// Detect whether the worker has stopped based on the event window.
+    /// Returns true if the most recent assistant-related event is
+    /// assistantText (not bashToolCall) — meaning the worker's last turn
+    /// had no tool_use blocks. Returns false if the last assistant-related
+    /// event is a tool call, or if there are no assistant events.
+    static func detectWorkerStopped(in events: [SupervisorEvent]) -> Bool {
+        // Walk backwards to find the last assistant-related event.
+        for event in events.reversed() {
+            switch event {
+            case .assistantText:
+                return true
+            case .bashToolCall:
+                return false
+            default:
+                continue
+            }
         }
-        return nil
+        return false
     }
 
     /// Spin up the 1Hz idle-check loop. The loop runs on `@MainActor` so
