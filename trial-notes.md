@@ -757,3 +757,74 @@ Six commits. 217 tests at Part B end, 227 at Part C end.
   router .continue tests, +9 Part C LoopController tests +1
   Part C migration smoke).
 
+---
+
+# Issue #8 -- section 2e symmetry (continuing on the same branch)
+
+Started: 2026-05-25 21:00 UTC. Continuing v0.4.0 build on
+branch `autonomous-20260525T193906Z`.
+
+## Log
+
+### Issue #8 implementation (done)
+
+- Added `assistantTextCategories`, `assistantTextCategoriesMarkdown`,
+  `assistantTextCategoryNames` to HardcodedRubric (mirrors
+  `bashCategories` pattern; single-element: `userQuestionPending`).
+- Added `idleCategories`, `idleCategoriesMarkdown`,
+  `idleCategoryNames` to HardcodedRubric (mirrors same pattern;
+  single-element: `workerIdlePostCompletion`).
+- Wired `buildAssistantQuestionRequest` to pass
+  `HardcodedRubric.assistantTextCategoriesMarkdown` into
+  `systemPrompt(categoriesMarkdown:)`.
+- Wired `buildIdleEvaluationRequest` to pass
+  `HardcodedRubric.idleCategoriesMarkdown` into
+  `systemPrompt(categoriesMarkdown:)`.
+- Updated `testSystemPromptDefaultArgReturnsFullCorpus` comment to
+  reflect all three paths now use per-path-scoped markdown.
+
+### Issue #8 tests (done)
+
+New file: `Tests/SupervisorCoreTests/PathIsolationSymmetryTests.swift`
+-- 7 tests, all green:
+
+1. `testAssistantTextCategoriesContainsOnlyUserQuestionPending` --
+   rubric snapshot: assistant-text category list is exactly
+   [user_question_pending].
+2. `testAssistantTextCategoriesMarkdownShape` -- rubric snapshot:
+   assistant-text markdown contains user_question_pending body,
+   excludes all others.
+3. `testIdleCategoriesContainsOnlyWorkerIdlePostCompletion` --
+   rubric snapshot: idle category list is exactly
+   [worker_idle_post_completion].
+4. `testIdleCategoriesMarkdownShape` -- rubric snapshot: idle
+   markdown contains worker_idle_post_completion body, excludes
+   all others.
+5. `testAssistantTextSystemPromptOmitsNonAssistantTextCategories` --
+   prompt wiring: buildAssistantQuestionRequest's system prompt
+   contains only user_question_pending, and request.system matches
+   the expected scoped prompt.
+6. `testIdleSystemPromptOmitsNonIdleCategories` -- prompt wiring:
+   buildIdleEvaluationRequest's system prompt contains only
+   worker_idle_post_completion, and request.system matches the
+   expected scoped prompt.
+7. `testAssistantTextPathDoesNotFalsePositiveOnDestructiveContent` --
+   behavioral plumbing: assistant text containing "rm -rf" +
+   literal category names + canned all-clear produces no decision.
+
+### Build / tests
+
+- `swift build` -- clean.
+- `swift test` -- 242 / 242 pass (was 235 before Issue #8; +7 new
+  PathIsolationSymmetryTests). 5 LIVE_API canaries skipped, unrelated.
+- Total diff: 3 files changed (HardcodedRubric.swift,
+  TriagePrompt.swift, BashCategoryIsolationTests.swift) + 1 new test
+  file (PathIsolationSymmetryTests.swift).
+
+### Budget decision
+
+$0 API spend. Pure code symmetry, no calibration sweep needed per
+section 9e. No rubric/prompt content changes that affect Haiku's
+verdicts -- the category bodies are unchanged; we're just scoping
+which bodies each path sees.
+
