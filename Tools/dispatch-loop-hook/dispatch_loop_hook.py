@@ -326,6 +326,32 @@ def fetch_issues(cwd: str, timeout: float) -> list[dict[str, Any]]:
     return issues
 
 
+def fetch_diff_stat(cwd: str, branch: str, timeout: float) -> list[str]:
+    """Return `git diff --stat main..branch` lines, truncated to the top 30
+    files by change size. Gives the Dispatcher file-level signal about
+    what's been touched — prevents hallucinating partial completion from
+    commit subjects alone (Issue #10)."""
+    code, out, err = run(
+        ["git", "diff", "--stat", f"main..{branch}"],
+        cwd=cwd,
+        timeout=timeout,
+    )
+    if code != 0:
+        log(f"git_diff_stat_error code={code} stderr={err.strip()[:120]}")
+        return []
+    lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+    # Last line is the summary ("N files changed, ..."); keep it but cap
+    # file lines to 30.
+    if not lines:
+        return []
+    summary = lines[-1] if "changed" in lines[-1] else None
+    file_lines = lines[:-1] if summary else lines
+    file_lines = file_lines[:30]
+    if summary:
+        file_lines.append(summary)
+    return file_lines
+
+
 def fetch_commits(cwd: str, branch: str, timeout: float) -> list[dict[str, str]]:
     code, out, err = run(
         ["git", "log", f"main..{branch}",
@@ -369,6 +395,7 @@ def build_user_message(
     recent_turns: list[dict[str, Any]],
     issues: list[dict[str, Any]],
     commits: list[dict[str, str]],
+    recent_files_changed: list[str],
     prior_count: int,
     principles_text: str,
 ) -> str:
@@ -390,6 +417,13 @@ def build_user_message(
             if c["body"]:
                 for ln in c["body"].split("\n"):
                     lines.append(f"  {ln}")
+    lines.append("")
+    lines.append("# Recent files changed on this branch (git diff --stat main..HEAD)")
+    if not recent_files_changed:
+        lines.append("(none — either fresh branch, or git diff failed)")
+    else:
+        for fl in recent_files_changed:
+            lines.append(fl)
     lines.append("")
     lines.append("# Open GitHub issues (work queue)")
     if not issues:
@@ -620,6 +654,7 @@ def main() -> None:
     # Fetch dispatch context.
     issues = fetch_issues(cwd, cfg["issue_fetch_timeout_s"])
     commits = fetch_commits(cwd, branch, cfg["git_log_timeout_s"])
+    diff_stat = fetch_diff_stat(cwd, branch, cfg["git_log_timeout_s"])
     prior_count = state.get("total_dispatches", 0)
 
     log(f"DISPATCH_PREPARE session={session_id} stop_phrase=\"{stop_phrase}\" "
@@ -638,6 +673,7 @@ def main() -> None:
         recent_turns=recent_turns,
         issues=issues,
         commits=commits,
+        recent_files_changed=diff_stat,
         prior_count=prior_count,
         principles_text=principles_text,
     )

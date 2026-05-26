@@ -4,6 +4,7 @@ You are given:
   - PRINCIPLES.md (the project's operating manual — opinions, conventions, hard stops, voice).
   - The session's last 10 turns (recent context — what the worker just finished).
   - The current branch's commits since it diverged from main (work shipped this session).
+  - `recent_files_changed` — the output of `git diff --stat main..HEAD`, showing which files were actually modified and how many lines changed. **This is the authoritative signal about what's already been touched on this branch.** If a file appears here, the work touching that file is at least in-progress — do NOT propose re-doing work on files that already show changes. Commit subjects can be ambiguous; the diff stat is concrete.
   - The open GitHub issues (the work queue).
   - `prior_dispatches_considered`: how many dispatches the loop has already issued in this run.
 
@@ -15,6 +16,8 @@ If the recent commits left obvious mechanical follow-on — missing tests for ne
 - HIGH confidence when the follow-on is obvious (e.g. CHANGELOG is the canonical follow to a feature ship; new code with no tests is the canonical follow to a tested module).
 - MEDIUM confidence when the follow-on is plausible but ambiguous (multiple plausible follow-ons; "should we add docs OR tests next").
 - LOW confidence when commits look like thrashing (multiple commits revising the same code without forward progress) — that's the worker stuck, not the worker ready for more.
+
+**Before inferring partial completion from a commit subject, check `recent_files_changed`.** A commit titled "Issue #8: per-path rubric body selection" might look like it only added the data layer — but if `recent_files_changed` shows `TriagePrompt.swift` was also modified, the consumer layer was wired too. The diff stat is the ground truth; commit subjects are summaries that can mislead.
 
 ## PATH 2 — Transition to a sized issue (`transition_to_issue`)
 If the current branch's work is clearly complete (tests passing per recent context, CHANGELOG written, no obvious follow-on), pick an open issue from the queue. Prefer issues with:

@@ -339,6 +339,89 @@ class TestParseDispatcherResponse(unittest.TestCase):
         self.assertIn("output_tokens=487", ok_lines[0])
 
 
+class TestFetchDiffStat(unittest.TestCase):
+    """Issue #10: fetch_diff_stat returns git diff --stat lines."""
+
+    def test_parses_normal_diff_stat(self):
+        sample = (
+            " Sources/SupervisorCore/Triage/TriageEngine.swift | 8 ++++++++\n"
+            " Tests/SupervisorCoreTests/TriageEngineTests.swift | 24 ++++++++++\n"
+            " Tools/dispatch-loop-hook/dispatch_loop_hook.py    | 8 ++++++++\n"
+            " 3 files changed, 40 insertions(+)\n"
+        )
+        with patch.object(hook, 'run', return_value=(0, sample, "")):
+            result = hook.fetch_diff_stat("/fake", "autonomous-test", 10)
+        self.assertEqual(len(result), 4)  # 3 file lines + 1 summary
+        self.assertIn("TriageEngine.swift", result[0])
+        self.assertIn("3 files changed", result[-1])
+
+    def test_empty_on_failure(self):
+        with patch.object(hook, 'run', return_value=(1, "", "fatal")):
+            result = hook.fetch_diff_stat("/fake", "autonomous-test", 10)
+        self.assertEqual(result, [])
+
+    def test_truncates_to_30_files(self):
+        file_lines = [f" file{i}.swift | {i} +\n" for i in range(40)]
+        sample = "".join(file_lines) + " 40 files changed, 100 insertions(+)\n"
+        with patch.object(hook, 'run', return_value=(0, sample, "")):
+            result = hook.fetch_diff_stat("/fake", "autonomous-test", 10)
+        # 30 file lines + 1 summary = 31
+        self.assertEqual(len(result), 31)
+        self.assertIn("40 files changed", result[-1])
+
+
+class TestBuildUserMessageDiffStat(unittest.TestCase):
+    """Issue #10: recent_files_changed appears in the dispatcher user message."""
+
+    def test_diff_stat_in_user_message(self):
+        msg = hook.build_user_message(
+            session_id="s1",
+            cwd="/Users/main/supervisor",
+            branch="autonomous-test",
+            recent_turns=[],
+            issues=[],
+            commits=[{"sha": "abc12345", "subject": "test commit", "body": ""}],
+            recent_files_changed=[
+                "Sources/SupervisorCore/Triage/TriagePrompt.swift | 10 ++++",
+                "Sources/SupervisorCore/Triage/HardcodedRubric.swift | 5 +++",
+                "2 files changed, 15 insertions(+)",
+            ],
+            prior_count=0,
+            principles_text="# Test principles",
+        )
+        self.assertIn("# Recent files changed on this branch", msg)
+        self.assertIn("TriagePrompt.swift", msg)
+        self.assertIn("HardcodedRubric.swift", msg)
+        self.assertIn("2 files changed", msg)
+
+    def test_empty_diff_stat_shows_placeholder(self):
+        msg = hook.build_user_message(
+            session_id="s1",
+            cwd="/Users/main/supervisor",
+            branch="autonomous-test",
+            recent_turns=[],
+            issues=[],
+            commits=[],
+            recent_files_changed=[],
+            prior_count=0,
+            principles_text="# Test principles",
+        )
+        self.assertIn("(none — either fresh branch, or git diff failed)", msg)
+
+
+class TestSystemPromptContainsDiffStatGuidance(unittest.TestCase):
+    """Issue #10: dispatcher system prompt teaches about recent_files_changed."""
+
+    def test_system_prompt_mentions_recent_files_changed(self):
+        prompt = hook.load_system_prompt()
+        self.assertIn("recent_files_changed", prompt)
+        self.assertIn("authoritative signal", prompt)
+
+    def test_system_prompt_warns_against_partial_completion_inference(self):
+        prompt = hook.load_system_prompt()
+        self.assertIn("Before inferring partial completion", prompt)
+
+
 class TestStopShapePhrases(unittest.TestCase):
     """Gate-4 stop-shape detection: each phrase must fire, negatives must not."""
 
