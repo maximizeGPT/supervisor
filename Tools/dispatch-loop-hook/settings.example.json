@@ -1,0 +1,12 @@
+{
+  "_comment": "Merge the `hooks` block below into your existing ~/.claude/settings.json. The other top-level fields in this file are illustrative — do not overwrite your existing values.",
+  "hooks": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "/Users/main/supervisor/Tools/dispatch-loop-hook/dispatch_loop_hook.py",
+        "timeout": 60
+      }
+    ]
+  }
+}
