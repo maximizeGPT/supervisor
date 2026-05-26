@@ -6,6 +6,163 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-25 (in progress — continuous autonomous dispatch loop)
+
+Supervisor gains the ability to keep an autonomous Claude Code
+session productive without user intervention. When a worker session
+finishes its task and goes idle, Supervisor detects the idle state,
+evaluates what to work on next (from open issues, branch context,
+and PRINCIPLES.md), and either auto-dispatches the next task or
+surfaces a proposal for the user to approve.
+
+The full pipeline: idle detection (Part A) → dispatch decision
+(Part B) → loop control with hard stops (Part C) → production
+wiring (Part D). Plus a complementary Claude Code Stop hook that
+lets the dispatch loop run outside the Supervisor.app process
+entirely.
+
+**Status: in progress.** Parts A through D are wired and the
+production `main.swift` constructs the full pipeline. The live
+Part D dogfood surfaced an AX-permission-revoke blocker that
+prevents unattended CGEventPost injection; the dispatch path is
+tested end-to-end in mocked tests (242 pass) but hasn't completed
+a physical-world trial under unattended conditions. The hook-based
+dispatch path (via `Tools/dispatch-loop-hook/`) works independently
+of AX permissions and is active on this branch.
+
+### Added
+
+**Part A — idle detection** (`TriageEngine.swift`, `HardcodedRubric.swift`)
+- `worker_idle_post_completion` rubric category. Fires when an
+  autonomous session emits a stop-shaped phrase ("all done",
+  "ready for next", "let me know if", etc.) followed by N seconds
+  of silence. Don't-fire conditions live in the rubric body per
+  ED-4: non-autonomous branch, pending user question, recent user
+  message, hard-stop preconditions.
+- `FlagAction.continue` added to the action ladder between
+  `.inject` and `.pause`. Continue types a multi-paragraph task
+  prompt — heavier than inject (which types a short answer) but
+  lighter than pause (which stops the session).
+- `record_triage` schema gains `next_task_proposal` (string) and
+  `confidence` (high/medium/low) fields.
+- Per-session idle state machine in `TriageEngine`: tracks
+  `lastEventTs`, `lastStopShapedTs`, `lastStopShapedPhrase`. 1Hz
+  timer fires `evaluateIdle` when stop-shape + silence threshold
+  hold. Re-triage gated at 60s intervals to bound API spend on
+  non-firing sessions.
+- 6 tests in `IdleDetectionTests`.
+
+**Part B — dispatch decision** (`Dispatcher.swift`, `DispatchFetchers.swift`)
+- `Dispatcher` module: second Haiku call that reads the primary
+  triage's idle signal and decides what to work on next. Consults
+  open GitHub issues (via `gh issue list`), recent branch commits
+  (via `git log`), and PRINCIPLES.md to ground the decision.
+- Three dispatch paths: `continue_branch` (keep working on current
+  task), `transition_to_issue` (pick up a filed issue), and
+  `low_confidence_no_action` (nothing grounded to dispatch — a
+  feature, not a failure).
+- `IssueFetcher` + `BranchCommitFetcher`: shell out to `gh` and
+  `git` with 10s hard timeouts. 60s/30s in-memory caches. Degrade
+  silently to empty arrays when tools aren't available — the
+  Dispatcher prompt is taught to lower confidence when context is
+  thin.
+- Four worked examples baked into the Dispatcher prompt, including
+  the low-confidence case. Specific file paths and function names
+  required in `next_task_proposal` (not just module names).
+- `prior_dispatches_considered` field in `record_dispatch` schema
+  for thrashing detection.
+- Router wiring: high-confidence dispatch injects the full task
+  prompt via CGEventPost; medium-confidence surfaces a proposal
+  banner for the user to paste; low-confidence shows the
+  Dispatcher's reasoning. Each case has its own
+  `InterventionOutcome` variant and banner copy.
+- 13 tests across `DispatcherTests` + `ContinueInterventionTests`.
+
+**Part C — loop control** (`LoopController.swift`, `LoopDispatchStore.swift`)
+- `LoopController` actor: per-session state machine enforcing four
+  hard stops (PRINCIPLES §12.5):
+  1. Kill fires against the current worker → loop stops (sticky).
+  2. 4 hours wall-clock elapsed → loop stops.
+  3. 3 consecutive low-confidence dispatches → loop stops.
+  4. User sends a message → loop pauses (clears when the worker
+     emits a `bashToolCall`, not `assistantText` — the worker may
+     answer the user before resuming autonomous work).
+- `loop_dispatches` SQLite table (v3 migration): durable record
+  of every dispatch decision. `LoopDispatchStore` provides insert /
+  recent / count. The table is the source of truth for post-mortem
+  inspection; in-memory state is the cache.
+- Engine integration: `evaluateIdle` consults `canDispatch` before
+  calling the Dispatcher; paused/stopped states degrade the
+  candidate to a plain notify with the reason in `reasoningPlain`.
+- 10 tests in `LoopControllerTests`.
+
+**Part D — production wiring** (`main.swift`)
+- `SupervisorApp.main.swift` constructs `TriageEngine` with the
+  full pipeline: `Dispatcher` + `LoopController` + `LoopDispatchStore`.
+  PRINCIPLES.md loaded from bundle for the Dispatcher's context.
+- Loop smoke test (`dogfood-loop-smoke-test.md`) and runbook
+  (`dogfood-loop-runbook.md`) for the physical-world trial.
+
+**v0.4.0-hook — dispatch-loop Stop hook** (`Tools/dispatch-loop-hook/`)
+- Claude Code Stop hook that runs after every Claude Code session
+  stop. Reads the session's JSONL, detects idle state, calls
+  DeepSeek to propose the next task, and writes the proposal to
+  the conversation input. Complementary to Supervisor.app — works
+  without AX permissions, runs in the Claude Code process itself.
+- Installed via `~/.claude/settings.json` hooks configuration.
+- Log at `~/.claude/hooks/dispatch-loop.log`.
+
+### Fixed
+
+**Issue #7 — bash cross-category isolation** (`HardcodedRubric.swift`,
+`TriagePrompt.swift`)
+- The bash triage path's system prompt now includes only the three
+  bash-relevant rubric categories (`destructive_action_pending`,
+  `edits_outside_worktree`, `prompt_injection_signature`). Before
+  this fix, the bash path enumerated all categories and Haiku
+  pattern-matched on literal category names appearing in bash
+  commands (e.g. a grep regex containing `user_question_pending`)
+  — the §2e gap surfaced during the 2026-05-25 autonomous trial.
+- Per-path scope sentence in the user message reinforces the
+  system-prompt filter (belt + suspenders per §8a).
+- `bashCategoriesMarkdown`, `bashCategories`, `bashCategoryNames`
+  added to `HardcodedRubric`.
+- 5 tests in `BashCategoryIsolationTests`.
+
+**Issue #8 — assistant-text + idle path isolation (§2e symmetry)**
+(`HardcodedRubric.swift`, `TriagePrompt.swift`)
+- Extends Issue #7's per-path pattern to the remaining two paths:
+  assistant-text (`user_question_pending` only) and idle
+  (`worker_idle_post_completion` only). All three triage paths now
+  use scoped `categoriesMarkdown` — no path sees rubric bodies
+  for categories it doesn't evaluate.
+- `assistantTextCategoriesMarkdown` and `idleCategoriesMarkdown`
+  added to `HardcodedRubric`.
+- 7 tests in `PathIsolationSymmetryTests`.
+
+### Known limitations
+
+- **AX-permission-revoke blocker**: CGEventPost injection requires
+  Accessibility permissions. macOS revokes AX permissions when the
+  app binary changes (every rebuild). The dispatch loop works in
+  tests but the physical-world dogfood hasn't completed a full
+  unattended cycle under production conditions. The hook-based
+  path (`Tools/dispatch-loop-hook/`) bypasses this entirely.
+- **Loop-state seed-on-restart**: `LoopController` does not query
+  `LoopDispatchStore` on startup to seed `totalDispatches` from a
+  previous run. Filed for a future single-LOC bootstrap change.
+- **PRINCIPLES.md references** loaded at engine construction time,
+  not refreshed mid-loop. A loop that runs for hours will use the
+  PRINCIPLES.md snapshot from boot. Acceptable for v0.4.0; filed
+  for v0.5.0 if loop durations regularly approach the 4hr cap.
+
+### Tests
+
+242 pass / 5 skipped / 0 failures (was 197 in v0.3.2). The 45 new
+tests cover idle detection (6), dispatch decisions (13), loop
+control (10), per-path prompt isolation (12), and production
+wiring (4). All five skipped are live-API gated.
+
 ## [0.3.2] — 2026-05-25 (process discovery hardened — Issue #1 closes)
 
 Closes GH Issue #1 ("ProcessLocator silently returns nil when Claude
