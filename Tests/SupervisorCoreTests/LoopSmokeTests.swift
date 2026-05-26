@@ -99,7 +99,7 @@ final class LoopSmokeTests: XCTestCase {
             lock.lock(); defer { lock.unlock() }
             return _calls
         }
-        func inject(text: String, claudeCodePID: pid_t) async throws -> Int {
+        func inject(text: String, claudeCodePID: pid_t, targetWindowTitle: String? = nil) async throws -> Int {
             lock.lock(); defer { lock.unlock() }
             _calls.append(Call(text: text, pid: claudeCodePID))
             return text.utf8.count

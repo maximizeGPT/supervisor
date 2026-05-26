@@ -105,7 +105,7 @@ public final class InterventionRouter {
             return
         }
         do {
-            let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid)
+            let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)
             trace.emit("router", "intervention.inject.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
             _ = await notifier.postInterventionResult(
                 decision: decision,
@@ -214,7 +214,7 @@ public final class InterventionRouter {
             return
         }
         do {
-            let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid)
+            let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)
             trace.emit("router", "intervention.continue.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
             let head = String(proposal.prefix(80))
             _ = await notifier.postInterventionResult(

@@ -16,6 +16,7 @@ import Foundation
 public struct TriageDecision: Sendable {
     public let sessionId: String
     public let cwd: String?      // v0.1.4: the router needs cwd to ask the locator for a PID
+    public let branch: String?   // v0.4.1: used by the injector for tab targeting (Issue #9)
     public let candidate: TriageCandidate
     public let triggeringEvent: BashToolCallInfo
     public let usage: AnthropicUsage
@@ -39,6 +40,7 @@ public struct TriageDecision: Sendable {
     public init(
         sessionId: String,
         cwd: String? = nil,
+        branch: String? = nil,
         candidate: TriageCandidate,
         triggeringEvent: BashToolCallInfo,
         usage: AnthropicUsage,
@@ -49,6 +51,7 @@ public struct TriageDecision: Sendable {
     ) {
         self.sessionId = sessionId
         self.cwd = cwd
+        self.branch = branch
         self.candidate = candidate
         self.triggeringEvent = triggeringEvent
         self.usage = usage
@@ -584,6 +587,7 @@ public final class TriageEngine {
             let decision = TriageDecision(
                 sessionId: sessionId,
                 cwd: cwd,
+                branch: branch,
                 candidate: finalCandidate,
                 triggeringEvent: pseudoTrigger,
                 usage: response.usage,
@@ -771,10 +775,12 @@ public final class TriageEngine {
             return
         }
 
+        let branch = sessionBranch[call.sessionId]
         for candidate in candidates {
             let decision = TriageDecision(
                 sessionId: call.sessionId,
                 cwd: cwd,
+                branch: branch,
                 candidate: candidate,
                 triggeringEvent: call,
                 usage: response.usage,
@@ -917,6 +923,7 @@ public final class TriageEngine {
             let decision = TriageDecision(
                 sessionId: info.sessionId,
                 cwd: cwd,
+                branch: sessionBranch[info.sessionId],
                 candidate: enriched,
                 triggeringEvent: pseudoTrigger,
                 usage: response.usage,

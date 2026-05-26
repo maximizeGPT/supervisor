@@ -49,7 +49,13 @@ public protocol Injector: Sendable {
     /// success returns the number of bytes injected (informational).
     /// On failure throws an `InjectError` so the router can decide
     /// how to degrade.
-    func inject(text: String, claudeCodePID: pid_t) async throws -> Int
+    ///
+    /// `targetWindowTitle`: when non-nil, the injector attempts to
+    /// focus the window whose title contains this substring before
+    /// posting keystrokes. This targets the correct Claude.app tab
+    /// when multiple tabs are open (Issue #9). When nil, falls back
+    /// to the current frontmost window.
+    func inject(text: String, claudeCodePID: pid_t, targetWindowTitle: String?) async throws -> Int
 }
 
 /// Production injector. Walks up the process tree from the Claude Code
@@ -93,7 +99,7 @@ public final class CGEventInjector: Injector {
         self.trace = trace
     }
 
-    public func inject(text: String, claudeCodePID: pid_t) async throws -> Int {
+    public func inject(text: String, claudeCodePID: pid_t, targetWindowTitle: String? = nil) async throws -> Int {
         // 1. Resolve the hosting app by walking up the process tree
         //    from claudeCodePID until we hit a running NSApplication.
         guard let hostApp = Self.findHostingApp(for: claudeCodePID) else {
@@ -113,6 +119,16 @@ public final class CGEventInjector: Injector {
             throw InjectError.activationFailed(bundleID: bundleID)
         }
         try? await Task.sleep(nanoseconds: focusSettleNanos)
+
+        // 2b. Issue #9: if a target window title is provided, try to
+        // focus the matching window via AXUIElement. This targets the
+        // correct tab when multiple Claude.app windows/tabs are open.
+        // Falls through silently on failure — we'll post into whatever
+        // window is frontmost, which is the pre-Issue-9 behavior.
+        if let title = targetWindowTitle {
+            Self.focusWindow(app: hostApp, titleContaining: title, trace: trace)
+            try? await Task.sleep(nanoseconds: focusSettleNanos / 2)
+        }
 
         // 3. Post the keystrokes via CGEventPost on the HID event tap.
         let source = CGEventSource(stateID: .hidSystemState)
@@ -143,6 +159,41 @@ public final class CGEventInjector: Injector {
 
         trace.emit("inject", "wrote \(bytes) bytes to PID \(claudeCodePID) host=\(bundleID)")
         return bytes
+    }
+
+    // MARK: - AX window targeting (Issue #9)
+
+    /// Enumerate the app's windows via AXUIElement and focus the one
+    /// whose title contains `substring`. Best-effort: if AX is disabled,
+    /// the app has no windows, or no title matches, this no-ops and the
+    /// caller falls back to posting into whatever window is frontmost.
+    static func focusWindow(
+        app: NSRunningApplication,
+        titleContaining substring: String,
+        trace: TraceLog
+    ) {
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var windowsRef: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef)
+        guard err == .success, let windows = windowsRef as? [AXUIElement] else {
+            trace.emit("inject", "ax_window_enum failed err=\(err.rawValue) pid=\(app.processIdentifier)")
+            return
+        }
+
+        for window in windows {
+            var titleRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef) == .success,
+                  let title = titleRef as? String else {
+                continue
+            }
+            if title.localizedCaseInsensitiveContains(substring) {
+                let raiseErr = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                trace.emit("inject", "ax_window_focused title=\"\(title.prefix(60))\" target=\"\(substring.prefix(40))\" raise_err=\(raiseErr.rawValue)")
+                return
+            }
+        }
+
+        trace.emit("inject", "ax_window_no_match target=\"\(substring.prefix(40))\" window_count=\(windows.count)")
     }
 
     // MARK: - Process-tree walking
@@ -185,6 +236,7 @@ public final class MockInjector: Injector, @unchecked Sendable {
     public struct Call: Sendable, Equatable {
         public let text: String
         public let pid: pid_t
+        public let targetWindowTitle: String?
     }
     private let lock = NSLock()
     private var _calls: [Call] = []
@@ -200,9 +252,9 @@ public final class MockInjector: Injector, @unchecked Sendable {
         self.trace = trace
     }
 
-    public func inject(text: String, claudeCodePID: pid_t) async throws -> Int {
+    public func inject(text: String, claudeCodePID: pid_t, targetWindowTitle: String? = nil) async throws -> Int {
         lock.lock()
-        _calls.append(Call(text: text, pid: claudeCodePID))
+        _calls.append(Call(text: text, pid: claudeCodePID, targetWindowTitle: targetWindowTitle))
         lock.unlock()
         if let err = errorToThrow {
             throw err

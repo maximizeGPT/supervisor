@@ -54,7 +54,7 @@ final class ContinueInterventionTests: XCTestCase {
     /// Default injector — succeeds, returns the byte count. Tests
     /// that want failure throw via `errorToThrow`.
     final class CountingMockInjector: Injector, @unchecked Sendable {
-        struct Call: Equatable { let text: String; let pid: pid_t }
+        struct Call: Equatable { let text: String; let pid: pid_t; let targetWindowTitle: String? }
         private let lock = NSLock()
         private var _calls: [Call] = []
         var calls: [Call] {
@@ -62,10 +62,10 @@ final class ContinueInterventionTests: XCTestCase {
             return _calls
         }
         var errorToThrow: InjectError?
-        func inject(text: String, claudeCodePID: pid_t) async throws -> Int {
+        func inject(text: String, claudeCodePID: pid_t, targetWindowTitle: String? = nil) async throws -> Int {
             lock.lock(); defer { lock.unlock() }
             if let err = errorToThrow { throw err }
-            _calls.append(Call(text: text, pid: claudeCodePID))
+            _calls.append(Call(text: text, pid: claudeCodePID, targetWindowTitle: targetWindowTitle))
             return text.utf8.count
         }
     }
@@ -80,7 +80,8 @@ final class ContinueInterventionTests: XCTestCase {
         confidence: String,
         proposal: String? = nil,
         justification: String = "Mechanical follow-on from the prior commit; tests are the canonical next unit per §6.",
-        cwd: String? = "/tmp/test-cwd"
+        cwd: String? = "/tmp/test-cwd",
+        branch: String? = nil
     ) -> TriageDecision {
         let candidate = TriageCandidate(
             category: "worker_idle_post_completion",
@@ -96,6 +97,7 @@ final class ContinueInterventionTests: XCTestCase {
         return TriageDecision(
             sessionId: "s-continue",
             cwd: cwd,
+            branch: branch,
             candidate: candidate,
             triggeringEvent: BashToolCallInfo(
                 sessionId: "s-continue",
@@ -299,5 +301,48 @@ final class ContinueInterventionTests: XCTestCase {
         } else {
             XCTFail("expected .continueFired")
         }
+    }
+
+    // MARK: - Issue #9: inject tab targeting
+
+    /// Issue #9: when a branch name is on the decision, the injector
+    /// receives it as `targetWindowTitle` so it can focus the correct
+    /// Claude.app tab before posting keystrokes.
+    func testContinueHighConfidencePassesBranchAsTargetWindowTitle() async throws {
+        let notifier = MockNotifier()
+        let injector = CountingMockInjector()
+        let router = makeRouter(notifier: notifier, injector: injector)
+
+        let decision = makeContinueDecision(
+            confidence: "high",
+            proposal: "Continue the dispatch loop work.",
+            branch: "autonomous-20260525T193906Z"
+        )
+
+        await router.dispatch(decision: decision)
+
+        XCTAssertEqual(injector.calls.count, 1)
+        XCTAssertEqual(injector.calls.first?.targetWindowTitle, "autonomous-20260525T193906Z",
+                       "branch from the decision must flow to the injector as targetWindowTitle")
+    }
+
+    /// Issue #9: when branch is nil, targetWindowTitle is nil →
+    /// injector falls back to the frontmost window (pre-Issue-9 behavior).
+    func testContinueHighConfidenceNilBranchPassesNilTargetWindowTitle() async throws {
+        let notifier = MockNotifier()
+        let injector = CountingMockInjector()
+        let router = makeRouter(notifier: notifier, injector: injector)
+
+        let decision = makeContinueDecision(
+            confidence: "high",
+            proposal: "Continue the dispatch loop work.",
+            branch: nil
+        )
+
+        await router.dispatch(decision: decision)
+
+        XCTAssertEqual(injector.calls.count, 1)
+        XCTAssertNil(injector.calls.first?.targetWindowTitle,
+                     "nil branch must result in nil targetWindowTitle (frontmost-window fallback)")
     }
 }
