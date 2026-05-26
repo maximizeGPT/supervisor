@@ -360,8 +360,10 @@ final class DispatcherTests: XCTestCase {
         let prompt = Dispatcher.systemPrompt
         XCTAssertTrue(prompt.contains("requires_human_presence"),
                       "system prompt must teach the gate")
-        XCTAssertTrue(prompt.contains("launching macOS apps") || prompt.contains("Accessibility permissions"),
-                      "system prompt must explain WHAT triggers the gate")
+        XCTAssertTrue(prompt.contains("IS human-required") && prompt.contains("Is NOT human-required"),
+                      "system prompt must enumerate both positive and negative examples for the gate")
+        XCTAssertTrue(prompt.contains("Default: false"),
+                      "system prompt must specify false as the default")
     }
 }
 

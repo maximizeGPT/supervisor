@@ -460,7 +460,22 @@ public final class Dispatcher: Dispatching, Sendable {
 
     # requires_human_presence gate
 
-    Some tasks cannot be executed by an autonomous Claude Code session from a terminal. Examples: launching macOS apps, granting Accessibility permissions, physical-world trials that require observing a running app, anything involving System Settings GUI. When the task you'd pick requires any of these, set `requires_human_presence: true` in `record_dispatch` regardless of confidence. The router will NOT auto-dispatch these; instead, the proposal surfaces as a banner for the user to act on when they're physically present.
+    Set `requires_human_presence: true` ONLY when the task literally cannot be completed by a process running unattended in a terminal. The test is: "can Claude Code, with no human watching, execute every step of this task from a shell?" If yes, requires_human_presence=false.
+
+    **IS human-required (true):**
+    - Clicking through System Settings (AX permission grants, notification prompts)
+    - Launching an app and verifying its visible UI behavior by eye
+    - Physical-world trials requiring sustained observation (e.g. the v0.4.0 dogfood: watch a running app for 30 minutes)
+    - Any step where a person must confirm a visual result before proceeding
+
+    **Is NOT human-required (false) even though the topic touches GUI surfaces:**
+    - Investigating AX APIs via Swift code (reading the accessibility tree is code, not clicking)
+    - Reading documentation about UI frameworks
+    - Writing code that targets GUI surfaces but doesn't execute them in production
+    - Implementing keyboard-injection or CGEventPost code (the code can be written and tested without a human pressing keys)
+    - Filing issues about GUI behavior
+
+    **Default: false.** Only flag true when the task definitively cannot proceed without a human at the keyboard for observation or interaction. When uncertain, err toward false — the hook dispatches, and Claude Code can itself surface "I need human input" if it actually gets stuck. A false negative (dispatching a task that turns out to need a human) is cheap — the worker idles and the next dispatch cycle catches it. A false positive (blocking a task that could have been done) wastes a dispatch cycle and forces the user to paste manually.
 
     # Hard constraint
 
