@@ -382,10 +382,12 @@ public final class TriageEngine {
             "let me know if",
             "let me know",
             "ship it",
+            "already done",
             "all done",
             "complete",
             "done",
             "pushed",
+            "already shipped",
             "shipped",
             "blocked on",
             "open issues remaining",
@@ -394,6 +396,12 @@ public final class TriageEngine {
             "no further action",
             "no remaining",
             "session summary",
+            "no work needed",
+            "all tests green",
+            "tests green",
+            "hallucinated",
+            "doesn't exist",
+            "no asymmetry",
         ]
         for p in phrases where lower.contains(p) {
             return p

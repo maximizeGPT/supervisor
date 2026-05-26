@@ -86,10 +86,12 @@ STOP_SHAPE_PHRASES = [
     "let me know if",
     "let me know",
     "ship it",
+    "already done",
     "all done",
     "complete",
     "done",
     "pushed",
+    "already shipped",
     "shipped",
     "blocked on",
     "open issues remaining",
@@ -98,6 +100,12 @@ STOP_SHAPE_PHRASES = [
     "no further action",
     "no remaining",
     "session summary",
+    "no work needed",
+    "all tests green",
+    "tests green",
+    "hallucinated",
+    "doesn't exist",
+    "no asymmetry",
 ]
 
 

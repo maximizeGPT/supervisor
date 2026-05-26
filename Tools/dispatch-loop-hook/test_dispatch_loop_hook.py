@@ -380,6 +380,30 @@ class TestStopShapePhrases(unittest.TestCase):
     def test_session_summary(self):
         self.assertEqual(hook.has_stop_shape("Session summary: 4 issues closed."), "session summary")
 
+    def test_no_work_needed(self):
+        self.assertEqual(hook.has_stop_shape("No work needed here."), "no work needed")
+
+    def test_already_shipped(self):
+        self.assertEqual(hook.has_stop_shape("That feature was already shipped."), "already shipped")
+
+    def test_already_done(self):
+        self.assertEqual(hook.has_stop_shape("The migration is already done."), "already done")
+
+    def test_all_tests_green(self):
+        self.assertEqual(hook.has_stop_shape("All tests green after the fix."), "all tests green")
+
+    def test_tests_green(self):
+        self.assertEqual(hook.has_stop_shape("Tests green on CI."), "tests green")
+
+    def test_hallucinated(self):
+        self.assertEqual(hook.has_stop_shape("The dispatcher hallucinated an asymmetry."), "hallucinated")
+
+    def test_doesnt_exist(self):
+        self.assertEqual(hook.has_stop_shape("The gap doesn't exist in the codebase."), "doesn't exist")
+
+    def test_no_asymmetry(self):
+        self.assertEqual(hook.has_stop_shape("There is no asymmetry to fix."), "no asymmetry")
+
     # -- Negative cases --
     def test_tests_alone_does_not_fire(self):
         self.assertIsNone(hook.has_stop_shape("I ran the tests and found failures."))

@@ -485,6 +485,30 @@ final class DetectStopShapeTests: XCTestCase {
     func testSessionSummary() {
         XCTAssertEqual(TriageEngine.detectStopShape(in: "Session summary: 4 issues closed."), "session summary")
     }
+    func testNoWorkNeeded() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "No work needed here."), "no work needed")
+    }
+    func testAlreadyShipped() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "That feature was already shipped."), "already shipped")
+    }
+    func testAlreadyDone() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "The migration is already done."), "already done")
+    }
+    func testAllTestsGreen() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "All tests green after the fix."), "all tests green")
+    }
+    func testTestsGreen() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "Tests green on CI."), "tests green")
+    }
+    func testHallucinated() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "The dispatcher hallucinated an asymmetry."), "hallucinated")
+    }
+    func testDoesntExist() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "The gap doesn't exist in the codebase."), "doesn't exist")
+    }
+    func testNoAsymmetry() {
+        XCTAssertEqual(TriageEngine.detectStopShape(in: "There is no asymmetry to fix."), "no asymmetry")
+    }
 
     // -- Negative cases --
     func testTestsAloneDoesNotFire() {
