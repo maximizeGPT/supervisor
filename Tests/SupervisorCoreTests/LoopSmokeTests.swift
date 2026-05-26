@@ -157,7 +157,8 @@ final class LoopSmokeTests: XCTestCase {
                 confidence: .high,
                 selectedPath: .transitionToIssue,
                 selectedIssueNumber: 7,
-                priorDispatchesEchoed: 0
+                priorDispatchesEchoed: 0,
+                requiresHumanPresence: false
             ),
             .ready(
                 prompt: "Step 2: add 3 calibration fixtures covering the regex-in-bash-command false positive.",
@@ -165,7 +166,8 @@ final class LoopSmokeTests: XCTestCase {
                 confidence: .high,
                 selectedPath: .continueBranch,
                 selectedIssueNumber: nil,
-                priorDispatchesEchoed: 1
+                priorDispatchesEchoed: 1,
+                requiresHumanPresence: false
             ),
             .ready(
                 prompt: "Step 3: write the CHANGELOG entry for v0.4.0 + Issue #7.",
@@ -173,7 +175,8 @@ final class LoopSmokeTests: XCTestCase {
                 confidence: .high,
                 selectedPath: .continueBranch,
                 selectedIssueNumber: nil,
-                priorDispatchesEchoed: 2
+                priorDispatchesEchoed: 2,
+                requiresHumanPresence: false
             ),
         ])
 
@@ -232,7 +235,7 @@ final class LoopSmokeTests: XCTestCase {
                 lastNTurns: [],
                 priorDispatchesConsidered: priorCount
             )
-            guard case let .ready(prompt, _, .high, _, _, _) = dispatchResult else {
+            guard case let .ready(prompt, _, .high, _, _, _, _) = dispatchResult else {
                 return XCTFail("cycle \(cycle): expected .ready(.high), got \(dispatchResult)")
             }
 

@@ -647,33 +647,49 @@ public final class TriageEngine {
             }
         }
         switch result {
-        case let .ready(prompt, justification, .high, _, _, _):
-            return reconfigure(
-                candidate,
-                action: .continue,
-                asymmetryNote: redactor.redact(justification),
-                suggestedInjectText: nil,
-                nextTaskProposal: redactor.redact(prompt),
-                confidence: "high"
-            )
-        case let .ready(prompt, justification, .medium, _, _, _):
-            return reconfigure(
-                candidate,
-                action: .continue,
-                asymmetryNote: redactor.redact(justification),
-                suggestedInjectText: nil,
-                nextTaskProposal: redactor.redact(prompt),
-                confidence: "medium"
-            )
-        case let .ready(_, justification, .low, _, _, _):
-            return reconfigure(
-                candidate,
-                action: .continue,
-                asymmetryNote: redactor.redact(justification),
-                suggestedInjectText: nil,
-                nextTaskProposal: nil,
-                confidence: "low"
-            )
+        case let .ready(prompt, justification, conf, _, _, _, requiresHuman):
+            // v0.4.1: requires_human_presence gate. Degrade to notify
+            // so the proposal surfaces as a banner, not an auto-dispatch.
+            if requiresHuman {
+                trace.emit("dispatch", "requires_human_presence=true → degrading to notify session=\(sessionId)")
+                return reconfigure(
+                    candidate,
+                    action: .notify,
+                    asymmetryNote: redactor.redact("Requires human presence: \(justification)"),
+                    suggestedInjectText: nil,
+                    nextTaskProposal: redactor.redact(prompt),
+                    confidence: "medium"
+                )
+            }
+            switch conf {
+            case .high:
+                return reconfigure(
+                    candidate,
+                    action: .continue,
+                    asymmetryNote: redactor.redact(justification),
+                    suggestedInjectText: nil,
+                    nextTaskProposal: redactor.redact(prompt),
+                    confidence: "high"
+                )
+            case .medium:
+                return reconfigure(
+                    candidate,
+                    action: .continue,
+                    asymmetryNote: redactor.redact(justification),
+                    suggestedInjectText: nil,
+                    nextTaskProposal: redactor.redact(prompt),
+                    confidence: "medium"
+                )
+            case .low:
+                return reconfigure(
+                    candidate,
+                    action: .continue,
+                    asymmetryNote: redactor.redact(justification),
+                    suggestedInjectText: nil,
+                    nextTaskProposal: nil,
+                    confidence: "low"
+                )
+            }
         case let .lowConfidence(reasoning):
             return reconfigure(
                 candidate,
@@ -991,7 +1007,7 @@ public final class TriageEngine {
         ts: Date
     ) -> StoredLoopDispatch {
         switch result {
-        case let .ready(prompt, justification, conf, path, issueN, _):
+        case let .ready(prompt, justification, conf, path, issueN, _, _):
             return StoredLoopDispatch(
                 sessionId: sessionId,
                 ts: ts,

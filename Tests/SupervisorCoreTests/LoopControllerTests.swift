@@ -48,7 +48,8 @@ final class LoopControllerTests: XCTestCase {
             confidence: .high,
             selectedPath: .transitionToIssue,
             selectedIssueNumber: 7,
-            priorDispatchesEchoed: 0
+            priorDispatchesEchoed: 0,
+            requiresHumanPresence: false
         )
     }
 

@@ -420,6 +420,10 @@ RECORD_DISPATCH_TOOL = {
                 },
                 "selected_issue_number": {"type": "integer"},
                 "prior_dispatches_considered": {"type": "integer"},
+                "requires_human_presence": {
+                    "type": "boolean",
+                    "description": "Set to true when the proposed task requires macOS GUI interaction (launching apps, granting AX permissions, physical-world trials, anything where Claude Code cannot fully execute from a terminal). The hook will NOT auto-dispatch these — they surface as a banner for the user to act on when present."
+                },
             },
             "required": ["next_task_proposal", "justification", "confidence", "selected_path"],
         },
@@ -465,6 +469,12 @@ def call_dispatcher(
     except Exception as e:
         log(f"deepseek_call_error error={e}")
         return None
+    return _parse_dispatcher_response(raw)
+
+
+def _parse_dispatcher_response(raw: str) -> dict[str, Any] | None:
+    """Parse the DeepSeek response JSON into tool-call arguments.
+    Returns None on any parse failure."""
     try:
         obj = json.loads(raw)
         choice = (obj.get("choices") or [{}])[0]
@@ -601,6 +611,20 @@ def main() -> None:
         user_message=user_message,
     )
 
+    # v0.4.1-hook: retry once on parse error (DeepSeek sometimes
+    # returns malformed JSON with unterminated strings).
+    if result is None:
+        log("RETRY_PARSE_ERROR attempt=1 reason=first_call_returned_none")
+        result = call_dispatcher(
+            key=key, cfg=cfg,
+            system_prompt=system_prompt,
+            user_message=user_message,
+        )
+        if result is None:
+            log("RETRY_PARSE_ERROR attempt=1 outcome=still_none")
+        else:
+            log("RETRY_PARSE_ERROR attempt=1 outcome=success")
+
     # Update state regardless of result, then act.
     state["total_dispatches"] = state.get("total_dispatches", 0) + 1
 
@@ -615,9 +639,20 @@ def main() -> None:
     selected_path = result.get("selected_path", "")
     proposal = result.get("next_task_proposal", "") or ""
     justification = result.get("justification", "") or ""
+    requires_human = bool(result.get("requires_human_presence", False))
 
     log(f"DISPATCH_RESULT confidence={confidence} path={selected_path} "
-        f"prop_bytes={len(proposal)} just=\"{justification[:120]}\"")
+        f"prop_bytes={len(proposal)} requires_human={requires_human} "
+        f"just=\"{justification[:120]}\"")
+
+    # v0.4.1-hook: requires_human_presence gate. Tasks needing GUI
+    # interaction (AX permissions, app launches, physical-world trials)
+    # must surface as banners, not auto-dispatch.
+    if requires_human:
+        state["consecutive_low"] = state.get("consecutive_low", 0) + 1
+        put_session_state(state_all, session_id, state)
+        save_state(state_all)
+        silent_exit(f"GATE_FAIL reason=requires_human_presence path={selected_path}")
 
     if confidence == "high" and selected_path != "low_confidence_no_action" and proposal:
         state["consecutive_low"] = 0

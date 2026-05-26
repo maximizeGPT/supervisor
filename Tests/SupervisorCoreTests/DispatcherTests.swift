@@ -62,7 +62,8 @@ final class DispatcherTests: XCTestCase {
         justification: String = "Mechanical follow-on from the dispatcher commit; tests are the obvious next unit per §6.",
         confidence: String = "high",
         selectedPath: String = "continue_branch",
-        selectedIssueNumber: Int? = nil
+        selectedIssueNumber: Int? = nil,
+        requiresHumanPresence: Bool? = nil
     ) -> Data {
         var input: [String: Any] = [
             "next_task_proposal": proposal,
@@ -72,6 +73,9 @@ final class DispatcherTests: XCTestCase {
         ]
         if let n = selectedIssueNumber {
             input["selected_issue_number"] = n
+        }
+        if let h = requiresHumanPresence {
+            input["requires_human_presence"] = h
         }
         let body: [String: Any] = [
             "id": "msg_disp",
@@ -141,7 +145,7 @@ final class DispatcherTests: XCTestCase {
 
         let result = await dispatcher.dispatch(context: sampleContext())
 
-        guard case let .ready(prompt, justification, confidence, path, _, _) = result else {
+        guard case let .ready(prompt, justification, confidence, path, _, _, _) = result else {
             return XCTFail("expected .ready, got \(result)")
         }
         XCTAssertFalse(prompt.isEmpty, "high-confidence dispatch must carry a prompt")
@@ -212,7 +216,7 @@ final class DispatcherTests: XCTestCase {
 
         let result = await dispatcher.dispatch(context: sampleContext())
 
-        guard case let .ready(_, _, confidence, path, issueNumber, _) = result else {
+        guard case let .ready(_, _, confidence, path, issueNumber, _, _) = result else {
             return XCTFail("expected .ready, got \(result)")
         }
         XCTAssertEqual(confidence, .high)
@@ -307,11 +311,57 @@ final class DispatcherTests: XCTestCase {
 
         let result = await dispatcher.dispatch(context: sampleContext())
 
-        guard case let .ready(_, _, _, _, _, priorEchoed) = result else {
+        guard case let .ready(_, _, _, _, _, priorEchoed, _) = result else {
             return XCTFail("expected .ready, got \(result)")
         }
         XCTAssertEqual(priorEchoed, 4,
                        "Haiku's prior_dispatches_considered echo must surface on the .ready result")
+    }
+
+    /// v0.4.1: requires_human_presence=true must surface on the .ready
+    /// result so the engine/router can gate auto-dispatch.
+    func testParserReadsRequiresHumanPresenceTrue() async throws {
+        Self.canned["/v1/messages"] = (200, Self.haikuDispatchResponse(
+            confidence: "high",
+            selectedPath: "continue_branch",
+            requiresHumanPresence: true
+        ), [:])
+        let dispatcher = makeDispatcher()
+
+        let result = await dispatcher.dispatch(context: sampleContext())
+
+        guard case let .ready(_, _, _, _, _, _, requiresHuman) = result else {
+            return XCTFail("expected .ready, got \(result)")
+        }
+        XCTAssertTrue(requiresHuman,
+                      "requires_human_presence=true must surface on the .ready result")
+    }
+
+    /// v0.4.1: when requires_human_presence is absent (pre-v0.4.1
+    /// dispatchers), it defaults to false.
+    func testParserDefaultsRequiresHumanPresenceToFalse() async throws {
+        Self.canned["/v1/messages"] = (200, Self.haikuDispatchResponse(
+            confidence: "high",
+            selectedPath: "continue_branch"
+        ), [:])
+        let dispatcher = makeDispatcher()
+
+        let result = await dispatcher.dispatch(context: sampleContext())
+
+        guard case let .ready(_, _, _, _, _, _, requiresHuman) = result else {
+            return XCTFail("expected .ready, got \(result)")
+        }
+        XCTAssertFalse(requiresHuman,
+                       "absent requires_human_presence must default to false")
+    }
+
+    /// v0.4.1: system prompt must teach the requires_human_presence gate.
+    func testSystemPromptTeachesRequiresHumanPresenceGate() {
+        let prompt = Dispatcher.systemPrompt
+        XCTAssertTrue(prompt.contains("requires_human_presence"),
+                      "system prompt must teach the gate")
+        XCTAssertTrue(prompt.contains("launching macOS apps") || prompt.contains("Accessibility permissions"),
+                      "system prompt must explain WHAT triggers the gate")
     }
 }
 

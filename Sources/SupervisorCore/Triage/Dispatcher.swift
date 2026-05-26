@@ -64,7 +64,8 @@ public enum DispatchResult: Sendable, Equatable {
         confidence: DispatchConfidence,
         selectedPath: SelectedPath,
         selectedIssueNumber: Int?,
-        priorDispatchesEchoed: Int?
+        priorDispatchesEchoed: Int?,
+        requiresHumanPresence: Bool
     )
     /// The Dispatcher saw the idle state but couldn't pick a task
     /// with enough confidence to dispatch OR propose. `reasoning`
@@ -78,8 +79,8 @@ public enum DispatchResult: Sendable, Equatable {
 
     public static func == (lhs: DispatchResult, rhs: DispatchResult) -> Bool {
         switch (lhs, rhs) {
-        case let (.ready(p1, j1, c1, sp1, n1, e1), .ready(p2, j2, c2, sp2, n2, e2)):
-            return p1 == p2 && j1 == j2 && c1 == c2 && sp1 == sp2 && n1 == n2 && e1 == e2
+        case let (.ready(p1, j1, c1, sp1, n1, e1, h1), .ready(p2, j2, c2, sp2, n2, e2, h2)):
+            return p1 == p2 && j1 == j2 && c1 == c2 && sp1 == sp2 && n1 == n2 && e1 == e2 && h1 == h2
         case let (.lowConfidence(r1), .lowConfidence(r2)):
             return r1 == r2
         case let (.error(r1), .error(r2)):
@@ -381,21 +382,22 @@ public final class Dispatcher: Dispatching, Sendable {
         // regardless of what next_task_proposal says — the router
         // shouldn't inject a half-confidence proposal.
         switch parsed {
-        case let .ready(_, justification, .low, _, _, _):
+        case let .ready(_, justification, .low, _, _, _, _):
             trace.emit("dispatch", "low-confidence dispatch path=\(parsed.selectedPathDescription) reasoning=\"\(justification.prefix(160))\"")
             return .lowConfidence(reasoning: justification)
-        case let .ready(_, justification, _, .lowConfidenceNoAction, _, _):
+        case let .ready(_, justification, _, .lowConfidenceNoAction, _, _, _):
             trace.emit("dispatch", "low-confidence dispatch (selected_path=low_confidence_no_action) reasoning=\"\(justification.prefix(160))\"")
             return .lowConfidence(reasoning: justification)
-        case let .ready(prompt, justification, confidence, path, issueN, priorEchoed):
-            trace.emit("dispatch", "ready confidence=\(confidence.rawValue) path=\(path.rawValue) issue=\(issueN.map(String.init) ?? "-") prior_echoed=\(priorEchoed.map(String.init) ?? "-") prompt_bytes=\(prompt.utf8.count) just=\"\(justification.prefix(120))\"")
+        case let .ready(prompt, justification, confidence, path, issueN, priorEchoed, requiresHuman):
+            trace.emit("dispatch", "ready confidence=\(confidence.rawValue) path=\(path.rawValue) issue=\(issueN.map(String.init) ?? "-") prior_echoed=\(priorEchoed.map(String.init) ?? "-") requires_human=\(requiresHuman) prompt_bytes=\(prompt.utf8.count) just=\"\(justification.prefix(120))\"")
             return .ready(
                 prompt: prompt,
                 justification: justification,
                 confidence: confidence,
                 selectedPath: path,
                 selectedIssueNumber: issueN,
-                priorDispatchesEchoed: priorEchoed
+                priorDispatchesEchoed: priorEchoed,
+                requiresHumanPresence: requiresHuman
             )
         default:
             return parsed
@@ -447,6 +449,10 @@ public final class Dispatcher: Dispatching, Sendable {
     **Low confidence is a feature, not a failure.** A confident "stop, don't dispatch" return is more valuable than a forced dispatch that improvises scope. If you can't ground the choice in a documented unit of work, return low. The user pays the cost of every dispatch (PRINCIPLES §9 cost transparency); a low-confidence return saves that cost AND surfaces the gap so the user can refill the work queue.
 
     **If `prior_dispatches_considered > 3`, weight evidence of thrashing more heavily.** A long chain of dispatches without progress is signal the loop is improvising. Ramp confidence down accordingly — a fourth or fifth dispatch should clear a higher bar to register as HIGH than the first one would.
+
+    # requires_human_presence gate
+
+    Some tasks cannot be executed by an autonomous Claude Code session from a terminal. Examples: launching macOS apps, granting Accessibility permissions, physical-world trials that require observing a running app, anything involving System Settings GUI. When the task you'd pick requires any of these, set `requires_human_presence: true` in `record_dispatch` regardless of confidence. The router will NOT auto-dispatch these; instead, the proposal surfaces as a banner for the user to act on when they're physically present.
 
     # Hard constraint
 
@@ -686,6 +692,10 @@ public final class Dispatcher: Dispatching, Sendable {
                         "type": .string("integer"),
                         "description": .string("Optional. Echo back the prior_dispatches_considered value you saw in the input, so the trace post-mortem can confirm you weighed thrashing detection correctly. Default 0 (fresh context). Populated by the engine; absent means the engine isn't yet instrumenting loop state (Part C ships the counter).")
                     ]),
+                    "requires_human_presence": .object([
+                        "type": .string("boolean"),
+                        "description": .string("Set to true when the proposed task requires macOS GUI interaction (launching apps, granting AX permissions, physical-world trials). The router will NOT auto-dispatch these — they surface as a banner for the user.")
+                    ]),
                 ]),
                 "required": .array([
                     .string("next_task_proposal"),
@@ -728,13 +738,19 @@ public final class Dispatcher: Dispatching, Sendable {
                 priorEchoed = Int(n)
             }
 
+            var requiresHuman = false
+            if case let .bool(b)? = input["requires_human_presence"] {
+                requiresHuman = b
+            }
+
             return .ready(
                 prompt: proposal,
                 justification: justification,
                 confidence: confidence,
                 selectedPath: path,
                 selectedIssueNumber: issueNumber,
-                priorDispatchesEchoed: priorEchoed
+                priorDispatchesEchoed: priorEchoed,
+                requiresHumanPresence: requiresHuman
             )
         }
         return nil
@@ -747,7 +763,7 @@ extension DispatchResult {
     /// Trace-line-friendly description of the selected path.
     var selectedPathDescription: String {
         switch self {
-        case let .ready(_, _, _, path, _, _): return path.rawValue
+        case let .ready(_, _, _, path, _, _, _): return path.rawValue
         case .lowConfidence: return "low_confidence_no_action"
         case .error: return "error"
         }

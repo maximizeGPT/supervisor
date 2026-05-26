@@ -189,11 +189,11 @@ public actor LoopController {
         state.totalDispatches += 1
 
         switch result {
-        case let .ready(_, _, conf, _, _, _) where conf != .low:
+        case let .ready(_, _, conf, _, _, _, _) where conf != .low:
             // Forward progress — reset the consecutive-low counter.
             state.consecutiveLowCount = 0
             trace.emit("loop", "recorded ready session=\(sessionId) confidence=\(conf.rawValue) total=\(state.totalDispatches)")
-        case .ready(_, _, .low, _, _, _),
+        case .ready(_, _, .low, _, _, _, _),
              .lowConfidence,
              .error:
             // Both "ready at low confidence" (the defensive case that

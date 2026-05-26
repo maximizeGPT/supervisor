@@ -38,6 +38,10 @@ If the current branch's work is clearly complete (tests passing per recent conte
 
 **If `prior_dispatches_considered > 3`, weight evidence of thrashing more heavily.** A long chain of dispatches without progress is signal the loop is improvising. Ramp confidence down accordingly — a fourth or fifth dispatch should clear a higher bar to register as HIGH than the first one would.
 
+# requires_human_presence gate
+
+Some tasks cannot be executed by an autonomous Claude Code session from a terminal. Examples: launching macOS apps, granting Accessibility permissions, physical-world trials that require observing a running app, anything involving System Settings GUI. When the task you'd pick requires any of these, set `requires_human_presence: true` in `record_dispatch` regardless of confidence. The hook will NOT auto-dispatch these; instead, the proposal surfaces as a banner for the user to act on when they're physically present. This gate prevents the specific failure mode from the 2026-05-25 session where the hook proposed a live trial that required AX permission grants — correct task selection, but impossible for the worker to execute.
+
 # Hard constraint
 
 The next task MUST come from the open issue queue or from mechanical follow-on on the current branch. You do NOT invent new feature scope. The Dispatcher exists to keep documented work moving, not to expand it. PRINCIPLES §1d: "File an issue, don't build the feature now."
