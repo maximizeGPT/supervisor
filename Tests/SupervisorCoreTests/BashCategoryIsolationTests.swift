@@ -142,14 +142,14 @@ final class BashCategoryIsolationTests: XCTestCase {
     }
 
     /// Default-arg compatibility: the systemPrompt() function with no
-    /// args still returns the full-corpus prompt, so assistant-text
-    /// + idle paths (which haven't been migrated to per-path-scoped
-    /// markdown) continue to work as before.
+    /// args still returns the full-corpus prompt. All three paths now
+    /// use per-path-scoped markdown (Issue #7 bash, Issue #8
+    /// assistant-text + idle), but the default is kept for future
+    /// paths and backward compatibility.
     func testSystemPromptDefaultArgReturnsFullCorpus() {
         let full = TriagePrompt.systemPrompt()
         XCTAssertTrue(full.contains("## destructive_action_pending"))
-        XCTAssertTrue(full.contains("## user_question_pending"),
-                      "default systemPrompt() still includes all bodies — assistant-text + idle paths rely on this")
+        XCTAssertTrue(full.contains("## user_question_pending"))
         XCTAssertTrue(full.contains("## worker_idle_post_completion"))
     }
 

@@ -82,6 +82,38 @@ public enum HardcodedRubric {
         bashCategories.map(\.name)
     }
 
+    /// v0.4.0 (Issue #8, §2e symmetry): categories for the
+    /// assistant-text triage path. Only `user_question_pending`.
+    public static var assistantTextCategories: [RubricCategory] {
+        [userQuestionPending]
+    }
+
+    public static var assistantTextCategoriesMarkdown: String {
+        assistantTextCategories
+            .map { "## \($0.name)\n\n\($0.body)" }
+            .joined(separator: "\n\n")
+    }
+
+    public static var assistantTextCategoryNames: [String] {
+        assistantTextCategories.map(\.name)
+    }
+
+    /// v0.4.0 (Issue #8, §2e symmetry): categories for the
+    /// idle-tick triage path. Only `worker_idle_post_completion`.
+    public static var idleCategories: [RubricCategory] {
+        [workerIdlePostCompletion]
+    }
+
+    public static var idleCategoriesMarkdown: String {
+        idleCategories
+            .map { "## \($0.name)\n\n\($0.body)" }
+            .joined(separator: "\n\n")
+    }
+
+    public static var idleCategoryNames: [String] {
+        idleCategories.map(\.name)
+    }
+
     // MARK: - Backwards-compat shims
     //
     // Older call sites still reference `HardcodedRubric.categoryName` /

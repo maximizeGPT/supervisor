@@ -292,7 +292,7 @@ public enum TriagePrompt {
         return AnthropicMessageRequest(
             model: model,
             max_tokens: 1024,
-            system: systemPrompt(),
+            system: systemPrompt(categoriesMarkdown: HardcodedRubric.assistantTextCategoriesMarkdown),
             messages: [
                 .init(role: "user", content: .string(userText))
             ],
@@ -361,7 +361,7 @@ public enum TriagePrompt {
         return AnthropicMessageRequest(
             model: model,
             max_tokens: 1024,
-            system: systemPrompt(),
+            system: systemPrompt(categoriesMarkdown: HardcodedRubric.idleCategoriesMarkdown),
             messages: [
                 .init(role: "user", content: .string(userText))
             ],
