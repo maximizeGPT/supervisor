@@ -946,3 +946,159 @@ Updated Tests/Dogfood/RUNBOOK-v0.4.0.md:
 
 - $0 API spend this session. All work is pure code + prompt changes.
 
+---
+
+# Session 5 — seed-on-restart + Issue #3 (continuing on the same branch)
+
+Started: 2026-05-25 05:08 UTC. Fresh session on
+`autonomous-20260525T193906Z`. Operating under PRINCIPLES.md v3.5.
+
+## Discovery
+
+- Read PRINCIPLES.md v3.5, AUTONOMOUS_SESSION_PROMPT.md v2.
+- STATUS-vs-reality diff: Issues #7 and #8 fixed on this branch but
+  still open in GH. Closed both.
+- Open issues: #2 (blocked, needs API key), #3 (configurable
+  terminals), #4 (blocked, needs API key), #9 (complex, filed).
+- No ANTHROPIC_API_KEY in env — calibration work off the table.
+
+## Proposal
+
+### Candidate 1 — Seed-on-restart + housekeeping (picked)
+- Source: CHANGELOG known limitation + Issues #7/#8 stale
+- LoopController seeding from LoopDispatchStore on first canDispatch.
+- Close #7/#8.
+
+### Candidate 2 — Issue #4 (rubric MEDIUM front-loading)
+- Blocked: no API key for calibration sweep.
+
+### Pick
+Candidate 1 first, then Issue #3 with remaining time.
+
+## Log
+
+### 05:10 — Seed-on-restart (done)
+
+- Added `loopStore: LoopDispatchStore?` param to `LoopController.init`.
+- Stored as `seedCount: ((String) -> Int)?` closure — captures the
+  store's `count(sessionId:)` query. All four lazy-init sites
+  (canDispatch, recordDispatch, notePause, stop) now seed from the
+  store instead of hardcoding 0.
+- `main.swift` passes `loopDispatchStore` to the controller.
+- Trace tag `SEEDED session=... totalDispatches=... from store` on
+  first canDispatch when seeded > 0.
+- CHANGELOG: removed known limitation, added Fixed entry.
+
+### 05:12 — Seed tests (done)
+
+- `testSeedOnRestartPicksUpTotalFromStore`: creates real SQLite DB,
+  inserts 5 dispatch rows, verifies canDispatch returns
+  `proceed(priorDispatchesConsidered: 5)`.
+- `testUnstoredSessionReturnZeroEvenWithStore`: verifies a session
+  with no store rows returns 0 even with the store wired.
+- 247/247 pass (was 245 pre-session).
+
+### 05:12 — Closed Issues #7 and #8
+
+Both implemented on this branch in prior sessions; GH issues were
+still open. Closed with commit references.
+
+### 05:13 — Issue #3: configurable terminals (started)
+
+**Engineering decision**: config.yaml format is trivially simple (one
+key, one list of strings). Adding Yams as a full YAML dependency
+violates §1a (restraint). Wrote a minimal substring parser for this
+specific YAML subset — 60 lines vs. a ~50K LOC dependency.
+
+### 05:14 — UserConfig.swift (done)
+
+- `UserConfig.parse(_ yaml: String?) -> UserConfig` — forgiving
+  parser that handles comments, inline comments, empty entries.
+  Degrades to empty config on nil/malformed input.
+- `UserConfig.load(from: URL)` — disk loader, degrades to default.
+
+### 05:15 — ConfigWatcher.swift (done)
+
+- FSEvents via `DispatchSource.makeFileSystemObjectSource`.
+- Watches the file if it exists, the parent directory if it doesn't.
+- On file creation/write/rename: re-reads, calls onChange callback.
+- @MainActor so the callback runs on the main thread (UI updates).
+
+### 05:16 — HoverWindowController changes (done)
+
+- `claudeCodeHostApps` changed from static to instance property.
+- `defaultHostApps` is the new static (the hardcoded floor).
+- Init accepts `additionalHostApps: [String]`, unions with defaults.
+- `mergeUserConfig(additionalHostApps:)` for live updates.
+
+### 05:17 — main.swift wiring (done)
+
+- Loads `UserConfig` at startup, passes to HoverWindowController init.
+- Creates ConfigWatcher with onChange that calls
+  `hoverWindow.mergeUserConfig`.
+
+### 05:18 — Tests (done)
+
+- `UserConfigTests.swift`: 10 tests covering parse happy path,
+  comments, inline comments, empty, nil, no key, top-level key,
+  stops at next key, disk load, empty dash entries.
+- `HoverHostAppsTests.swift`: 2 new tests (init merge + live merge).
+  Updated existing tests to use `defaultHostApps` (was
+  `claudeCodeHostApps` static).
+- 259/259 pass (was 247 pre-session; +12 new tests).
+
+### 05:20 — CHANGELOG + Issue #3 closed
+
+Full CHANGELOG entry under v0.4.0 Fixed section. Issue #3 closed
+with implementation summary.
+
+## Post-mortem
+
+### What I tried to ship
+1. Seed-on-restart for LoopController (known limitation fix).
+2. Issue #3 (user-configurable host-app list).
+3. Close stale Issues #7 and #8.
+
+### What actually shipped
+All three. Commits pending (will commit per §1e granularity after
+writing this post-mortem).
+
+### What didn't ship and why
+- Issue #4 (rubric refinement): blocked on API key availability.
+  The issue is well-scoped with a $0.04 targeted sweep plan; it's
+  the single highest-impact calibration improvement waiting for a
+  session with a working Anthropic key.
+- Issue #2 (false negatives from v0.1.4): also blocked on API key.
+
+### Honest mistakes
+None. Both tasks were straightforward code changes with no
+ambiguity. The HoverHostAppsTests needed a SupervisorCore import
+for HoverViewModel — caught on first test run, fixed immediately.
+
+### What surprised me
+- The `claudeCodeHostApps` → `defaultHostApps` rename was cleaner
+  than expected. The instance-vs-static split fell out naturally
+  from the requirement (live-updatable set on the controller
+  instance, immutable defaults as the floor).
+- The minimal YAML parser is 60 lines. Yams is ~50K LOC. For this
+  one config key with one list of strings, the restraint principle
+  clearly applies.
+
+### Open questions for Mohammed
+- **Config format long-term**: if config.yaml grows beyond
+  `hover.known_terminals` (e.g., adding cost caps, notification
+  preferences), does Mohammed want to stay with the minimal parser
+  or switch to Yams at that point? The current parser handles
+  exactly one key — extending it to multiple keys is trivial, but
+  nested objects or anchors/aliases would need Yams.
+- **Issue #4 API key**: the calibration sweep is ready to run at
+  $0.04. Next session with a working ANTHROPIC_API_KEY should
+  prioritize it — it's the single largest recall improvement
+  available (5 fixtures × MEDIUM front-loading).
+
+### Calibration / cost summary
+- API spend this session: $0 (pure code, no live calls).
+- Sweeps run: none.
+- Tests passing locally: 259/259 (was 245 at session start; +14
+  over the session: +2 seed, +10 UserConfig, +2 hover merge).
+

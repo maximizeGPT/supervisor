@@ -44,6 +44,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private var costStore: CostStore?
     private var loopDispatchStore: LoopDispatchStore?
     private var loopController: LoopController?
+    private var configWatcher: ConfigWatcher?
     private var llm: LLMClient?
     private var triageEngine: TriageEngine?
     private var discovery: SessionDiscovery?
@@ -169,11 +170,24 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // v0.1.4 Gap 8: hover visibility depends on whether Supervisor
         // is actually tailing a session. discovery is constructed later
         // (step 6) so we read it lazily via a closure capturing self.
-        let hoverWindow = HoverWindowController(vm: hoverVM, isAnySessionActive: { [weak self] in
-            (self?.discovery?.activeSessions().isEmpty == false)
-        })
+        // Load user config (Issue #3: additional host apps from config.yaml).
+        let userConfig = UserConfig.load(from: paths.configPath)
+        let hoverWindow = HoverWindowController(
+            vm: hoverVM,
+            isAnySessionActive: { [weak self] in
+                (self?.discovery?.activeSessions().isEmpty == false)
+            },
+            additionalHostApps: userConfig.additionalHostApps
+        )
         self.hoverWindow = hoverWindow
         hoverWindow.present()
+
+        // Watch config.yaml for live changes — FSEvents fires on write/rename.
+        let watcher = ConfigWatcher(configPath: paths.configPath, trace: trace) { [weak hoverWindow] config in
+            hoverWindow?.mergeUserConfig(additionalHostApps: config.additionalHostApps)
+        }
+        watcher.start()
+        self.configWatcher = watcher
 
         // 3. LLM client (key required — should be present post-onboarding).
         // v0.2.0: provider is whatever the user picked in onboarding (or
@@ -225,7 +239,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // pure logic — no external deps). LoopDispatchStore was set up
         // in step 1 above. Both are passed into the engine; tests
         // bypass them by passing nil.
-        let loopController = LoopController(trace: trace)
+        let loopController = LoopController(trace: trace, loopStore: loopDispatchStore)
         self.loopController = loopController
         let engine = TriageEngine(
             client: client,

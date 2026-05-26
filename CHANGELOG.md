@@ -160,6 +160,42 @@ of AX permissions and is active on this branch.
 - 7 Python tests in `test_dispatch_loop_hook.py`; 3 new Swift tests
   in `DispatcherTests.swift`.
 
+**Loop-state seed-on-restart** (`LoopController.swift`, `main.swift`)
+- `LoopController` now accepts an optional `LoopDispatchStore` at
+  init. On first `canDispatch` for a session, it queries
+  `store.count(sessionId:)` to seed `totalDispatches` from prior
+  runs. A Supervisor restart mid-loop now picks up the dispatch
+  counter instead of resetting to zero — the Dispatcher's
+  `prior_dispatches_considered` stays accurate across restarts.
+- `main.swift` passes `loopDispatchStore` to the controller.
+- 2 tests in `LoopControllerTests`: seeded session reads 5 from
+  store; unknown session returns 0 even with store wired.
+
+**Issue #3 — user-configurable host-app list** (`UserConfig.swift`,
+`ConfigWatcher.swift`, `HoverWindowController.swift`, `main.swift`)
+- Users can add terminal/IDE bundle IDs to
+  `~/Library/Application Support/Supervisor/config.yaml`:
+  ```yaml
+  hover:
+    known_terminals:
+      - com.microsoft.VSCode
+      - com.todesktop.230313mzl4w4u92  # Cursor
+  ```
+  Entries are merged additively with the hardcoded defaults
+  (Terminal.app, iTerm2, Ghostty, Warp, Alacritty, Claude.app).
+- `UserConfig.parse` handles the YAML subset without a Yams
+  dependency — comments, inline comments, empty entries.
+- `ConfigWatcher` uses `DispatchSource.makeFileSystemObjectSource`
+  (FSEvents) to detect file changes; re-reads config.yaml and
+  calls `mergeUserConfig` on the hover controller. Watches the
+  parent directory if config.yaml doesn't exist yet and upgrades
+  to file-level watching when it appears.
+- `HoverWindowController.claudeCodeHostApps` is now a live
+  instance property (was static). `defaultHostApps` remains static
+  as the floor.
+- 10 tests in `UserConfigTests`; 2 tests in `HoverHostAppsTests`
+  (init merge + live merge).
+
 ### Known limitations
 
 - **AX-permission-revoke blocker**: CGEventPost injection requires
@@ -168,9 +204,6 @@ of AX permissions and is active on this branch.
   tests but the physical-world dogfood hasn't completed a full
   unattended cycle under production conditions. The hook-based
   path (`Tools/dispatch-loop-hook/`) bypasses this entirely.
-- **Loop-state seed-on-restart**: `LoopController` does not query
-  `LoopDispatchStore` on startup to seed `totalDispatches` from a
-  previous run. Filed for a future single-LOC bootstrap change.
 - **PRINCIPLES.md references** loaded at engine construction time,
   not refreshed mid-loop. A loop that runs for hours will use the
   PRINCIPLES.md snapshot from boot. Acceptable for v0.4.0; filed
