@@ -52,6 +52,36 @@ public enum HardcodedRubric {
             .joined(separator: "\n\n")
     }
 
+    /// v0.4.0 (Issue #7, PRINCIPLES §2e per-path prompt isolation):
+    /// the subset of categories that apply to the bash triage path.
+    /// Excludes `user_question_pending` (fires only from assistant
+    /// messages, never from bash commands) and
+    /// `worker_idle_post_completion` (fires only from the idle-tick
+    /// timer, never from bash). Without this filter, the bash
+    /// path's system prompt enumerates all categories and Haiku
+    /// pattern-matches on the literal category name appearing in
+    /// the bash command (e.g. a grep regex containing
+    /// `user_question_pending`) — the §2e gap the autonomous trial
+    /// on 2026-05-25 surfaced.
+    public static var bashCategoriesMarkdown: String {
+        bashCategories
+            .map { "## \($0.name)\n\n\($0.body)" }
+            .joined(separator: "\n\n")
+    }
+
+    /// Categories the bash triage path evaluates against. Source of
+    /// truth for the per-path filter used by `bashCategoriesMarkdown`
+    /// and by the per-path scope sentence in
+    /// `TriagePrompt.buildRequest`.
+    public static var bashCategories: [RubricCategory] {
+        [destructiveActionPending, editsOutsideWorktree, promptInjectionSignature]
+    }
+
+    /// Names-only convenience for the per-path scope sentence + tests.
+    public static var bashCategoryNames: [String] {
+        bashCategories.map(\.name)
+    }
+
     // MARK: - Backwards-compat shims
     //
     // Older call sites still reference `HardcodedRubric.categoryName` /
