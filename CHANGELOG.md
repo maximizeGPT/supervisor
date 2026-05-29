@@ -6,14 +6,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.5.1-hook] — 2026-05-29
+## [0.5.1] — 2026-05-29
 
-Dispatch hook reliability: JSON truncation repair + control flow
-hardening.
+JSON truncation repair across both dispatch paths (Python hook +
+Swift LLMClient). When DeepSeek hits max_tokens and returns
+`finish_reason=length` with truncated tool-call arguments, both
+paths now attempt repair instead of treating the response as a
+failure.
 
 ### Fixed
 
-**JSON truncation repair** (`dispatch_loop_hook.py`)
+**JSON truncation repair — Swift** (`LLMClient.swift`)
+- `LLMClient.tryRepairTruncatedJSON(_:)`: two-strategy repair
+  mirroring the Python hook's algorithm. Wired into
+  `translateResponse` — triggers only on `finish_reason == "length"`.
+  All OpenAI-compat consumers (TriageEngine, Dispatcher,
+  QuestionAnswerer) benefit without individual changes.
+- 6 tests: 4 repair unit tests + 2 `translateResponse` integration
+  tests (length triggers repair; non-length stays `.null`).
+
+**JSON truncation repair — Python hook** (`dispatch_loop_hook.py`)
 - When DeepSeek hits `max_tokens` and returns `finish_reason=length`
   with truncated tool-call arguments (unterminated strings, missing
   closing braces), the parser now attempts repair via

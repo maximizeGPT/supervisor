@@ -1264,3 +1264,50 @@ sweep. Per section 9e: verification of already-decided outcome.
   a false positive — Haiku fires on CVE writeups that quote injection
   language. Separate calibration item, deferred.
 
+---
+
+# Session 6c — Swift-side JSON truncation repair (dispatch-loop continuation)
+
+Started: 2026-05-29 ~17:35 UTC. Dispatch hook auto-dispatched:
+"The Python hook got the repair; the Swift Dispatcher is the
+production consumer and has the same vulnerability."
+
+## Log
+
+### 17:36 — Investigation
+- Python hook's `_try_repair_truncated_json` repairs truncated JSON
+  from DeepSeek at the dispatch hook level.
+- Swift `LLMClient.translateResponse` has the same vulnerability:
+  when `call.function.arguments` fails JSON parse, it falls back to
+  `.null` — no repair attempt.
+- `choice.finish_reason` is available at the translation layer.
+- Fix goes in `translateResponse` (not Dispatcher) so ALL consumers
+  benefit: TriageEngine, QuestionAnswerer, Dispatcher.
+
+### 17:40 — Implementation
+- Added `LLMClient.tryRepairTruncatedJSON(_:)` — mirrors Python's
+  two-strategy algorithm (close unterminated strings + add braces;
+  truncate to last complete key-value pair).
+- Wired into `translateResponse`: when initial parse fails AND
+  `finish_reason == "length"`, attempt repair before `.null` fallback.
+
+### 17:42 — Tests
+- 6 new tests in `LLMClientProviderTests.swift`:
+  - `testTryRepairUnterminatedString`
+  - `testTryRepairMissingClosingBrace`
+  - `testTryRepairTruncatedAtKeyBoundary`
+  - `testTryRepairReturnsNilForEmpty`
+  - `testTranslateResponseRepairsTruncatedArgsOnFinishReasonLength`
+  - `testTranslateResponseDoesNotRepairWhenFinishReasonIsStop`
+- 275/275 Swift pass (was 269; +6). 39/39 Python pass. 0 failures.
+
+### Engineering decision
+Per section 1c (wrappers, not rewrites): placed repair in the
+translation layer where the truncation first manifests, not in each
+consumer. Per section 8 (belt + suspenders): repair only triggers on
+`finish_reason == "length"` — non-truncation parse failures still
+surface as `.null` for the existing error paths to handle.
+
+### Budget decision
+$0 API spend. Pure unit tests, no live API calls.
+
