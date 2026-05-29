@@ -203,6 +203,103 @@ final class LLMClientProviderTests: XCTestCase {
         XCTAssertThrowsError(try LLMClient.translateResponse(openAI, requestedModel: "x"))
     }
 
+    // MARK: - v0.5.1: JSON truncation repair
+
+    func testTryRepairUnterminatedString() {
+        let truncated = #"{"next_task_proposal": "Fix the bug in dispatch"#
+        let repaired = LLMClient.tryRepairTruncatedJSON(truncated)
+        XCTAssertNotNil(repaired, "should repair unterminated string")
+        let obj = try! JSONSerialization.jsonObject(with: repaired!) as! [String: Any]
+        XCTAssertNotNil(obj["next_task_proposal"])
+    }
+
+    func testTryRepairMissingClosingBrace() {
+        let truncated = #"{"confidence": "high", "next_task_proposal": "Do the thing""#
+        let repaired = LLMClient.tryRepairTruncatedJSON(truncated)
+        XCTAssertNotNil(repaired, "should repair missing brace")
+        let obj = try! JSONSerialization.jsonObject(with: repaired!) as! [String: Any]
+        XCTAssertEqual(obj["confidence"] as? String, "high")
+    }
+
+    func testTryRepairTruncatedAtKeyBoundary() {
+        let truncated = #"{"confidence": "high", "next_task_pro"#
+        let repaired = LLMClient.tryRepairTruncatedJSON(truncated)
+        XCTAssertNotNil(repaired, "should truncate to last complete pair")
+        let obj = try! JSONSerialization.jsonObject(with: repaired!) as! [String: Any]
+        XCTAssertEqual(obj["confidence"] as? String, "high")
+    }
+
+    func testTryRepairReturnsNilForEmpty() {
+        XCTAssertNil(LLMClient.tryRepairTruncatedJSON(""))
+        XCTAssertNil(LLMClient.tryRepairTruncatedJSON("   "))
+    }
+
+    func testTranslateResponseRepairsTruncatedArgsOnFinishReasonLength() throws {
+        // Simulates DeepSeek returning finish_reason=length with truncated
+        // tool-call arguments. The translator should repair the JSON.
+        let truncatedArgs = #"{"next_task_proposal": "Read the file", "confidence": "high", "selected_path": "continue_bra"#
+        let openAI = OpenAIChatResponse(
+            id: "test",
+            model: "deepseek-chat",
+            choices: [OpenAIChoice(
+                index: 0,
+                message: OpenAIResponseMessage(
+                    role: "assistant",
+                    content: nil,
+                    tool_calls: [OpenAIToolCall(
+                        id: "call_1",
+                        type: "function",
+                        function: OpenAIFunctionCall(
+                            name: "record_dispatch",
+                            arguments: truncatedArgs
+                        )
+                    )]
+                ),
+                finish_reason: "length"
+            )],
+            usage: OpenAIUsage(prompt_tokens: 100, completion_tokens: 8192, total_tokens: 8292)
+        )
+        let mapped = try LLMClient.translateResponse(openAI, requestedModel: "deepseek-chat")
+        XCTAssertEqual(mapped.content.count, 1)
+        XCTAssertEqual(mapped.content[0].type, "tool_use")
+        // Input should be a parsed object, not .null
+        if case let .object(input)? = mapped.content[0].input {
+            XCTAssertNotNil(input["next_task_proposal"])
+            XCTAssertNotNil(input["confidence"])
+        } else {
+            XCTFail("repaired input should be an object, got: \(String(describing: mapped.content[0].input))")
+        }
+    }
+
+    func testTranslateResponseDoesNotRepairWhenFinishReasonIsStop() throws {
+        // When finish_reason is NOT length, truncated args should remain .null
+        let truncatedArgs = #"{"next_task_proposal": "unterminated"#
+        let openAI = OpenAIChatResponse(
+            id: "test",
+            model: "deepseek-chat",
+            choices: [OpenAIChoice(
+                index: 0,
+                message: OpenAIResponseMessage(
+                    role: "assistant",
+                    content: nil,
+                    tool_calls: [OpenAIToolCall(
+                        id: "call_1",
+                        type: "function",
+                        function: OpenAIFunctionCall(
+                            name: "record_dispatch",
+                            arguments: truncatedArgs
+                        )
+                    )]
+                ),
+                finish_reason: "stop"
+            )],
+            usage: nil
+        )
+        let mapped = try LLMClient.translateResponse(openAI, requestedModel: "deepseek-chat")
+        XCTAssertEqual(mapped.content[0].input, .null,
+            "should NOT repair when finish_reason is not length")
+    }
+
     // MARK: - End-to-end via MockURLProtocol
 
     func testOpenAICompatPathSendsBearerAndDecodesToolCall() async throws {

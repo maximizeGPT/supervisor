@@ -340,6 +340,8 @@ public final class LLMClient: Sendable {
         }
         var blocks: [AnthropicContentBlock] = []
 
+        let isLengthTruncated = choice.finish_reason == "length"
+
         if let calls = choice.message.tool_calls, !calls.isEmpty {
             for call in calls {
                 // Tool arguments arrive as a JSON-encoded string. Parse them
@@ -349,6 +351,15 @@ public final class LLMClient: Sendable {
                 if let argData = call.function.arguments.data(using: .utf8),
                    let parsed = try? JSONDecoder().decode(AnthropicJSON.self, from: argData) {
                     parsedInput = parsed
+                } else if isLengthTruncated,
+                          let repairedData = Self.tryRepairTruncatedJSON(call.function.arguments),
+                          let repaired = try? JSONDecoder().decode(AnthropicJSON.self, from: repairedData) {
+                    // finish_reason=length: DeepSeek hit max_tokens and truncated
+                    // the JSON mid-string. Attempt repair — close unterminated
+                    // strings, add missing braces, or truncate to the last complete
+                    // key-value pair. Mirrors the Python hook's
+                    // _try_repair_truncated_json (v0.5.1-hook).
+                    parsedInput = repaired
                 } else {
                     // Malformed JSON in arguments — surface as null so the
                     // extractor can log the schema.malformed line instead
@@ -385,5 +396,52 @@ public final class LLMClient: Sendable {
             stop_sequence: nil,
             usage: usage
         )
+    }
+
+    // MARK: - JSON truncation repair (v0.5.1)
+
+    /// Attempt to recover a JSON object from a truncated string.
+    /// DeepSeek sometimes hits max_tokens mid-JSON, leaving unterminated
+    /// strings and missing closing braces. Mirrors the Python hook's
+    /// `_try_repair_truncated_json` (v0.5.1-hook, commit ed8fccd).
+    ///
+    /// Returns repaired JSON as Data suitable for JSONDecoder, or nil.
+    static func tryRepairTruncatedJSON(_ raw: String) -> Data? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // Strategy 1: close unterminated string + add missing braces.
+        var repaired = trimmed
+        let quoteCount = repaired.filter { $0 == "\"" }.count
+        if quoteCount % 2 != 0 {
+            repaired += "\""
+        }
+        let openBraces = repaired.filter { $0 == "{" }.count - repaired.filter { $0 == "}" }.count
+        let openBrackets = repaired.filter { $0 == "[" }.count - repaired.filter { $0 == "]" }.count
+        repaired += String(repeating: "]", count: max(0, openBrackets))
+        repaired += String(repeating: "}", count: max(0, openBraces))
+        if let data = repaired.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data),
+           obj is [String: Any] {
+            return data
+        }
+
+        // Strategy 2: truncate to last complete key-value pair.
+        let chars = Array(raw)
+        for i in stride(from: chars.count - 1, through: 1, by: -1) {
+            guard chars[i] == "," || chars[i] == "{" else { continue }
+            let prefix = chars[i] == "," ? String(chars[..<i]) : String(chars[...i])
+            var candidate = prefix
+            let ob = candidate.filter { $0 == "{" }.count - candidate.filter { $0 == "}" }.count
+            let ok = candidate.filter { $0 == "[" }.count - candidate.filter { $0 == "]" }.count
+            candidate += String(repeating: "]", count: max(0, ok))
+            candidate += String(repeating: "}", count: max(0, ob))
+            if let data = candidate.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data),
+               obj is [String: Any] {
+                return data
+            }
+        }
+        return nil
     }
 }
