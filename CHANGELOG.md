@@ -6,6 +6,90 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1-hook] — 2026-05-29
+
+Dispatch hook reliability: JSON truncation repair + control flow
+hardening.
+
+### Fixed
+
+**JSON truncation repair** (`dispatch_loop_hook.py`)
+- When DeepSeek hits `max_tokens` and returns `finish_reason=length`
+  with truncated tool-call arguments (unterminated strings, missing
+  closing braces), the parser now attempts repair via
+  `_try_repair_truncated_json`. Two strategies: (1) close the
+  unterminated string and add missing braces; (2) truncate to the
+  last complete key-value pair. Repair only triggers on
+  `finish_reason=length` — other causes still return None and fall
+  through to retry/SelfExtender.
+- Both `_parse_dispatcher_response` and `_parse_self_extender_response`
+  use the shared repair helper. Successful repairs logged as
+  `PARSE_REPAIRED` / `SELF_EXTEND_PARSE_REPAIRED`.
+
+**`try_self_extend` control flow** (`dispatch_loop_hook.py`)
+- Added explicit `return` after each `emit_block()` call.
+  `emit_block` calls `sys.exit(0)` so the returns never execute, but
+  they make the control flow explicit and safe against future changes.
+  Per PRINCIPLES section 8 (belt + suspenders).
+
+**Test log isolation** (`dispatch_loop_hook.py`)
+- `HOOK_HOME` is now overridable via `DISPATCH_HOOK_HOME` env var.
+  Tests can redirect logs to a temp directory instead of polluting the
+  production log at `~/.claude/hooks/dispatch-loop.log`.
+
+### Closed
+
+- **Issue #11** — closed as stale. CalibrationRunner infrastructure
+  already exists as `RubricCalibrationTests.swift` with full-corpus,
+  targeted, and discovery sweep functions.
+
+### Tests
+
+39 Python pass (was 31; +8 new truncation repair tests).
+269 Swift pass (unchanged). 6 skipped. 0 failures.
+
+## [0.5.0] — 2026-05-26
+
+SelfExtender: the dispatch loop self-heals on failure instead of
+silent-exiting.
+
+### Added
+
+**SelfExtender** (`dispatch_loop_hook.py`, `self-extender-system-prompt.txt`)
+- When the Dispatcher returns low confidence, parse errors, or None,
+  the hook invokes a second DeepSeek call (SelfExtender) that
+  diagnoses the failure and produces a fix prompt. Three-tier
+  escalation: high confidence fix injected directly; low confidence
+  retried with escalation prompt; both fail triggers investigation
+  fallback. The loop never `silent_exit`s on recoverable failures.
+- `detect_stuck_patterns()`: checks worker's last text for stuck
+  signals ("would normally ask", "needs a values call", etc.).
+- Meta-rule enforcement: SelfExtender cannot weaken the safety
+  architecture, modify PRINCIPLES.md/PROTOCOL.md safety gates,
+  disable the hook, or remove Mohammed's visibility. Violations
+  surface to Mohammed instead of self-extending.
+- Issue-filing prohibition: `try_self_extend` logs a violation if the
+  fix prompt contains `gh issue create` or `filed as Issue`.
+
+**Swift plumbing** (`StorageModels.swift`, `HardcodedRubric.swift`,
+`InterventionRouter.swift`, `TriagePrompt.swift`, `HoverView.swift`)
+- `FlagAction.selfExtend` case added to the action ladder.
+- `self_extension_needed` rubric category in `HardcodedRubric`.
+- Router routes `.selfExtend` to `.notify` (in-app degradation).
+
+### Changed
+
+- **PRINCIPLES.md section 1d**: defer scope to `trial-notes.md`, not
+  GitHub issues. SelfExtender picks up deferred work from
+  trial-notes.md on the next dispatch cycle.
+- `consecutive_low` hard stop removed from the hook — SelfExtender
+  handles the recovery path that `consecutive_low` was protecting
+  against.
+
+### Tests
+
+10 Python tests added (7 SelfExtender, 3 stuck-pattern detection).
+
 ## [0.4.0] — 2026-05-25 (in progress — continuous autonomous dispatch loop)
 
 Supervisor gains the ability to keep an autonomous Claude Code
