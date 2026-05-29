@@ -247,7 +247,9 @@ class TestParseDispatcherResponse(unittest.TestCase):
         result = hook._parse_dispatcher_response('{"choices": [{"message":')
         self.assertIsNone(result)
 
-    def test_truncated_arguments_returns_none(self):
+    def test_truncated_arguments_repaired_on_length(self):
+        """v0.5.1: finish_reason=length with truncated args should now
+        recover via JSON repair instead of returning None."""
         raw = json.dumps({
             "choices": [{
                 "finish_reason": "length",
@@ -262,11 +264,30 @@ class TestParseDispatcherResponse(unittest.TestCase):
             }]
         })
         result = hook._parse_dispatcher_response(raw)
+        self.assertIsNotNone(result, "repair should recover truncated JSON")
+        self.assertIn("next_task_proposal", result)
+
+    def test_truncated_arguments_still_none_when_not_length(self):
+        """When finish_reason is NOT length, truncated args still return None."""
+        raw = json.dumps({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "record_dispatch",
+                            "arguments": '{"next_task_proposal": "unterminated string'
+                        }
+                    }]
+                }
+            }]
+        })
+        result = hook._parse_dispatcher_response(raw)
         self.assertIsNone(result)
 
-    def test_truncated_args_logs_finish_reason_and_raw_head(self):
-        """When args_raw is truncated JSON (max_tokens hit), the log
-        must include finish_reason and the first 300 chars of args."""
+    def test_truncated_args_repaired_and_logged(self):
+        """v0.5.1: truncated args with finish_reason=length are now
+        repaired. The log should show PARSE_REPAIRED."""
         log_lines = []
         truncated_args = '{"next_task_proposal": "Pick up Issue #9. Do the AX investigation per'
 
@@ -288,14 +309,12 @@ class TestParseDispatcherResponse(unittest.TestCase):
         with patch.object(hook, 'log', side_effect=lambda msg: log_lines.append(msg)):
             result = hook._parse_dispatcher_response(raw)
 
-        self.assertIsNone(result)
-        # Find the parse error log line
-        error_lines = [l for l in log_lines if "deepseek_parse_error" in l]
-        self.assertEqual(len(error_lines), 1)
-        line = error_lines[0]
-        self.assertIn("finish_reason=length", line)
-        self.assertIn("RAW_RESPONSE", line)
-        self.assertIn("Pick up Issue #9", line)
+        self.assertIsNotNone(result, "repair should succeed")
+        self.assertIn("next_task_proposal", result)
+        # Verify repair was logged
+        repair_lines = [l for l in log_lines if "PARSE_REPAIRED" in l]
+        self.assertEqual(len(repair_lines), 1)
+        self.assertIn("finish_reason=length", repair_lines[0])
 
     def test_no_tool_call_logs_finish_reason(self):
         """When no tool_calls in response (e.g. refusal or length),
@@ -570,6 +589,87 @@ class TestSelfExtender(unittest.TestCase):
     def test_parse_self_extender_response_malformed(self):
         result = hook._parse_self_extender_response('{"broken":')
         self.assertIsNone(result)
+
+
+class TestTruncatedJsonRepair(unittest.TestCase):
+    """v0.5.1: JSON repair for finish_reason=length truncated responses."""
+
+    def test_repair_unterminated_string(self):
+        truncated = '{"next_task_proposal": "Fix the bug in dispatch_loop_hook.py by adding'
+        result = hook._try_repair_truncated_json(truncated)
+        self.assertIsNotNone(result)
+        self.assertIn("next_task_proposal", result)
+
+    def test_repair_missing_closing_brace(self):
+        truncated = '{"confidence": "high", "next_task_proposal": "Do the thing"'
+        result = hook._try_repair_truncated_json(truncated)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["confidence"], "high")
+        self.assertEqual(result["next_task_proposal"], "Do the thing")
+
+    def test_repair_truncated_mid_key(self):
+        truncated = '{"confidence": "high", "next_task_pro'
+        result = hook._try_repair_truncated_json(truncated)
+        # Strategy 2: truncate to last comma, recover confidence
+        self.assertIsNotNone(result)
+        self.assertEqual(result["confidence"], "high")
+
+    def test_repair_valid_json_passthrough(self):
+        valid = '{"confidence": "high", "proposal": "Do it"}'
+        result = hook._try_repair_truncated_json(valid)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["confidence"], "high")
+
+    def test_repair_empty_returns_none(self):
+        self.assertIsNone(hook._try_repair_truncated_json(""))
+        self.assertIsNone(hook._try_repair_truncated_json(None))
+
+    def test_repair_single_brace_returns_empty_dict(self):
+        # A lone "{" repairs to "{}" — a valid but empty dict
+        result = hook._try_repair_truncated_json("{")
+        self.assertEqual(result, {})
+
+    def test_dispatcher_uses_repair_on_length(self):
+        """Full parse path: finish_reason=length with truncated args
+        should recover via repair."""
+        truncated_args = '{"next_task_proposal": "Read the file", "confidence": "high", "selected_path": "continue_bra'
+        raw = json.dumps({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "record_dispatch",
+                            "arguments": truncated_args,
+                        }
+                    }]
+                }
+            }]
+        })
+        result = hook._parse_dispatcher_response(raw)
+        self.assertIsNotNone(result, "repair should recover partial dispatch result")
+        self.assertEqual(result["confidence"], "high")
+        self.assertEqual(result["next_task_proposal"], "Read the file")
+
+    def test_self_extender_uses_repair_on_length(self):
+        """SelfExtender parse path also uses repair."""
+        truncated_args = '{"fix_prompt": "Run swift test", "diagnosis": "Tests failing", "confidence": "hi'
+        raw = json.dumps({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "record_self_extend",
+                            "arguments": truncated_args,
+                        }
+                    }]
+                }
+            }]
+        })
+        result = hook._parse_self_extender_response(raw)
+        self.assertIsNotNone(result, "repair should recover partial self-extend result")
+        self.assertIn("fix_prompt", result)
 
 
 if __name__ == "__main__":

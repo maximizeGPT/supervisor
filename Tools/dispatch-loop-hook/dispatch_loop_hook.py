@@ -57,7 +57,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPT_FILE = SCRIPT_DIR / "dispatcher-system-prompt.txt"
 SELF_EXTENDER_PROMPT_FILE = SCRIPT_DIR / "self-extender-system-prompt.txt"
 
-HOOK_HOME = Path.home() / ".claude" / "hooks"
+HOOK_HOME = Path(os.environ.get("DISPATCH_HOOK_HOME", "")) if os.environ.get("DISPATCH_HOOK_HOME") else Path.home() / ".claude" / "hooks"
 ENABLED_FLAG = HOOK_HOME / "dispatch-loop-enabled.json"
 STATE_FILE = HOOK_HOME / "dispatch-loop-state.json"
 LOG_FILE = HOOK_HOME / "dispatch-loop.log"
@@ -523,6 +523,49 @@ def call_dispatcher(
     return _parse_dispatcher_response(raw)
 
 
+def _try_repair_truncated_json(s: str) -> dict[str, Any] | None:
+    """Attempt to recover a dict from truncated JSON (finish_reason=length).
+    DeepSeek sometimes hits max_tokens mid-JSON, leaving unterminated strings
+    and missing closing braces. Try progressively aggressive repairs."""
+    if not s or not s.strip():
+        return None
+    # Strategy 1: close unterminated string + add missing braces.
+    # Find the last complete key-value pair boundary.
+    repaired = s.rstrip()
+    # If we're inside a string value, close it
+    quote_count = repaired.count('"')
+    if quote_count % 2 != 0:
+        repaired += '"'
+    # Close any open braces/brackets
+    open_braces = repaired.count('{') - repaired.count('}')
+    open_brackets = repaired.count('[') - repaired.count(']')
+    repaired += ']' * max(0, open_brackets)
+    repaired += '}' * max(0, open_braces)
+    try:
+        result = json.loads(repaired)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    # Strategy 2: truncate to last complete key-value pair.
+    # Walk backwards to find a comma or opening brace before the damage.
+    for i in range(len(s) - 1, 0, -1):
+        if s[i] in (',', '{'):
+            candidate = s[:i] if s[i] == ',' else s[:i+1]
+            # Close any remaining structure
+            open_b = candidate.count('{') - candidate.count('}')
+            open_k = candidate.count('[') - candidate.count(']')
+            candidate += ']' * max(0, open_k)
+            candidate += '}' * max(0, open_b)
+            try:
+                result = json.loads(candidate)
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                continue
+    return None
+
+
 def _parse_dispatcher_response(raw: str) -> dict[str, Any] | None:
     """Parse the DeepSeek response JSON into tool-call arguments.
     Returns None on any parse failure."""
@@ -553,12 +596,19 @@ def _parse_dispatcher_response(raw: str) -> dict[str, Any] | None:
             finish_reason = (obj.get("choices") or [{}])[0].get("finish_reason", "(missing)")
         except Exception:
             pass
-        args_head = ""
+        args_raw = ""
         try:
-            args_head = (obj.get("choices") or [{}])[0].get("message", {}).get("tool_calls", [{}])[0].get("function", {}).get("arguments", "")[:300]
+            args_raw = (obj.get("choices") or [{}])[0].get("message", {}).get("tool_calls", [{}])[0].get("function", {}).get("arguments", "")
         except Exception:
             pass
-        log(f"deepseek_parse_error error={e} finish_reason={finish_reason} RAW_RESPONSE args_head=\"{args_head}\" total_bytes={len(raw)}")
+        # Attempt JSON repair on truncated responses
+        if finish_reason == "length" and args_raw:
+            repaired = _try_repair_truncated_json(args_raw)
+            if repaired:
+                log(f"PARSE_REPAIRED finish_reason=length original_bytes={len(args_raw)} "
+                    f"keys={list(repaired.keys())}")
+                return repaired
+        log(f"deepseek_parse_error error={e} finish_reason={finish_reason} RAW_RESPONSE args_head=\"{args_raw[:300]}\" total_bytes={len(raw)}")
         return None
 
 
@@ -699,6 +749,7 @@ def _parse_self_extender_response(raw: str) -> dict[str, Any] | None:
         return None
     try:
         choice = (obj.get("choices") or [{}])[0]
+        finish_reason = choice.get("finish_reason", "(missing)")
         msg = choice.get("message") or {}
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
@@ -706,7 +757,21 @@ def _parse_self_extender_response(raw: str) -> dict[str, Any] | None:
         args_raw = tool_calls[0].get("function", {}).get("arguments", "")
         return json.loads(args_raw)
     except Exception as e:
-        log(f"self_extender_parse_error error={e}")
+        # Attempt repair on truncated responses
+        finish_reason = "(unknown)"
+        args_raw = ""
+        try:
+            choice = (obj.get("choices") or [{}])[0]
+            finish_reason = choice.get("finish_reason", "(missing)")
+            args_raw = choice.get("message", {}).get("tool_calls", [{}])[0].get("function", {}).get("arguments", "")
+        except Exception:
+            pass
+        if finish_reason == "length" and args_raw:
+            repaired = _try_repair_truncated_json(args_raw)
+            if repaired:
+                log(f"SELF_EXTEND_PARSE_REPAIRED finish_reason=length keys={list(repaired.keys())}")
+                return repaired
+        log(f"self_extender_parse_error error={e} finish_reason={finish_reason}")
         return None
 
 
@@ -778,7 +843,6 @@ def try_self_extend(
         # Validate: never allow issue-filing in the fix prompt
         if "gh issue create" in fix_prompt.lower() or "filed as issue" in fix_prompt.lower():
             log(f"SELF_EXTEND_BLOCKED reason=fix_prompt_contains_issue_filing")
-            fix_prompt = fix_prompt  # still use it but log the violation
         log(f"SELF_EXTEND_HIGH diagnosis=\"{diagnosis[:120]}\"")
         state["consecutive_low"] = 0
         put_session_state(state_all, session_id, state)
@@ -789,6 +853,7 @@ def try_self_extend(
             f"{fix_prompt.strip()}"
         )
         emit_block(prefixed)
+        return  # emit_block calls sys.exit(0); return is belt-and-suspenders
 
     # First attempt returned low or None — retry with escalation
     log("SELF_EXTEND_RETRY reason=first_call_low_or_none")
@@ -815,6 +880,7 @@ def try_self_extend(
             f"{fix_prompt.strip()}"
         )
         emit_block(prefixed)
+        return  # emit_block calls sys.exit(0); return is belt-and-suspenders
 
     # Both calls failed — inject investigation prompt as last resort
     log("SELF_EXTEND_FALLBACK reason=both_calls_failed")
