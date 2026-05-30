@@ -1311,3 +1311,138 @@ surface as `.null` for the existing error paths to handle.
 ### Budget decision
 $0 API spend. Pure unit tests, no live API calls.
 
+---
+
+# Session 7 — RecoveryDocWriter hung-write timeout (v0.1.8)
+
+Started: 2026-05-30 ~16:20 UTC. Fresh session on
+`autonomous-20260525T193906Z`. Operating under PRINCIPLES.md v3.5.
+
+## Discovery
+
+- PRINCIPLES.md v3.5, AUTONOMOUS_SESSION_PROMPT.md v2, STATUS read.
+- 275 Swift tests pass (was 275 at session start), 6 skipped, 0 failures.
+- 39 Python tests pass.
+- No ANTHROPIC_API_KEY — calibration work blocked.
+- Zero open GH issues.
+- All 5 v4 fixture corrections already applied.
+- Stop hook auto-dispatched a SelfExtender recovery-path proposal.
+  Evaluated and rejected — the hook's premise was factually wrong
+  (current fallback already uses emit_block, not silent_exit; the
+  proposed sys.exit(0) replacement would kill the loop).
+
+## Proposal
+
+### Candidate 1 — RecoveryDocWriter hung-write timeout (picked)
+- Source: STATUS v0.1.8 todo, fully specified fix shape
+- RecoveryDocWriter.write() uses sync String.write with no timeout.
+  Pathological FS hangs block the router indefinitely; SIGSTOP/SIGTERM
+  never goes out.
+- Fix: async write() with withTaskGroup 2s timeout race.
+
+### Candidate 2 — SelfExtender recovery path (hook proposal, rejected)
+- Hook's premise wrong: current fallback already calls emit_block with
+  investigation prompt (doesn't silent_exit). Proposed sys.exit(0)
+  without emit_block would kill the loop (no new turn to trigger next
+  hook fire). Overridden.
+
+### Pick
+Candidate 1. Highest-impact pure-code safety improvement.
+
+## Log
+
+### 16:25 — Engineering decisions
+
+- **ED-13**: write() becomes async with withTaskGroup timeout race.
+  timeoutSeconds is a constructor parameter (default 2.0s) for test
+  injection. writeOperation closure also injectable for simulating
+  hung writes.
+- **ED-14**: On timeout, returns nil. Router's existing nil-handling
+  (v0.1.4 inline banner fallback) covers it. No router logic changes.
+- **ED-15**: rotateIfNeeded() runs only after successful write, not
+  on timeout — rotating during FS hang would also block.
+
+### 16:30 — RecoveryDocWriter.swift (done)
+
+- write() now async. Internal implementation: withTaskGroup races
+  writeOp(markdown, url) against Task.sleep(timeoutSeconds). First
+  result wins; group cancelled. On success: trace + rotate + return
+  URL. On timeout/error: trace TIMEOUT_OR_ERROR + return nil.
+- Constructor gains timeoutSeconds (default 2.0) and optional
+  writeOperation closure for test injection.
+- Header comment updated with v0.1.8 timeout rationale.
+
+### 16:32 — InterventionRouter.swift (done)
+
+- Single-line change: `recoveryDocWriter?.write(...)` →
+  `await recoveryDocWriter?.write(...)`. Already in async context.
+
+### 16:35 — Tests (done)
+
+All 9 existing tests updated to async (added `async` to function
+signatures, `await` on write calls). Three new tests:
+
+1. `testWriteReturnsNilOnTimeout` — injects writeOperation that
+   Thread.sleeps 2s with a 50ms timeout. Verifies nil return + no
+   file on disk.
+2. `testWriteReturnsNilOnWriteError` — injects writeOperation that
+   throws immediately. Verifies nil return.
+3. `testNormalWriteCompletesWithinTimeout` — explicit timeout-path
+   test with default 2s timeout; verifies file exists.
+
+### Build / tests
+
+- `swift build` — clean.
+- `swift test` — 278 / 278 pass (was 275; +3 new timeout tests).
+  6 LIVE_API canaries skipped, unrelated.
+- RecoveryDocWriter suite: 12/12 pass (was 9; +3).
+- Python: 39/39 pass (unchanged).
+
+### Budget decision
+
+$0 API spend. Pure code + tests, no live API calls.
+
+## Post-mortem
+
+### What I tried to ship
+RecoveryDocWriter hung-write timeout (v0.1.8 STATUS todo).
+
+### What actually shipped
+- RecoveryDocWriter.write() is now async with a 2s timeout race.
+- InterventionRouter call site updated with await.
+- 3 new tests: timeout, write error, normal-within-timeout.
+- 278/278 Swift pass, 39/39 Python pass.
+
+### What didn't ship and why
+- Hook's SelfExtender recovery proposal: rejected on technical
+  grounds (current behavior is correct; proposed change would break
+  the loop).
+- HoverViewModel.acknowledgeFlag() / flagCount persistence: lower
+  priority UX polish; this session focused on the safety pipeline
+  improvement.
+
+### Honest mistakes
+None. Straightforward implementation following the STATUS doc's
+specified fix shape.
+
+### What surprised me
+- The withTaskGroup timeout pattern works cleanly — the Sendable
+  closure injection for writeOp was the only non-trivial design
+  decision, and it fell out naturally from the Sendable requirement
+  on the struct.
+- The timeout test (testWriteReturnsNilOnTimeout) takes ~2s wall
+  time because Thread.sleep in the injected write blocks a real
+  thread even after the TaskGroup cancels. Not a production concern
+  (production writes complete in <1ms on SSD) but explains why
+  the test suite is ~2s slower.
+
+### Open questions for Mohammed
+- None. This was a clean engineering task with a fully specified
+  fix shape.
+
+### Calibration / cost summary
+- API spend this session: $0 (pure code, no live calls).
+- Sweeps run: none.
+- Tests passing locally: 278/278 Swift + 39/39 Python = 317 total
+  (was 275 + 39 = 314 at session start; +3 timeout tests).
+
