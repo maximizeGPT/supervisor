@@ -1,7 +1,7 @@
-// RecoveryDocWriterTests.swift — v0.1.6 A6.
+// RecoveryDocWriterTests.swift — v0.1.6 A6 + v0.1.8 timeout.
 //
 // Coverage:
-//   - Doc file is created synchronously at write() return (proves it's
+//   - Doc file is created before write() returns (proves it's
 //     ready before the router sends SIGSTOP/SIGTERM).
 //   - Filename format is `<ISO8601>-<uuid-short>-<action>.md`.
 //   - Doc contains all required sections per the v0.1.6 spec.
@@ -11,6 +11,8 @@
 //     claude, do-not-retry the command, prompt template).
 //   - JSONL window edge cases: empty window, fewer than 10 tool calls.
 //   - Retention: more than `retentionLimit` files → oldest deleted.
+//   - v0.1.8: write() returns nil on timeout (hung filesystem).
+//   - v0.1.8: write() returns nil on write error.
 
 import XCTest
 @testable import SupervisorCore
@@ -65,25 +67,22 @@ final class RecoveryDocWriterTests: XCTestCase {
 
     // MARK: - File creation + naming
 
-    func testWriteCreatesFileSynchronously() throws {
+    func testWriteCreatesFile() async throws {
         let dir = makeTempDir("sync")
         defer { cleanup(dir) }
         let writer = RecoveryDocWriter(directory: dir,
                                        trace: TraceLog(path: dir.appendingPathComponent("trace.log")))
-        let url = writer.write(decision: makeDecision(), action: .pause, pid: 1234)
+        let url = await writer.write(decision: makeDecision(), action: .pause, pid: 1234)
         XCTAssertNotNil(url, "writer should return a URL")
-        // Critical: file must exist by the time write() returns — the router
-        // signals immediately after this call returns and the file MUST
-        // already be on disk.
         XCTAssertTrue(FileManager.default.fileExists(atPath: url!.path),
-                      "recovery doc must exist on disk by the time write() returns (before signal lands)")
+                      "recovery doc must exist on disk after write() returns")
     }
 
-    func testFilenameFormat() throws {
+    func testFilenameFormat() async throws {
         let dir = makeTempDir("filename")
         defer { cleanup(dir) }
         let writer = RecoveryDocWriter(directory: dir)
-        let url = writer.write(decision: makeDecision(), action: .kill, pid: 9999)
+        let url = await writer.write(decision: makeDecision(), action: .kill, pid: 9999)
         let name = url!.lastPathComponent
         // <ISO8601-no-colons>-<uuid-short-8>-<action>.md
         // Example: 2026-05-23T19-08-42Z-2457a4cf-kill.md
@@ -94,11 +93,11 @@ final class RecoveryDocWriterTests: XCTestCase {
 
     // MARK: - Required sections
 
-    func testDocContainsAllRequiredSections() throws {
+    func testDocContainsAllRequiredSections() async throws {
         let dir = makeTempDir("sections")
         defer { cleanup(dir) }
         let writer = RecoveryDocWriter(directory: dir)
-        let url = writer.write(decision: makeDecision(), action: .pause, pid: 4242)
+        let url = await writer.write(decision: makeDecision(), action: .pause, pid: 4242)
         let body = try String(contentsOf: url!, encoding: .utf8)
 
         // Required v0.1.6 sections per the spec
@@ -117,11 +116,11 @@ final class RecoveryDocWriterTests: XCTestCase {
         XCTAssertTrue(body.contains("Asymmetry note"), "must include asymmetry section when note is present")
     }
 
-    func testDocOmitsAsymmetrySectionWhenNoteIsAbsent() throws {
+    func testDocOmitsAsymmetrySectionWhenNoteIsAbsent() async throws {
         let dir = makeTempDir("noasym")
         defer { cleanup(dir) }
         let writer = RecoveryDocWriter(directory: dir)
-        let url = writer.write(decision: makeDecision(asymmetryNote: nil),
+        let url = await writer.write(decision: makeDecision(asymmetryNote: nil),
                                 action: .pause, pid: 1)
         let body = try String(contentsOf: url!, encoding: .utf8)
         XCTAssertFalse(body.contains("Asymmetry note"),
@@ -130,11 +129,11 @@ final class RecoveryDocWriterTests: XCTestCase {
 
     // MARK: - Action-specific recovery guidance
 
-    func testPauseRecoveryHasKillCONTAndDecisionBranches() throws {
+    func testPauseRecoveryHasKillCONTAndDecisionBranches() async throws {
         let dir = makeTempDir("pauseguide")
         defer { cleanup(dir) }
         let writer = RecoveryDocWriter(directory: dir)
-        let url = writer.write(decision: makeDecision(), action: .pause, pid: 5555)
+        let url = await writer.write(decision: makeDecision(), action: .pause, pid: 5555)
         let body = try String(contentsOf: url!, encoding: .utf8)
         XCTAssertTrue(body.contains("kill -CONT 5555"), "pause section must show kill -CONT with PID baked in")
         XCTAssertTrue(body.contains("If YES"), "pause section must offer YES branch")
@@ -143,11 +142,11 @@ final class RecoveryDocWriterTests: XCTestCase {
         XCTAssertTrue(body.contains("Supervisor paused you on"), "must include the prompt-template the user pastes back")
     }
 
-    func testKillRecoveryHasStartNewClaudeAndDoNotRetry() throws {
+    func testKillRecoveryHasStartNewClaudeAndDoNotRetry() async throws {
         let dir = makeTempDir("killguide")
         defer { cleanup(dir) }
         let writer = RecoveryDocWriter(directory: dir)
-        let url = writer.write(decision: makeDecision(), action: .kill, pid: 8888)
+        let url = await writer.write(decision: makeDecision(), action: .kill, pid: 8888)
         let body = try String(contentsOf: url!, encoding: .utf8)
         XCTAssertTrue(body.contains("Claude Code session is dead"),
                       "kill section must announce session is dead")
@@ -161,18 +160,18 @@ final class RecoveryDocWriterTests: XCTestCase {
 
     // MARK: - JSONL window edge cases
 
-    func testEmptyWindowProducesPlaceholder() throws {
+    func testEmptyWindowProducesPlaceholder() async throws {
         let dir = makeTempDir("emptywin")
         defer { cleanup(dir) }
         let writer = RecoveryDocWriter(directory: dir)
-        let url = writer.write(decision: makeDecision(recentEvents: []),
+        let url = await writer.write(decision: makeDecision(recentEvents: []),
                                 action: .pause, pid: 1)
         let body = try String(contentsOf: url!, encoding: .utf8)
         XCTAssertTrue(body.contains("No prior tool calls in the window"),
                       "empty window must produce a clear placeholder, not crash")
     }
 
-    func testWindowWithFewerThan10ToolCallsIsHandled() throws {
+    func testWindowWithFewerThan10ToolCallsIsHandled() async throws {
         let dir = makeTempDir("fewcalls")
         defer { cleanup(dir) }
         let ts = Date()
@@ -184,7 +183,7 @@ final class RecoveryDocWriterTests: XCTestCase {
                                  toolUseId: "t2", turnUUID: "u2", ts: ts.addingTimeInterval(-10))),
         ]
         let writer = RecoveryDocWriter(directory: dir)
-        let url = writer.write(decision: makeDecision(recentEvents: events),
+        let url = await writer.write(decision: makeDecision(recentEvents: events),
                                 action: .pause, pid: 1)
         let body = try String(contentsOf: url!, encoding: .utf8)
         XCTAssertTrue(body.contains("`ls`"), "must surface ls command")
@@ -195,7 +194,7 @@ final class RecoveryDocWriterTests: XCTestCase {
 
     // MARK: - Retention
 
-    func testRetentionDropsOldestBeyondLimit() throws {
+    func testRetentionDropsOldestBeyondLimit() async throws {
         let dir = makeTempDir("retention")
         defer { cleanup(dir) }
         let writer = RecoveryDocWriter(directory: dir, retentionLimit: 3)
@@ -204,7 +203,7 @@ final class RecoveryDocWriterTests: XCTestCase {
         // the threshold. Final state: exactly 3 docs (the 3 newest).
         for i in 0..<5 {
             let d = makeDecision(sessionId: "sess\(i)abcd-uuid-here")
-            _ = writer.write(decision: d, action: .pause, pid: pid_t(1000 + i))
+            _ = await writer.write(decision: d, action: .pause, pid: pid_t(1000 + i))
             // Sleep a tick so creationDate ordering is deterministic
             usleep(50_000)
         }
@@ -213,5 +212,53 @@ final class RecoveryDocWriterTests: XCTestCase {
         let files = (try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))
             .filter { $0.pathExtension == "md" }
         XCTAssertEqual(files.count, 3, "retention should leave exactly 3 files (the limit)")
+    }
+
+    // MARK: - v0.1.8 timeout
+
+    func testWriteReturnsNilOnTimeout() async throws {
+        let dir = makeTempDir("timeout")
+        defer { cleanup(dir) }
+        // Inject a write operation that sleeps longer than the timeout.
+        let writer = RecoveryDocWriter(
+            directory: dir,
+            timeoutSeconds: 0.05,
+            writeOperation: { _, _ in
+                // Simulate a hung filesystem: sleep 2s (well past the 50ms timeout).
+                Thread.sleep(forTimeInterval: 2.0)
+            }
+        )
+        let url = await writer.write(decision: makeDecision(), action: .pause, pid: 1234)
+        XCTAssertNil(url, "write must return nil when the filesystem hangs past timeout")
+        // Verify no file was created (the hung write never completed).
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?
+            .filter { $0.pathExtension == "md" } ?? []
+        XCTAssertEqual(files.count, 0, "no recovery doc should exist after a timeout")
+    }
+
+    func testWriteReturnsNilOnWriteError() async throws {
+        let dir = makeTempDir("writeerror")
+        defer { cleanup(dir) }
+        // Inject a write operation that throws immediately.
+        let writer = RecoveryDocWriter(
+            directory: dir,
+            writeOperation: { _, _ in
+                throw NSError(domain: "test", code: 42, userInfo: [NSLocalizedDescriptionKey: "simulated ENOSPC"])
+            }
+        )
+        let url = await writer.write(decision: makeDecision(), action: .kill, pid: 5678)
+        XCTAssertNil(url, "write must return nil when the write operation throws")
+    }
+
+    func testNormalWriteCompletesWithinTimeout() async throws {
+        // Verify that a normal write with the default 2s timeout succeeds.
+        // This is implicitly covered by every other test, but this test
+        // makes the timeout path explicit.
+        let dir = makeTempDir("normaltimeout")
+        defer { cleanup(dir) }
+        let writer = RecoveryDocWriter(directory: dir, timeoutSeconds: 2.0)
+        let url = await writer.write(decision: makeDecision(), action: .pause, pid: 7777)
+        XCTAssertNotNil(url, "normal write should complete well within 2s timeout")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url!.path))
     }
 }

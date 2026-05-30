@@ -278,7 +278,7 @@ public final class InterventionRouter {
         // second. The doc reads "Supervisor fired <action>" past-tense
         // because at the user's read-time, the signal has landed.
         let recoveryAction: RecoveryAction = (signal == SIGSTOP) ? .pause : .kill
-        let recoveryDocPath = recoveryDocWriter?.write(
+        let recoveryDocPath = await recoveryDocWriter?.write(
             decision: decision,
             action: recoveryAction,
             pid: handle.pid
