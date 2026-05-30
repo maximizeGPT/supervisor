@@ -6,6 +6,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-05-30
+
+RecoveryDocWriter timeout: the intervention pipeline no longer blocks
+indefinitely on a sick filesystem.
+
+### Fixed
+
+**RecoveryDocWriter hung-write timeout** (`RecoveryDocWriter.swift`,
+`InterventionRouter.swift`)
+- `write()` is now `async` with a `withTaskGroup` timeout race
+  (default 2s). The filesystem write and a `Task.sleep` sentinel run
+  concurrently; the first to complete wins. On a healthy local SSD
+  the write completes in <1ms; the timeout exists for pathological
+  cases (frozen NFS mount, stalled encrypted-disk lock, FUSE driver
+  hang) that would otherwise block the router thread indefinitely,
+  preventing SIGSTOP/SIGTERM from ever going out.
+- On timeout, `write()` returns nil. The router's existing fallback
+  (v0.1.4 inline banner copy via `recoveryDocPath = nil`) handles
+  this — the intervention still fires, it just lacks the recovery doc.
+- Constructor gains `timeoutSeconds: Double` (default 2.0) and an
+  optional `writeOperation` closure for test injection.
+- `rotateIfNeeded()` runs only after a successful write, not on
+  timeout — rotating during a filesystem hang would also block.
+
+### Tests
+
+3 new tests in `RecoveryDocWriterTests`:
+- `testWriteReturnsNilOnTimeout` — injected 2s sleep vs 50ms timeout.
+- `testWriteReturnsNilOnWriteError` — injected throwing write op.
+- `testNormalWriteCompletesWithinTimeout` — explicit 2s timeout
+  with real filesystem write.
+
+278 Swift pass (was 275; +3 new). 6 skipped. 0 failures.
+39 Python pass (unchanged).
+
 ## [0.5.1] — 2026-05-29
 
 JSON truncation repair across both dispatch paths (Python hook +
