@@ -794,6 +794,7 @@ def build_self_extender_message(
     recent_files_changed: list[str],
     principles_text: str,
     hook_log_tail: str,
+    self_watch_warnings: list[str] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append("# Failure context")
@@ -816,6 +817,18 @@ def build_self_extender_message(
         for fl in recent_files_changed:
             lines.append(fl)
     lines.append("")
+
+    # Self-watch warnings — these explain WHY the dispatch failed.
+    lines.append("# Self-watch warnings (problems detected by the loop)")
+    if self_watch_warnings:
+        for w in self_watch_warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+        lines.append("These warnings may explain the dispatch failure. If a warning is actionable (e.g. rebuild), consider making the fix prompt address it.")
+    else:
+        lines.append("(no problems detected)")
+    lines.append("")
+
     lines.append("# Recent transcript turns")
     if not recent_turns:
         lines.append("(no events)")
@@ -943,11 +956,14 @@ def try_self_extend(
     principles_text: str,
     state: dict[str, Any],
     state_all: dict[str, Any],
+    self_watch_warnings: list[str] | None = None,
 ) -> None:
     """Invoke the SelfExtender. On high-confidence result, emit_block.
     On low-confidence, retry once with escalation. If still low, inject
-    an investigation prompt. Never silent_exit — the loop stays alive."""
+    an investigation prompt. Never silent_exit — the loop stays alive.
+    Writes owner brief after each successful self-extend."""
     log(f"SELF_EXTEND_START reason={failure_reason}")
+    warnings = self_watch_warnings or []
 
     try:
         se_prompt = load_self_extender_prompt()
@@ -967,6 +983,7 @@ def try_self_extend(
         recent_files_changed=recent_files_changed,
         principles_text=principles_text,
         hook_log_tail=hook_log,
+        self_watch_warnings=warnings,
     )
 
     result = call_self_extender(key=key, cfg=cfg, system_prompt=se_prompt, user_message=user_msg)
@@ -981,8 +998,17 @@ def try_self_extend(
         state["consecutive_low"] = 0
         put_session_state(state_all, session_id, state)
         save_state(state_all)
+        # v0.7.0: write owner brief after self-extend fix.
+        write_owner_brief(
+            cwd=cwd,
+            what_shipped=summarize_recent_commits(commits),
+            most_valuable_next=f"Self-extend fix: {diagnosis[:200]}",
+            needs_owner="",
+            loop_doing_next=f"Applying SelfExtender fix: {fix_prompt[:150]}{'...' if len(fix_prompt) > 150 else ''}",
+            warnings=warnings,
+        )
         prefixed = (
-            f"[dispatch-loop-hook v0.5.0 — SelfExtender auto-fix; "
+            f"[dispatch-loop-hook v0.7.0 — SelfExtender auto-fix; "
             f"failure: {failure_reason}; diagnosis: {diagnosis.strip()[:200]}]\n\n"
             f"{fix_prompt.strip()}"
         )
@@ -1008,8 +1034,17 @@ def try_self_extend(
         state["consecutive_low"] = 0
         put_session_state(state_all, session_id, state)
         save_state(state_all)
+        # v0.7.0: write owner brief after retry fix.
+        write_owner_brief(
+            cwd=cwd,
+            what_shipped=summarize_recent_commits(commits),
+            most_valuable_next=f"Self-extend retry fix: {diagnosis[:200]}",
+            needs_owner="",
+            loop_doing_next=f"Applying SelfExtender retry fix: {fix_prompt[:150]}{'...' if len(fix_prompt) > 150 else ''}",
+            warnings=warnings,
+        )
         prefixed = (
-            f"[dispatch-loop-hook v0.5.0 — SelfExtender retry; "
+            f"[dispatch-loop-hook v0.7.0 — SelfExtender retry; "
             f"failure: {failure_reason}; diagnosis: {diagnosis.strip()[:200]}]\n\n"
             f"{fix_prompt.strip()}"
         )
@@ -1021,8 +1056,18 @@ def try_self_extend(
     state["consecutive_low"] = 0  # reset to prevent infinite loop
     put_session_state(state_all, session_id, state)
     save_state(state_all)
+    # v0.7.0: write owner brief on fallback — the owner should know
+    # the loop is struggling.
+    write_owner_brief(
+        cwd=cwd,
+        what_shipped=summarize_recent_commits(commits),
+        most_valuable_next="The SelfExtender couldn't diagnose the dispatch failure after two attempts.",
+        needs_owner="The loop is stuck. Check the dispatch log and decide what to work on next.",
+        loop_doing_next="Injecting an investigation prompt as a last resort.",
+        warnings=warnings,
+    )
     fallback = (
-        "[dispatch-loop-hook v0.5.0 — SelfExtender fallback; "
+        "[dispatch-loop-hook v0.7.0 — SelfExtender fallback; "
         f"failure: {failure_reason}; both SelfExtender calls failed]\n\n"
         "Investigate the dispatch failure. Read:\n"
         "  1. ~/.claude/hooks/dispatch-loop.log (last 50 lines)\n"
@@ -1444,11 +1489,16 @@ def main() -> None:
     # Update state regardless of result, then act.
     state["total_dispatches"] = state.get("total_dispatches", 0) + 1
 
-    # v0.5.0: common kwargs for SelfExtender invocation.
+    # v0.7.0: common kwargs for SelfExtender invocation.
+    # pre_warnings (stale build, ineffective change) are available now;
+    # post_warnings (suspicious stop) come after the result is known.
+    # The SelfExtender gets pre_warnings immediately; the combined set
+    # flows into the owner brief downstream.
     se_kwargs = dict(
         key=key, cfg=cfg, session_id=session_id, cwd=cwd, branch=branch,
         recent_turns=recent_turns, commits=commits, recent_files_changed=diff_stat,
         principles_text=principles_text, state=state, state_all=state_all,
+        self_watch_warnings=pre_warnings,
     )
 
     if not result:
