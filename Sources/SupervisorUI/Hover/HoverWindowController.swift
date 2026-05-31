@@ -18,6 +18,11 @@
 //
 // v0.1.7: expanded panel. Click on hover toggles a 480x360 panel
 // below the hover with recent flags, session metrics, and cost.
+//
+// v0.8.1: draggable hover. The user can grab and drag the hover window
+// anywhere on screen. A click (< 3pt movement) toggles the expanded
+// panel; a drag (>= 3pt) moves the window. Once dragged, the hover
+// remembers its user-set position and doesn't snap back to top-right.
 
 import AppKit
 import Combine
@@ -27,14 +32,7 @@ import SupervisorCore
 @MainActor
 public final class HoverWindowController {
 
-    /// Single source of truth for the hover panel's dimensions. Used at
-    /// init (contentRect), at position-time (origin math), and at every
-    /// re-anchor. Don't compute the size from `panel.frame.size` —
-    /// during early init the panel reports (0, 0) until the SwiftUI
-    /// hosting controller realizes its content. We hit that exact bug
-    /// during the Checkpoint C visual smoke: the hover ended up at
-    /// (1908, 2)–(2148, 42), only the leftmost 12 px on-screen. Caught
-    /// when I reported "some bubble top right but not sure".
+    /// Single source of truth for the hover panel's dimensions.
     public static let panelSize = NSSize(width: 240, height: 40)
 
     /// Expanded panel dimensions per DESIGN.md section 6.2.
@@ -46,12 +44,7 @@ public final class HoverWindowController {
     /// Pixel inset from the right edge and top edge of visibleFrame.
     private static let edgeInset: CGFloat = 12
 
-    /// Default apps that host a tailable Claude Code session — terminal
-    /// emulators where the `claude` CLI runs, plus the Claude desktop app
-    /// which spawns `claude` internally. Users can add more via
-    /// `~/Library/Application Support/Supervisor/config.yaml` under
-    /// `hover.known_terminals` (Issue #3). The defaults here are the
-    /// floor; user entries are merged additively.
+    /// Default apps that host a tailable Claude Code session.
     public static let defaultHostApps: Set<String> = [
         "com.apple.Terminal",
         "com.googlecode.iterm2",
@@ -65,14 +58,18 @@ public final class HoverWindowController {
     public private(set) var claudeCodeHostApps: Set<String>
 
     private let vm: HoverViewModel
-    private let panel: NSPanel
-    private let expandedPanel: NSPanel
+    private let panel: HoverPanel
+    private let expandedPanel: HoverPanel
     private let isAnySessionActive: () -> Bool
 
     private var workspaceObserver: NSObjectProtocol?
     private var pollTimer: Timer?
     private var currentlyVisible: Bool = false
     private var expandedCancellable: AnyCancellable?
+    private var frameObserver: NSObjectProtocol?
+
+    /// Once the user drags the hover, don't auto-position it anymore.
+    private var userHasRepositioned: Bool = false
 
     public init(
         vm: HoverViewModel,
@@ -95,23 +92,16 @@ public final class HoverWindowController {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        // `.canJoinAllSpaces` keeps the panel pinned to the active
-        // Space so alt-tab → different Space + alt-tab back doesn't
-        // strand the panel on the old Space. `.stationary` prevents
-        // Mission Control / Expose from grouping the panel with app
-        // windows. `.ignoresCycle` keeps the panel out of Cmd-` /
-        // Cmd-Tab cycles.
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
-        panel.isMovableByWindowBackground = false
+        // v0.8.1: enable native drag via isMovableByWindowBackground.
+        // Click vs drag is distinguished in HoverPanel's mouse handling.
+        panel.isMovableByWindowBackground = true
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
 
-        // Wrap HoverView in a button-like tap gesture for toggle.
-        let hoverView = HoverView(vm: vm)
-            .onTapGesture { [weak vm] in
-                vm?.toggleExpanded()
-            }
-        panel.contentViewController = NSHostingController(rootView: hoverView)
+        // The HoverView no longer has onTapGesture — click detection is
+        // handled at the NSPanel level to properly distinguish from drag.
+        panel.contentViewController = NSHostingController(rootView: HoverView(vm: vm))
         self.panel = panel
 
         // -- Expanded panel (480x360) --
@@ -135,6 +125,14 @@ public final class HoverWindowController {
         )
         self.expandedPanel = expanded
 
+        // Wire callbacks now that all stored properties are initialized.
+        panel.onClick = { [weak vm] in
+            vm?.toggleExpanded()
+        }
+        panel.onDragStarted = { [weak self] in
+            self?.userHasRepositioned = true
+        }
+
         // Observe vm.isExpanded to show/hide the expanded panel.
         self.expandedCancellable = vm.$isExpanded
             .removeDuplicates()
@@ -146,19 +144,26 @@ public final class HoverWindowController {
                     self.hideExpanded()
                 }
             }
+
+        // Observe hover panel frame changes — re-anchor expanded panel
+        // when the hover is dragged to a new position.
+        self.frameObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.expandedPanel.isVisible else { return }
+            Task { @MainActor in self.positionExpanded() }
+        }
     }
 
-    /// Merge user config into the live host-apps set. Called by
-    /// ConfigWatcher on file change. Additive: defaults are always
-    /// included; user entries are unioned on top.
+    /// Merge user config into the live host-apps set.
     public func mergeUserConfig(additionalHostApps: [String]) {
         claudeCodeHostApps = Self.defaultHostApps.union(additionalHostApps)
         applyVisibility()
     }
 
     public func present() {
-        // v0.1.4 Gap 8: don't unconditionally show. Hook up the
-        // visibility-deciding observer + poller, then apply once.
         registerWorkspaceObserver()
         startPollTimer()
         applyVisibility()
@@ -177,17 +182,8 @@ public final class HoverWindowController {
     // MARK: - Expanded panel show/hide
 
     private func showExpanded() {
-        // Use the actual NSWindow visibility, not the software flag.
-        // `currentlyVisible` can lag behind actual panel state due to
-        // timing between the 3s poll / workspace observer and the user's
-        // click. If the user can see and click the hover dot,
-        // `panel.isVisible` is true.
         guard panel.isVisible else { return }
         positionExpanded()
-        // Set alpha to 1 immediately, then order front. The previous
-        // approach animated from 0→1, but if the panel was already
-        // ordered out with alpha=0, the animation could be invisible
-        // (nothing to animate from). Set it directly and order front.
         expandedPanel.alphaValue = 1.0
         expandedPanel.orderFrontRegardless()
     }
@@ -210,9 +206,6 @@ public final class HoverWindowController {
 
     // MARK: - Visibility logic (Gap 8)
 
-    /// Compound visibility rule: show iff a Claude-Code-hosting app is
-    /// frontmost AND Supervisor is tailing at least one session.
-    /// Re-applied on every workspace activation event + on a 3s poll.
     private func applyVisibility() {
         let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontmostHostsClaudeCode = frontmostBundleID.map(claudeCodeHostApps.contains) ?? false
@@ -220,16 +213,15 @@ public final class HoverWindowController {
         let shouldShow = frontmostHostsClaudeCode && sessionActive
 
         if shouldShow && !currentlyVisible {
-            positionTopRight()
-            // `.nonactivatingPanel` + `orderFrontRegardless()` shows
-            // the panel without activating Supervisor — focus stays
-            // with the user's frontmost terminal.
+            // Only auto-position if the user hasn't manually dragged.
+            if !userHasRepositioned {
+                positionTopRight()
+            }
             panel.orderFrontRegardless()
             currentlyVisible = true
         } else if !shouldShow && currentlyVisible {
             panel.orderOut(nil)
             currentlyVisible = false
-            // Close expanded panel when hover hides.
             vm.isExpanded = false
         }
     }
@@ -242,12 +234,6 @@ public final class HoverWindowController {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            // The observer queue is `.main`, so this fires on the main
-            // thread; we hop to the @MainActor context explicitly to
-            // satisfy Swift concurrency without doubling up the dispatch.
-            // Local-bind self before Task so Swift 5.10 (CI) accepts the
-            // capture pattern — see HoverViewModel.swift for the long
-            // form of this comment.
             guard let self else { return }
             Task { @MainActor in self.applyVisibility() }
         }
@@ -260,9 +246,6 @@ public final class HoverWindowController {
         }
     }
 
-    /// 3s poll catches the "session became active while my terminal was
-    /// already frontmost" case (the NSWorkspace event only fires on app
-    /// switches). Cheap — one closure tick + a string lookup.
     private func startPollTimer() {
         guard pollTimer == nil else { return }
         pollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
@@ -279,15 +262,7 @@ public final class HoverWindowController {
     private func positionTopRight() {
         guard let screen = NSScreen.main else { return }
         let frame = screen.visibleFrame
-
-        // Belt: pin the content size now so layout has the right rect.
         panel.setContentSize(Self.panelSize)
-
-        // Suspenders: compute origin from the known constant, not from
-        // `panel.frame.size`. If the SwiftUI hosting controller hasn't
-        // realized layout yet (Checkpoint-C-visual-smoke bug), frame.size
-        // can be (0, 0) — using the constant makes the position correct
-        // regardless of init timing.
         let origin = NSPoint(
             x: frame.maxX - Self.panelSize.width - Self.edgeInset,
             y: frame.maxY - Self.panelSize.height - Self.edgeInset
@@ -296,10 +271,61 @@ public final class HoverWindowController {
     }
 }
 
-/// `canBecomeKey` override on a borderless NSPanel. Default borderless
-/// panels can't become key, which would block the v0.1.7+ expanded-panel
-/// interactions. For v0.1.0 the hover is read-only — we override anyway so
-/// the foundation is in place.
-private final class HoverPanel: NSPanel {
+// MARK: - HoverPanel (click vs drag distinction)
+
+/// Custom NSPanel that distinguishes a click (< 3pt movement) from a drag.
+/// `canBecomeKey` is overridden so the expanded panel can receive input.
+/// `isMovableByWindowBackground` is true so macOS handles the native drag;
+/// this class tracks mouse-down/up to detect whether it was a click.
+final class HoverPanel: NSPanel {
+
+    /// Movement threshold: if the mouse moves less than this many points
+    /// between mouseDown and mouseUp, it's a click, not a drag.
+    private static let clickThreshold: CGFloat = 3.0
+
+    /// Called when the user clicks (not drags) the panel.
+    var onClick: (() -> Void)?
+
+    /// Called when the user starts dragging (movement exceeds threshold).
+    var onDragStarted: (() -> Void)?
+
+    private var mouseDownLocation: NSPoint?
+    private var didNotifyDrag = false
+
     override var canBecomeKey: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownLocation = NSEvent.mouseLocation
+        didNotifyDrag = false
+        super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        super.mouseDragged(with: event)
+        // Check if we've exceeded the drag threshold.
+        if !didNotifyDrag, let start = mouseDownLocation {
+            let current = NSEvent.mouseLocation
+            let dx = current.x - start.x
+            let dy = current.y - start.y
+            let distance = sqrt(dx * dx + dy * dy)
+            if distance >= Self.clickThreshold {
+                didNotifyDrag = true
+                onDragStarted?()
+            }
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        guard let start = mouseDownLocation else { return }
+        let end = NSEvent.mouseLocation
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        let distance = sqrt(dx * dx + dy * dy)
+        if distance < Self.clickThreshold {
+            // Click — not a drag.
+            onClick?()
+        }
+        mouseDownLocation = nil
+    }
 }
