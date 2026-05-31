@@ -6,6 +6,60 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-31
+
+Dispatch loop reliability. Three fixes that eliminated false stops
+when real work remained.
+
+### Fixed
+
+**Diff-stat resolution** (`dispatch_loop_hook.py`,
+`DispatchFetchers.swift`)
+- Both Python and Swift now use `HEAD` instead of the branch name in
+  git diff/log ranges. The branch name could fail to resolve as a git
+  ref when the hook ran in certain contexts (e.g. stale branch name
+  cached from a prior session). `HEAD` is always valid.
+- `_resolve_diff_base` / `resolveDiffRange` gained a HEAD fallback:
+  if `merge-base main <branch>` fails, tries `merge-base main HEAD`.
+- Python `fetch_diff_stat` retries with `HEAD~20..HEAD` if the
+  primary range fails, instead of returning empty.
+
+**requires_human_presence over-firing** (`dispatcher-system-prompt.txt`,
+`Dispatcher.swift`)
+- The system prompt now explicitly lists rebuilds, script execution,
+  tests, commits, pushes as NOT human-required. Only AX permission
+  grants in System Settings and sustained visual observation trials
+  are genuinely human-required.
+- The tool schema description mirrors the tightened definition.
+- When requires_human fires, the hook no longer increments
+  `consecutive_low` — the task needing a human is not a confidence
+  problem. The loop skips that one proposal and looks for other work
+  on the next idle.
+
+### Added
+
+**Deferred-work fallback** (`dispatch_loop_hook.py`)
+- `_build_fallback_from_gaps()` scans Known Gaps for actionable
+  unblocked items (filters out struck-through, blocked-on-API-key,
+  requires-human items). When the primary dispatcher returns low
+  confidence but real work exists, the hook builds a fallback
+  dispatch prompt from those gaps.
+- Fires after 2+ consecutive lows (gives the primary dispatcher
+  first crack). Resets `consecutive_low` to 0 on dispatch.
+- Includes diff-stat and recent commit context so the worker doesn't
+  duplicate shipped work.
+
+**LoopController.clearConsecutiveLowStop** (`LoopController.swift`)
+- Clears a `three_consecutive_low_confidence` stop so the loop can
+  resume when real work is discovered. Does NOT clear kill or
+  4-hour stops — those are genuine hard stops.
+
+### Tests
+
+307 Swift pass (6 skipped, 0 failures). Was 304; +3 new
+LoopControllerTests for clearConsecutiveLowStop (resume, kill-safe,
+4hr-safe). 43 Python pass (was 39; +4 fallback-from-gaps tests).
+
 ## [0.1.7] — 2026-05-31
 
 Expanded hover panel. Click the hover window to toggle a 480x360
