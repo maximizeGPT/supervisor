@@ -6,6 +6,46 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-05-31
+
+Self-watch → SelfExtender wiring, PRINCIPLES.md live refresh,
+and status bar owner-brief access.
+
+### Fixed
+
+**SelfExtender self-watch wiring** (`dispatch_loop_hook.py`)
+- `build_self_extender_message()` gains `self_watch_warnings`
+  parameter. When warnings are present (stale build, suspicious
+  stop), they flow into the SelfExtender's context as a dedicated
+  section explaining WHY the dispatch failed.
+- `try_self_extend()` writes `OWNER-BRIEF.md` after every
+  successful fix (high, retry, and fallback paths). Full cycle:
+  detect (self-watch) -> inform (SelfExtender) -> act (fix prompt)
+  -> report (owner brief).
+
+**PRINCIPLES.md live refresh** (`Dispatcher.swift`, `main.swift`)
+- `principlesText` was loaded once at engine construction. A
+  4-hour dispatch loop used a stale snapshot. Now re-reads from
+  disk on each dispatch call (~28k, <1ms on SSD).
+- `Dispatcher` gains `principlesPath: URL?`. `main.swift` passes
+  the discovered path through at construction.
+
+### Added
+
+**Status bar: Open Owner Brief** (`SupervisorStatusBar/main.swift`)
+- "Open Owner Brief" menu item between "Open Recovery Folder" and
+  "Open Trace Log". Opens `OWNER-BRIEF.md` from the repo root so
+  the owner can read the dispatch loop's plain-language summary
+  directly from the menu bar.
+
+### Known Gaps resolved
+
+- PRINCIPLES.md loaded once at construction (now re-reads per call)
+
+### Tests
+
+280 Swift pass (6 skipped, 0 failures). 39 Python pass.
+
 ## [0.7.0] — 2026-05-31
 
 Owner-facing voice + expanded self-watch. Supervisor now talks UP
