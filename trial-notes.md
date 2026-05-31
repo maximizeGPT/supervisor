@@ -1446,3 +1446,76 @@ specified fix shape.
 - Tests passing locally: 278/278 Swift + 39/39 Python = 317 total
   (was 275 + 39 = 314 at session start; +3 timeout tests).
 
+---
+
+# Known Gaps
+
+Standing record of unfinished, unticketed, or blocked work. The
+Dispatcher reads this section on every call. Sessions update it as
+work completes or new gaps surface.
+
+Last updated: 2026-05-30
+
+## Never verified end-to-end
+
+- **Live autonomous dispatch trial.** The dispatch loop (v0.4.0) has
+  never completed a physical-world unattended trial. The AX-permission-
+  revoke blocker prevents CGEventPost injection after app binary change.
+  The hook-based path works but hasn't been observed for a sustained
+  multi-dispatch run (>= 3 sequential high-confidence dispatches).
+  Requires human presence for the initial AX permission grant.
+
+- **Multi-provider calibration.** DeepSeek and Anthropic both work as
+  triage providers but have never been compared on the same fixture
+  corpus. No tie-breaker exists if they disagree. Filed in PRINCIPLES
+  section 13.
+
+## Calibration gaps
+
+- **Positive recall at 75-87%, gate is 95%.** Destructive and edits
+  categories still below the 95% positive-floor. The gap breaks down
+  as: model-didn't-recognize-pattern (4 fixtures), rubric-exception-
+  too-broad (6 fixtures, need corpus refresh with non-authorizing
+  prompts), prompt-failed-to-teach-LOW-vs-MEDIUM (5 fixtures, need
+  MEDIUM-as-default severity philosophy). Issue #4's front-loading
+  fix helped but didn't close the gap.
+
+- **False positive: `inj.neg.003.cve-writeup-injection-quote`.** Haiku
+  fires on CVE writeups that quote injection language. Separate from
+  Issue #2 (closed). Needs a quotation-context refinement in the
+  injection rubric body.
+
+## Half-wired features
+
+- **HoverViewModel.acknowledgeFlag() not called.** The flagged-color
+  dot stays in flagged state until a new flag arrives. Should clear on
+  debounce. Deferred since v0.1.4.
+
+- **In-memory flagCount resets on app restart.** Should seed from the
+  SQLite flag history on launch. Deferred since v0.1.4.
+
+- **SIGCONT-from-button not wired.** The pause recovery path requires
+  the user to run `kill -CONT <pid>` manually. The v0.1.7 expanded
+  hover panel should expose a Resume button. Deferred since v0.1.4.
+
+- **PRINCIPLES.md loaded once at engine construction, not refreshed
+  mid-loop.** A 4-hour loop uses a stale snapshot. Acceptable for now;
+  filed for refresh if loop durations approach the cap.
+
+## Blocked on external setup
+
+- **No ANTHROPIC_API_KEY in autonomous sessions.** Calibration sweeps
+  and Issue #2-style rubric verification require a working Anthropic
+  key. Sessions without it can only do pure-code work.
+
+## Deferred architectural improvements
+
+- **Config format long-term.** The minimal YAML parser handles exactly
+  `hover.known_terminals`. If config.yaml grows beyond one key,
+  evaluate switching to Yams. Currently 60 LOC vs ~50K LOC dependency.
+
+- **DeepSeek ~50% first-call failure rate.** Roughly 1 in 2 dispatcher
+  calls fails on first attempt (tiny incomplete HTTP responses). The
+  retry + JSON repair mechanisms mask this but the root cause
+  (DeepSeek API flakiness or undocumented rate limits) is uninvestigated.
+
