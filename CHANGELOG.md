@@ -6,6 +6,54 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-05-31
+
+Expanded hover panel. Click the hover window to toggle a 480x360
+panel showing recent flags, session metrics, and cost.
+
+### Added
+
+**Expanded panel** (`ExpandedPanelView.swift`,
+`HoverWindowController.swift`)
+- 480x360 pt panel slides in below the 240x40 hover on click.
+  Per DESIGN.md section 6.2.
+- **Recent flags section**: last 5 flags from FlagStore with
+  severity badge (color-coded), category name, reasoning text,
+  and relative timestamp.
+- **Current activity section**: triage model name, turn count,
+  tool call count, today's cost (from CostStore), and current
+  action detail.
+- Toggle state driven by `HoverViewModel.isExpanded`. Panel
+  hides automatically when the hover hides (app switch away
+  from a Claude Code host).
+- Second NSPanel with the same always-on-top / non-activating /
+  cross-Space behavior as the hover. Positioned right-aligned
+  below the hover with a 4pt gap.
+
+**Session metrics tracking** (`HoverViewModel.swift`)
+- `turnCount` increments on each `userPrompt` event.
+- `toolCallCount` increments on each `bashToolCall` event.
+- Both reset on `sessionStart` (new session = new metrics).
+- `sessionCwd` tracked for the expanded panel header.
+- `modelName` set at construction from the active provider.
+- `todayCostUSD()` reads from CostStore; `recentFlags()` reads
+  from FlagStore. Both degrade to sensible defaults when stores
+  are nil.
+
+### Deferred (v0.1.7.1+)
+
+- Flag action buttons (Approve / Dismiss / False positive) —
+  need router wiring for re-executing interventions.
+- Session switcher dropdown — needs multi-session UI (v0.1.2).
+- Settings panel launch from footer.
+- Hover-on-flag row expansion to show full reasoning + evidence.
+
+### Tests
+
+295 Swift pass (6 skipped, 0 failures). Was 280; +15 new
+ExpandedPanelTests covering session metrics, toggle state, cost
+formatting, relative time display, and store-absent defaults.
+
 ## [0.7.1] — 2026-05-31
 
 Self-watch → SelfExtender wiring, PRINCIPLES.md live refresh,
