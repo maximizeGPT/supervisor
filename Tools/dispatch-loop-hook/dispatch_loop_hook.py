@@ -1023,6 +1023,253 @@ def try_self_extend(
 
 
 # ----------------------------------------------------------------------
+# Owner Brief (Capability 1 — talk UP to the owner)
+# ----------------------------------------------------------------------
+
+def write_owner_brief(
+    *,
+    cwd: str,
+    what_shipped: str,
+    most_valuable_next: str,
+    needs_owner: str,
+    loop_doing_next: str,
+    warnings: list[str],
+) -> None:
+    """Write OWNER-BRIEF.md — a plain-language update for the project
+    owner. Updated after each dispatch cycle. The voice is an advisor
+    talking to the person who owns the project, not an engineer
+    talking to another engineer."""
+    lines: list[str] = []
+    lines.append("# Owner Brief")
+    lines.append("")
+    lines.append(f"Last updated: {_ts()}")
+    lines.append("")
+
+    lines.append("## What shipped recently")
+    lines.append("")
+    lines.append(what_shipped if what_shipped else "Nothing new since the last brief.")
+    lines.append("")
+
+    lines.append("## Most valuable thing remaining")
+    lines.append("")
+    lines.append(most_valuable_next if most_valuable_next else "The loop couldn't identify a clear next priority.")
+    lines.append("")
+
+    if needs_owner:
+        lines.append("## Needs your attention")
+        lines.append("")
+        lines.append(needs_owner)
+        lines.append("")
+
+    if warnings:
+        lines.append("## Warnings")
+        lines.append("")
+        for w in warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+
+    lines.append("## What the loop is doing next")
+    lines.append("")
+    lines.append(loop_doing_next if loop_doing_next else "Waiting for direction.")
+    lines.append("")
+
+    brief_path = Path(cwd) / "OWNER-BRIEF.md"
+    try:
+        brief_path.write_text("\n".join(lines), encoding="utf-8")
+        log(f"OWNER_BRIEF_WRITTEN path={brief_path}")
+    except Exception as e:
+        log(f"OWNER_BRIEF_ERROR error={e}")
+
+
+def summarize_recent_commits(commits: list[dict[str, str]], limit: int = 10) -> str:
+    """Plain-language summary of recent commits for the owner brief."""
+    if not commits:
+        return "No new commits on this branch."
+    recent = commits[:limit]
+    lines = []
+    for c in recent:
+        # Strip Co-Authored-By and other noise from subjects
+        subject = c["subject"].strip()
+        if subject:
+            lines.append(f"- {subject}")
+    if not lines:
+        return "No new commits on this branch."
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# Self-Watch (Capability 2 — catch mismatches, fix them)
+# ----------------------------------------------------------------------
+
+def detect_stale_build(cwd: str, timeout: float) -> str | None:
+    """Detect when committed code changes user-facing behavior but the
+    running Supervisor.app predates those commits. Returns a plain
+    warning string or None."""
+    app_path = "/Applications/Supervisor.app/Contents/Info.plist"
+    if not Path(app_path).exists():
+        return None  # No app installed — nothing to compare
+
+    # Get the app's modification time
+    try:
+        app_mtime = Path(app_path).stat().st_mtime
+    except Exception:
+        return None
+
+    # Get the latest commit time that touched user-facing files
+    ui_paths = [
+        "Sources/SupervisorUI/",
+        "Sources/SupervisorCore/Intervention/Notifier.swift",
+        "Sources/SupervisorCore/Hover/HoverViewModel.swift",
+    ]
+    latest_commit_time = 0
+    for ui_path in ui_paths:
+        code, out, _ = run(
+            ["git", "log", "-1", "--format=%ct", "--", ui_path],
+            cwd=cwd,
+            timeout=timeout,
+        )
+        if code == 0 and out.strip():
+            try:
+                t = int(out.strip())
+                if t > latest_commit_time:
+                    latest_commit_time = t
+            except ValueError:
+                pass
+
+    if latest_commit_time > 0 and latest_commit_time > app_mtime:
+        return (
+            "The running Supervisor app is older than recent code changes "
+            "to the hover label, notifications, or UI. The new wording "
+            "won't be visible until you rebuild and relaunch. "
+            "Run build-app.sh and do the atomic swap to /Applications."
+        )
+    return None
+
+
+def detect_suspicious_stop(
+    recent_turns: list[dict[str, Any]],
+    known_gaps: str,
+    result: dict[str, Any] | None,
+) -> str | None:
+    """Detect a suspicious stop — the worker went quiet but the work
+    looks incomplete. Returns a plain warning or None."""
+    if not recent_turns:
+        return None
+
+    last_text = ""
+    for t in reversed(recent_turns):
+        if t.get("role") == "assistant":
+            last_text = t.get("text", "")
+            break
+
+    if not last_text:
+        return None
+
+    lower = last_text.lower()
+    # Patterns that suggest the worker stopped in a bad state
+    stuck_signals = [
+        "error:",
+        "failed to",
+        "cannot find",
+        "compilation error",
+        "build failed",
+        "test failed",
+        "i'm stuck",
+        "i need help",
+        "unable to",
+    ]
+
+    for signal in stuck_signals:
+        if signal in lower:
+            # Check if the worker acknowledged the error and moved on,
+            # or if it just stopped
+            resolution_signals = ["fixed", "resolved", "working now", "pass", "succeeded"]
+            resolved = any(r in lower for r in resolution_signals)
+            if not resolved:
+                return (
+                    f"The worker stopped after mentioning '{signal}' without "
+                    f"indicating the issue was resolved. The last message may "
+                    f"indicate a stuck or failed state worth investigating."
+                )
+
+    # Check if the dispatcher returned low confidence on an empty queue
+    # but known gaps exist — this suggests the loop is stalling
+    if result and (result.get("confidence") or "").lower() == "low" and known_gaps:
+        return (
+            "The Dispatcher returned low confidence even though Known Gaps "
+            "lists actionable work. The loop may be stalling. Check if "
+            "the gaps are actually blocked or if the Dispatcher needs "
+            "better context."
+        )
+
+    return None
+
+
+def detect_ineffective_change(
+    cwd: str,
+    commits: list[dict[str, str]],
+    recent_files_changed: list[str],
+) -> str | None:
+    """Detect when recent commits changed UI-facing code (notification
+    text, hover labels) but the running app can't reflect them without
+    a rebuild. Similar to stale_build but focused on recent-session
+    commits specifically."""
+    if not commits:
+        return None
+
+    # Check if recent commits touched notification/hover code
+    ui_file_patterns = ["Notifier.swift", "HoverViewModel.swift", "HoverView.swift"]
+    ui_files_touched = []
+    for f in recent_files_changed:
+        for pat in ui_file_patterns:
+            if pat in f:
+                ui_files_touched.append(pat)
+
+    if ui_files_touched:
+        app_path = "/Applications/Supervisor.app"
+        if Path(app_path).exists():
+            return (
+                f"This session changed {', '.join(set(ui_files_touched))} "
+                f"but the installed Supervisor.app predates these changes. "
+                f"The new hover labels and notification wording won't appear "
+                f"until the app is rebuilt and relaunched."
+            )
+    return None
+
+
+def run_self_watch(
+    *,
+    cwd: str,
+    recent_turns: list[dict[str, Any]],
+    commits: list[dict[str, str]],
+    recent_files_changed: list[str],
+    known_gaps: str,
+    result: dict[str, Any] | None,
+    timeout: float,
+) -> list[str]:
+    """Run all self-watch checks. Returns a list of plain-language
+    warnings (empty if everything looks healthy)."""
+    warnings: list[str] = []
+
+    stale = detect_stale_build(cwd, timeout)
+    if stale:
+        warnings.append(stale)
+        log(f"SELF_WATCH stale_build detected")
+
+    suspicious = detect_suspicious_stop(recent_turns, known_gaps, result)
+    if suspicious:
+        warnings.append(suspicious)
+        log(f"SELF_WATCH suspicious_stop detected")
+
+    ineffective = detect_ineffective_change(cwd, commits, recent_files_changed)
+    if ineffective:
+        warnings.append(ineffective)
+        log(f"SELF_WATCH ineffective_change detected")
+
+    return warnings
+
+
+# ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 
@@ -1191,6 +1438,17 @@ def main() -> None:
         f"prop_bytes={len(proposal)} requires_human={requires_human} "
         f"just=\"{justification[:120]}\"")
 
+    # v0.7.0: run self-watch checks before acting on the dispatch result.
+    self_watch_warnings = run_self_watch(
+        cwd=cwd,
+        recent_turns=recent_turns,
+        commits=commits,
+        recent_files_changed=diff_stat,
+        known_gaps=known_gaps,
+        result=result,
+        timeout=cfg["git_log_timeout_s"],
+    )
+
     # v0.4.1-hook: requires_human_presence gate. Tasks needing GUI
     # interaction (AX permissions, app launches, physical-world trials)
     # must surface as banners, not auto-dispatch.
@@ -1198,17 +1456,32 @@ def main() -> None:
         state["consecutive_low"] = state.get("consecutive_low", 0) + 1
         put_session_state(state_all, session_id, state)
         save_state(state_all)
+        # v0.7.0: write owner brief when something needs the human.
+        write_owner_brief(
+            cwd=cwd,
+            what_shipped=summarize_recent_commits(commits),
+            most_valuable_next=proposal[:300] if proposal else justification[:300],
+            needs_owner=f"This task needs you at the keyboard: {justification}",
+            loop_doing_next="Waiting for you to handle this — the loop can't proceed autonomously.",
+            warnings=self_watch_warnings,
+        )
         silent_exit(f"GATE_FAIL reason=requires_human_presence path={selected_path}")
 
     if confidence == "high" and selected_path != "low_confidence_no_action" and proposal:
         state["consecutive_low"] = 0
         put_session_state(state_all, session_id, state)
         save_state(state_all)
-        # Include a short prefix so the assistant knows this came from
-        # the hook (not from Mohammed). The autonomous opener tone is
-        # already inside `proposal`; the prefix just labels the source.
+        # v0.7.0: write owner brief on successful dispatch.
+        write_owner_brief(
+            cwd=cwd,
+            what_shipped=summarize_recent_commits(commits),
+            most_valuable_next=justification[:300],
+            needs_owner="",
+            loop_doing_next=f"Dispatching now: {proposal[:200]}{'...' if len(proposal) > 200 else ''}",
+            warnings=self_watch_warnings,
+        )
         prefixed = (
-            "[dispatch-loop-hook v0.5.0 — auto-dispatched by Stop hook; "
+            "[dispatch-loop-hook v0.7.0 — auto-dispatched by Stop hook; "
             f"justification: {justification.strip()}]\n\n{proposal.strip()}"
         )
         emit_block(prefixed)
@@ -1216,6 +1489,15 @@ def main() -> None:
         state["consecutive_low"] = state.get("consecutive_low", 0) + 1
         put_session_state(state_all, session_id, state)
         save_state(state_all)
+        # v0.7.0: write owner brief on low confidence.
+        write_owner_brief(
+            cwd=cwd,
+            what_shipped=summarize_recent_commits(commits),
+            most_valuable_next="The loop couldn't decide what to do next with enough confidence.",
+            needs_owner="Tell the loop what to work on, or add items to the issue queue." if not known_gaps else "",
+            loop_doing_next="Trying the SelfExtender to recover...",
+            warnings=self_watch_warnings,
+        )
         # v0.5.0: SelfExtender on non-high confidence instead of silent_exit.
         try_self_extend(
             failure_reason=f"non_high_confidence confidence={confidence} path={selected_path}",
