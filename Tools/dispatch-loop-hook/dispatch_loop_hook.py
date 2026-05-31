@@ -733,7 +733,9 @@ def call_dispatcher(
     user_message: str,
 ) -> dict[str, Any] | None:
     """POST to DeepSeek's chat completions endpoint with a forced
-    tool call. Returns the parsed tool-call arguments dict, or None."""
+    tool call. Retries up to 3 times with exponential backoff on
+    transient failures (truncated responses, HTTP errors).
+    Returns the parsed tool-call arguments dict, or None."""
     body = {
         "model": cfg["deepseek_model"],
         "max_tokens": 8192,
@@ -745,25 +747,46 @@ def call_dispatcher(
         "tool_choice": {"type": "function", "function": {"name": "record_dispatch"}},
     }
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        cfg["deepseek_url"],
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=cfg["deepseek_timeout_s"]) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        log(f"deepseek_http_error code={e.code} body={(e.read() or b'')[:200]!r}")
-        return None
-    except Exception as e:
-        log(f"deepseek_call_error error={e}")
-        return None
-    return _parse_dispatcher_response(raw)
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        req = urllib.request.Request(
+            cfg["deepseek_url"],
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=cfg["deepseek_timeout_s"]) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            log(f"deepseek_http_error code={e.code} attempt={attempt+1}/{max_attempts} body={(e.read() or b'')[:200]!r}")
+            if attempt < max_attempts - 1:
+                time.sleep(1.0 * (2 ** attempt))
+                continue
+            return None
+        except Exception as e:
+            log(f"deepseek_call_error error={e} attempt={attempt+1}/{max_attempts}")
+            if attempt < max_attempts - 1:
+                time.sleep(1.0 * (2 ** attempt))
+                continue
+            return None
+
+        result = _parse_dispatcher_response(raw)
+        if result is not None:
+            if attempt > 0:
+                log(f"deepseek_retry_success attempt={attempt+1}")
+            return result
+
+        # Parse failed — retry with backoff if attempts remain.
+        if attempt < max_attempts - 1:
+            log(f"deepseek_retry attempt={attempt+1}/{max_attempts} reason=parse_failed")
+            time.sleep(1.0 * (2 ** attempt))
+
+    return None
 
 
 def _try_repair_truncated_json(s: str) -> dict[str, Any] | None:
@@ -1632,25 +1655,14 @@ def main() -> None:
     )
     log(f"DISPATCH_CALL user_message_bytes={len(user_message.encode('utf-8'))}")
 
+    # v0.8.0: call_dispatcher handles retries internally (3 attempts
+    # with exponential backoff). The old v0.4.1 single-retry in main()
+    # is removed — the built-in retry is more robust.
     result = call_dispatcher(
         key=key, cfg=cfg,
         system_prompt=system_prompt,
         user_message=user_message,
     )
-
-    # v0.4.1-hook: retry once on parse error (DeepSeek sometimes
-    # returns malformed JSON with unterminated strings).
-    if result is None:
-        log("RETRY_PARSE_ERROR attempt=1 reason=first_call_returned_none")
-        result = call_dispatcher(
-            key=key, cfg=cfg,
-            system_prompt=system_prompt,
-            user_message=user_message,
-        )
-        if result is None:
-            log("RETRY_PARSE_ERROR attempt=1 outcome=still_none")
-        else:
-            log("RETRY_PARSE_ERROR attempt=1 outcome=success")
 
     # Update state regardless of result, then act.
     state["total_dispatches"] = state.get("total_dispatches", 0) + 1

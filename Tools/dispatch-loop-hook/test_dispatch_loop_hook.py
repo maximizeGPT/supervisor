@@ -73,56 +73,64 @@ class TestParseRetry(unittest.TestCase):
             except SystemExit:
                 pass
 
-        self.assertEqual(call_count, 2,
-                         "hook must call dispatcher exactly twice (original + 1 retry)")
+        # v0.8.0: retries are now internal to call_dispatcher, so main()
+        # calls it exactly once. The mock returns None, so SelfExtender fires.
+        self.assertEqual(call_count, 1,
+                         "main() must call dispatcher exactly once (retries are internal)")
         self.assertTrue(len(se_calls) > 0, "v0.5.0: SelfExtender must be called on dispatcher failure")
         self.assertIn("dispatcher_returned_none", se_calls[-1])
 
-    def test_retry_succeeds_on_second_attempt(self):
-        """When first call returns None but second returns valid high-confidence
-        result, the hook should emit_block (not silent_exit)."""
+    def test_call_dispatcher_retries_on_parse_failure(self):
+        """v0.8.0: call_dispatcher handles retries internally with
+        exponential backoff. First HTTP call returns garbage, second
+        returns valid JSON — should succeed on attempt 2."""
         call_count = 0
+        valid_response = json.dumps({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "record_dispatch",
+                            "arguments": json.dumps({
+                                "next_task_proposal": "Do the next thing.",
+                                "justification": "Follow-on.",
+                                "confidence": "high",
+                                "selected_path": "continue_branch",
+                            })
+                        }
+                    }]
+                },
+                "finish_reason": "stop",
+            }]
+        })
 
-        def fake_call(*, key, cfg, system_prompt, user_message):
+        def fake_urlopen(req, timeout=None):
             nonlocal call_count
             call_count += 1
+            resp = MagicMock()
             if call_count == 1:
-                return None  # first call fails
-            return {
-                "next_task_proposal": "Do the next thing per PRINCIPLES.",
-                "justification": "Mechanical follow-on.",
-                "confidence": "high",
-                "selected_path": "continue_branch",
-            }
+                # First call returns truncated garbage.
+                resp.read.return_value = b'{"choices": [{"message":'
+                resp.__enter__ = lambda s: s
+                resp.__exit__ = MagicMock(return_value=False)
+                return resp
+            # Second call returns valid response.
+            resp.read.return_value = valid_response.encode("utf-8")
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
 
-        with patch.object(hook, 'call_dispatcher', side_effect=fake_call), \
-             patch.object(hook, 'emit_block') as mock_block, \
-             patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
-             patch.object(hook, 'load_state', return_value={}), \
-             patch.object(hook, 'save_state'), \
-             patch.object(hook, 'detect_worker_stopped', return_value=True), \
-             patch.object(hook, 'read_recent_turns', return_value=[
-                 {"role": "assistant", "text": "All done.", "ts": ""}
-             ]), \
-             patch.object(hook, 'fetch_diff_stat', return_value=[]), \
-             patch.object(hook, 'current_branch', return_value="autonomous-test"), \
-             patch.object(hook, 'fetch_issues', return_value=[]), \
-             patch.object(hook, 'fetch_commits', return_value=[]), \
-             patch.object(hook, 'read_keychain', return_value="sk-test"), \
-             patch.object(hook, 'load_system_prompt', return_value="test prompt"), \
-             patch.object(hook, 'ENABLED_FLAG', new=MagicMock(exists=MagicMock(return_value=True))), \
-             patch('sys.stdin', MagicMock(read=MagicMock(return_value=json.dumps({
-                 "session_id": "s1",
-                 "cwd": "/Users/main/supervisor",
-                 "transcript_path": "/tmp/test.jsonl",
-             })))):
-            try:
-                hook.main()
-            except SystemExit:
-                pass
+        cfg = dict(hook.DEFAULTS)
+        with patch('urllib.request.urlopen', side_effect=fake_urlopen), \
+             patch('time.sleep'):  # skip actual backoff delay
+            result = hook.call_dispatcher(
+                key="sk-test", cfg=cfg,
+                system_prompt="test", user_message="test",
+            )
 
-        self.assertEqual(call_count, 2)
-        mock_block.assert_called_once()
+        self.assertIsNotNone(result, "should succeed on second attempt")
+        self.assertEqual(call_count, 2, "should take exactly 2 attempts")
+        self.assertEqual(result["confidence"], "high")
 
 
 class TestRequiresHumanPresenceGate(unittest.TestCase):
