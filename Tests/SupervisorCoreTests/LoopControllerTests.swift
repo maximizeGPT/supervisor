@@ -315,4 +315,72 @@ final class LoopControllerTests: XCTestCase {
         let count = try store.count(sessionId: "s-mig")
         XCTAssertEqual(count, 1)
     }
+
+    // MARK: - clearConsecutiveLowStop
+
+    func testClearConsecutiveLowStopResumesLoop() async {
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock, consecutiveLowThreshold: 3)
+
+        // Initialize + trigger 3 consecutive lows to stop.
+        _ = await lc.canDispatch(sessionId: "s-1")
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "a"))
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "b"))
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "c"))
+
+        // Verify stopped.
+        let stopped = await lc.canDispatch(sessionId: "s-1")
+        guard case .stopped = stopped else {
+            return XCTFail("expected stopped, got \(stopped)")
+        }
+
+        // Clear the stop.
+        await lc.clearConsecutiveLowStop(sessionId: "s-1")
+
+        // Verify loop can proceed again.
+        let resumed = await lc.canDispatch(sessionId: "s-1")
+        guard case .proceed = resumed else {
+            return XCTFail("expected proceed after clear, got \(resumed)")
+        }
+
+        // Verify consecutive_low was reset.
+        let snap = await lc.snapshot(sessionId: "s-1")
+        XCTAssertEqual(snap?.consecutiveLowCount, 0)
+        XCTAssertFalse(snap?.stopped ?? true)
+    }
+
+    func testClearConsecutiveLowDoesNotClearKillStop() async {
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock)
+
+        _ = await lc.canDispatch(sessionId: "s-1")
+        await lc.stop(sessionId: "s-1", reason: .killFired)
+
+        // Try to clear — should be a no-op for kill stops.
+        await lc.clearConsecutiveLowStop(sessionId: "s-1")
+
+        let decision = await lc.canDispatch(sessionId: "s-1")
+        guard case .stopped = decision else {
+            return XCTFail("kill stop must persist after clear attempt, got \(decision)")
+        }
+        let snap = await lc.snapshot(sessionId: "s-1")
+        XCTAssertEqual(snap?.stopReason, .killFired)
+    }
+
+    func testClearConsecutiveLowDoesNotClearFourHourStop() async {
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock, maxLoopDuration: 3600)
+
+        _ = await lc.canDispatch(sessionId: "s-1")
+        clock.advance(by: 3601)
+        _ = await lc.canDispatch(sessionId: "s-1")
+
+        // Try to clear — should be a no-op for 4-hour stops.
+        await lc.clearConsecutiveLowStop(sessionId: "s-1")
+
+        let decision = await lc.canDispatch(sessionId: "s-1")
+        guard case .stopped = decision else {
+            return XCTFail("4-hour stop must persist after clear attempt, got \(decision)")
+        }
+    }
 }

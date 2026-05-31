@@ -672,5 +672,51 @@ class TestTruncatedJsonRepair(unittest.TestCase):
         self.assertIn("fix_prompt", result)
 
 
+class TestBuildFallbackFromGaps(unittest.TestCase):
+    """Tests for the _build_fallback_from_gaps deferred-work fallback."""
+
+    def test_returns_prompt_for_actionable_gap(self):
+        gaps = """# Known Gaps
+
+## Half-wired features
+
+- **SIGCONT-from-button not wired.** The pause recovery path requires manual kill -CONT.
+- ~~**Already fixed item.**~~ Done.
+
+## Blocked on external setup
+
+- **No ANTHROPIC_API_KEY.** Blocked on API key."""
+
+        result = hook._build_fallback_from_gaps(gaps, ["3 files changed"], [{"subject": "test", "body": ""}])
+        self.assertIsNotNone(result)
+        self.assertIn("SIGCONT", result)
+        self.assertNotIn("ANTHROPIC_API_KEY", result)  # blocked items excluded
+        self.assertNotIn("Already fixed", result)  # struck-through excluded
+
+    def test_returns_none_when_all_blocked(self):
+        gaps = """# Known Gaps
+
+- **Blocked on ANTHROPIC_API_KEY.** Needs API key.
+- ~~**Done.**~~ Fixed."""
+
+        result = hook._build_fallback_from_gaps(gaps, [], [])
+        self.assertIsNone(result)
+
+    def test_returns_none_for_empty_gaps(self):
+        result = hook._build_fallback_from_gaps("", [], [])
+        self.assertIsNone(result)
+
+    def test_includes_diff_and_commits_context(self):
+        gaps = "- **Approve button.** Needs router wiring."
+        result = hook._build_fallback_from_gaps(
+            gaps,
+            ["src/foo.swift | 10 +"],
+            [{"subject": "v0.1.7 panel", "body": ""}],
+        )
+        self.assertIsNotNone(result)
+        self.assertIn("src/foo.swift", result)
+        self.assertIn("v0.1.7 panel", result)
+
+
 if __name__ == "__main__":
     unittest.main()
