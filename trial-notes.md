@@ -1493,13 +1493,13 @@ Last updated: 2026-05-31
 - ~~**In-memory flagCount resets on app restart.**~~ Fixed in v0.6.1
   — seeded from FlagStore.count() at construction.
 
-- **SIGCONT-from-button not wired.** The pause recovery path requires
-  the user to run `kill -CONT <pid>` manually. The expanded panel
-  should expose a Resume button. Deferred since v0.1.4.
+- ~~**SIGCONT-from-button not wired.**~~ Fixed in v0.1.7 — expanded
+  panel shows Resume button when paused. Sends SIGCONT via the same
+  ProcessLocator + DarwinSignalSender used for the pause path.
 
-- **Expanded panel flag action buttons.** Approve / Dismiss / False
-  positive buttons are in the DESIGN spec but deferred — they need
-  router wiring for re-executing interventions with gates off.
+- ~~**Expanded panel flag action buttons.**~~ Dismiss and False
+  positive buttons wired in v0.1.7. Approve button still deferred
+  — needs router re-execution with gates off.
 
 - ~~**PRINCIPLES.md loaded once at engine construction.**~~ Fixed —
   Dispatcher now re-reads from disk on each call via `principlesPath`.

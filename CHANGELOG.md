@@ -40,19 +40,33 @@ panel showing recent flags, session metrics, and cost.
   from FlagStore. Both degrade to sensible defaults when stores
   are nil.
 
+**Resume button** (`HoverViewModel.swift`, `ExpandedPanelView.swift`,
+`main.swift`)
+- When Supervisor pauses Claude Code (SIGSTOP), the expanded panel
+  shows a Resume button. Sends SIGCONT via ProcessLocator +
+  DarwinSignalSender. On success, auto-acknowledges the flag.
+- Closes Known Gap "SIGCONT-from-button not wired" (deferred since
+  v0.1.4).
+
+**Flag response buttons** (`ExpandedPanelView.swift`,
+`HoverViewModel.swift`)
+- Dismiss and False positive buttons on each flag row. Persists via
+  `FlagStore.markUserResponse()`. After response, the row shows a
+  label instead of buttons.
+
 ### Deferred (v0.1.7.1+)
 
-- Flag action buttons (Approve / Dismiss / False positive) —
-  need router wiring for re-executing interventions.
+- Approve button — needs router re-execution with gates off.
 - Session switcher dropdown — needs multi-session UI (v0.1.2).
 - Settings panel launch from footer.
 - Hover-on-flag row expansion to show full reasoning + evidence.
 
 ### Tests
 
-295 Swift pass (6 skipped, 0 failures). Was 280; +15 new
+304 Swift pass (6 skipped, 0 failures). Was 280; +24 new
 ExpandedPanelTests covering session metrics, toggle state, cost
-formatting, relative time display, and store-absent defaults.
+formatting, relative time display, store-absent defaults, resume
+button (6 tests), and flag response persistence (3 tests).
 
 ## [0.7.1] — 2026-05-31
 
