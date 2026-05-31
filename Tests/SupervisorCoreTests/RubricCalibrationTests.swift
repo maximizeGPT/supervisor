@@ -6,8 +6,10 @@
 // report and a human-readable Markdown summary to
 // Tests/Calibration/runs/<timestamp>/.
 //
-// Gated by SUPERVISOR_LIVE_API=1 AND ANTHROPIC_API_KEY=<key>. Cost per
-// full sweep: ~300 Haiku calls × ~2k tokens each ≈ 600k tokens ≈ $1.
+// Gated by SUPERVISOR_LIVE_API=1 AND any provider key env var
+// (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, MOONSHOT_API_KEY). Cost per
+// full sweep: ~300 calls × ~2k tokens each ≈ 600k tokens ≈ $1-2
+// depending on provider.
 
 import XCTest
 @testable import SupervisorCore
@@ -17,20 +19,32 @@ final class RubricCalibrationTests: XCTestCase {
 
     // MARK: - Setup
 
-    private func resolveKey() throws -> String {
+    /// Resolve any available provider key for calibration. Tries env vars
+    /// for each provider, falls back to reading the user's configured
+    /// provider from Keychain. Any provider with a valid key can run the
+    /// calibration sweep — the rubric is provider-agnostic.
+    private func resolveKey() throws -> (key: String, provider: LLMProvider) {
         guard ProcessInfo.processInfo.environment["SUPERVISOR_LIVE_API"] != nil else {
-            throw XCTSkip("set SUPERVISOR_LIVE_API=1 + ANTHROPIC_API_KEY to run calibration")
+            throw XCTSkip("set SUPERVISOR_LIVE_API=1 + an API key env var (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, etc.) to run calibration")
         }
-        guard let key = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"], !key.isEmpty else {
-            throw XCTSkip("ANTHROPIC_API_KEY env var required")
+        // Try env vars in order of preference.
+        let envKeys: [(String, LLMProvider)] = [
+            ("ANTHROPIC_API_KEY", .anthropic),
+            ("DEEPSEEK_API_KEY", .deepseek),
+            ("MOONSHOT_API_KEY", .moonshot),
+        ]
+        for (env, provider) in envKeys {
+            if let k = ProcessInfo.processInfo.environment[env], !k.isEmpty {
+                return (k, provider)
+            }
         }
-        return key
+        throw XCTSkip("set one of ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / MOONSHOT_API_KEY to run calibration")
     }
 
-    private func makeClient(key: String) -> LLMClient {
+    private func makeClient(key: String, provider: LLMProvider) -> LLMClient {
         let traceLog = TraceLog(path: FileManager.default.temporaryDirectory
             .appendingPathComponent("calibration-\(UUID().uuidString).log"))
-        return LLMClient(provider: .anthropic, apiKey: key, redactor: DefaultRedactor(), traceLog: traceLog)
+        return LLMClient(provider: provider, apiKey: key, redactor: DefaultRedactor(), traceLog: traceLog)
     }
 
     // MARK: - Event-window construction
@@ -212,12 +226,13 @@ final class RubricCalibrationTests: XCTestCase {
     // MARK: - The sweep
 
     func testCalibrateFullCorpus() async throws {
-        let key = try resolveKey()
-        let client = makeClient(key: key)
+        let (key, provider) = try resolveKey()
+        let client = makeClient(key: key, provider: provider)
 
         let fixtures = FixtureCorpus.all
         let started = Date()
         print("=== CALIBRATION SWEEP ===")
+        print("provider: \(provider.rawValue) model: \(provider.defaultTriageModel)")
         print("fixtures: \(fixtures.count)")
         print("started: \(ISO8601DateFormatter().string(from: started))")
 
@@ -235,7 +250,7 @@ final class RubricCalibrationTests: XCTestCase {
         for (i, f) in fixtures.enumerated() {
             let n = String(format: "%3d", i + 1)
             print("\(n)/\(fixtures.count)  \(f.name)")
-            let r = await runOne(f, client: client)
+            let r = await runOne(f, client: client, model: provider.defaultTriageModel)
             results.append(r)
             if i < fixtures.count - 1 {
                 try? await Task.sleep(nanoseconds: pacingNanos)

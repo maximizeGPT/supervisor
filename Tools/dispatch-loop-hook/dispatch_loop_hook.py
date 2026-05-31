@@ -62,17 +62,74 @@ ENABLED_FLAG = HOOK_HOME / "dispatch-loop-enabled.json"
 STATE_FILE = HOOK_HOME / "dispatch-loop-state.json"
 LOG_FILE = HOOK_HOME / "dispatch-loop.log"
 
+# Provider registry — mirrors LLMProvider.swift. Maps provider name
+# (as stored in active-provider.json) to URL, model, keychain service.
+PROVIDERS = {
+    "anthropic": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "model": "claude-haiku-4-5-20251001",
+        "keychain_service": "live.supervisor.api.anthropic",
+        "api_shape": "anthropic",
+    },
+    "deepseek": {
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "model": "deepseek-chat",
+        "keychain_service": "live.supervisor.api.deepseek",
+        "api_shape": "openai",
+    },
+    "moonshot": {
+        "url": "https://api.moonshot.ai/v1/chat/completions",
+        "model": "kimi-k2-0905-preview",
+        "keychain_service": "live.supervisor.api.moonshot",
+        "api_shape": "openai",
+    },
+    "minimax": {
+        "url": "https://api.minimax.chat/v1/chat/completions",
+        "model": "MiniMax-M1",
+        "keychain_service": "live.supervisor.api.minimax",
+        "api_shape": "openai",
+    },
+    "qwenHF": {
+        "url": "https://router.huggingface.co/v1/chat/completions",
+        "model": "Qwen/Qwen2.5-72B-Instruct",
+        "keychain_service": "live.supervisor.api.qwenhf",
+        "api_shape": "openai",
+    },
+}
+
+ACTIVE_PROVIDER_PATH = Path.home() / "Library" / "Application Support" / "Supervisor" / "active-provider.json"
+
+
+def resolve_provider_config() -> dict[str, str]:
+    """Read the user's active provider from active-provider.json and return
+    the matching URL, model, keychain service. Falls back to DeepSeek if the
+    file is missing or unreadable (backwards compat with v0.4.x hook)."""
+    provider_name = "deepseek"  # default fallback
+    try:
+        if ACTIVE_PROVIDER_PATH.exists():
+            data = json.loads(ACTIVE_PROVIDER_PATH.read_text(encoding="utf-8"))
+            provider_name = data.get("activeProvider", "deepseek")
+    except Exception:
+        pass  # fall through to default
+    if provider_name not in PROVIDERS:
+        provider_name = "deepseek"
+    return PROVIDERS[provider_name]
+
+
 DEFAULTS = {
     "max_consecutive_low": 3,            # per §12.5 #3 — same as LoopController
     "max_loop_duration_s": 4 * 3600,      # per §12.5 #2
     "max_total_dispatches": 20,           # safety cap beyond §12.5 — outer ceiling
     "supervisor_repo_path": "/Users/main/supervisor",
     "branch_prefix": "autonomous-",
-    "deepseek_url": "https://api.deepseek.com/v1/chat/completions",
-    "deepseek_model": "deepseek-chat",
-    "deepseek_timeout_s": 30,
+    # Provider settings are resolved dynamically from active-provider.json.
+    # These defaults are overridden by resolve_provider_config() in main().
+    "provider_url": "https://api.deepseek.com/v1/chat/completions",
+    "provider_model": "deepseek-chat",
+    "provider_timeout_s": 30,
     "keychain_service": "live.supervisor.api.deepseek",
     "keychain_account": "api-key",
+    "api_shape": "openai",
     "issue_fetch_timeout_s": 10,
     "git_log_timeout_s": 10,
     "transcript_last_n_turns": 10,
@@ -129,6 +186,13 @@ def load_config() -> dict[str, Any]:
                 cfg.update(raw)
     except Exception as e:
         log(f"config_parse_error error={e}")
+    # Resolve provider from active-provider.json — overrides defaults
+    # with the user's actual configured provider.
+    prov = resolve_provider_config()
+    cfg["provider_url"] = prov["url"]
+    cfg["provider_model"] = prov["model"]
+    cfg["keychain_service"] = prov["keychain_service"]
+    cfg["api_shape"] = prov["api_shape"]
     return cfg
 
 
@@ -775,7 +839,7 @@ def call_dispatcher(
     transient failures (truncated responses, HTTP errors).
     Returns the parsed tool-call arguments dict, or None."""
     body = {
-        "model": cfg["deepseek_model"],
+        "model": cfg["provider_model"],
         "max_tokens": 8192,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -789,7 +853,7 @@ def call_dispatcher(
     max_attempts = 3
     for attempt in range(max_attempts):
         req = urllib.request.Request(
-            cfg["deepseek_url"],
+            cfg["provider_url"],
             data=data,
             method="POST",
             headers={
@@ -798,7 +862,7 @@ def call_dispatcher(
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=cfg["deepseek_timeout_s"]) as resp:
+            with urllib.request.urlopen(req, timeout=cfg["provider_timeout_s"]) as resp:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             log(f"deepseek_http_error code={e.code} attempt={attempt+1}/{max_attempts} body={(e.read() or b'')[:200]!r}")
@@ -1044,7 +1108,7 @@ def call_self_extender(
     """Call DeepSeek with the SelfExtender prompt. Same retry mechanics
     as call_dispatcher (3 attempts with exponential backoff)."""
     body = {
-        "model": cfg["deepseek_model"],
+        "model": cfg["provider_model"],
         "max_tokens": 8192,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -1058,7 +1122,7 @@ def call_self_extender(
     max_attempts = 3
     for attempt in range(max_attempts):
         req = urllib.request.Request(
-            cfg["deepseek_url"],
+            cfg["provider_url"],
             data=data,
             method="POST",
             headers={
@@ -1067,7 +1131,7 @@ def call_self_extender(
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=cfg["deepseek_timeout_s"]) as resp:
+            with urllib.request.urlopen(req, timeout=cfg["provider_timeout_s"]) as resp:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             log(f"self_extender_http_error code={e.code} attempt={attempt+1}/{max_attempts}")
@@ -1681,10 +1745,19 @@ def main() -> None:
         f"gaps={len(known_gaps)} markers={len(source_markers)} "
         f"direction={'yes' if product_direction else 'no'}")
 
-    # Read API key.
+    # Read API key from the user's configured provider.
     key = read_keychain(cfg["keychain_service"], cfg["keychain_account"])
     if not key:
-        silent_exit("no_deepseek_key")
+        silent_exit(f"no_provider_key service={cfg['keychain_service']}")
+
+    # The Python hook uses the OpenAI-compatible chat.completions shape.
+    # If the user's active provider is Anthropic (which uses a different
+    # wire format), the Swift app handles dispatch natively — the hook
+    # gates out. This only matters if someone configures Anthropic as
+    # active provider; all other providers (DeepSeek, Moonshot, MiniMax,
+    # Qwen) use the OpenAI-compatible shape the hook already speaks.
+    if cfg.get("api_shape") == "anthropic":
+        silent_exit("provider_is_anthropic_use_swift_app")
 
     # v0.7.0: run pre-dispatch self-watch (stale build, ineffective change).
     # These warnings flow into the dispatcher's context so it can act on them.
