@@ -6,6 +6,61 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-05-31
+
+Diff-stat bugfix + plain-language voice across hover and notifications.
+
+### Fixed
+
+**Branch diff-stat resolution** (`dispatch_loop_hook.py`,
+`DispatchFetchers.swift`)
+- `fetch_diff_stat` and `fetch_commits` were using `main..{branch}`
+  directly, which fails with "fatal: ambiguous argument" when `main`
+  isn't a valid local ref. This caused `git_diff_stat_error` on
+  essentially every dispatch, leaving the Dispatcher blind to what's
+  already shipped.
+- Both Python and Swift now resolve the comparison base via
+  `git merge-base`, trying `main` then `origin/main`, falling back
+  to `{branch}~20` if neither resolves. Error logs include the
+  attempted range and 200 chars of stderr.
+- New `GitDiffStatFetcher` actor (Swift) with `DiffStatFetching`
+  protocol, parallel to the existing issue and commit fetchers.
+- Live-verified: dispatch log shows diff_stat loaded (31 lines)
+  instead of git_diff_stat_error.
+
+### Changed
+
+**Plain-language hover label** (`HoverViewModel.swift`,
+`HoverView.swift`, `TriageEngine.swift`, `main.swift`)
+- `sessionLabel`/`currentToolDescription` replaced with
+  `plainLabel`/`detailLabel`. The hover headline is now a sentence
+  a non-engineer understands at a glance:
+  - Idle: "Watching supervisor — all clear"
+  - Triaging: "Checking something..."
+  - Running: "Running a command" (detail: the actual command)
+  - Flagged: first sentence of `reasoning_plain`, or a generic
+    action sentence ("Paused Claude Code — needs your attention")
+- `Activity.flagged` enum case gains optional `reasoningPlain`
+  parameter. Flows from TriageEngine through main.swift to the
+  hover view model.
+
+**Plain-language notifications** (`Notifier.swift`)
+- Notification title was "Supervisor: destructive_action_pending"
+  (raw category name). Now uses action-specific plain titles:
+  "Supervisor paused Claude Code", "Supervisor kept Claude Code
+  working", "Supervisor is waiting for direction", etc.
+- Notification body uses `reasoning_plain` directly. No raw category
+  names, severity integers, or PIDs in the headline. Recovery
+  details go to a second line.
+- Dispatch-loop notifications: "Supervisor sent Claude Code its next
+  task", "Supervisor thinks Claude Code should work on this next,
+  but wants your approval", "Claude Code finished its work and
+  Supervisor couldn't decide what to do next."
+
+### Tests
+
+280 Swift pass (6 skipped, 0 failures). 39 Python pass.
+
 ## [0.6.0] — 2026-05-30
 
 Dispatcher rebuild: from queue-reader to expert advisor. The
