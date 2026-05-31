@@ -165,7 +165,10 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // 2. Bus + Hover
         let bus = EventBus(trace: trace)
         self.bus = bus
-        let hoverVM = HoverViewModel(bus: bus, trace: trace)
+        // Seed flagCount from SQLite history so the badge persists across
+        // launches (Known Gap since v0.1.4).
+        let historicFlagCount = (try? flagStore?.count()) ?? 0
+        let hoverVM = HoverViewModel(bus: bus, trace: trace, initialFlagCount: historicFlagCount)
         self.hoverVM = hoverVM
         // v0.1.4 Gap 8: hover visibility depends on whether Supervisor
         // is actually tailing a session. discovery is constructed later

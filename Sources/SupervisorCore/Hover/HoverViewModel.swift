@@ -53,13 +53,22 @@ public final class HoverViewModel: ObservableObject {
     /// Resets on each new flag.
     public let acknowledgeDebounceDuration: TimeInterval
 
-    public init(bus: EventBus, trace: TraceLog = .shared, acknowledgeDebounceDuration: TimeInterval = 5.0) {
+    public init(
+        bus: EventBus,
+        trace: TraceLog = .shared,
+        acknowledgeDebounceDuration: TimeInterval = 5.0,
+        initialFlagCount: Int = 0
+    ) {
         self.bus = bus
         self.trace = trace
         self.acknowledgeDebounceDuration = acknowledgeDebounceDuration
+        self.flagCount = initialFlagCount
         self.busCancellable = bus.subscribe { [weak self] event in
             guard let self else { return }
             Task { @MainActor in self.handle(event: event) }
+        }
+        if initialFlagCount > 0 {
+            trace.emit("hover", "seeded flagCount=\(initialFlagCount) from history")
         }
     }
 
