@@ -1180,21 +1180,20 @@ def summarize_recent_commits(commits: list[dict[str, str]], limit: int = 10) -> 
 # Self-Watch (Capability 2 — catch mismatches, fix them)
 # ----------------------------------------------------------------------
 
-def detect_stale_build(cwd: str, timeout: float) -> str | None:
+def detect_stale_build(cwd: str, timeout: float) -> tuple[str | None, float]:
     """Detect when committed code changes user-facing behavior but the
-    running Supervisor.app predates those commits. Returns a plain
-    warning string or None."""
+    running Supervisor.app predates those commits. Returns (warning, commit_time)
+    or (None, 0). The commit_time is used for deduplication — same commit_time
+    means same staleness, no need to re-warn."""
     app_path = "/Applications/Supervisor.app/Contents/Info.plist"
     if not Path(app_path).exists():
-        return None  # No app installed — nothing to compare
+        return None, 0
 
-    # Get the app's modification time
     try:
         app_mtime = Path(app_path).stat().st_mtime
     except Exception:
-        return None
+        return None, 0
 
-    # Get the latest commit time that touched user-facing files
     ui_paths = [
         "Sources/SupervisorUI/",
         "Sources/SupervisorCore/Intervention/Notifier.swift",
@@ -1221,8 +1220,8 @@ def detect_stale_build(cwd: str, timeout: float) -> str | None:
             "to the hover label, notifications, or UI. The new wording "
             "won't be visible until you rebuild and relaunch. "
             "Run build-app.sh and do the atomic swap to /Applications."
-        )
-    return None
+        ), latest_commit_time
+    return None, 0
 
 
 def detect_suspicious_stop(
@@ -1323,21 +1322,57 @@ def run_self_watch_pre_dispatch(
     commits: list[dict[str, str]],
     recent_files_changed: list[str],
     timeout: float,
+    state: dict[str, Any],
 ) -> list[str]:
     """Run self-watch checks that don't depend on the dispatch result.
-    Called BEFORE the dispatcher so warnings flow into its context."""
+    Called BEFORE the dispatcher so warnings flow into its context.
+    Uses state-based deduplication: once a warning is surfaced in
+    the owner brief, it's recorded in state. Subsequent cycles with
+    the same underlying condition skip the warning to avoid noise.
+    The warning re-fires when the condition changes (new commit) or
+    resolves (app rebuilt)."""
     warnings: list[str] = []
+    surfaced = state.get("surfaced_warnings") or {}
 
-    stale = detect_stale_build(cwd, timeout)
-    if stale:
-        warnings.append(stale)
-        log(f"SELF_WATCH stale_build detected")
+    stale_warning, stale_commit_time = detect_stale_build(cwd, timeout)
+    if stale_warning:
+        # Only surface if this is a NEW staleness (different commit time
+        # than what we already surfaced). If the same commit time was
+        # already surfaced, the owner already knows — don't repeat.
+        last_surfaced_time = surfaced.get("stale_build_commit_time", 0)
+        if stale_commit_time != last_surfaced_time:
+            warnings.append(stale_warning)
+            surfaced["stale_build_commit_time"] = stale_commit_time
+            log(f"SELF_WATCH stale_build detected (new, commit_time={stale_commit_time})")
+        else:
+            log(f"SELF_WATCH stale_build still present but already surfaced (commit_time={stale_commit_time})")
+    else:
+        # Condition resolved (app rebuilt or no app installed) — clear.
+        if "stale_build_commit_time" in surfaced:
+            del surfaced["stale_build_commit_time"]
+            log("SELF_WATCH stale_build resolved")
 
     ineffective = detect_ineffective_change(cwd, commits, recent_files_changed)
     if ineffective:
-        warnings.append(ineffective)
-        log(f"SELF_WATCH ineffective_change detected")
+        # Ineffective-change is session-scoped (tied to recent commits),
+        # so it only fires when recent commits touch UI files. Dedup by
+        # the set of touched files.
+        touched_key = str(sorted(set(
+            p for p in ["Notifier.swift", "HoverViewModel.swift", "HoverView.swift"]
+            if any(p in f for f in recent_files_changed)
+        )))
+        last_surfaced_key = surfaced.get("ineffective_change_key", "")
+        if touched_key != last_surfaced_key:
+            warnings.append(ineffective)
+            surfaced["ineffective_change_key"] = touched_key
+            log(f"SELF_WATCH ineffective_change detected (new)")
+        else:
+            log(f"SELF_WATCH ineffective_change still present but already surfaced")
+    else:
+        if "ineffective_change_key" in surfaced:
+            del surfaced["ineffective_change_key"]
 
+    state["surfaced_warnings"] = surfaced
     return warnings
 
 
@@ -1468,7 +1503,11 @@ def main() -> None:
         cwd=cwd, recent_turns=recent_turns,
         commits=commits, recent_files_changed=diff_stat,
         timeout=cfg["git_log_timeout_s"],
+        state=state,
     )
+    # Save state after pre-dispatch so dedup keys persist.
+    put_session_state(state_all, session_id, state)
+    save_state(state_all)
 
     # Build + send the Dispatcher request.
     user_message = build_user_message(
