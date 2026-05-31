@@ -349,16 +349,43 @@ def _resolve_diff_base(cwd: str, branch: str, timeout: float) -> str | None:
     return None
 
 
+def _safe_head_range(cwd: str, n: int, timeout: float) -> str:
+    """Return a safe diff range like 'HEAD~N..HEAD' where N is capped to the
+    actual number of commits available. Falls back to diffing against the
+    repo root commit if the branch is very short."""
+    # Count available commits.
+    code, out, _ = run(
+        ["git", "rev-list", "--count", "HEAD"],
+        cwd=cwd, timeout=timeout,
+    )
+    if code == 0 and out.strip().isdigit():
+        available = int(out.strip())
+        actual_n = min(n, max(available - 1, 0))
+        if actual_n > 0:
+            return f"HEAD~{actual_n}..HEAD"
+    # Very short branch or rev-list failed — diff against root commit.
+    code, out, _ = run(
+        ["git", "rev-list", "--max-parents=0", "HEAD"],
+        cwd=cwd, timeout=timeout,
+    )
+    if code == 0 and out.strip():
+        root = out.strip().splitlines()[0]
+        return f"{root}..HEAD"
+    # Absolute fallback — empty tree (shows all files as added).
+    return "4b825dc642cb6eb9a060e54bf899d69f82cf7256..HEAD"
+
+
 def fetch_diff_stat(cwd: str, branch: str, timeout: float) -> list[str]:
     """Return `git diff --stat base..HEAD` lines, truncated to the top 30
     files by change size. Resolves the comparison base robustly via
-    merge-base, falling back to HEAD~20 if main isn't reachable."""
+    merge-base, falling back to a safe HEAD range that handles short
+    branches without erroring."""
     base = _resolve_diff_base(cwd, branch, timeout)
     if base:
         diff_range = f"{base}..HEAD"
     else:
-        # No merge-base — fall back to the last 20 commits.
-        diff_range = "HEAD~20..HEAD"
+        # No merge-base — use safe fallback that counts actual commits.
+        diff_range = _safe_head_range(cwd, 20, timeout)
         log(f"diff_stat_fallback reason=no_merge_base branch={branch} using={diff_range}")
 
     code, out, err = run(
@@ -367,11 +394,12 @@ def fetch_diff_stat(cwd: str, branch: str, timeout: float) -> list[str]:
         timeout=timeout,
     )
     if code != 0:
-        # Second attempt: try HEAD~20..HEAD if the first range failed.
-        if diff_range != "HEAD~20..HEAD":
-            log(f"git_diff_stat_retry range={diff_range} failed, trying HEAD~20..HEAD")
+        # Primary range failed — try safe fallback.
+        fallback_range = _safe_head_range(cwd, 20, timeout)
+        if fallback_range != diff_range:
+            log(f"git_diff_stat_retry range={diff_range} failed, trying {fallback_range}")
             code, out, err = run(
-                ["git", "diff", "--stat", "HEAD~20..HEAD"],
+                ["git", "diff", "--stat", fallback_range],
                 cwd=cwd,
                 timeout=timeout,
             )
@@ -543,7 +571,7 @@ def fetch_commits(cwd: str, branch: str, timeout: float) -> list[dict[str, str]]
     if base:
         log_range = f"{base}..HEAD"
     else:
-        log_range = "HEAD~20..HEAD"
+        log_range = _safe_head_range(cwd, 20, timeout)
         log(f"git_log_fallback reason=no_merge_base branch={branch} using={log_range}")
 
     code, out, err = run(
@@ -554,8 +582,18 @@ def fetch_commits(cwd: str, branch: str, timeout: float) -> list[dict[str, str]]
         timeout=timeout,
     )
     if code != 0:
-        log(f"git_log_error code={code} range={log_range} stderr={err.strip()[:200]}")
-        return []
+        # Try safe fallback range.
+        fallback = _safe_head_range(cwd, 20, timeout)
+        if fallback != log_range:
+            code, out, err = run(
+                ["git", "log", fallback,
+                 "--pretty=format:%H%x00%s%x00%b%x1E",
+                 "--no-merges"],
+                cwd=cwd, timeout=timeout,
+            )
+        if code != 0:
+            log(f"git_log_error code={code} range={log_range} stderr={err.strip()[:200]}")
+            return []
     commits: list[dict[str, str]] = []
     for record in out.split("\x1e"):
         record = record.strip()

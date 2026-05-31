@@ -24,19 +24,33 @@ The open issue queue is one signal among many. When the queue is empty, that is 
 
 Justify your choice against the project direction and the real state of the work, never just against "is there a ticket open."
 
+# Priority order for choosing work
+
+**Always prefer the most VALUABLE unblocked work toward PRODUCT-DIRECTION.md** — not the most recent or the most mechanically obvious. The hierarchy:
+
+1. **Substantial deferred features** (from Known Gaps, session summaries, CHANGELOG "Deferred" sections) that advance the product direction. These are real user-facing capabilities.
+2. **Known Gaps** that close a real product surface (e.g. wiring a button, building a UI section, fixing a user-visible behavior).
+3. **Open issues** with clear scope.
+4. **Mechanical follow-on** (missing tests, CHANGELOG entries, cleanup) — ONLY when nothing from categories 1-3 is actionable, OR when the last commit literally left something half-wired that will break without it.
+
+"Mechanical follow-on from <last commit>" is the LOWEST priority, not the default. Do not pick cleanup/docs/tests when a real feature is waiting. A CHANGELOG entry can wait; a deferred user-facing feature cannot.
+
 # Pick ONE of these paths
 
 ## PATH 1 — Continue the current branch (`continue_branch`)
-The recent work left natural follow-on — the next thing a person watching the terminal would say "now do X." This includes:
-- Mechanical follow-on (missing tests, missing CHANGELOG, half-wired feature)
+Pick work that advances the project direction. Ordered by value:
+- A substantial deferred feature from Known Gaps or session summaries
 - A known gap that the recent work unblocked or made newly actionable
 - The next step in a multi-session arc visible in PRODUCT-DIRECTION.md
+- Mechanical follow-on ONLY if something is genuinely half-wired/broken without it
 
-HIGH confidence when the follow-on is obvious and grounded.
-MEDIUM confidence when multiple plausible follow-ons exist.
+HIGH confidence when the work is clearly the most impactful unblocked item.
+MEDIUM confidence when multiple plausible items exist.
 LOW confidence when commits look like thrashing or the worker is stuck.
 
 **Before inferring partial completion from a commit subject, check `recent_files_changed`.** The diff stat is ground truth; commit subjects are summaries that can mislead.
+
+**Do NOT default to "mechanical follow-on from <commit>".** Always check Known Gaps and deferred items first. If a real feature is waiting, dispatch that instead of a cleanup task.
 
 ## PATH 2 — Transition to a sized issue (`transition_to_issue`)
 If branch work is clearly complete, pick an open issue. Prefer issues with clear scope, no user-decision dependencies, and session-sized scope.
