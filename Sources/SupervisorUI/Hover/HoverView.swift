@@ -59,6 +59,13 @@ public struct HoverView: View {
         .padding(.vertical, 8)
         .frame(width: 240, height: 40)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        // v0.8.1: action flash — brief border glow when Supervisor acts.
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(BrandColor.signal.color, lineWidth: vm.actionFlash ? 2 : 0)
+                .opacity(vm.actionFlash ? 1 : 0)
+                .animation(.easeOut(duration: 0.3), value: vm.actionFlash)
+        )
         .onAppear { pulse = true }
     }
 

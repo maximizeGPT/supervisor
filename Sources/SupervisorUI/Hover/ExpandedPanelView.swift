@@ -24,6 +24,8 @@ public struct ExpandedPanelView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            actionsSection
+            Divider()
             flagsSection
             Divider()
             activitySection
@@ -53,6 +55,61 @@ public struct ExpandedPanelView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    // MARK: - Actions section (what Supervisor DID)
+
+    private var actionsSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("RECENT ACTIONS")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+
+            if vm.recentActions.isEmpty {
+                Text("No actions taken yet")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+            } else {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(vm.recentActions.prefix(5)) { action in
+                        HStack(spacing: 6) {
+                            actionIcon(action.action)
+                            Text(action.plainDescription)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(Self.relativeTime(action.ts))
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 12)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .frame(maxHeight: 100)
+    }
+
+    private func actionIcon(_ action: FlagAction) -> some View {
+        let (icon, color): (String, Color) = {
+            switch action {
+            case .pause:      return ("pause.fill", .orange)
+            case .kill:       return ("xmark.circle.fill", .red)
+            case .inject:     return ("text.bubble.fill", .blue)
+            case .continue:   return ("arrow.right.circle.fill", BrandColor.signal.color)
+            case .selfExtend: return ("wrench.fill", .purple)
+            case .notify:     return ("bell.fill", .secondary)
+            }
+        }()
+        return Image(systemName: icon)
+            .font(.system(size: 9))
+            .foregroundStyle(color)
     }
 
     // MARK: - Flags section

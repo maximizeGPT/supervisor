@@ -382,7 +382,15 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             await self?.router?.dispatch(decision: decision)
         }
 
-        // 3. Hover view already updated by engine.onActivityChange.
+        // 3. v0.8.1: record the action in the hover's action log.
+        //    The plain description comes from the same labels the
+        //    flagRaised already uses. Only substantial actions are
+        //    recorded (recordAction filters out .notify internally).
+        let actionDesc = HoverViewModel.plainLabelForFlag(
+            action: candidate.action,
+            reasoningPlain: candidate.reasoningPlain
+        )
+        hoverVM?.recordAction(action: candidate.action, description: actionDesc)
     }
 
     // MARK: - Heartbeat child

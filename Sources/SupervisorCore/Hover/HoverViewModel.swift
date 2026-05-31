@@ -67,6 +67,31 @@ public final class HoverViewModel: ObservableObject {
     /// Whether a resume from pause is in progress.
     @Published public private(set) var isResuming: Bool = false
 
+    // MARK: - Action log (v0.8.1 — "what Supervisor DID")
+
+    /// A record of a substantial action Supervisor took.
+    public struct ActionRecord: Identifiable, Equatable {
+        public let id: String
+        public let ts: Date
+        public let action: FlagAction
+        public let plainDescription: String
+
+        public init(action: FlagAction, plainDescription: String, ts: Date = Date()) {
+            self.id = UUID().uuidString
+            self.ts = ts
+            self.action = action
+            self.plainDescription = plainDescription
+        }
+    }
+
+    /// Recent actions (newest first). Capped at 20.
+    @Published public private(set) var recentActions: [ActionRecord] = []
+
+    /// Transient "action flash" — true for a brief moment when Supervisor
+    /// takes a substantial action (pause/kill/inject/continue/selfExtend).
+    /// Drives a distinct flash animation on the hover dot.
+    @Published public private(set) var actionFlash: Bool = false
+
     // MARK: - Dependencies
 
     private let bus: EventBus
@@ -139,6 +164,30 @@ public final class HoverViewModel: ObservableObject {
             trace.emit("hover", "respondToFlag id=\(flagId) response=\(response.rawValue)")
         } catch {
             trace.emit("hover", "respondToFlag ERROR: \(error)")
+        }
+    }
+
+    // MARK: - Action recording
+
+    /// Record a substantial action Supervisor just took. Triggers the
+    /// action flash and adds to the action log. Called from main.swift
+    /// after the InterventionRouter dispatches.
+    public func recordAction(action: FlagAction, description: String) {
+        // Only record substantial actions, not plain notify.
+        guard action != .notify else { return }
+
+        let record = ActionRecord(action: action, plainDescription: description)
+        recentActions.insert(record, at: 0)
+        if recentActions.count > 20 {
+            recentActions.removeLast()
+        }
+        trace.emit("hover", "action recorded: \(action.rawValue) — \(description)")
+
+        // Trigger the transient flash.
+        actionFlash = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000) // 2s flash
+            self?.actionFlash = false
         }
     }
 
@@ -222,7 +271,7 @@ public final class HoverViewModel: ObservableObject {
     }
 
     /// Plain-language label for a flag, based on the action taken.
-    static func plainLabelForFlag(action: FlagAction, reasoningPlain: String?) -> String {
+    public static func plainLabelForFlag(action: FlagAction, reasoningPlain: String?) -> String {
         // If we have a plain reasoning, use a short version of it.
         if let plain = reasoningPlain, !plain.isEmpty {
             // Take the first sentence, capped at 60 chars for the hover.
