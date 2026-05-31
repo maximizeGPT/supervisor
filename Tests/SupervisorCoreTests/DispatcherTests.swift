@@ -244,39 +244,40 @@ final class DispatcherTests: XCTestCase {
     /// contract, this catches it before it ships.
     func testSystemPromptCarriesCoreConstraints() {
         let prompt = Dispatcher.systemPrompt
-        // Critical voice + content constraints surfaced in the B8
-        // checkpoint:
-        XCTAssertTrue(prompt.contains("File an issue, don't build the feature now"),
-                      "must cite PRINCIPLES §1d (no inventing scope)")
+        // Core dispatch paths
         XCTAssertTrue(prompt.contains("continue_branch"),
                       "must define PATH 1")
         XCTAssertTrue(prompt.contains("transition_to_issue"),
                       "must define PATH 2")
         XCTAssertTrue(prompt.contains("low_confidence_no_action"),
                       "must define the low-confidence path")
-        XCTAssertTrue(prompt.contains("autonomous opener"),
-                      "must teach the voice for the next_task_proposal")
+        // Voice / shape constraints
+        XCTAssertTrue(prompt.contains("senior collaborator"),
+                      "must teach the advisor voice for the next_task_proposal")
         XCTAssertTrue(prompt.contains("75 min"),
-                      "must reference the §12 hard stop in the proposal-shape rule")
+                      "must reference the hard stop in the proposal-shape rule")
         XCTAssertTrue(prompt.contains("record_dispatch"),
                       "must reference the forced tool call")
-        // Mohammed's B8 edits:
-        XCTAssertTrue(prompt.contains("Cite specific file paths or function names"),
+        XCTAssertTrue(prompt.contains("Cite specific file paths"),
                       "must require file-paths-not-just-modules specificity in the proposal")
         XCTAssertTrue(prompt.contains("prior_dispatches_considered"),
-                      "must teach Haiku to read the loop-state signal")
+                      "must teach the model to read the loop-state signal")
         XCTAssertTrue(prompt.contains("Low confidence is a feature, not a failure"),
                       "must include the framing that teaches confident low-confidence returns")
-        XCTAssertTrue(prompt.contains("# Worked examples"),
-                      "must carry the four worked examples Mohammed approved at B8")
-        XCTAssertTrue(prompt.contains("Example 1 — PATH 1 (continue_branch), HIGH"),
-                      "Example 1 (continue_branch, high) must be present")
-        XCTAssertTrue(prompt.contains("Example 2 — PATH 2 (transition_to_issue), HIGH"),
-                      "Example 2 (transition_to_issue, high) must be present")
-        XCTAssertTrue(prompt.contains("Example 3 — PATH 1 (continue_branch), MEDIUM"),
-                      "Example 3 (continue_branch, medium) must be present")
-        XCTAssertTrue(prompt.contains("Example 4 — LOW confidence"),
-                      "Example 4 (the low-confidence framing) must be present")
+        // Direction + Known Gaps awareness
+        XCTAssertTrue(prompt.contains("PRODUCT-DIRECTION"),
+                      "must reference the project direction file")
+        XCTAssertTrue(prompt.contains("Known Gaps"),
+                      "must reference the known gaps record")
+        XCTAssertTrue(prompt.contains("requires_human_presence"),
+                      "must include the human-presence gate")
+        // Worked examples
+        XCTAssertTrue(prompt.contains("Example 1"),
+                      "Example 1 must be present")
+        XCTAssertTrue(prompt.contains("Example 2"),
+                      "Example 2 must be present")
+        XCTAssertTrue(prompt.contains("Example 3"),
+                      "Example 3 must be present")
     }
 
     /// The user message must surface `prior_dispatches_considered` so

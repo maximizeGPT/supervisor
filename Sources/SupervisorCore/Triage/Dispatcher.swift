@@ -121,21 +121,23 @@ public struct SessionContext: Sendable {
     /// surface "what did the worker just finish" to the Dispatcher.
     public let lastNTurns: [SupervisorEvent]
     /// Open issues from `gh issue list`. Empty array on fetch
-    /// failure or gh not installed; the Dispatcher prompt is
-    /// taught to lower confidence when the queue is empty.
+    /// failure or gh not installed.
     public let openIssues: [DispatchIssue]
     /// Commits on this branch since it diverged from main. Empty on
     /// fetch failure or non-repo.
     public let currentBranchCommits: [DispatchCommit]
-    /// v0.4.0 Part B (per Mohammed's B8 review): how many dispatches
-    /// the loop control has already issued in this run, before this
-    /// call. Default 0 = fresh context. The Dispatcher prompt uses
-    /// this to weight thrashing detection: a long chain of dispatches
-    /// without progress is signal the loop is improvising, and the
-    /// dispatcher should ramp confidence down. Part C is what
-    /// actually populates this from `loop_dispatches`; until then
-    /// every call passes 0.
+    /// How many dispatches the loop has already issued in this run.
     public let priorDispatchesConsidered: Int
+    /// PRODUCT-DIRECTION.md content — the project's north star.
+    /// Empty string if the file doesn't exist.
+    public let productDirection: String
+    /// Known Gaps section from trial-notes.md — standing record of
+    /// unfinished, unticketed, or blocked work.
+    public let knownGaps: String
+    /// TODO/FIXME markers from source files.
+    public let sourceMarkers: [String]
+    /// `git diff --stat main..HEAD` output lines.
+    public let recentFilesChanged: [String]
 
     public init(
         sessionUUID: String,
@@ -144,7 +146,11 @@ public struct SessionContext: Sendable {
         lastNTurns: [SupervisorEvent],
         openIssues: [DispatchIssue],
         currentBranchCommits: [DispatchCommit],
-        priorDispatchesConsidered: Int = 0
+        priorDispatchesConsidered: Int = 0,
+        productDirection: String = "",
+        knownGaps: String = "",
+        sourceMarkers: [String] = [],
+        recentFilesChanged: [String] = []
     ) {
         self.sessionUUID = sessionUUID
         self.cwd = cwd
@@ -153,6 +159,10 @@ public struct SessionContext: Sendable {
         self.openIssues = openIssues
         self.currentBranchCommits = currentBranchCommits
         self.priorDispatchesConsidered = priorDispatchesConsidered
+        self.productDirection = productDirection
+        self.knownGaps = knownGaps
+        self.sourceMarkers = sourceMarkers
+        self.recentFilesChanged = recentFilesChanged
     }
 }
 
@@ -414,165 +424,28 @@ public final class Dispatcher: Dispatching, Sendable {
 
     // MARK: - Prompts
 
-    /// The Dispatcher system prompt. Single source of truth for the
-    /// dispatch contract; surfaced verbatim to Mohammed at the B8
-    /// checkpoint per the spec ("the prompt IS the product").
-    static let systemPrompt: String = """
-    You are the dispatcher for an autonomous Claude Code session running under Supervisor. The session just completed a piece of work and is idle on an autonomous branch. Your job: pick the next task and write the prompt that starts it.
-
-    You are given:
-      - PRINCIPLES.md (the project's operating manual — opinions, conventions, hard stops, voice).
-      - The session's last 10 turns (recent context — what the worker just finished).
-      - The current branch's commits since it diverged from main (work shipped this session).
-      - The open GitHub issues (the work queue).
-      - `prior_dispatches_considered`: how many dispatches the loop has already issued in this run.
-
-    # Pick ONE of these two paths
-
-    ## PATH 1 — Continue the current branch (`continue_branch`)
-    If the recent commits left obvious mechanical follow-on — missing tests for new code, missing CHANGELOG entry, missing documentation for a new feature, an obvious second commit that completes a half-shipped change — the next task is that follow-on.
-
-    - HIGH confidence when the follow-on is obvious (e.g. CHANGELOG is the canonical follow to a feature ship; new code with no tests is the canonical follow to a tested module).
-    - MEDIUM confidence when the follow-on is plausible but ambiguous (multiple plausible follow-ons; "should we add docs OR tests next").
-    - LOW confidence when commits look like thrashing (multiple commits revising the same code without forward progress) — that's the worker stuck, not the worker ready for more.
-
-    ## PATH 2 — Transition to a sized issue (`transition_to_issue`)
-    If the current branch's work is clearly complete (tests passing per recent context, CHANGELOG written, no obvious follow-on), pick an open issue from the queue. Prefer issues with:
-
-    - Clear scope (the issue body specifies the work, not just the symptom).
-    - No dependencies on user decisions (no "what should we call this" / "should we even do this").
-    - Small enough to plausibly complete in one session (≤75 min per PRINCIPLES §12 hard-stop).
-
-    - HIGH confidence when one issue obviously matches all three criteria.
-    - MEDIUM confidence when several issues are plausible candidates and the choice is taste-shaped.
-
-    # Return LOW confidence (`low_confidence_no_action`) when
-
-    - Both paths look unclear: no obvious follow-on, no obvious next issue.
-    - The recent commits suggest the worker is stuck or thrashing.
-    - The next plausible task requires a values call from the user (taste-shaped questions, scope decisions, naming, anything in PRINCIPLES §5 "values defer to Mohammed").
-    - PRINCIPLES.md doesn't ground the decision — you'd be guessing, not deciding from principles.
-    - The open issue queue is empty AND there's no obvious mechanical follow-on.
-
-    **Low confidence is a feature, not a failure.** A confident "stop, don't dispatch" return is more valuable than a forced dispatch that improvises scope. If you can't ground the choice in a documented unit of work, return low. The user pays the cost of every dispatch (PRINCIPLES §9 cost transparency); a low-confidence return saves that cost AND surfaces the gap so the user can refill the work queue.
-
-    **If `prior_dispatches_considered > 3`, weight evidence of thrashing more heavily.** A long chain of dispatches without progress is signal the loop is improvising. Ramp confidence down accordingly — a fourth or fifth dispatch should clear a higher bar to register as HIGH than the first one would.
-
-    # requires_human_presence gate
-
-    Set `requires_human_presence: true` ONLY when the task literally cannot be completed by a process running unattended in a terminal. The test is: "can Claude Code, with no human watching, execute every step of this task from a shell?" If yes, requires_human_presence=false.
-
-    **IS human-required (true):**
-    - Clicking through System Settings (AX permission grants, notification prompts)
-    - Launching an app and verifying its visible UI behavior by eye
-    - Physical-world trials requiring sustained observation (e.g. the v0.4.0 dogfood: watch a running app for 30 minutes)
-    - Any step where a person must confirm a visual result before proceeding
-
-    **Is NOT human-required (false) even though the topic touches GUI surfaces:**
-    - Investigating AX APIs via Swift code (reading the accessibility tree is code, not clicking)
-    - Reading documentation about UI frameworks
-    - Writing code that targets GUI surfaces but doesn't execute them in production
-    - Implementing keyboard-injection or CGEventPost code (the code can be written and tested without a human pressing keys)
-    - Filing issues about GUI behavior
-
-    **Default: false.** Only flag true when the task definitively cannot proceed without a human at the keyboard for observation or interaction. When uncertain, err toward false — the hook dispatches, and Claude Code can itself surface "I need human input" if it actually gets stuck. A false negative (dispatching a task that turns out to need a human) is cheap — the worker idles and the next dispatch cycle catches it. A false positive (blocking a task that could have been done) wastes a dispatch cycle and forces the user to paste manually.
-
-    # Hard constraint
-
-    The next task MUST come from the open issue queue or from mechanical follow-on on the current branch. You do NOT invent new feature scope. The Dispatcher exists to keep documented work moving, not to expand it. PRINCIPLES §1d: "File an issue, don't build the feature now."
-
-    # The next_task_proposal — voice and shape
-
-    The `next_task_proposal` IS the prompt that gets typed into Claude Code's input. Write it in the autonomous opener's voice — first-person, direct, specific signatures over abstract behavior. The worker is a fresh Claude Code session reading only the prompt + PRINCIPLES.md + the repo.
-
-    Required shape:
-      - Opens with what's being picked up ("Continue Part B's dispatcher" / "Pick up Issue #7 — bash cross-category bleed").
-      - References PRINCIPLES sections by number when grounding decisions (e.g. "per §1d file an issue if scope grows").
-      - Names a clear acceptance criterion: what does "done" look like for this task.
-      - Includes a hard-stop reminder ("75 min cap; stop and write the post-mortem if you hit it").
-      - 150-300 words. The proposal is a pointer to work, not a full briefing — the worker reads PRINCIPLES.md anyway. Shorter proposals produce more reliable structured output and reduce truncation risk.
-      - **Cite specific file paths or function names when the work touches code (not just module names).** Examples in this prompt do this — `TriagePrompt.swift`'s `allBodiesMarkdown`, `main.swift`'s `loadQuestionAnswerer` pattern. Match that specificity. A worker that sees "edit the rubric file" has to go searching; a worker that sees "edit `HardcodedRubric.swift`'s `categories` array" can act immediately.
-      - No marketing language (PRINCIPLES §11a). No emojis (§11e).
-
-    # Justification
-
-    2-3 sentences. Why this task, why now, what principles ground it. Lands in the trace log + the asymmetry note on the flag. Future post-mortems read this to understand the dispatch choice.
-
-    # Worked examples
-
-    Four examples covering the full output space. The voice, shape, and §-references in these examples are the target — match them.
-
-    ## Example 1 — PATH 1 (continue_branch), HIGH confidence
-
-    ```
-    selected_path: continue_branch
-    confidence: high
-    selected_issue_number: (omit)
-    next_task_proposal:
-      Continue v0.4.0 Part B by wiring SupervisorApp's main.swift to actually instantiate a Dispatcher in production.
-
-      Part B's branch (`autonomous-20260525T193906Z`) just landed two commits: the Dispatcher module + tests, and the engine/router wiring. The Dispatcher is plumbed into TriageEngine as an optional constructor param, but main.swift still passes `dispatcher: nil` — production users get the Part-A-only idle notify, not the new auto-dispatch path.
-
-      Done looks like: main.swift constructs `Dispatcher` after `loadQuestionAnswerer`, mirroring the same PRINCIPLES.md loader pattern (the three candidate URLs: bundle resource, repo-root fallback, hard-coded dev path). The Dispatcher takes the `LLMClient` we already build, the loaded `principlesText`, a `GitHubIssueFetcher`, and a `GitBranchCommitFetcher`. Pass the resulting instance into the `TriageEngine` constructor. If PRINCIPLES.md isn't found, the Dispatcher stays nil (matching the QuestionAnswerer degrade pattern), and the engine falls back to plain idle notify.
-
-      Acceptance: rebuild the app, drive an idle session locally, confirm the trace log emits `[dispatch] start session=...` followed by `[dispatch] haiku returned confidence=...`. No need to drive a real auto-dispatch — Part D is the dogfood session; this is just plumbing.
-
-      Reference PRINCIPLES §1c (wrappers not rewrites — copy the loadQuestionAnswerer shape, don't invent a new loader) and §4b (every state transition traces — confirm the dispatch trace lines fire). Hard-stop: 75 min cap per §12; if main.swift wiring spirals into a refactor, stop and journal what was missing instead of expanding scope.
-    justification:
-      Mechanical follow-on from the Part B impl commit — production wiring is the canonical next step after a module ships per §1a's vertical-slice rule. main.swift's loadQuestionAnswerer is the exact pattern to mirror; the work is well-shaped and grounded in §1c.
-    ```
-
-    ## Example 2 — PATH 2 (transition_to_issue), HIGH confidence
-
-    ```
-    selected_path: transition_to_issue
-    selected_issue_number: 7
-    confidence: high
-    next_task_proposal:
-      Pick up Issue #7 — bash cross-category bleed. A bash command whose grep regex contains `user_question_pending` is firing that category, but it's meant only for the assistant-text path. This is the §2e per-path prompt isolation gap.
-
-      Fix: in `TriagePrompt.swift`, restrict the bash `buildRequest` path to bash-relevant categories only (destructive_action_pending, edits_outside_worktree, prompt_injection_signature) via a per-path whitelist on `HardcodedRubric`. The assistant-text path already does this — make bash symmetric.
-
-      Done looks like: bash triage explicitly excludes user_question_pending + worker_idle_post_completion. Add 2-3 fixtures for literal category-name-in-regex bash commands, run a targeted sweep (~30 fixtures, ~$0.10 under §9e), confirm the false positive is gone without regressing bash positives.
-
-      Per §2e, §6f, §1d. Hard-stop: 75 min per §12; calibration regression >10% from baseline = do not ship.
-    justification:
-      Issue #7 has clear scope grounded in §2e; touches `TriagePrompt.swift` plus a small fixture addition. Small enough to ship in one session.
-    ```
-
-    ## Example 3 — PATH 1 (continue_branch), MEDIUM confidence
-
-    ```
-    selected_path: continue_branch
-    confidence: medium
-    selected_issue_number: (omit)
-    next_task_proposal:
-      Write the v0.4.0 CHANGELOG entry. Parts A + B are on the autonomous branch but neither is merged to main — the entry needs an "In progress" header covering: `worker_idle_post_completion` rubric category, dispatcher two-call architecture, `.continue` action in the ladder, and deferred Parts C + D with §1d framing.
-
-      Done looks like: new section in `CHANGELOG.md` with 5-8 bullets. Mirror the v0.3.0/v0.3.1 entry voice — first-person, specific signatures (not "robust idle detection" but "1Hz polling + 8-phrase stop-shape match"). Entry reads as half-product-with-clear-deferral, not finished release.
-
-      Per §1a (vertical slice), §4c (list what didn't ship), §11 (voice). Hard-stop: 75 min per §12.
-    justification:
-      Both the CHANGELOG and Part C prep are plausible follow-ons; CHANGELOG is smaller and grounds review per §4c. Medium because taste-shaped (which of two reasonable follow-ons).
-    ```
-
-    ## Example 4 — LOW confidence (`low_confidence_no_action`)
-
-    ```
-    selected_path: low_confidence_no_action
-    confidence: low
-    selected_issue_number: (omit)
-    next_task_proposal: ""
-    justification:
-      The open issue queue is empty (gh fetch returned no results) and the recent commits ship a complete unit — the Part C loop control + tests landed, with the CHANGELOG entry as the most recent commit. No mechanical follow-on, no queued work. Per §1d the Dispatcher does not invent scope; the right call is to stop, surface the idle state, and let the user refill the queue.
-    ```
-
-    The fourth example is the hardest call. Returning low confidence here saves the user money (no improvised dispatch), surfaces a real gap (empty queue), and preserves trust in the loop (no garbage dispatches when there's nothing to dispatch). Getting comfortable returning low when low is correct is the most valuable skill in this prompt.
-
-    # Output
-
-    Call `record_dispatch` exactly once with the structured output.
-    """
+    /// The Dispatcher system prompt. Synced with
+    /// `Tools/dispatch-loop-hook/dispatcher-system-prompt.txt` which is
+    /// the canonical source for the Python hook path. When editing,
+    /// update both. The .txt file is what the Python hook reads at
+    /// runtime; this static is what the Swift in-app path uses.
+    static let systemPrompt: String = {
+        // Try to load from the .txt file at the known repo-relative path.
+        // Falls back to a minimal inline prompt if the file isn't found
+        // (e.g. when running from a built .app bundle without the repo).
+        let candidates = [
+            // Repo-relative (dev builds, autonomous sessions)
+            URL(fileURLWithPath: "/Users/main/supervisor/Tools/dispatch-loop-hook/dispatcher-system-prompt.txt"),
+        ]
+        for url in candidates {
+            if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
+                return text
+            }
+        }
+        // Fallback: minimal inline version. Should never fire in practice
+        // since the dispatch loop only runs in the repo working directory.
+        return "You are the dispatcher for an autonomous Claude Code session. Pick the next task and write the prompt. Call record_dispatch exactly once."
+    }()
 
     /// User message — pulls together the live context the system prompt
     /// references. Same pattern as `QuestionAnswerer.engineeringUserMessage`.
@@ -589,6 +462,16 @@ public final class Dispatcher: Dispatching, Sendable {
         lines.append("prior_dispatches_considered: \(context.priorDispatchesConsidered)")
         lines.append("")
 
+        // Product direction — the north star
+        lines.append("# PRODUCT-DIRECTION.md (where the project is going)")
+        lines.append("")
+        if !context.productDirection.isEmpty {
+            lines.append(context.productDirection)
+        } else {
+            lines.append("(not found — no PRODUCT-DIRECTION.md in repo root; reason from PRINCIPLES.md and recent work instead)")
+        }
+        lines.append("")
+
         lines.append("# Recent commits on this branch (since divergence from main)")
         if context.currentBranchCommits.isEmpty {
             lines.append("(none — either fresh branch, or git fetch failed; treat as 'no commits to follow up on')")
@@ -596,7 +479,6 @@ public final class Dispatcher: Dispatching, Sendable {
             for c in context.currentBranchCommits {
                 lines.append("- \(c.sha.prefix(8)) \(c.subject)")
                 if !c.body.isEmpty {
-                    // Indent body by two spaces so it reads as a sub-item.
                     for line in c.body.split(separator: "\n") {
                         lines.append("  \(line)")
                     }
@@ -605,15 +487,34 @@ public final class Dispatcher: Dispatching, Sendable {
         }
         lines.append("")
 
-        lines.append("# Open GitHub issues (work queue)")
+        lines.append("# Recent files changed on this branch (git diff --stat main..HEAD)")
+        if context.recentFilesChanged.isEmpty {
+            lines.append("(none — either fresh branch, or git diff failed)")
+        } else {
+            for fl in context.recentFilesChanged {
+                lines.append(fl)
+            }
+        }
+        lines.append("")
+
+        // Known Gaps — the standing work record
+        lines.append("# Known Gaps (unfinished, unticketed, or blocked work)")
+        lines.append("")
+        if !context.knownGaps.isEmpty {
+            lines.append(context.knownGaps)
+        } else {
+            lines.append("(no Known Gaps section found in trial-notes.md)")
+        }
+        lines.append("")
+
+        lines.append("# Open GitHub issues")
         if context.openIssues.isEmpty {
-            lines.append("(empty — either no open issues, or gh fetch failed; lower confidence accordingly if you were about to pick PATH 2)")
+            lines.append("(empty — this is normal; check Known Gaps and source markers for real remaining work)")
         } else {
             for i in context.openIssues {
                 let labelTag = i.labels.isEmpty ? "" : " [\(i.labels.joined(separator: ", "))]"
                 lines.append("## Issue #\(i.number) — \(i.title)\(labelTag)")
                 if !i.body.isEmpty {
-                    // Cap at ~600 chars per issue so the prompt stays bounded.
                     let trimmed = String(i.body.prefix(600))
                     lines.append(trimmed)
                 }
@@ -621,7 +522,18 @@ public final class Dispatcher: Dispatching, Sendable {
             }
         }
 
-        lines.append("# Session's last turns (most recent first)")
+        // Source-level markers
+        lines.append("# Source markers (TODO/FIXME in recently-touched files)")
+        if !context.sourceMarkers.isEmpty {
+            for m in context.sourceMarkers {
+                lines.append(m)
+            }
+        } else {
+            lines.append("(none found)")
+        }
+        lines.append("")
+
+        lines.append("# Session's last turns (what the worker just did — 'the screen')")
         if context.lastNTurns.isEmpty {
             lines.append("(no events in window)")
         } else {
@@ -640,7 +552,7 @@ public final class Dispatcher: Dispatching, Sendable {
         lines.append("")
 
         lines.append("# Task")
-        lines.append("Call `record_dispatch` exactly once. Pick PATH 1 (continue_branch) or PATH 2 (transition_to_issue), with confidence calibrated per the rubric in the system prompt. The next_task_proposal you write IS the prompt that gets typed into Claude Code — write it in the autonomous opener's voice.")
+        lines.append("Call `record_dispatch` exactly once. Choose the single most useful next move that advances the project direction, grounded in the real state of the work. The next_task_proposal you write IS the prompt that gets typed into Claude Code — write it like a senior collaborator giving specific, actionable direction.")
 
         return lines.joined(separator: "\n")
     }
