@@ -271,32 +271,46 @@ extension Dispatching {
 public final class Dispatcher: Dispatching, Sendable {
 
     private let client: LLMClient
-    private let principlesText: String
+    private let fallbackPrinciplesText: String
+    private let principlesPath: URL?
     private let issueFetcher: (any IssueFetching)?
     private let commitFetcher: (any BranchCommitFetching)?
     private let trace: TraceLog
 
-    /// `principlesText` is the full PRINCIPLES.md body, loaded once at
-    /// construction (same pattern as QuestionAnswerer). PRINCIPLES is
-    /// session-stable; re-reading on every dispatch would add ~28k of
-    /// disk IO per call for no benefit.
+    /// `principlesText` is the fallback PRINCIPLES.md body. If
+    /// `principlesPath` is provided, the Dispatcher re-reads from disk
+    /// on each dispatch call so a 4-hour loop picks up edits. The disk
+    /// read (~28k, <1ms on SSD) is cheap relative to the Haiku call.
+    /// Falls back to the constructor text if the file read fails.
     ///
     /// `issueFetcher` and `commitFetcher` are optional: if nil, the
-    /// dispatcher proceeds with empty context for that source. Useful
-    /// for tests (canned context, no shell-out) and for graceful
-    /// degradation in production when gh isn't installed.
+    /// dispatcher proceeds with empty context for that source.
     public init(
         client: LLMClient,
         principlesText: String,
+        principlesPath: URL? = nil,
         issueFetcher: (any IssueFetching)? = nil,
         commitFetcher: (any BranchCommitFetching)? = nil,
         trace: TraceLog = .shared
     ) {
         self.client = client
-        self.principlesText = principlesText
+        self.fallbackPrinciplesText = principlesText
+        self.principlesPath = principlesPath
         self.issueFetcher = issueFetcher
         self.commitFetcher = commitFetcher
         self.trace = trace
+    }
+
+    /// Read PRINCIPLES.md from disk if a path is set, falling back to
+    /// the constructor-provided text. Re-reads on every dispatch so
+    /// long-running loops pick up edits.
+    private var principlesText: String {
+        guard let path = principlesPath,
+              let fresh = try? String(contentsOf: path, encoding: .utf8),
+              !fresh.isEmpty else {
+            return fallbackPrinciplesText
+        }
+        return fresh
     }
 
     /// Engine-facing entry point. Concurrently fetches issues + commits

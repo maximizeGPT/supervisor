@@ -487,6 +487,7 @@ private func loadDispatcher(client: LLMClient, trace: TraceLog) -> Dispatcher? {
             return Dispatcher(
                 client: client,
                 principlesText: text,
+                principlesPath: url,
                 issueFetcher: GitHubIssueFetcher(trace: trace),
                 commitFetcher: GitBranchCommitFetcher(trace: trace),
                 trace: trace
