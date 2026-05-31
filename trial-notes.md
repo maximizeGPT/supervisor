@@ -1497,9 +1497,8 @@ Last updated: 2026-05-31
   the user to run `kill -CONT <pid>` manually. The v0.1.7 expanded
   hover panel should expose a Resume button. Deferred since v0.1.4.
 
-- **PRINCIPLES.md loaded once at engine construction, not refreshed
-  mid-loop.** A 4-hour loop uses a stale snapshot. Acceptable for now;
-  filed for refresh if loop durations approach the cap.
+- ~~**PRINCIPLES.md loaded once at engine construction.**~~ Fixed —
+  Dispatcher now re-reads from disk on each call via `principlesPath`.
 
 ## Blocked on external setup
 
