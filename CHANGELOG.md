@@ -6,6 +6,45 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-31
+
+Owner-facing voice + expanded self-watch. Supervisor now talks UP
+to the project owner (not just down to the worker), and catches
+mismatches the owner used to spot manually.
+
+### Added
+
+**Owner brief** (`dispatch_loop_hook.py`)
+- `write_owner_brief()` writes `OWNER-BRIEF.md` at repo root after
+  each dispatch cycle. Plain language: what shipped, what's most
+  valuable next, what needs the owner, what the loop is doing.
+- Written on every dispatch path (high-confidence, low-confidence,
+  requires-human-presence). The owner reads one file instead of
+  decoding dispatch logs.
+- `summarize_recent_commits()` produces a plain-language commit
+  summary for the brief.
+
+**Self-watch detections** (`dispatch_loop_hook.py`)
+- `detect_stale_build()`: compares `/Applications/Supervisor.app`
+  modification time against the latest commit that touched UI files
+  (`SupervisorUI/`, `Notifier.swift`, `HoverViewModel.swift`). When
+  the running app predates code changes, warns the owner to rebuild.
+- `detect_suspicious_stop()`: distinguishes healthy completion from
+  stuck states. Fires on error/failure patterns without resolution
+  signals. Also catches low-confidence dispatch when Known Gaps has
+  actionable work (loop-stalling detection).
+- `detect_ineffective_change()`: recent commits changed UI-facing
+  code but the installed app predates them.
+- `run_self_watch()`: orchestrates all three checks. Warnings flow
+  to both the dispatch log and the owner brief.
+
+### Tests
+
+280 Swift pass. 39 Python pass. Live-verified: self-watch caught
+stale-build and ineffective-change on real repo state. Suspicious-
+stop correctly fires on stuck workers and correctly ignores
+resolved errors (no false positives).
+
 ## [0.6.1] — 2026-05-31
 
 Diff-stat bugfix + plain-language voice across hover and notifications.
