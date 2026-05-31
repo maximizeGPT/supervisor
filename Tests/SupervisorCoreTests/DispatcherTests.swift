@@ -280,6 +280,61 @@ final class DispatcherTests: XCTestCase {
                       "Example 3 must be present")
     }
 
+    /// Verify the system prompt loaded from the .txt file, not the
+    /// minimal inline fallback. The file-load mechanism matters because
+    /// the .txt is the canonical source shared with the Python hook.
+    func testSystemPromptLoadsFromFile() {
+        let prompt = Dispatcher.systemPrompt
+        // The inline fallback is ~100 chars. The real prompt is >5000.
+        // If this fails, the file wasn't found at the expected path.
+        XCTAssertTrue(prompt.count > 2000,
+                      "system prompt should be the full file, not the ~100-char inline fallback (got \(prompt.count) chars)")
+        // Cross-check: read the .txt directly and verify the opening matches.
+        let txtPath = "/Users/main/supervisor/Tools/dispatch-loop-hook/dispatcher-system-prompt.txt"
+        if let fileContent = try? String(contentsOfFile: txtPath, encoding: .utf8) {
+            let fileHead = String(fileContent.prefix(200))
+            let promptHead = String(prompt.prefix(200))
+            XCTAssertEqual(fileHead, promptHead,
+                           "system prompt head must match the .txt file head")
+        }
+        // If the file doesn't exist (CI, different machine), the length
+        // check above is sufficient — the fallback is too short to pass.
+    }
+
+    /// Verify the user message includes the new context sections
+    /// (direction, known gaps, source markers, diff stat).
+    func testUserMessageIncludesEnrichedContext() {
+        let ctx = SessionContext(
+            sessionUUID: "sess-ctx",
+            cwd: "/Users/test/supervisor",
+            gitBranch: "autonomous-test",
+            lastNTurns: [],
+            openIssues: [],
+            currentBranchCommits: [],
+            productDirection: "Build a great product.",
+            knownGaps: "## Half-wired\n- Feature X not wired",
+            sourceMarkers: ["Sources/Foo.swift:42: // TODO: wire this"],
+            recentFilesChanged: ["Sources/Foo.swift | 10 +++"]
+        )
+        let msg = Dispatcher.userMessage(context: ctx, principles: "(stub)")
+        XCTAssertTrue(msg.contains("PRODUCT-DIRECTION.md"),
+                      "user message must include direction section")
+        XCTAssertTrue(msg.contains("Build a great product"),
+                      "user message must include direction content")
+        XCTAssertTrue(msg.contains("Known Gaps"),
+                      "user message must include known gaps section")
+        XCTAssertTrue(msg.contains("Feature X not wired"),
+                      "user message must include known gaps content")
+        XCTAssertTrue(msg.contains("Source markers"),
+                      "user message must include source markers section")
+        XCTAssertTrue(msg.contains("TODO: wire this"),
+                      "user message must include marker content")
+        XCTAssertTrue(msg.contains("Recent files changed"),
+                      "user message must include diff stat section")
+        XCTAssertTrue(msg.contains("Sources/Foo.swift | 10"),
+                      "user message must include diff stat content")
+    }
+
     /// The user message must surface `prior_dispatches_considered` so
     /// Haiku can read it. The Loop state section is the Part C
     /// integration point.
