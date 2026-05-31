@@ -489,6 +489,7 @@ def build_user_message(
     product_direction: str = "",
     known_gaps: str = "",
     source_markers: list[str] | None = None,
+    self_watch_warnings: list[str] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append("# Session context")
@@ -554,6 +555,17 @@ def build_user_message(
             lines.append(m)
     else:
         lines.append("(none found)")
+    lines.append("")
+
+    # Self-watch warnings (problems the loop detected)
+    lines.append("# Self-watch warnings (problems detected by the loop)")
+    if self_watch_warnings:
+        for w in self_watch_warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+        lines.append("If any warning is actionable by the worker (e.g. rebuild), consider making it the next task. If it needs the owner (e.g. AX permissions), flag requires_human_presence=true.")
+    else:
+        lines.append("(no problems detected — everything looks healthy)")
     lines.append("")
 
     lines.append("# Session's last turns (what the worker just did — 'the screen')")
@@ -1237,18 +1249,16 @@ def detect_ineffective_change(
     return None
 
 
-def run_self_watch(
+def run_self_watch_pre_dispatch(
     *,
     cwd: str,
     recent_turns: list[dict[str, Any]],
     commits: list[dict[str, str]],
     recent_files_changed: list[str],
-    known_gaps: str,
-    result: dict[str, Any] | None,
     timeout: float,
 ) -> list[str]:
-    """Run all self-watch checks. Returns a list of plain-language
-    warnings (empty if everything looks healthy)."""
+    """Run self-watch checks that don't depend on the dispatch result.
+    Called BEFORE the dispatcher so warnings flow into its context."""
     warnings: list[str] = []
 
     stale = detect_stale_build(cwd, timeout)
@@ -1256,15 +1266,28 @@ def run_self_watch(
         warnings.append(stale)
         log(f"SELF_WATCH stale_build detected")
 
-    suspicious = detect_suspicious_stop(recent_turns, known_gaps, result)
-    if suspicious:
-        warnings.append(suspicious)
-        log(f"SELF_WATCH suspicious_stop detected")
-
     ineffective = detect_ineffective_change(cwd, commits, recent_files_changed)
     if ineffective:
         warnings.append(ineffective)
         log(f"SELF_WATCH ineffective_change detected")
+
+    return warnings
+
+
+def run_self_watch_post_dispatch(
+    *,
+    recent_turns: list[dict[str, Any]],
+    known_gaps: str,
+    result: dict[str, Any] | None,
+) -> list[str]:
+    """Run self-watch checks that depend on the dispatch result.
+    Called AFTER the dispatcher, before acting on the result."""
+    warnings: list[str] = []
+
+    suspicious = detect_suspicious_stop(recent_turns, known_gaps, result)
+    if suspicious:
+        warnings.append(suspicious)
+        log(f"SELF_WATCH suspicious_stop detected")
 
     return warnings
 
@@ -1372,6 +1395,14 @@ def main() -> None:
     if not key:
         silent_exit("no_deepseek_key")
 
+    # v0.7.0: run pre-dispatch self-watch (stale build, ineffective change).
+    # These warnings flow into the dispatcher's context so it can act on them.
+    pre_warnings = run_self_watch_pre_dispatch(
+        cwd=cwd, recent_turns=recent_turns,
+        commits=commits, recent_files_changed=diff_stat,
+        timeout=cfg["git_log_timeout_s"],
+    )
+
     # Build + send the Dispatcher request.
     user_message = build_user_message(
         session_id=session_id,
@@ -1386,6 +1417,7 @@ def main() -> None:
         product_direction=product_direction,
         known_gaps=known_gaps,
         source_markers=source_markers,
+        self_watch_warnings=pre_warnings,
     )
     log(f"DISPATCH_CALL user_message_bytes={len(user_message.encode('utf-8'))}")
 
@@ -1438,16 +1470,13 @@ def main() -> None:
         f"prop_bytes={len(proposal)} requires_human={requires_human} "
         f"just=\"{justification[:120]}\"")
 
-    # v0.7.0: run self-watch checks before acting on the dispatch result.
-    self_watch_warnings = run_self_watch(
-        cwd=cwd,
+    # v0.7.0: run post-dispatch self-watch (suspicious stop — needs result).
+    post_warnings = run_self_watch_post_dispatch(
         recent_turns=recent_turns,
-        commits=commits,
-        recent_files_changed=diff_stat,
         known_gaps=known_gaps,
         result=result,
-        timeout=cfg["git_log_timeout_s"],
     )
+    self_watch_warnings = pre_warnings + post_warnings
 
     # v0.4.1-hook: requires_human_presence gate. Tasks needing GUI
     # interaction (AX permissions, app launches, physical-world trials)
