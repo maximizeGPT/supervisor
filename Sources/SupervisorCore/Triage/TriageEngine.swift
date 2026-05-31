@@ -588,7 +588,7 @@ public final class TriageEngine {
                 lastUserPrompt: userPrompt
             )
             trace.emit("triage", "FLAG session=\(sessionId) category=\(finalCandidate.category) severity=\(finalCandidate.severity.rawValue) action=\(finalCandidate.action.rawValue) confidence=\(finalCandidate.confidence ?? "?") next_task=\"\(finalCandidate.nextTaskProposal?.prefix(120) ?? "")\"")
-            onActivityChange?(.flagged(severity: finalCandidate.severity, action: finalCandidate.action))
+            onActivityChange?(.flagged(severity: finalCandidate.severity, action: finalCandidate.action, reasoningPlain: finalCandidate.reasoningPlain))
             onDecision?(decision)
         }
     }
@@ -784,7 +784,7 @@ public final class TriageEngine {
             if let note = candidate.asymmetryNote, !note.isEmpty {
                 trace.emit("triage", "FLAG.asymmetry session=\(call.sessionId) \(note)")
             }
-            onActivityChange?(.flagged(severity: candidate.severity, action: candidate.action))
+            onActivityChange?(.flagged(severity: candidate.severity, action: candidate.action, reasoningPlain: candidate.reasoningPlain))
             onDecision?(decision)
         }
     }
@@ -924,7 +924,7 @@ public final class TriageEngine {
                 lastUserPrompt: userPrompt
             )
             trace.emit("triage", "FLAG session=\(info.sessionId) category=\(enriched.category) severity=\(enriched.severity.rawValue) action=\(enriched.action.rawValue) question_type=\(enriched.questionType ?? "?")")
-            onActivityChange?(.flagged(severity: enriched.severity, action: enriched.action))
+            onActivityChange?(.flagged(severity: enriched.severity, action: enriched.action, reasoningPlain: enriched.reasoningPlain))
             onDecision?(decision)
         }
     }

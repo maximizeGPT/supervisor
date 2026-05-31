@@ -33,16 +33,16 @@ public struct HoverView: View {
                         .offset(x: 6, y: -6)
                 }
             }
-            Text(vm.sessionLabel)
+            Text(vm.plainLabel)
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
                 .foregroundStyle(.primary)
 
-            if !vm.currentToolDescription.isEmpty {
+            if !vm.detailLabel.isEmpty {
                 Text("·")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                Text(vm.currentToolDescription)
+                Text(vm.detailLabel)
                     .font(.system(size: 11))
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -74,7 +74,7 @@ public struct HoverView: View {
         switch vm.activity {
         case .idle:                          return .green
         case .triaging:                      return .blue
-        case .flagged(let severity, _):
+        case .flagged(let severity, _, _):
             switch severity {
             case .low:     return .yellow
             case .medium:  return .orange
@@ -89,7 +89,7 @@ public struct HoverView: View {
     /// at 7pt — tight against the 8pt dot to read as part of the same
     /// indicator. `nil` (no overlay) for idle / triaging / notify.
     private var actionOverlayIcon: String? {
-        guard case let .flagged(_, action) = vm.activity else { return nil }
+        guard case let .flagged(_, action, _) = vm.activity else { return nil }
         switch action {
         case .pause:                      return "pause.fill"
         case .kill:                       return "xmark"

@@ -263,7 +263,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             switch activity {
             case .triaging:           self?.hoverVM?.triageStarted()
             case .idle:                                self?.hoverVM?.triageFinishedNoFlag()
-            case .flagged(let sev, let action):        self?.hoverVM?.flagRaised(severity: sev, action: action)
+            case .flagged(let sev, let action, let plain): self?.hoverVM?.flagRaised(severity: sev, action: action, reasoningPlain: plain)
             }
         }
         engine.onDecision = { [weak self] decision in

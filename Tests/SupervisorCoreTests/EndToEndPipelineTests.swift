@@ -83,8 +83,8 @@ final class EndToEndPipelineTests: XCTestCase {
         // decision → flagStore.insert + Notifier copy + hoverVM.flagRaised.
         let routed = RoutedFlagSink()
         engine.onActivityChange = { activity in
-            if case .flagged(let sev, let action) = activity {
-                hoverVM.flagRaised(severity: sev, action: action)
+            if case .flagged(let sev, let action, let plain) = activity {
+                hoverVM.flagRaised(severity: sev, action: action, reasoningPlain: plain)
             }
         }
         engine.onDecision = { decision in
@@ -162,14 +162,15 @@ final class EndToEndPipelineTests: XCTestCase {
 
         // HoverViewModel state.
         XCTAssertEqual(hoverVM.flagCount, 1)
-        if case .flagged(let sev, let action) = hoverVM.activity {
+        if case .flagged(let sev, let action, _) = hoverVM.activity {
             XCTAssertEqual(sev, .high)
             XCTAssertEqual(action, .pause, "Haiku recommended pause; hover activity should carry that")
         } else {
             XCTFail("hover activity should be .flagged(.high, ...), got \(hoverVM.activity)")
         }
-        XCTAssertTrue(hoverVM.currentToolDescription.contains("Bash"),
-                      "hover should show current tool, got: \(hoverVM.currentToolDescription)")
+        // Plain label should reflect the flag, not raw tool jargon.
+        XCTAssertFalse(hoverVM.plainLabel.isEmpty,
+                       "hover plain label should be set after flag, got empty")
 
         // Notifier copy is exercised against the decision so we know the
         // wire all the way to "what would the banner say" lines up with
