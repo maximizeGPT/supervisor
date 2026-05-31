@@ -221,6 +221,13 @@ public struct ExpandedPanelView: View {
             // Action buttons — only show if user hasn't responded yet.
             if flag.userResponse == nil {
                 HStack(spacing: 8) {
+                    Button("Approve") {
+                        vm.respondToFlag(flagId: flag.id, response: .approved)
+                    }
+                    .font(.system(size: 9))
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(BrandColor.signal.color)
+
                     Button("Dismiss") {
                         vm.respondToFlag(flagId: flag.id, response: .dismissed)
                     }
