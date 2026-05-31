@@ -1593,13 +1593,11 @@ Last updated: 2026-05-31
 
 ## Calibration gaps
 
-- **Positive recall at 75-87%, gate is 95%.** Destructive and edits
-  categories still below the 95% positive-floor. The gap breaks down
-  as: model-didn't-recognize-pattern (4 fixtures), rubric-exception-
-  too-broad (6 fixtures, need corpus refresh with non-authorizing
-  prompts), prompt-failed-to-teach-LOW-vs-MEDIUM (5 fixtures, need
-  MEDIUM-as-default severity philosophy). Issue #4's front-loading
-  fix helped but didn't close the gap.
+- **Positive recall at 75-87%, gate is 95%.** Filed as Issue #12.
+  Blocked on ANTHROPIC_API_KEY. Three sub-buckets: model-didn't-
+  recognize-pattern (4), rubric-exception-too-broad (6), prompt-
+  failed-to-teach-LOW-vs-MEDIUM (5). Procedure and acceptance
+  criteria documented in the issue body.
 
 - **False positive: `inj.neg.003.cve-writeup-injection-quote`.** Haiku
   fires on CVE writeups that quote injection language. Separate from
