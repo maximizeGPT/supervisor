@@ -169,4 +169,112 @@ final class ExpandedPanelTests: XCTestCase {
         let (vm, _) = makeVM()
         XCTAssertTrue(vm.recentFlags().isEmpty)
     }
+
+    // MARK: - Resume (SIGCONT)
+
+    func testIsPausedReturnsTrueWhenFlaggedWithPause() {
+        let (vm, _) = makeVM()
+        vm.flagRaised(severity: .high, action: .pause, reasoningPlain: "danger")
+        XCTAssertTrue(vm.isPaused)
+    }
+
+    func testIsPausedReturnsFalseWhenNotPaused() {
+        let (vm, _) = makeVM()
+        XCTAssertFalse(vm.isPaused)
+        vm.flagRaised(severity: .medium, action: .notify, reasoningPlain: "info")
+        XCTAssertFalse(vm.isPaused)
+    }
+
+    func testResumeCallsHandlerAndAcknowledgesOnSuccess() {
+        let (vm, bus) = makeVM()
+        // Set up session cwd via sessionStart event.
+        bus.publish(.sessionStart(SessionStartInfo(
+            sessionId: "s1", cwd: "/Users/main/project",
+            gitBranch: "main", projectHash: "hash",
+            jsonlPath: "/tmp/test.jsonl", ts: Date()
+        )))
+        let exp1 = expectation(description: "session start processed")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            exp1.fulfill()
+        }
+        wait(for: [exp1], timeout: 1.0)
+
+        // Simulate pause flag.
+        vm.flagRaised(severity: .high, action: .pause, reasoningPlain: "danger")
+        XCTAssertTrue(vm.isPaused)
+
+        // Wire resume handler that succeeds.
+        var handlerCwd: String?
+        vm.resumeHandler = { cwd in
+            handlerCwd = cwd
+            return true
+        }
+
+        vm.resumePausedSession()
+
+        let exp2 = expectation(description: "resume completes")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            exp2.fulfill()
+        }
+        wait(for: [exp2], timeout: 1.0)
+
+        XCTAssertEqual(handlerCwd, "/Users/main/project")
+        // After successful resume, flag should be acknowledged (idle).
+        XCTAssertFalse(vm.isPaused)
+        XCTAssertEqual(vm.activity, .idle)
+    }
+
+    func testResumeDoesNotAcknowledgeOnFailure() {
+        let (vm, bus) = makeVM()
+        bus.publish(.sessionStart(SessionStartInfo(
+            sessionId: "s1", cwd: "/Users/main/project",
+            gitBranch: "main", projectHash: "hash",
+            jsonlPath: "/tmp/test.jsonl", ts: Date()
+        )))
+        let exp1 = expectation(description: "session start processed")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            exp1.fulfill()
+        }
+        wait(for: [exp1], timeout: 1.0)
+
+        vm.flagRaised(severity: .high, action: .pause, reasoningPlain: "danger")
+
+        // Wire resume handler that fails.
+        vm.resumeHandler = { _ in return false }
+
+        vm.resumePausedSession()
+
+        let exp2 = expectation(description: "resume completes")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            exp2.fulfill()
+        }
+        wait(for: [exp2], timeout: 1.0)
+
+        // Should still be paused after failed resume.
+        XCTAssertTrue(vm.isPaused)
+    }
+
+    func testResumeNoOpWithoutHandler() {
+        let (vm, _) = makeVM()
+        vm.flagRaised(severity: .high, action: .pause, reasoningPlain: "danger")
+        // No handler wired — should be a no-op, not crash.
+        vm.resumePausedSession()
+        XCTAssertTrue(vm.isPaused)
+    }
+
+    func testResumeNoOpWhenNotPaused() {
+        let (vm, _) = makeVM()
+        var handlerCalled = false
+        vm.resumeHandler = { _ in
+            handlerCalled = true
+            return true
+        }
+        // Not paused — resume should be a no-op.
+        vm.resumePausedSession()
+        XCTAssertFalse(handlerCalled)
+    }
 }
