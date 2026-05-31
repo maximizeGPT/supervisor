@@ -267,6 +267,23 @@ public actor LoopController {
         trace.emit("loop", "RESUMED session=\(sessionId)")
     }
 
+    /// Clear a previous three_consecutive_low stop so the loop can
+    /// resume. Called when the engine discovers actionable work that
+    /// the previous dispatcher calls missed (e.g. new commits arrived,
+    /// Known Gaps updated). Does NOT clear kills or 4-hour stops —
+    /// those are genuine hard stops, not false signals.
+    public func clearConsecutiveLowStop(sessionId: String) {
+        guard var state = sessions[sessionId],
+              state.stopped,
+              state.stopReason == .threeConsecutiveLow
+        else { return }
+        state.stopped = false
+        state.stopReason = nil
+        state.consecutiveLowCount = 0
+        sessions[sessionId] = state
+        trace.emit("loop", "CLEARED consecutive-low stop session=\(sessionId) — resuming loop")
+    }
+
     /// Force-stop a session's loop. Called by the engine when the
     /// router fires a kill action (the worker is gone — the loop
     /// has nothing to dispatch INTO).

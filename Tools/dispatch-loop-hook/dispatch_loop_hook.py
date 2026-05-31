@@ -330,16 +330,22 @@ def _resolve_diff_base(cwd: str, branch: str, timeout: float) -> str | None:
     """Find the best base ref to diff against. Tries, in order:
     1. merge-base of main and the branch (the actual divergence point)
     2. merge-base of origin/main and the branch
-    3. None (caller falls back to HEAD~20)
+    3. merge-base of main and HEAD (if branch name doesn't resolve)
+    4. merge-base of origin/main and HEAD
+    5. None (caller falls back to HEAD~20)
     Returns the base commit SHA or None."""
-    for base_ref in ("main", "origin/main"):
-        code, out, _ = run(
-            ["git", "merge-base", base_ref, branch],
-            cwd=cwd,
-            timeout=timeout,
-        )
-        if code == 0 and out.strip():
-            return out.strip()
+    # Try branch name first, then HEAD as fallback (handles detached HEAD
+    # and cases where the branch name doesn't resolve as a git ref).
+    targets = [branch, "HEAD"] if branch != "HEAD" else ["HEAD"]
+    for target in targets:
+        for base_ref in ("main", "origin/main"):
+            code, out, _ = run(
+                ["git", "merge-base", base_ref, target],
+                cwd=cwd,
+                timeout=timeout,
+            )
+            if code == 0 and out.strip():
+                return out.strip()
     return None
 
 
@@ -349,11 +355,10 @@ def fetch_diff_stat(cwd: str, branch: str, timeout: float) -> list[str]:
     merge-base, falling back to HEAD~20 if main isn't reachable."""
     base = _resolve_diff_base(cwd, branch, timeout)
     if base:
-        diff_range = f"{base}..{branch}"
+        diff_range = f"{base}..HEAD"
     else:
-        # No merge-base — likely a disconnected branch or missing main.
-        # Fall back to the last 20 commits on the current branch.
-        diff_range = f"{branch}~20..{branch}"
+        # No merge-base — fall back to the last 20 commits.
+        diff_range = "HEAD~20..HEAD"
         log(f"diff_stat_fallback reason=no_merge_base branch={branch} using={diff_range}")
 
     code, out, err = run(
@@ -362,8 +367,17 @@ def fetch_diff_stat(cwd: str, branch: str, timeout: float) -> list[str]:
         timeout=timeout,
     )
     if code != 0:
-        log(f"git_diff_stat_error code={code} range={diff_range} stderr={err.strip()[:200]}")
-        return []
+        # Second attempt: try HEAD~20..HEAD if the first range failed.
+        if diff_range != "HEAD~20..HEAD":
+            log(f"git_diff_stat_retry range={diff_range} failed, trying HEAD~20..HEAD")
+            code, out, err = run(
+                ["git", "diff", "--stat", "HEAD~20..HEAD"],
+                cwd=cwd,
+                timeout=timeout,
+            )
+        if code != 0:
+            log(f"git_diff_stat_error code={code} range={diff_range} stderr={err.strip()[:200]}")
+            return []
     lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
     # Last line is the summary ("N files changed, ..."); keep it but cap
     # file lines to 30.
@@ -419,6 +433,71 @@ def fetch_known_gaps(cwd: str) -> str:
     return "\n".join(result).strip()
 
 
+def _build_fallback_from_gaps(
+    known_gaps: str,
+    diff_stat: list[str],
+    commits: list[dict[str, str]],
+) -> str | None:
+    """When the dispatcher returns low confidence, check if Known Gaps has
+    actionable work. Returns a fallback dispatch prompt, or None if
+    everything is blocked.
+
+    Strategy: scan Known Gaps for items that are NOT blocked on external
+    setup (API keys, human presence). If found, build a dispatch prompt
+    that points the worker at the most impactful unblocked gap."""
+
+    if not known_gaps:
+        return None
+
+    gaps_lower = known_gaps.lower()
+
+    # Skip if all gaps are blocked or struck-through.
+    blocked_markers = [
+        "blocked on",
+        "requires human presence",
+        "needs api key",
+        "blocked on anthropic_api_key",
+        "blocked on external",
+    ]
+    # Parse individual gap items (lines starting with "- **").
+    lines = known_gaps.split("\n")
+    actionable: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("- "):
+            continue
+        # Skip struck-through items.
+        if stripped.startswith("- ~~"):
+            continue
+        # Skip items that mention blocked markers.
+        line_lower = stripped.lower()
+        is_blocked = any(m in line_lower for m in blocked_markers)
+        if is_blocked:
+            continue
+        actionable.append(stripped)
+
+    if not actionable:
+        return None
+
+    # Build a compact diff summary for context.
+    diff_summary = "\n".join(diff_stat[:10]) if diff_stat else "(no diff available)"
+    recent_subjects = ", ".join(c.get("subject", "")[:60] for c in commits[:5])
+
+    prompt = (
+        "The dispatch loop's primary dispatcher returned low confidence, "
+        "but Known Gaps has actionable unblocked work. Pick the most "
+        "impactful item from the list below and work on it.\n\n"
+        f"## Actionable Known Gaps\n\n"
+        + "\n".join(actionable) + "\n\n"
+        f"## Recent commits on this branch\n{recent_subjects}\n\n"
+        f"## Files changed (diff stat)\n{diff_summary}\n\n"
+        "Read PRINCIPLES.md first. Pick the gap that most advances "
+        "PRODUCT-DIRECTION.md. Don't duplicate work already in the diff. "
+        "Hard-stop: 75 min per PRINCIPLES section 12."
+    )
+    return prompt
+
+
 def fetch_source_markers(cwd: str, timeout: float) -> list[str]:
     """Grep for TODO/FIXME in source files. Returns up to 30 lines."""
     code, out, err = run(
@@ -436,9 +515,9 @@ def fetch_source_markers(cwd: str, timeout: float) -> list[str]:
 def fetch_commits(cwd: str, branch: str, timeout: float) -> list[dict[str, str]]:
     base = _resolve_diff_base(cwd, branch, timeout)
     if base:
-        log_range = f"{base}..{branch}"
+        log_range = f"{base}..HEAD"
     else:
-        log_range = f"{branch}~20..{branch}"
+        log_range = "HEAD~20..HEAD"
         log(f"git_log_fallback reason=no_merge_base branch={branch} using={log_range}")
 
     code, out, err = run(
@@ -1589,22 +1668,26 @@ def main() -> None:
     )
     self_watch_warnings = pre_warnings + post_warnings
 
-    # v0.4.1-hook: requires_human_presence gate. Tasks needing GUI
-    # interaction (AX permissions, app launches, physical-world trials)
-    # must surface as banners, not auto-dispatch.
+    # v0.4.1-hook: requires_human_presence gate.
+    # When the dispatcher says a task needs a human, DON'T count it as a
+    # low-confidence dispatch. Instead, skip that specific proposal and
+    # let the loop try again — there may be other actionable work.
+    # Only write the owner brief so the human sees what's waiting.
     if requires_human:
-        state["consecutive_low"] = state.get("consecutive_low", 0) + 1
-        put_session_state(state_all, session_id, state)
-        save_state(state_all)
-        # v0.7.0: write owner brief when something needs the human.
+        log(f"HUMAN_GATE skipping proposal, not counting as low")
+        # Don't increment consecutive_low — this isn't a signal problem,
+        # it's just one task that needs a human. The next dispatch may
+        # find different work.
         write_owner_brief(
             cwd=cwd,
             what_shipped=summarize_recent_commits(commits),
             most_valuable_next=proposal[:300] if proposal else justification[:300],
             needs_owner=f"This task needs you at the keyboard: {justification}",
-            loop_doing_next="Waiting for you to handle this — the loop can't proceed autonomously.",
+            loop_doing_next="Skipped human-required task; will look for other work on next idle.",
             warnings=self_watch_warnings,
         )
+        put_session_state(state_all, session_id, state)
+        save_state(state_all)
         silent_exit(f"GATE_FAIL reason=requires_human_presence path={selected_path}")
 
     if confidence == "high" and selected_path != "low_confidence_no_action" and proposal:
@@ -1626,7 +1709,36 @@ def main() -> None:
         )
         emit_block(prefixed)
     else:
-        state["consecutive_low"] = state.get("consecutive_low", 0) + 1
+        # Low confidence or non-actionable path. Before giving up, check
+        # if Known Gaps has actionable work that the dispatcher missed.
+        consecutive = state.get("consecutive_low", 0) + 1
+        state["consecutive_low"] = consecutive
+
+        # v0.8.0: deferred-work fallback. If the dispatcher returned low
+        # confidence but there's real unblocked work in Known Gaps or
+        # deferred items, build a fallback dispatch from that work instead
+        # of stopping the loop.
+        if consecutive >= 2 and known_gaps:
+            fallback = _build_fallback_from_gaps(known_gaps, diff_stat, commits)
+            if fallback:
+                log(f"FALLBACK_DISPATCH from known_gaps consecutive_was={consecutive}")
+                state["consecutive_low"] = 0
+                put_session_state(state_all, session_id, state)
+                save_state(state_all)
+                write_owner_brief(
+                    cwd=cwd,
+                    what_shipped=summarize_recent_commits(commits),
+                    most_valuable_next="Picked up deferred work from Known Gaps.",
+                    needs_owner="",
+                    loop_doing_next=f"Dispatching fallback: {fallback[:200]}...",
+                    warnings=self_watch_warnings,
+                )
+                prefixed = (
+                    "[dispatch-loop-hook v0.8.0 — fallback dispatch from Known Gaps; "
+                    f"the dispatcher returned low confidence but real work remains]\n\n{fallback}"
+                )
+                emit_block(prefixed)
+
         put_session_state(state_all, session_id, state)
         save_state(state_all)
         # v0.7.0: write owner brief on low confidence.

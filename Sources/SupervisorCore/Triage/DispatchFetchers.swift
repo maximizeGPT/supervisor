@@ -312,11 +312,14 @@ public actor GitDiffStatFetcher: DiffStatFetching {
 // MARK: - Merge-base resolution (shared by commit + diff-stat fetchers)
 
 /// Resolve the best diff range for comparing a branch against its base.
-/// Tries merge-base with the base branch (and origin/ variant), falling
-/// back to branch~20 if neither resolves. This handles:
-///   - Normal case: main exists locally → merge-base works
-///   - Shallow clone: main not fetched → try origin/main
-///   - Disconnected branch: neither works → last 20 commits
+/// Tries merge-base with the base branch (and origin/ variant), using
+/// HEAD as the comparison target (always valid). Falls back to HEAD~20
+/// if neither base ref resolves.
+///
+/// Uses HEAD instead of the branch name because the branch name may not
+/// resolve as a git ref in all contexts (e.g. when the hook runs with a
+/// CWD that has a different HEAD, or when the branch name is stale).
+/// HEAD is always valid and points to the current working tree state.
 func resolveDiffRange(
     cwd: String,
     branch: String,
@@ -325,27 +328,31 @@ func resolveDiffRange(
     timeout: TimeInterval,
     trace: TraceLog
 ) async -> String {
-    for baseRef in [baseBranch, "origin/\(baseBranch)"] {
-        do {
-            let result = try await runProcess(
-                executable: gitPath,
-                args: ["git", "merge-base", baseRef, branch],
-                cwd: cwd,
-                timeout: timeout
-            )
-            if result.exitCode == 0 {
-                let sha = String(data: result.stdout, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !sha.isEmpty {
-                    return "\(sha)..\(branch)"
+    // Try branch first, then HEAD as fallback target for merge-base.
+    let targets = branch == "HEAD" ? ["HEAD"] : [branch, "HEAD"]
+    for target in targets {
+        for baseRef in [baseBranch, "origin/\(baseBranch)"] {
+            do {
+                let result = try await runProcess(
+                    executable: gitPath,
+                    args: ["git", "merge-base", baseRef, target],
+                    cwd: cwd,
+                    timeout: timeout
+                )
+                if result.exitCode == 0 {
+                    let sha = String(data: result.stdout, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !sha.isEmpty {
+                        return "\(sha)..HEAD"
+                    }
                 }
+            } catch {
+                // merge-base failed — try next candidate
             }
-        } catch {
-            // merge-base failed — try next candidate
         }
     }
-    trace.emit("dispatch", "diff_range_fallback reason=no_merge_base branch=\(branch) base=\(baseBranch) using=\(branch)~20..\(branch)")
-    return "\(branch)~20..\(branch)"
+    trace.emit("dispatch", "diff_range_fallback reason=no_merge_base branch=\(branch) base=\(baseBranch) using=HEAD~20..HEAD")
+    return "HEAD~20..HEAD"
 }
 
 // MARK: - Process runner (the shared internals)

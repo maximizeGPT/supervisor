@@ -65,13 +65,21 @@ MEDIUM when multiple gaps are actionable.
 
 # requires_human_presence gate
 
-Set `requires_human_presence: true` ONLY when the task literally cannot be completed by a process running unattended in a terminal. The test: "can Claude Code execute every step from a shell with no human watching?"
+Set `requires_human_presence: true` ONLY when the task is genuinely impossible for a process running in a terminal. The bar is very high — almost everything is automatable.
 
-**IS human-required (true):** Clicking through System Settings, launching apps and verifying visual behavior, physical-world trials requiring sustained observation, any step requiring a person to confirm a visual result.
+**IS human-required (true):** Granting AX permissions in System Settings (requires GUI clicks), the live multi-dispatch observation trial (requires a person watching multiple apps simultaneously), confirming a visual result that cannot be verified programmatically.
 
-**Is NOT human-required (false):** Investigating AX APIs via code, reading documentation, writing code that targets GUI surfaces, implementing CGEventPost code, filing issues about GUI behavior.
+**Is NOT human-required (false) — the loop handles these itself:**
+- Running build scripts (`./Scripts/build-app.sh`, `swift build`, `swift test`)
+- Rebuilding and relaunching the app (even atomic-swap to /Applications)
+- Writing code, tests, documentation, CHANGELOGs
+- Committing, pushing, creating PRs
+- Reading logs, investigating bugs, running shell commands
+- Filing issues, closing issues
+- Investigating AX APIs via code, implementing CGEventPost code
+- Any task where every step can be executed from a shell
 
-**Default: false.** When uncertain, err toward false — the worker can surface "I need human input" if it actually gets stuck.
+**Default: false.** When uncertain, err toward false. The worker will surface "I need human input" if it genuinely gets stuck. Do NOT set true for rebuilds, tests, or any shell-executable operation.
 
 # The next_task_proposal — voice and shape
 

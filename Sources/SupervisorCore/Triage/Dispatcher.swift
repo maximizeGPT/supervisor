@@ -637,7 +637,7 @@ public final class Dispatcher: Dispatching, Sendable {
                     ]),
                     "requires_human_presence": .object([
                         "type": .string("boolean"),
-                        "description": .string("Set to true when the proposed task requires macOS GUI interaction (launching apps, granting AX permissions, physical-world trials). The router will NOT auto-dispatch these — they surface as a banner for the user.")
+                        "description": .string("Set to true ONLY when the task is genuinely impossible for a terminal process — AX permission grants in System Settings, sustained visual observation trials. NOT for rebuilds, tests, commits, script execution, or any shell-executable operation. Default false.")
                     ]),
                 ]),
                 "required": .array([
