@@ -1490,8 +1490,8 @@ Last updated: 2026-05-31
 - ~~**HoverViewModel.acknowledgeFlag() not called.**~~ Fixed in v0.6.1
   — 5-second debounce auto-acknowledges after each flag.
 
-- **In-memory flagCount resets on app restart.** Should seed from the
-  SQLite flag history on launch. Deferred since v0.1.4.
+- ~~**In-memory flagCount resets on app restart.**~~ Fixed in v0.6.1
+  — seeded from FlagStore.count() at construction.
 
 - **SIGCONT-from-button not wired.** The pause recovery path requires
   the user to run `kill -CONT <pid>` manually. The v0.1.7 expanded
