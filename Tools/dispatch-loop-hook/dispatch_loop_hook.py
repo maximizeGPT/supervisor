@@ -510,15 +510,14 @@ def build_user_message(
         lines.append("(not found — no PRODUCT-DIRECTION.md in repo root; reason from PRINCIPLES.md and recent work instead)")
     lines.append("")
 
-    lines.append("# Recent commits on this branch (since divergence from main)")
+    lines.append("# Recent commits on this branch (last 20)")
     if not commits:
         lines.append("(none — either fresh branch, or git fetch failed; treat as 'no commits to follow up on')")
     else:
-        for c in commits:
+        for c in commits[:20]:
             lines.append(f"- {c['sha'][:8]} {c['subject']}")
-            if c["body"]:
-                for ln in c["body"].split("\n"):
-                    lines.append(f"  {ln}")
+        if len(commits) > 20:
+            lines.append(f"(... {len(commits) - 20} older commits omitted)")
     lines.append("")
     lines.append("# Recent files changed on this branch (git diff --stat main..HEAD)")
     if not recent_files_changed:
@@ -579,9 +578,14 @@ def build_user_message(
             lines.append(f"[{ts}] {role}: {text}")
     lines.append("")
 
-    lines.append("# PRINCIPLES.md (the project's operating manual)")
+    # Cap PRINCIPLES.md to ~15K chars to stay within DeepSeek's context
+    # window. Sections 0-7 are decision-relevant; sections 8-13 are
+    # reference material the Dispatcher rarely needs.
+    lines.append("# PRINCIPLES.md (key sections — capped at 15K chars)")
     lines.append("")
-    lines.append(principles_text)
+    lines.append(principles_text[:15000])
+    if len(principles_text) > 15000:
+        lines.append("\n(... remaining sections omitted for context budget)")
     lines.append("")
     lines.append("# Task")
     lines.append("Call `record_dispatch` exactly once. Choose the single most useful next move that advances the project direction, grounded in the real state of the work. The next_task_proposal you write IS the prompt that gets typed into Claude Code — write it like a senior collaborator giving specific, actionable direction.")
@@ -796,6 +800,11 @@ def build_self_extender_message(
     hook_log_tail: str,
     self_watch_warnings: list[str] | None = None,
 ) -> str:
+    """Build the SelfExtender user message. IMPORTANT: this message must
+    stay compact (~8-12K chars) to leave room for the model's output.
+    The Dispatcher's message can be ~60K because it's a broader reasoning
+    task; the SelfExtender only needs enough to diagnose a specific
+    failure. Cap each section aggressively."""
     lines: list[str] = []
     lines.append("# Failure context")
     lines.append(f"failure_reason: {failure_reason}")
@@ -803,49 +812,59 @@ def build_self_extender_message(
     lines.append(f"cwd: {cwd}")
     lines.append(f"branch: {branch}")
     lines.append("")
-    lines.append("# Recent commits on this branch")
+
+    # Last 10 commits only (the SelfExtender diagnoses the recent failure,
+    # not the full branch history).
+    lines.append("# Recent commits (last 10)")
     if not commits:
         lines.append("(none)")
     else:
-        for c in commits:
+        for c in commits[:10]:
             lines.append(f"- {c['sha'][:8]} {c['subject']}")
     lines.append("")
-    lines.append("# Recent files changed (git diff --stat main..HEAD)")
+
+    # Diff stat: top 15 files only.
+    lines.append("# Files changed (top 15)")
     if not recent_files_changed:
         lines.append("(none)")
     else:
-        for fl in recent_files_changed:
+        for fl in recent_files_changed[:15]:
             lines.append(fl)
     lines.append("")
 
     # Self-watch warnings — these explain WHY the dispatch failed.
-    lines.append("# Self-watch warnings (problems detected by the loop)")
     if self_watch_warnings:
+        lines.append("# Self-watch warnings")
         for w in self_watch_warnings:
             lines.append(f"- {w}")
         lines.append("")
-        lines.append("These warnings may explain the dispatch failure. If a warning is actionable (e.g. rebuild), consider making the fix prompt address it.")
-    else:
-        lines.append("(no problems detected)")
-    lines.append("")
 
-    lines.append("# Recent transcript turns")
+    # Last 5 transcript turns (not 10 — the SelfExtender needs the
+    # immediate context, not the full conversation).
+    lines.append("# Recent transcript (last 5 turns)")
     if not recent_turns:
         lines.append("(no events)")
     else:
-        for t in recent_turns[-10:]:
+        for t in recent_turns[-5:]:
             role = t.get("role", "?")
-            text = (t.get("text") or "")[:240]
+            text = (t.get("text") or "")[:160]
             lines.append(f"[{t.get('ts', '')}] {role}: {text}")
     lines.append("")
-    lines.append("# dispatch-loop.log (last 200 lines)")
-    lines.append(hook_log_tail)
+
+    # Hook log: last 50 lines (not 200 — the SelfExtender only needs
+    # the recent failure pattern, not the full session history).
+    lines.append("# dispatch-loop.log (last 50 lines)")
+    log_lines = hook_log_tail.strip().splitlines()
+    lines.append("\n".join(log_lines[-50:]) if log_lines else "(empty)")
     lines.append("")
-    lines.append("# PRINCIPLES.md")
-    lines.append(principles_text)
-    lines.append("")
+
+    # PRINCIPLES.md: OMIT entirely. The SelfExtender has its own system
+    # prompt with the relevant rules (meta-rule, scope, fix strategies).
+    # Including the full ~35K PRINCIPLES.md was consuming the context
+    # window and causing finish_reason=length truncation at ~92 bytes.
+
     lines.append("# Task")
-    lines.append("Call `record_self_extend` exactly once. Diagnose the failure and produce a fix prompt.")
+    lines.append("Call `record_self_extend` exactly once. Diagnose the failure and produce a fix prompt. Keep fix_prompt under 300 words and diagnosis under 3 sentences.")
     return "\n".join(lines)
 
 
@@ -971,7 +990,10 @@ def try_self_extend(
         log(f"self_extender_prompt_load_error error={e}")
         silent_exit("no_self_extender_prompt")
 
-    hook_log = read_hook_log_tail(200)
+    # Read only 50 lines of hook log for the SelfExtender (not 200).
+    # The full log consumed too much of DeepSeek's context window,
+    # causing finish_reason=length truncation at ~92 bytes.
+    hook_log = read_hook_log_tail(50)
 
     user_msg = build_self_extender_message(
         failure_reason=failure_reason,
