@@ -449,8 +449,6 @@ def _build_fallback_from_gaps(
     if not known_gaps:
         return None
 
-    gaps_lower = known_gaps.lower()
-
     # Skip if all gaps are blocked or struck-through.
     blocked_markers = [
         "blocked on",
@@ -458,23 +456,51 @@ def _build_fallback_from_gaps(
         "needs api key",
         "blocked on anthropic_api_key",
         "blocked on external",
+        "requires human",
+        "need.*api key",
+        "calibration sweep",
+        "refinement in the",
+        "rubric body",
+        "evaluate switching",
     ]
-    # Parse individual gap items (lines starting with "- **").
+    # Parse individual gap items. Each item starts with "- " and may
+    # span multiple continuation lines (indented or not starting with "- ").
+    # Track the current section header to filter entire blocked sections.
+    blocked_sections = ["blocked on external", "calibration gap", "never verified"]
     lines = known_gaps.split("\n")
-    actionable: list[str] = []
+    items: list[tuple[str, str]] = []  # (section, item_text)
+    current_item: list[str] = []
+    current_section = ""
     for line in lines:
         stripped = line.strip()
-        if not stripped.startswith("- "):
+        if stripped.startswith("## "):
+            current_section = stripped.lower()
+            continue
+        if stripped.startswith("- "):
+            if current_item:
+                items.append((current_section, "\n".join(current_item)))
+            current_item = [stripped]
+        elif current_item and stripped and not stripped.startswith("#"):
+            current_item.append(stripped)
+    if current_item:
+        items.append((current_section, "\n".join(current_item)))
+
+    actionable: list[str] = []
+    for section, item in items:
+        # Skip items in blocked sections.
+        if any(bs in section for bs in blocked_sections):
             continue
         # Skip struck-through items.
-        if stripped.startswith("- ~~"):
+        if item.startswith("- ~~"):
             continue
-        # Skip items that mention blocked markers.
-        line_lower = stripped.lower()
-        is_blocked = any(m in line_lower for m in blocked_markers)
+        # Check the FULL item text (not just first line) for blocked markers.
+        item_lower = item.lower()
+        is_blocked = any(m in item_lower for m in blocked_markers)
         if is_blocked:
             continue
-        actionable.append(stripped)
+        # Take just the first line for the dispatch prompt.
+        first_line = item.split("\n")[0]
+        actionable.append(first_line)
 
     if not actionable:
         return None
