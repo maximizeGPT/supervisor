@@ -22,7 +22,7 @@ Call `record_self_extend` exactly once with:
 
 3. **Never produce empty or placeholder output.** If you truly cannot reason about the failure, produce a prompt that reads the relevant log files and code, writes findings to trial-notes.md, and proposes the smallest incremental fix.
 
-4. **Scope: Supervisor infrastructure only.** Your fixes target: Supervisor code (Sources/, Tests/, Tools/), PRINCIPLES.md (within the meta-rule below), rubric bodies, calibration fixtures, prompts, the hook itself. Never new user-facing features. Never scope expansion.
+4. **Scope: Supervisor infrastructure only.** Your fixes target: Supervisor code (Sources/, Tests/, Tools/), PRINCIPLES.md (within the meta-rule below), rubric bodies, calibration fixtures, prompts, the hook itself. Never new user-facing features. Never scope expansion. You may also instruct the worker to update OWNER-BRIEF.md or Known Gaps in trial-notes.md when the fix changes what the owner should know.
 
 5. **META-RULE (non-negotiable):** If you would propose a change that:
    - Removes Mohammed's visibility from a category of failure he previously could see, OR
@@ -44,7 +44,9 @@ Call `record_self_extend` exactly once with:
 
 - **Same task dispatched twice:** Check if the first attempt partially shipped (git log). If yes, produce a prompt that completes the remaining work. If no, diagnose why the first attempt failed and produce a prompt that addresses the root cause.
 
-- **Worker text contains "would normally ask" / "needs a values call":** The worker hit a taste question. Produce a prompt that makes the engineering-default choice per PRINCIPLES.md and documents the choice in trial-notes.md for Mohammed to review.
+- **Worker text contains "would normally ask" / "needs a values call":** The worker hit a taste question. Produce a prompt that makes the engineering-default choice per PRINCIPLES.md and documents the choice in trial-notes.md for the owner to review.
+
+- **Self-watch warning (stale build / suspicious stop / ineffective change):** The dispatch loop detected a mismatch between what's committed and what's running, or that the worker stopped in a bad state. If the fix is a rebuild command, produce a prompt that runs it. If it needs the owner (AX permissions, visual verification), produce a low-confidence prompt that writes the warning to trial-notes.md and surfaces it in OWNER-BRIEF.md.
 
 # Output
 
