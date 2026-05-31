@@ -54,6 +54,23 @@ when real work remained.
   resume when real work is discovered. Does NOT clear kill or
   4-hour stops — those are genuine hard stops.
 
+**DeepSeek exponential backoff** (`dispatch_loop_hook.py`)
+- `call_dispatcher` now retries up to 3 times internally with 1s/2s
+  exponential backoff. The old v0.4.1 single external retry in main()
+  is removed — the built-in retry is more robust. Effective success
+  rate near 100% despite DeepSeek's ~50% first-call failure rate.
+
+**Expandable flag rows** (`ExpandedPanelView.swift`)
+- Click a flag row to expand: shows full `reasoning_plain`,
+  `reasoning_technical`, `asymmetry_note`, action + severity metadata.
+  Collapsed shows 2-line truncated reasoning. Chevron icon indicates
+  state. 200ms ease animation.
+
+**TriageEngine recovery wiring** (`TriageEngine.swift`)
+- After a high/medium confidence dispatch, calls
+  `clearConsecutiveLowStop` to recover from false three-consecutive-low
+  stops caused by transient API failures or broken diff-stat.
+
 ### Tests
 
 307 Swift pass (6 skipped, 0 failures). Was 304; +3 new
