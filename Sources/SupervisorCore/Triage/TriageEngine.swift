@@ -533,6 +533,14 @@ public final class TriageEngine {
                let dispatcher = self.dispatcher {
                 let loopDecision: LoopDecision
                 if let lc = loopController {
+                    // v0.8.0: clear a three-consecutive-low stop before
+                    // checking canDispatch. The idle detection firing
+                    // means the worker just completed work — the
+                    // underlying problem (broken diff, transient API
+                    // failures) that caused three consecutive lows is
+                    // likely resolved. Let the loop try again. Kill and
+                    // 4-hour stops are NOT cleared — those are terminal.
+                    await lc.clearConsecutiveLowStop(sessionId: sessionId)
                     loopDecision = await lc.canDispatch(sessionId: sessionId)
                 } else {
                     loopDecision = .proceed(priorDispatchesConsidered: 0)

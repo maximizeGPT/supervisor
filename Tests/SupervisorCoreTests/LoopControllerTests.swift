@@ -383,4 +383,32 @@ final class LoopControllerTests: XCTestCase {
             return XCTFail("4-hour stop must persist after clear attempt, got \(decision)")
         }
     }
+
+    /// Simulates the v0.8.0 idle-detection flow: after a three-consecutive-low
+    /// stop, the next idle evaluation calls clearConsecutiveLowStop before
+    /// canDispatch, so the loop resumes instead of staying stuck.
+    func testIdleDetectionClearsThreeLowStopBeforeCanDispatch() async {
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock, consecutiveLowThreshold: 3)
+
+        // Trigger the stop.
+        _ = await lc.canDispatch(sessionId: "s-1")
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "a"))
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "b"))
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "c"))
+
+        // Confirm stopped.
+        let stopped = await lc.canDispatch(sessionId: "s-1")
+        guard case .stopped = stopped else {
+            return XCTFail("expected stopped, got \(stopped)")
+        }
+
+        // Simulate what TriageEngine.evaluateIdle now does:
+        // clear the consecutive-low stop, then call canDispatch.
+        await lc.clearConsecutiveLowStop(sessionId: "s-1")
+        let afterClear = await lc.canDispatch(sessionId: "s-1")
+        guard case .proceed = afterClear else {
+            return XCTFail("expected proceed after idle-detection clear, got \(afterClear)")
+        }
+    }
 }
