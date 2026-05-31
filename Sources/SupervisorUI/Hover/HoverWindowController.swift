@@ -177,13 +177,18 @@ public final class HoverWindowController {
     // MARK: - Expanded panel show/hide
 
     private func showExpanded() {
-        guard currentlyVisible else { return }
+        // Use the actual NSWindow visibility, not the software flag.
+        // `currentlyVisible` can lag behind actual panel state due to
+        // timing between the 3s poll / workspace observer and the user's
+        // click. If the user can see and click the hover dot,
+        // `panel.isVisible` is true.
+        guard panel.isVisible else { return }
         positionExpanded()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.24
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            self.expandedPanel.animator().alphaValue = 1.0
-        }
+        // Set alpha to 1 immediately, then order front. The previous
+        // approach animated from 0→1, but if the panel was already
+        // ordered out with alpha=0, the animation could be invisible
+        // (nothing to animate from). Set it directly and order front.
+        expandedPanel.alphaValue = 1.0
         expandedPanel.orderFrontRegardless()
     }
 

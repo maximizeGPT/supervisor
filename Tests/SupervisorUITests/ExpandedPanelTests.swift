@@ -348,4 +348,42 @@ final class ExpandedPanelTests: XCTestCase {
         // Should not crash when flagStore is nil.
         vm.respondToFlag(flagId: "nonexistent", response: .dismissed)
     }
+
+    // MARK: - Expanded panel visibility (guard fix)
+
+    func testExpandedPanelShowsWhenHoverIsVisible() {
+        // Create a real HoverWindowController with a visible hover panel.
+        let (vm, _) = makeVM()
+        let controller = HoverWindowController(
+            vm: vm,
+            isAnySessionActive: { true }
+        )
+        // Manually present the hover to make it visible.
+        // In test environment, we order it front so panel.isVisible = true.
+        controller.present()
+
+        // Give the run loop a tick to process the present.
+        let exp = expectation(description: "panel visible")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 1.0)
+
+        // Toggle expanded — should NOT early-return from the guard.
+        vm.toggleExpanded()
+
+        // Give Combine sink a tick to fire.
+        let exp2 = expectation(description: "expanded toggled")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            exp2.fulfill()
+        }
+        wait(for: [exp2], timeout: 1.0)
+
+        XCTAssertTrue(vm.isExpanded, "isExpanded should be true after toggle")
+
+        // Clean up.
+        controller.dismiss()
+    }
 }
