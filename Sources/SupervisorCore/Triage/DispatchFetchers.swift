@@ -189,13 +189,16 @@ public actor GitBranchCommitFetcher: BranchCommitFetching {
         }
 
         let start = Date()
-        // %x00 is a NUL separator — let us split fields without
-        // collision with subject/body line breaks. %x1E (record sep)
-        // between commits.
+        // Resolve the actual merge-base rather than assuming baseBranch
+        // exists as a local ref. Falls back to branch~20 if unreachable.
+        let logRange = await resolveDiffRange(
+            cwd: cwd, branch: branch, baseBranch: baseBranch,
+            gitPath: gitPath, timeout: timeout, trace: trace
+        )
         let format = "%H%x00%s%x00%b%x1E"
         let args = [
             "git", "log",
-            "\(baseBranch)..\(branch)",
+            logRange,
             "--pretty=format:\(format)",
             "--no-merges",
         ]
@@ -236,6 +239,113 @@ public actor GitBranchCommitFetcher: BranchCommitFetching {
         trace.emit("dispatch", "git commits fetched count=\(commits.count) branch=\(branch) latency=\(latencyMs)ms")
         return commits
     }
+}
+
+// MARK: - Diff-stat fetcher
+
+public protocol DiffStatFetching: Sendable {
+    func fetchDiffStat(cwd: String, branch: String, baseBranch: String) async throws -> [String]
+}
+
+/// Shells out to `git diff --stat <base>..<branch>`. Uses merge-base
+/// resolution to handle cases where the base branch isn't directly
+/// reachable (e.g. shallow clones, detached HEADs).
+public actor GitDiffStatFetcher: DiffStatFetching {
+    private let timeout: TimeInterval
+    private let trace: TraceLog
+    private let gitPath: String
+
+    public init(
+        timeout: TimeInterval = 10,
+        gitPath: String = "/usr/bin/env",
+        trace: TraceLog = .shared
+    ) {
+        self.timeout = timeout
+        self.gitPath = gitPath
+        self.trace = trace
+    }
+
+    public func fetchDiffStat(
+        cwd: String,
+        branch: String,
+        baseBranch: String = "main"
+    ) async throws -> [String] {
+        let diffRange = await resolveDiffRange(
+            cwd: cwd, branch: branch, baseBranch: baseBranch,
+            gitPath: gitPath, timeout: timeout, trace: trace
+        )
+
+        let result: ProcessResult
+        do {
+            result = try await runProcess(
+                executable: gitPath,
+                args: ["git", "diff", "--stat", diffRange],
+                cwd: cwd,
+                timeout: timeout
+            )
+        } catch let err as FetcherError {
+            trace.emit("dispatch", "git diff stat ERROR \(err) cwd=\(cwd)")
+            throw err
+        }
+
+        if result.exitCode != 0 {
+            let stderr = String(String(data: result.stderr, encoding: .utf8)?.prefix(400) ?? "")
+            trace.emit("dispatch", "git diff stat nonzero exit=\(result.exitCode) range=\(diffRange) stderr=\(stderr)")
+            throw FetcherError.nonZeroExit(tool: "git", exitCode: result.exitCode, stderr: stderr)
+        }
+
+        let raw = String(data: result.stdout, encoding: .utf8) ?? ""
+        var lines = raw.split(separator: "\n", omittingEmptySubsequences: true)
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+        // Last line is the summary ("N files changed, ..."); keep it but cap
+        // file lines to 30.
+        guard !lines.isEmpty else { return [] }
+        let summary = lines.last.map { $0.contains("changed") ? $0 : nil } ?? nil
+        var fileLines = summary != nil ? Array(lines.dropLast()) : lines
+        fileLines = Array(fileLines.prefix(30))
+        if let summary { fileLines.append(summary) }
+        trace.emit("dispatch", "git diff stat fetched lines=\(fileLines.count) range=\(diffRange)")
+        return fileLines
+    }
+}
+
+// MARK: - Merge-base resolution (shared by commit + diff-stat fetchers)
+
+/// Resolve the best diff range for comparing a branch against its base.
+/// Tries merge-base with the base branch (and origin/ variant), falling
+/// back to branch~20 if neither resolves. This handles:
+///   - Normal case: main exists locally → merge-base works
+///   - Shallow clone: main not fetched → try origin/main
+///   - Disconnected branch: neither works → last 20 commits
+func resolveDiffRange(
+    cwd: String,
+    branch: String,
+    baseBranch: String,
+    gitPath: String,
+    timeout: TimeInterval,
+    trace: TraceLog
+) async -> String {
+    for baseRef in [baseBranch, "origin/\(baseBranch)"] {
+        do {
+            let result = try await runProcess(
+                executable: gitPath,
+                args: ["git", "merge-base", baseRef, branch],
+                cwd: cwd,
+                timeout: timeout
+            )
+            if result.exitCode == 0 {
+                let sha = String(data: result.stdout, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !sha.isEmpty {
+                    return "\(sha)..\(branch)"
+                }
+            }
+        } catch {
+            // merge-base failed — try next candidate
+        }
+    }
+    trace.emit("dispatch", "diff_range_fallback reason=no_merge_base branch=\(branch) base=\(baseBranch) using=\(branch)~20..\(branch)")
+    return "\(branch)~20..\(branch)"
 }
 
 // MARK: - Process runner (the shared internals)

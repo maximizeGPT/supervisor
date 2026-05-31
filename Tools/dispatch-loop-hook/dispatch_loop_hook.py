@@ -326,18 +326,43 @@ def fetch_issues(cwd: str, timeout: float) -> list[dict[str, Any]]:
     return issues
 
 
+def _resolve_diff_base(cwd: str, branch: str, timeout: float) -> str | None:
+    """Find the best base ref to diff against. Tries, in order:
+    1. merge-base of main and the branch (the actual divergence point)
+    2. merge-base of origin/main and the branch
+    3. None (caller falls back to HEAD~20)
+    Returns the base commit SHA or None."""
+    for base_ref in ("main", "origin/main"):
+        code, out, _ = run(
+            ["git", "merge-base", base_ref, branch],
+            cwd=cwd,
+            timeout=timeout,
+        )
+        if code == 0 and out.strip():
+            return out.strip()
+    return None
+
+
 def fetch_diff_stat(cwd: str, branch: str, timeout: float) -> list[str]:
-    """Return `git diff --stat main..branch` lines, truncated to the top 30
-    files by change size. Gives the Dispatcher file-level signal about
-    what's been touched — prevents hallucinating partial completion from
-    commit subjects alone (Issue #10)."""
+    """Return `git diff --stat base..HEAD` lines, truncated to the top 30
+    files by change size. Resolves the comparison base robustly via
+    merge-base, falling back to HEAD~20 if main isn't reachable."""
+    base = _resolve_diff_base(cwd, branch, timeout)
+    if base:
+        diff_range = f"{base}..{branch}"
+    else:
+        # No merge-base — likely a disconnected branch or missing main.
+        # Fall back to the last 20 commits on the current branch.
+        diff_range = f"{branch}~20..{branch}"
+        log(f"diff_stat_fallback reason=no_merge_base branch={branch} using={diff_range}")
+
     code, out, err = run(
-        ["git", "diff", "--stat", f"main..{branch}"],
+        ["git", "diff", "--stat", diff_range],
         cwd=cwd,
         timeout=timeout,
     )
     if code != 0:
-        log(f"git_diff_stat_error code={code} stderr={err.strip()[:120]}")
+        log(f"git_diff_stat_error code={code} range={diff_range} stderr={err.strip()[:200]}")
         return []
     lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
     # Last line is the summary ("N files changed, ..."); keep it but cap
@@ -409,15 +434,22 @@ def fetch_source_markers(cwd: str, timeout: float) -> list[str]:
 
 
 def fetch_commits(cwd: str, branch: str, timeout: float) -> list[dict[str, str]]:
+    base = _resolve_diff_base(cwd, branch, timeout)
+    if base:
+        log_range = f"{base}..{branch}"
+    else:
+        log_range = f"{branch}~20..{branch}"
+        log(f"git_log_fallback reason=no_merge_base branch={branch} using={log_range}")
+
     code, out, err = run(
-        ["git", "log", f"main..{branch}",
+        ["git", "log", log_range,
          "--pretty=format:%H%x00%s%x00%b%x1E",
          "--no-merges"],
         cwd=cwd,
         timeout=timeout,
     )
     if code != 0:
-        log(f"git_log_error code={code} stderr={err.strip()[:120]}")
+        log(f"git_log_error code={code} range={log_range} stderr={err.strip()[:200]}")
         return []
     commits: list[dict[str, str]] = []
     for record in out.split("\x1e"):
