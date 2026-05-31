@@ -15,8 +15,12 @@
 // with the user's frontmost app; `[.canJoinAllSpaces, .stationary,
 // .ignoresCycle]` collection behavior survives hide/show cycles
 // without losing the top-right anchor.
+//
+// v0.1.7: expanded panel. Click on hover toggles a 480x360 panel
+// below the hover with recent flags, session metrics, and cost.
 
 import AppKit
+import Combine
 import SwiftUI
 import SupervisorCore
 
@@ -32,6 +36,12 @@ public final class HoverWindowController {
     /// (1908, 2)–(2148, 42), only the leftmost 12 px on-screen. Caught
     /// when I reported "some bubble top right but not sure".
     public static let panelSize = NSSize(width: 240, height: 40)
+
+    /// Expanded panel dimensions per DESIGN.md section 6.2.
+    public static let expandedSize = NSSize(width: 480, height: 360)
+
+    /// Gap between hover and expanded panel.
+    private static let expandedGap: CGFloat = 4
 
     /// Pixel inset from the right edge and top edge of visibleFrame.
     private static let edgeInset: CGFloat = 12
@@ -56,11 +66,13 @@ public final class HoverWindowController {
 
     private let vm: HoverViewModel
     private let panel: NSPanel
+    private let expandedPanel: NSPanel
     private let isAnySessionActive: () -> Bool
 
     private var workspaceObserver: NSObjectProtocol?
     private var pollTimer: Timer?
     private var currentlyVisible: Bool = false
+    private var expandedCancellable: AnyCancellable?
 
     public init(
         vm: HoverViewModel,
@@ -71,6 +83,7 @@ public final class HoverWindowController {
         self.isAnySessionActive = isAnySessionActive
         self.claudeCodeHostApps = Self.defaultHostApps.union(additionalHostApps)
 
+        // -- Hover panel (240x40) --
         let panel = HoverPanel(
             contentRect: NSRect(origin: .zero, size: Self.panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -92,8 +105,47 @@ public final class HoverWindowController {
         panel.isMovableByWindowBackground = false
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
-        panel.contentViewController = NSHostingController(rootView: HoverView(vm: vm))
+
+        // Wrap HoverView in a button-like tap gesture for toggle.
+        let hoverView = HoverView(vm: vm)
+            .onTapGesture { [weak vm] in
+                vm?.toggleExpanded()
+            }
+        panel.contentViewController = NSHostingController(rootView: hoverView)
         self.panel = panel
+
+        // -- Expanded panel (480x360) --
+        let expanded = HoverPanel(
+            contentRect: NSRect(origin: .zero, size: Self.expandedSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: true
+        )
+        expanded.isFloatingPanel = true
+        expanded.level = .statusBar
+        expanded.isOpaque = false
+        expanded.backgroundColor = .clear
+        expanded.hasShadow = true
+        expanded.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        expanded.isMovableByWindowBackground = false
+        expanded.isReleasedWhenClosed = false
+        expanded.hidesOnDeactivate = false
+        expanded.contentViewController = NSHostingController(
+            rootView: ExpandedPanelView(vm: vm)
+        )
+        self.expandedPanel = expanded
+
+        // Observe vm.isExpanded to show/hide the expanded panel.
+        self.expandedCancellable = vm.$isExpanded
+            .removeDuplicates()
+            .sink { [weak self] isExpanded in
+                guard let self else { return }
+                if isExpanded {
+                    self.showExpanded()
+                } else {
+                    self.hideExpanded()
+                }
+            }
     }
 
     /// Merge user config into the live host-apps set. Called by
@@ -119,6 +171,36 @@ public final class HoverWindowController {
             panel.orderOut(nil)
             currentlyVisible = false
         }
+        hideExpanded()
+    }
+
+    // MARK: - Expanded panel show/hide
+
+    private func showExpanded() {
+        guard currentlyVisible else { return }
+        positionExpanded()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.24
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            self.expandedPanel.animator().alphaValue = 1.0
+        }
+        expandedPanel.orderFrontRegardless()
+    }
+
+    private func hideExpanded() {
+        expandedPanel.orderOut(nil)
+        expandedPanel.alphaValue = 0.0
+    }
+
+    /// Position expanded panel directly below the hover, right-aligned.
+    private func positionExpanded() {
+        let hoverFrame = panel.frame
+        expandedPanel.setContentSize(Self.expandedSize)
+        let origin = NSPoint(
+            x: hoverFrame.maxX - Self.expandedSize.width,
+            y: hoverFrame.minY - Self.expandedGap - Self.expandedSize.height
+        )
+        expandedPanel.setFrameOrigin(origin)
     }
 
     // MARK: - Visibility logic (Gap 8)
@@ -142,6 +224,8 @@ public final class HoverWindowController {
         } else if !shouldShow && currentlyVisible {
             panel.orderOut(nil)
             currentlyVisible = false
+            // Close expanded panel when hover hides.
+            vm.isExpanded = false
         }
     }
 

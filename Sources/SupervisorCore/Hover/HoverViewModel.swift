@@ -7,6 +7,10 @@
 // One viewmodel per process. v0.1.0 follows a "show the most recently
 // active session" rule — no session picker yet. Multi-session UI is
 // v0.1.2.
+//
+// v0.1.7: expanded panel support. The viewmodel now tracks session
+// metrics (turn count, tool call count) and holds references to
+// CostStore + FlagStore for the expanded panel's data needs.
 
 import Combine
 import Foundation
@@ -40,13 +44,32 @@ public final class HoverViewModel: ObservableObject {
     /// Drives the dot color + pulse intensity.
     @Published public private(set) var activity: Activity = .idle
 
+    /// Whether the expanded panel is visible.
+    @Published public var isExpanded: Bool = false
+
+    // MARK: - Session metrics (v0.1.7 expanded panel)
+
+    /// Number of assistant turns (user prompt → assistant response cycles).
+    @Published public private(set) var turnCount: Int = 0
+
+    /// Number of tool calls observed this session.
+    @Published public private(set) var toolCallCount: Int = 0
+
+    /// The triage model name (e.g. "claude-haiku-4-5-20251001").
+    @Published public private(set) var modelName: String = ""
+
     /// The project name (cwd basename) for use in plain labels.
-    private var projectName: String = ""
+    public private(set) var projectName: String = ""
+
+    /// The full cwd path for the expanded panel header.
+    @Published public private(set) var sessionCwd: String = ""
 
     // MARK: - Dependencies
 
     private let bus: EventBus
     private let trace: TraceLog
+    public let costStore: CostStore?
+    public let flagStore: FlagStore?
     private var busCancellable: AnyCancellable?
     private var acknowledgeDebouncerTask: Task<Void, Never>?
     /// How long to hold the flagged state before auto-acknowledging.
@@ -57,12 +80,18 @@ public final class HoverViewModel: ObservableObject {
         bus: EventBus,
         trace: TraceLog = .shared,
         acknowledgeDebounceDuration: TimeInterval = 5.0,
-        initialFlagCount: Int = 0
+        initialFlagCount: Int = 0,
+        costStore: CostStore? = nil,
+        flagStore: FlagStore? = nil,
+        modelName: String = ""
     ) {
         self.bus = bus
         self.trace = trace
         self.acknowledgeDebounceDuration = acknowledgeDebounceDuration
         self.flagCount = initialFlagCount
+        self.costStore = costStore
+        self.flagStore = flagStore
+        self.modelName = modelName
         self.busCancellable = bus.subscribe { [weak self] event in
             guard let self else { return }
             Task { @MainActor in self.handle(event: event) }
@@ -70,6 +99,26 @@ public final class HoverViewModel: ObservableObject {
         if initialFlagCount > 0 {
             trace.emit("hover", "seeded flagCount=\(initialFlagCount) from history")
         }
+    }
+
+    // MARK: - Expanded panel data
+
+    /// Today's estimated cost from CostStore. Returns 0 if store unavailable.
+    public func todayCostUSD() -> Double {
+        guard let store = costStore else { return 0 }
+        return (try? store.today().estimatedCostUsd) ?? 0
+    }
+
+    /// Recent flags from FlagStore, most recent first.
+    public func recentFlags(limit: Int = 20) -> [StoredFlag] {
+        guard let store = flagStore else { return [] }
+        return (try? store.recent(limit: limit)) ?? []
+    }
+
+    /// Toggle expanded panel state.
+    public func toggleExpanded() {
+        isExpanded.toggle()
+        trace.emit("hover", "expanded panel \(isExpanded ? "opened" : "closed")")
     }
 
     // MARK: - Triage state hooks
@@ -150,10 +199,15 @@ public final class HoverViewModel: ObservableObject {
         case .sessionStart(let info):
             let basename = (info.cwd as NSString).lastPathComponent
             projectName = basename.isEmpty ? "" : basename
+            sessionCwd = info.cwd
+            // Reset per-session metrics on new session.
+            turnCount = 0
+            toolCallCount = 0
             plainLabel = projectName.isEmpty
                 ? "Watching — all clear"
                 : "Watching \(projectName) — all clear"
         case .bashToolCall(let info):
+            toolCallCount += 1
             // Plain headline: "Running a command"
             // Detail (secondary, de-emphasized): the actual command
             let head = info.command
@@ -166,7 +220,9 @@ public final class HoverViewModel: ObservableObject {
             if info.isError {
                 detailLabel += " (errored)"
             }
-        case .userPrompt, .assistantText, .systemSignal:
+        case .userPrompt:
+            turnCount += 1
+        case .assistantText, .systemSignal:
             break
         }
     }

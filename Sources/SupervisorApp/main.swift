@@ -168,7 +168,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // Seed flagCount from SQLite history so the badge persists across
         // launches (Known Gap since v0.1.4).
         let historicFlagCount = (try? flagStore?.count()) ?? 0
-        let hoverVM = HoverViewModel(bus: bus, trace: trace, initialFlagCount: historicFlagCount)
+        // v0.1.7: pass stores + model name for the expanded panel.
+        let activeProviderForHover = (try? activeProviderStore.read()) ?? .anthropic
+        let hoverVM = HoverViewModel(
+            bus: bus,
+            trace: trace,
+            initialFlagCount: historicFlagCount,
+            costStore: costStore,
+            flagStore: flagStore,
+            modelName: activeProviderForHover.defaultTriageModel
+        )
         self.hoverVM = hoverVM
         // v0.1.4 Gap 8: hover visibility depends on whether Supervisor
         // is actually tailing a session. discovery is constructed later
