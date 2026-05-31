@@ -1454,7 +1454,7 @@ Standing record of unfinished, unticketed, or blocked work. The
 Dispatcher reads this section on every call. Sessions update it as
 work completes or new gaps surface.
 
-Last updated: 2026-05-30
+Last updated: 2026-05-31
 
 ## Never verified end-to-end
 
@@ -1487,9 +1487,8 @@ Last updated: 2026-05-30
 
 ## Half-wired features
 
-- **HoverViewModel.acknowledgeFlag() not called.** The flagged-color
-  dot stays in flagged state until a new flag arrives. Should clear on
-  debounce. Deferred since v0.1.4.
+- ~~**HoverViewModel.acknowledgeFlag() not called.**~~ Fixed in v0.6.1
+  — 5-second debounce auto-acknowledges after each flag.
 
 - **In-memory flagCount resets on app restart.** Should seed from the
   SQLite flag history on launch. Deferred since v0.1.4.
