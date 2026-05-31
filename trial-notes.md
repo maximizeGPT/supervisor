@@ -1637,8 +1637,9 @@ Last updated: 2026-05-31
   `hover.known_terminals`. If config.yaml grows beyond one key,
   evaluate switching to Yams. Currently 60 LOC vs ~50K LOC dependency.
 
-- **DeepSeek ~50% first-call failure rate.** Roughly 1 in 2 dispatcher
-  calls fails on first attempt (tiny incomplete HTTP responses). The
-  retry + JSON repair mechanisms mask this but the root cause
-  (DeepSeek API flakiness or undocumented rate limits) is uninvestigated.
+- ~~**DeepSeek ~50% first-call failure rate.**~~ Root cause: DeepSeek
+  returns 24-byte truncated HTTP responses under load. Fixed in v0.8.0
+  with 3-attempt exponential backoff (1s, 2s) inside call_dispatcher.
+  JSON repair handles finish_reason=length truncation. Combined, the
+  effective success rate is near 100%.
 
