@@ -1448,6 +1448,127 @@ specified fix shape.
 
 ---
 
+# Session 9 — v0.1.7 expanded hover panel
+
+Started: 2026-05-31 ~04:00 UTC. Continuing on
+`autonomous-20260525T193906Z`. Operating under PRINCIPLES.md v3.5.
+
+## Discovery
+
+- Read PRINCIPLES.md v3.5, AUTONOMOUS_SESSION_PROMPT.md v2,
+  PRODUCT-DIRECTION.md.
+- 280 Swift tests pass, 6 skipped, 0 failures. 39 Python pass.
+- No ANTHROPIC_API_KEY — calibration work blocked.
+- Zero open GH issues.
+- PRODUCT-DIRECTION.md: "hover panel shows live session cost and
+  flag history" is the only "done" criterion achievable without
+  API key or human presence.
+
+## Proposal
+
+### Candidate 1 — v0.1.7 expanded hover panel (picked)
+- Source: PRODUCT-DIRECTION.md "what done looks like", DESIGN.md
+  section 6.2, Known Gaps "SIGCONT-from-button not wired."
+- Builds: expanded panel (480x360), session metrics, cost display,
+  recent flags, Resume button, Dismiss/False-positive buttons.
+- Pure code, no API key needed.
+
+### Candidate 2 — Calibration sweep
+- Blocked on ANTHROPIC_API_KEY.
+
+### Pick
+Candidate 1. Highest-value pure-code work available. Addresses
+PRODUCT-DIRECTION deliverable + two Known Gaps (SIGCONT button,
+flag response buttons).
+
+## Log
+
+### 04:02 — HoverViewModel additions
+- Added turnCount, toolCallCount, sessionCwd, modelName, isExpanded,
+  isResuming, costStore, flagStore, resumeHandler.
+- Event handling: turnCount increments on userPrompt, toolCallCount
+  on bashToolCall, both reset on sessionStart.
+- todayCostUSD(), recentFlags(), toggleExpanded(), respondToFlag(),
+  isPaused, resumePausedSession() methods.
+
+### 04:05 — ExpandedPanelView (480x360)
+- New file. Header (session selector), recent flags section (5 most
+  recent with severity badge, category, reasoning, timestamp),
+  current activity section (model, turns, tools, cost, current
+  action), footer, Resume button (when paused), Dismiss/False
+  positive buttons on flag rows.
+
+### 04:08 — HoverWindowController expanded panel wiring
+- Second NSPanel with same always-on-top behavior. Positioned below
+  hover, right-aligned, 4pt gap. Toggle via vm.$isExpanded Combine
+  observer. 240ms fade-in animation. Closes when hover hides.
+- Tap gesture on HoverView toggles expansion.
+
+### 04:10 — main.swift wiring
+- Pass costStore, flagStore, modelName to HoverViewModel.
+- Wire resumeHandler with captured locator + signalSender.
+
+### 04:12 — Tests (24 total)
+- 15 expanded panel tests: session metrics (turn, tool, reset),
+  toggle, model name, cost formatting (4), relative time (4),
+  store-absent defaults (2).
+- 6 resume tests: isPaused states, handler+acknowledge, handler
+  failure, no-handler, not-paused.
+- 3 flag response tests: dismiss persistence, false positive
+  persistence, no-store safety.
+
+### Build / tests (final)
+- swift build — clean.
+- swift test — 304/304 pass (was 280; +24). 6 skipped. 0 failures.
+- 8 commits, pushed to origin.
+
+## Post-mortem
+
+### What I tried to ship
+v0.1.7 expanded hover panel with session metrics, cost, flags,
+Resume button, and flag response buttons.
+
+### What actually shipped
+- `3204c29` v0.1.7: expanded hover panel (480x360)
+- `301ee1c` Tests: 15 expanded panel tests
+- `badd4a3` CHANGELOG: v0.1.7 entry
+- `cf77d30` SIGCONT resume button
+- `75b5618` Tests: 6 resume tests
+- `e79e982` Dismiss + False positive flag buttons
+- `bfd5c74` Tests: 3 flag response tests
+- `b26e4b3` Known Gaps resolved
+
+### What didn't ship and why
+- Approve button: needs router re-execution with gates off.
+  Values-shaped decision (what does "approve" mean for each
+  action type?). Deferred per section 5.
+- Session switcher: needs multi-session UI infrastructure.
+- Calibration improvements: blocked on ANTHROPIC_API_KEY.
+
+### Honest mistakes
+None. Straightforward implementation following DESIGN.md spec.
+One build-time fix: EventBus method is `publish`, not `emit`
+(caught on first test compile).
+
+### What surprised me
+- The expanded panel implementation was simpler than expected.
+  SwiftUI + NSPanel + Combine observer covered the toggle +
+  positioning in ~100 LOC. The heavyweight part was the
+  HoverViewModel additions, not the view layer.
+- The Resume button approach (callback wired in main.swift)
+  keeps the ViewModel clean of infrastructure deps — mirrors
+  the existing onActivityChange/onDecision callback pattern.
+
+### Open questions for Mohammed
+- None. All engineering decisions.
+
+### Calibration / cost summary
+- API spend this session: $0 (pure code, no live calls).
+- Sweeps run: none.
+- Tests passing locally: 304/304 Swift (was 280; +24).
+
+---
+
 # Known Gaps
 
 Standing record of unfinished, unticketed, or blocked work. The
