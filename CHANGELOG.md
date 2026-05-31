@@ -6,6 +6,47 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-05-31
+
+Draggable hover + dispatch reliability hardening.
+
+### Added
+
+**Draggable hover window** (`HoverWindowController.swift`)
+- The hover is now draggable anywhere on screen via native macOS
+  window-background dragging.
+- Click vs drag distinguished at the NSPanel level: movement < 3pt
+  is a click (toggles expanded panel), >= 3pt is a drag (moves
+  window).
+- Once dragged, the hover stays at its user-chosen position and
+  doesn't snap back to top-right on visibility updates.
+- Expanded panel re-anchors below the hover when it moves (live
+  frame observation via NSWindow.didMoveNotification).
+
+### Fixed
+
+**SelfExtender 401** — the live hook at `~/.claude/hooks/` was stale
+(May 29), missing the 3x retry with exponential backoff added in
+v0.8.0. Redeployed current version. The SelfExtender now retries
+through DeepSeek's transient 401 rate-limit responses.
+
+**Diff on short branches** (`dispatch_loop_hook.py`)
+- `_safe_head_range()` counts actual commits via `git rev-list
+  --count HEAD`. Uses `min(20, available-1)` instead of hardcoded
+  `HEAD~20`. Falls back to root commit, then to the empty tree SHA.
+  The diff never hard-errors regardless of branch length.
+
+**Dispatcher prefers substantial work** (`dispatcher-system-prompt.txt`)
+- Priority order explicitly ranked: substantial deferred features >
+  Known Gaps > issues > mechanical follow-on.
+- "Mechanical follow-on from <commit>" is lowest priority, not the
+  default. The dispatcher must check Known Gaps and deferred items
+  first.
+
+### Tests
+
+309 Swift pass (6 skipped, 0 failures). 43 Python pass.
+
 ## [0.8.0] — 2026-05-31
 
 Dispatch loop reliability. Three fixes that eliminated false stops
