@@ -14,6 +14,7 @@ import SupervisorCore
 public struct ExpandedPanelView: View {
 
     @ObservedObject var vm: HoverViewModel
+    @State private var expandedFlagIds: Set<String> = []
 
     public init(vm: HoverViewModel) {
         self.vm = vm
@@ -86,7 +87,10 @@ public struct ExpandedPanelView: View {
     }
 
     private func flagRow(_ flag: StoredFlag) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
+        let isExpanded = expandedFlagIds.contains(flag.id)
+
+        return VStack(alignment: .leading, spacing: 2) {
+            // Header row — always visible, clickable to toggle.
             HStack {
                 severityBadge(flag.severity)
                 Text(flag.category.replacingOccurrences(of: "_", with: " "))
@@ -96,11 +100,66 @@ public struct ExpandedPanelView: View {
                 Text(Self.relativeTime(flag.ts))
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.secondary)
             }
-            Text(flag.reasoningPlain)
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    if isExpanded {
+                        expandedFlagIds.remove(flag.id)
+                    } else {
+                        expandedFlagIds.insert(flag.id)
+                    }
+                }
+            }
+
+            // Collapsed: 2-line truncated reasoning.
+            if !isExpanded {
+                Text(flag.reasoningPlain)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            // Expanded: full reasoning + technical + asymmetry note.
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(flag.reasoningPlain)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+
+                    if !flag.reasoningTechnical.isEmpty {
+                        Text("Technical:")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text(flag.reasoningTechnical)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let note = flag.asymmetryNote, !note.isEmpty {
+                        Text("Asymmetry:")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text(note)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    // Action + severity details.
+                    HStack(spacing: 8) {
+                        Text("Action: \(flag.action.rawValue)")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                        Text("Severity: \(flag.severity.rawValue)")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.top, 2)
+            }
 
             // Action buttons — only show if user hasn't responded yet.
             if flag.userResponse == nil {
