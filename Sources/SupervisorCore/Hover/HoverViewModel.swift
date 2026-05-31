@@ -128,6 +128,20 @@ public final class HoverViewModel: ObservableObject {
         trace.emit("hover", "expanded panel \(isExpanded ? "opened" : "closed")")
     }
 
+    /// Record user response (dismiss / false positive) for a flag.
+    public func respondToFlag(flagId: String, response: FlagUserResponse) {
+        guard let store = flagStore else {
+            trace.emit("hover", "respondToFlag: no flagStore")
+            return
+        }
+        do {
+            try store.markUserResponse(flagId: flagId, response: response)
+            trace.emit("hover", "respondToFlag id=\(flagId) response=\(response.rawValue)")
+        } catch {
+            trace.emit("hover", "respondToFlag ERROR: \(error)")
+        }
+    }
+
     /// Whether the current flag is a pause that can be resumed.
     public var isPaused: Bool {
         guard case .flagged(_, .pause, _) = activity else { return false }

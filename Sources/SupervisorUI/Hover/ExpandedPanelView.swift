@@ -101,9 +101,41 @@ public struct ExpandedPanelView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
+
+            // Action buttons — only show if user hasn't responded yet.
+            if flag.userResponse == nil {
+                HStack(spacing: 8) {
+                    Button("Dismiss") {
+                        vm.respondToFlag(flagId: flag.id, response: .dismissed)
+                    }
+                    .font(.system(size: 9))
+                    .buttonStyle(.borderless)
+
+                    Button("False positive") {
+                        vm.respondToFlag(flagId: flag.id, response: .falsePositive)
+                    }
+                    .font(.system(size: 9))
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.orange)
+                }
+                .padding(.top, 2)
+            } else {
+                Text(Self.responseLabel(flag.userResponse!))
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+            }
         }
         .padding(6)
         .background(severityBackground(flag.severity), in: RoundedRectangle(cornerRadius: 4))
+    }
+
+    private static func responseLabel(_ response: FlagUserResponse) -> String {
+        switch response {
+        case .approved: return "Approved"
+        case .dismissed: return "Dismissed"
+        case .falsePositive: return "Marked as false positive"
+        }
     }
 
     private func severityBadge(_ severity: FlagSeverity) -> some View {
