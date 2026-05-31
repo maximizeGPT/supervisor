@@ -109,7 +109,7 @@ public final class Notifier: Notifying, @unchecked Sendable {
     @discardableResult
     public func post(decision: TriageDecision) async -> Outcome {
         let content = UNMutableNotificationContent()
-        content.title = "Supervisor: \(decision.candidate.category)"
+        content.title = Self.plainTitle(for: .notifyOnly)
         content.body = body(for: decision)
         content.sound = .default
 
@@ -145,61 +145,67 @@ public final class Notifier: Notifying, @unchecked Sendable {
     /// the same string and never drift. Trailing space is part of the prefix.
     public static let bannerPrefix = "Supervisor: "
 
-    /// v0.1.2 body composer. Just the brand prefix + the plain-English
-    /// reasoning Haiku wrote. No pre/post tense synthesis here — Haiku
-    /// writes its own tense based on the "Has the command already
-    /// executed?" section of the triage prompt.
-    public func body(for decision: TriageDecision) -> String {
-        Self.bannerPrefix + decision.candidate.reasoningPlain
-    }
-
-    /// v0.1.4 Gap 1+2+3 + v0.1.6 recovery doc pointer: outcome-aware body
-    /// composer. Pause/kill banners include the recovery doc path so the
-    /// user can open it from Finder or `open <path>`. If the doc write
-    /// failed (path is nil), the banner falls back to v0.1.4's inline
-    /// recovery copy — never silent about how to recover.
-    public func body(for decision: TriageDecision, outcome: InterventionOutcome) -> String {
-        let base = Self.bannerPrefix + decision.candidate.reasoningPlain
+    /// Plain-language notification title. Uses the triage's plain
+    /// reasoning to describe what happened, not raw category names.
+    public static func plainTitle(for outcome: InterventionOutcome) -> String {
         switch outcome {
         case .notifyOnly:
-            return base
-        case .pauseSucceeded(let pid, let recoveryDocPath):
+            return "Supervisor noticed something"
+        case .pauseSucceeded:
+            return "Supervisor paused Claude Code"
+        case .killSucceeded:
+            return "Supervisor stopped Claude Code"
+        case .injectSucceeded:
+            return "Supervisor answered a question"
+        case .injectDegraded:
+            return "Supervisor has an answer for you"
+        case .continueFired:
+            return "Supervisor kept Claude Code working"
+        case .continueProposedMedium:
+            return "Supervisor has a suggestion"
+        case .continueLowConfidence:
+            return "Supervisor is waiting for direction"
+        }
+    }
+
+    /// v0.1.2 body composer. Plain-language — what happened and what
+    /// (if anything) the user should do. No raw category names, no
+    /// severity integers, no PIDs in the headline.
+    public func body(for decision: TriageDecision) -> String {
+        decision.candidate.reasoningPlain
+    }
+
+    /// Outcome-aware body composer. Plain language throughout.
+    /// Recovery details (doc paths, PIDs) go to a second line when
+    /// relevant, never the headline.
+    public func body(for decision: TriageDecision, outcome: InterventionOutcome) -> String {
+        let plain = decision.candidate.reasoningPlain
+        switch outcome {
+        case .notifyOnly:
+            return plain
+        case .pauseSucceeded(_, let recoveryDocPath):
             if let path = recoveryDocPath {
-                return base + " Session paused (PID \(pid)). Recovery: \(path.path)"
+                return plain + "\n\nClaude Code is paused. Open the recovery doc for next steps: \(path.path)"
             } else {
-                return base + " Session paused. To resume: `kill -CONT \(pid)`."
+                return plain + "\n\nClaude Code is paused and waiting for you to decide what to do next."
             }
         case .killSucceeded(let recoveryDocPath):
             if let path = recoveryDocPath {
-                return base + " Session killed. Read recovery doc before starting new `claude`: \(path.path)"
+                return plain + "\n\nThe session was stopped. Read the recovery doc before continuing: \(path.path)"
             } else {
-                return base + " Session killed. Start a new `claude` invocation to continue."
+                return plain + "\n\nThe session was stopped. Start a new Claude Code session to continue your work."
             }
-        case .injectSucceeded(let pid, let bytes):
-            // The injected text is already in the user's terminal — no
-            // need to repeat it in the banner. Just acknowledge.
-            return base + " Supervisor answered (PID \(pid), \(bytes) bytes injected)."
+        case .injectSucceeded:
+            return plain + "\n\nSupervisor answered the question directly — check your terminal to see the response."
         case .injectDegraded(let intendedText, _):
-            // The inject path failed; surface the intended text so the
-            // user can paste it manually. Reason goes to trace, not the
-            // banner — banner stays user-facing, not diagnostic.
-            return base + " Supervisor would have answered: \(intendedText) Paste this into Claude Code to continue."
-        case .continueFired(let pid, _, let promptHead):
-            // The autonomous loop dispatched — show what got typed so
-            // the user can read along. PID + bytes go to the trace; the
-            // banner stays user-facing.
-            return base + " Supervisor dispatched: \(promptHead)\(promptHead.count >= 80 ? "..." : "") (PID \(pid))"
+            return plain + "\n\nSupervisor couldn't type the answer automatically. Paste this into Claude Code:\n\(intendedText)"
+        case .continueFired(_, _, let promptHead):
+            let head = promptHead.count >= 80 ? promptHead + "..." : promptHead
+            return "Supervisor sent Claude Code its next task: \(head)"
         case .continueProposedMedium(let proposal, _):
-            // Propose-and-wait: medium-confidence dispatch is surfaced
-            // for the user to copy/paste, NOT auto-injected. The full
-            // proposal text goes in the banner; justification lives in
-            // the trace.
-            return base + " Supervisor proposes: \(proposal) Paste this into Claude Code to continue, or write your own."
+            return "Supervisor thinks Claude Code should work on this next, but wants your approval:\n\n\(proposal)\n\nPaste this into Claude Code if you agree, or write your own direction."
         case .continueLowConfidence(let reasoning):
-            // Low-confidence dispatch: surface the idle state with the
-            // dispatcher's reason so the user knows WHY supervisor went
-            // quiet rather than just hanging.
-            return base + " Supervisor saw idle but couldn't confidently dispatch — pick the next task yourself. Reason: \(reasoning)"
+            return "Claude Code finished its work and Supervisor couldn't decide what to do next. \(reasoning)\n\nTell Claude Code what to work on, or add items to the issue queue."
         }
     }
 
@@ -214,7 +220,7 @@ public final class Notifier: Notifying, @unchecked Sendable {
         outcome: InterventionOutcome
     ) async -> Outcome {
         let content = UNMutableNotificationContent()
-        content.title = "Supervisor: \(decision.candidate.category)"
+        content.title = Self.plainTitle(for: outcome)
         content.body = body(for: decision, outcome: outcome)
         content.sound = .default
 
