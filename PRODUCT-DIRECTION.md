@@ -58,8 +58,12 @@ has to notice them.
   sequential high-confidence dispatches) without user intervention
   and without safety regression.
 - Calibration hits the 95/95 gate on all three rubric categories.
-- The hover panel shows live session cost and flag history (v0.1.7
-  expanded panel).
+  (Issue #12 — blocked on ANTHROPIC_API_KEY.)
+- ~~The hover panel shows live session cost and flag history (v0.1.7
+  expanded panel).~~ **DONE** — v0.1.7 shipped: 480x360 expanded
+  panel with recent flags, session metrics, cost, Resume button,
+  Dismiss/False-positive buttons, expandable flag rows. v0.8.1 added
+  draggable hover.
 - The system runs reliably on both Anthropic and DeepSeek providers
   without provider-specific workarounds beyond the translation layer.
 
