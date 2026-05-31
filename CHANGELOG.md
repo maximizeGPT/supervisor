@@ -6,6 +6,84 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-30
+
+Dispatcher rebuild: from queue-reader to expert advisor. The
+Dispatcher now reasons about what the project actually needs,
+grounded in the project's stated direction and the real state of
+the work, rather than just checking the issue queue.
+
+### Added
+
+**PRODUCT-DIRECTION.md** (repo root)
+- The project owner's plain-language statement of where the product
+  is going. Generic format — any repo owner drops in their own
+  direction file and the dispatch loop uses it. The Dispatcher reads
+  it on every call as the primary reference for "what does forward
+  mean."
+
+**Known Gaps section** (`trial-notes.md`)
+- Standing record of unfinished, unticketed, or blocked work. Seeded
+  from deferred items across sessions 1-7. The Dispatcher reads it
+  on every call. When the issue queue is empty, this is where the
+  real remaining work lives.
+
+**New context fetchers** (Python hook + Swift Dispatcher)
+- `fetch_product_direction`: reads PRODUCT-DIRECTION.md from repo root.
+- `fetch_known_gaps`: extracts the Known Gaps section from
+  trial-notes.md on the current branch.
+- `fetch_source_markers`: greps TODO/FIXME in Sources/ for half-
+  finished state signals.
+- `SessionContext` (Swift) gains `productDirection`, `knownGaps`,
+  `sourceMarkers`, `recentFilesChanged` fields. All default to
+  empty for backward compatibility.
+
+### Changed
+
+**Dispatcher system prompt** (`dispatcher-system-prompt.txt`)
+- Reframed from "pick from the issue queue or mechanical follow-on"
+  to "you are an expert advisor watching the developer work — choose
+  the single most useful next move that pushes the product toward its
+  direction."
+- The issue queue is now one input among several, not the primary
+  source. Known Gaps, source markers, diff stat, and the project
+  direction are equally weighted.
+- PATH 3 added: pick up a Known Gap when the issue queue is empty.
+- Worked examples updated: Example 1 shows a Known Gap dispatch;
+  Example 3 shows a correct LOW when all gaps are blocked.
+- Generic: nothing project-specific baked in. All project knowledge
+  comes from files the owner writes.
+
+**Swift `Dispatcher.systemPrompt`** (`Dispatcher.swift`)
+- Now loads from `dispatcher-system-prompt.txt` at runtime instead
+  of an inline string literal. Single source of truth for both
+  Python hook and Swift in-app paths.
+
+**`build_user_message`** (Python hook + Swift `Dispatcher.userMessage`)
+- Includes PRODUCT-DIRECTION.md, Known Gaps, source markers, and
+  diff stat sections alongside the existing context (commits, issues,
+  recent turns, PRINCIPLES.md).
+
+### Live verification
+
+Two live dispatches against DeepSeek with empty issue queue:
+1. First call: proposed the live autonomous trial (the most impactful
+   Known Gap) with `requires_human_presence: true` and direction-
+   grounded justification referencing PRODUCT-DIRECTION.md.
+2. Second call (with worker hint that human-presence work is blocked):
+   proposed loop-controller integration tests — a code-actionable
+   Known Gap that advances the product direction.
+
+Both responses demonstrated advisor behavior: reasoning about project
+state, not just ticket-checking.
+
+### Tests
+
+278 Swift pass (0 failures, 6 skipped). 39 Python pass.
+Snapshot test `testSystemPromptCarriesCoreConstraints` updated to
+match new prompt's key constraints (advisor voice, direction
+awareness, Known Gaps reference).
+
 ## [0.1.8] — 2026-05-30
 
 RecoveryDocWriter timeout: the intervention pipeline no longer blocks
