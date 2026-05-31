@@ -45,6 +45,13 @@ artifact has a spec, tests, and voice constraints. The hover panel,
 the onboarding flow, the recovery doc template are all artifacts
 that mature with each release.
 
+**4. Owner-facing intelligence.** Supervisor talks UP to the project
+owner, not just down to the worker. The owner brief
+(OWNER-BRIEF.md) surfaces what shipped, what's stuck, and what
+needs a human — in plain language. The self-watch catches stale
+builds, stuck workers, and ineffective changes before the owner
+has to notice them.
+
 ## What "done" looks like for the next phase
 
 - The dispatch loop runs a multi-session autonomous trial (>= 3
