@@ -628,6 +628,13 @@ public final class TriageEngine {
         // still sees the banner/inject outcome.
         if let lc = loopController {
             await lc.recordDispatch(sessionId: sessionId, result: result)
+            // v0.8.0: if we just recorded a high/medium confidence
+            // result, clear any prior consecutive-low stop so the loop
+            // recovers. This handles the case where false lows caused
+            // a stop but subsequent dispatches found real work.
+            if case let .ready(_, _, conf, _, _, _, _) = result, conf != .low {
+                await lc.clearConsecutiveLowStop(sessionId: sessionId)
+            }
         }
         if let store = loopStore {
             do {
