@@ -48,15 +48,15 @@ public final class HoverViewModel: ObservableObject {
     private let bus: EventBus
     private let trace: TraceLog
     private var busCancellable: AnyCancellable?
+    private var acknowledgeDebouncerTask: Task<Void, Never>?
+    /// How long to hold the flagged state before auto-acknowledging.
+    /// Resets on each new flag.
+    public let acknowledgeDebounceDuration: TimeInterval
 
-    public init(bus: EventBus, trace: TraceLog = .shared) {
+    public init(bus: EventBus, trace: TraceLog = .shared, acknowledgeDebounceDuration: TimeInterval = 5.0) {
         self.bus = bus
         self.trace = trace
-        // Bind self locally before the Task so Swift 5.10 (CI toolchain)
-        // doesn't reject the closure as "reference to captured var 'self'
-        // in concurrently-executing code." Swift 6.2 (my local) is more
-        // permissive; CI is the source of truth. Same nil-safety as the
-        // original `self?.handle` — guard returns early on dealloc.
+        self.acknowledgeDebounceDuration = acknowledgeDebounceDuration
         self.busCancellable = bus.subscribe { [weak self] event in
             guard let self else { return }
             Task { @MainActor in self.handle(event: event) }
@@ -91,6 +91,16 @@ public final class HoverViewModel: ObservableObject {
         activity = .flagged(severity: severity, action: action)
         plainLabel = Self.plainLabelForFlag(action: action, reasoningPlain: reasoningPlain)
         trace.emit("hover", "flag raised severity=\(severity.rawValue) action=\(action.rawValue) total=\(flagCount)")
+
+        // Auto-acknowledge after the debounce duration. Each new flag
+        // resets the timer so rapid flags don't flicker.
+        acknowledgeDebouncerTask?.cancel()
+        let duration = acknowledgeDebounceDuration
+        acknowledgeDebouncerTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.acknowledgeFlag()
+        }
     }
 
     /// Resets the activity dot to idle. UI calls after a flag has been
