@@ -226,15 +226,36 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             directory: paths.recoveryDir,
             trace: trace
         )
+        let locator = LiveProcessLocator(trace: trace)
+        let signalSender = DarwinSignalSender()
         let router = InterventionRouter(
             notifier: notifier,
-            locator: LiveProcessLocator(trace: trace),
-            signalSender: DarwinSignalSender(),
+            locator: locator,
+            signalSender: signalSender,
             injector: CGEventInjector(trace: trace),
             recoveryDocWriter: recoveryWriter,
             trace: trace
         )
         self.router = router
+
+        // v0.1.7: wire the resume handler for the expanded panel's
+        // Resume button. Uses the same locator + signal sender as the
+        // router's pause path, but sends SIGCONT instead of SIGSTOP.
+        hoverVM.resumeHandler = { [weak self] cwd in
+            guard let self else { return false }
+            guard let handle = locator.locate(targetCwd: cwd) else {
+                self.trace.emit("hover", "resume: locator returned nil for cwd=\(cwd)")
+                return false
+            }
+            do {
+                try signalSender.send(SIGCONT, to: handle.pid)
+                self.trace.emit("hover", "resume: SIGCONT sent pid=\(handle.pid) cwd=\(cwd)")
+                return true
+            } catch {
+                self.trace.emit("hover", "resume: SIGCONT failed pid=\(handle.pid) error=\(error)")
+                return false
+            }
+        }
 
         // 5. Triage engine. v0.2.0: model comes from the active provider.
         // v0.3.0: optional QuestionAnswerer for the user_question_pending

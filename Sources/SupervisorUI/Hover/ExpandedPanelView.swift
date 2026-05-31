@@ -164,6 +164,27 @@ public struct ExpandedPanelView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+
+            if vm.isPaused {
+                Button(action: { vm.resumePausedSession() }) {
+                    HStack(spacing: 4) {
+                        if vm.isResuming {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 9))
+                        }
+                        Text(vm.isResuming ? "Resuming..." : "Resume Claude Code")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(BrandColor.signal.color)
+                .disabled(vm.isResuming)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 6)

@@ -64,6 +64,9 @@ public final class HoverViewModel: ObservableObject {
     /// The full cwd path for the expanded panel header.
     @Published public private(set) var sessionCwd: String = ""
 
+    /// Whether a resume from pause is in progress.
+    @Published public private(set) var isResuming: Bool = false
+
     // MARK: - Dependencies
 
     private let bus: EventBus
@@ -75,6 +78,10 @@ public final class HoverViewModel: ObservableObject {
     /// How long to hold the flagged state before auto-acknowledging.
     /// Resets on each new flag.
     public let acknowledgeDebounceDuration: TimeInterval
+
+    /// Callback to resume a paused session. Takes cwd, returns true on
+    /// success. Wired in main.swift with ProcessLocator + SignalSender.
+    public var resumeHandler: ((String) async -> Bool)?
 
     public init(
         bus: EventBus,
@@ -119,6 +126,34 @@ public final class HoverViewModel: ObservableObject {
     public func toggleExpanded() {
         isExpanded.toggle()
         trace.emit("hover", "expanded panel \(isExpanded ? "opened" : "closed")")
+    }
+
+    /// Whether the current flag is a pause that can be resumed.
+    public var isPaused: Bool {
+        guard case .flagged(_, .pause, _) = activity else { return false }
+        return true
+    }
+
+    /// Resume a paused session by sending SIGCONT to the process.
+    /// Called from the expanded panel's Resume button.
+    public func resumePausedSession() {
+        guard isPaused, !sessionCwd.isEmpty, let handler = resumeHandler else {
+            trace.emit("hover", "resume: precondition failed (isPaused=\(isPaused) cwd=\(sessionCwd.isEmpty ? "empty" : "set") handler=\(resumeHandler == nil ? "nil" : "set"))")
+            return
+        }
+        isResuming = true
+        let cwd = sessionCwd
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let ok = await handler(cwd)
+            self.isResuming = false
+            if ok {
+                self.trace.emit("hover", "resume: SIGCONT sent successfully cwd=\(cwd)")
+                self.acknowledgeFlag()
+            } else {
+                self.trace.emit("hover", "resume: SIGCONT failed cwd=\(cwd)")
+            }
+        }
     }
 
     // MARK: - Triage state hooks
