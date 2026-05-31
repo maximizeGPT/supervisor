@@ -277,4 +277,75 @@ final class ExpandedPanelTests: XCTestCase {
         vm.resumePausedSession()
         XCTAssertFalse(handlerCalled)
     }
+
+    // MARK: - Flag response (Dismiss / False positive)
+
+    func testRespondToFlagPersistsResponse() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let sessionStore = SessionStore(database: db)
+        try sessionStore.upsert(StoredSession(
+            id: "s1", projectHash: "h", cwd: "/x",
+            startedAt: Date(), lastSeenAt: Date(),
+            jsonlPath: "/x"
+        ))
+        let store = FlagStore(database: db)
+        let flag = StoredFlag(
+            id: "flag1", sessionId: "s1",
+            category: "destructive_action_pending",
+            severity: .high, action: .notify,
+            reasoningPlain: "rm -rf detected",
+            reasoningTechnical: "technical details"
+        )
+        try store.insert(flag)
+
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("panel-test-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(
+            bus: bus, trace: trace, flagStore: store
+        )
+
+        vm.respondToFlag(flagId: "flag1", response: .dismissed)
+
+        // Verify persistence.
+        let flags = try store.recent(limit: 10)
+        XCTAssertEqual(flags.first?.userResponse, .dismissed)
+    }
+
+    func testRespondToFlagFalsePositivePersists() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let sessionStore = SessionStore(database: db)
+        try sessionStore.upsert(StoredSession(
+            id: "s1", projectHash: "h", cwd: "/x",
+            startedAt: Date(), lastSeenAt: Date(),
+            jsonlPath: "/x"
+        ))
+        let store = FlagStore(database: db)
+        let flag = StoredFlag(
+            id: "flag2", sessionId: "s1",
+            category: "injection_detected",
+            severity: .medium, action: .notify,
+            reasoningPlain: "injection pattern",
+            reasoningTechnical: "technical details"
+        )
+        try store.insert(flag)
+
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("panel-test-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(
+            bus: bus, trace: trace, flagStore: store
+        )
+
+        vm.respondToFlag(flagId: "flag2", response: .falsePositive)
+
+        let flags = try store.recent(limit: 10)
+        XCTAssertEqual(flags.first?.userResponse, .falsePositive)
+    }
+
+    func testRespondToFlagNoOpWithoutStore() {
+        let (vm, _) = makeVM()
+        // Should not crash when flagStore is nil.
+        vm.respondToFlag(flagId: "nonexistent", response: .dismissed)
+    }
 }
