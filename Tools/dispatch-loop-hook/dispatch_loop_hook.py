@@ -352,6 +352,62 @@ def fetch_diff_stat(cwd: str, branch: str, timeout: float) -> list[str]:
     return file_lines
 
 
+def fetch_product_direction(cwd: str) -> str:
+    """Read PRODUCT-DIRECTION.md from the repo root. Returns empty string if missing."""
+    path = Path(cwd) / "PRODUCT-DIRECTION.md"
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as e:
+        log(f"product_direction_read_error error={e}")
+        return ""
+
+
+def fetch_known_gaps(cwd: str) -> str:
+    """Read the '# Known Gaps' section from trial-notes.md on the current branch.
+    Returns the section text or empty string if not found."""
+    path = Path(cwd) / "trial-notes.md"
+    if not path.exists():
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        log(f"known_gaps_read_error error={e}")
+        return ""
+    # Extract the Known Gaps section — starts at "# Known Gaps" and ends
+    # at the next top-level heading or EOF.
+    marker = "# Known Gaps"
+    idx = content.find(marker)
+    if idx < 0:
+        return ""
+    section = content[idx:]
+    # Find the next "---" or top-level "# " heading that isn't our own.
+    lines = section.split("\n")
+    result: list[str] = [lines[0]]
+    for line in lines[1:]:
+        if line.startswith("# ") and not line.startswith("# Known Gaps"):
+            break
+        if line.strip() == "---":
+            break
+        result.append(line)
+    return "\n".join(result).strip()
+
+
+def fetch_source_markers(cwd: str, timeout: float) -> list[str]:
+    """Grep for TODO/FIXME in source files. Returns up to 30 lines."""
+    code, out, err = run(
+        ["grep", "-rn", "-E", "TODO|FIXME", "Sources/"],
+        cwd=cwd,
+        timeout=timeout,
+    )
+    if code not in (0, 1):  # 1 = no matches, which is fine
+        log(f"source_markers_error code={code} stderr={err.strip()[:120]}")
+        return []
+    lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+    return lines[:30]
+
+
 def fetch_commits(cwd: str, branch: str, timeout: float) -> list[dict[str, str]]:
     code, out, err = run(
         ["git", "log", f"main..{branch}",
@@ -398,6 +454,9 @@ def build_user_message(
     recent_files_changed: list[str],
     prior_count: int,
     principles_text: str,
+    product_direction: str = "",
+    known_gaps: str = "",
+    source_markers: list[str] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append("# Session context")
@@ -408,6 +467,16 @@ def build_user_message(
     lines.append("# Loop state")
     lines.append(f"prior_dispatches_considered: {prior_count}")
     lines.append("")
+
+    # Product direction — the north star
+    lines.append("# PRODUCT-DIRECTION.md (where the project is going)")
+    lines.append("")
+    if product_direction:
+        lines.append(product_direction)
+    else:
+        lines.append("(not found — no PRODUCT-DIRECTION.md in repo root; reason from PRINCIPLES.md and recent work instead)")
+    lines.append("")
+
     lines.append("# Recent commits on this branch (since divergence from main)")
     if not commits:
         lines.append("(none — either fresh branch, or git fetch failed; treat as 'no commits to follow up on')")
@@ -425,9 +494,19 @@ def build_user_message(
         for fl in recent_files_changed:
             lines.append(fl)
     lines.append("")
-    lines.append("# Open GitHub issues (work queue)")
+
+    # Known Gaps — the standing work record
+    lines.append("# Known Gaps (unfinished, unticketed, or blocked work)")
+    lines.append("")
+    if known_gaps:
+        lines.append(known_gaps)
+    else:
+        lines.append("(no Known Gaps section found in trial-notes.md)")
+    lines.append("")
+
+    lines.append("# Open GitHub issues")
     if not issues:
-        lines.append("(empty — either no open issues, or gh fetch failed; lower confidence accordingly if you were about to pick PATH 2)")
+        lines.append("(empty — this is normal; check Known Gaps and source markers for real remaining work)")
     else:
         for i in issues:
             tag = f" [{', '.join(i['labels'])}]" if i["labels"] else ""
@@ -435,7 +514,17 @@ def build_user_message(
             if i["body"]:
                 lines.append(i["body"][:600])
             lines.append("")
-    lines.append("# Session's last turns (most recent first)")
+
+    # Source-level markers
+    lines.append("# Source markers (TODO/FIXME in recently-touched files)")
+    if source_markers:
+        for m in source_markers:
+            lines.append(m)
+    else:
+        lines.append("(none found)")
+    lines.append("")
+
+    lines.append("# Session's last turns (what the worker just did — 'the screen')")
     if not recent_turns:
         lines.append("(no events in window)")
     else:
@@ -445,12 +534,13 @@ def build_user_message(
             ts = t.get("ts", "")
             lines.append(f"[{ts}] {role}: {text}")
     lines.append("")
+
     lines.append("# PRINCIPLES.md (the project's operating manual)")
     lines.append("")
     lines.append(principles_text)
     lines.append("")
     lines.append("# Task")
-    lines.append("Call `record_dispatch` exactly once. Pick PATH 1 (continue_branch) or PATH 2 (transition_to_issue), with confidence calibrated per the rubric in the system prompt. The next_task_proposal you write IS the prompt that gets typed into Claude Code — write it in the autonomous opener's voice.")
+    lines.append("Call `record_dispatch` exactly once. Choose the single most useful next move that advances the project direction, grounded in the real state of the work. The next_task_proposal you write IS the prompt that gets typed into Claude Code — write it like a senior collaborator giving specific, actionable direction.")
     return "\n".join(lines)
 
 
@@ -980,14 +1070,23 @@ def main() -> None:
         log(f"prompt_load_error error={e}")
         silent_exit("no_system_prompt")
 
+    # Read PRODUCT-DIRECTION.md (the north star).
+    product_direction = fetch_product_direction(cwd)
+
+    # Read Known Gaps from trial-notes.md.
+    known_gaps = fetch_known_gaps(cwd)
+
     # Fetch dispatch context.
     issues = fetch_issues(cwd, cfg["issue_fetch_timeout_s"])
     commits = fetch_commits(cwd, branch, cfg["git_log_timeout_s"])
     diff_stat = fetch_diff_stat(cwd, branch, cfg["git_log_timeout_s"])
+    source_markers = fetch_source_markers(cwd, cfg["git_log_timeout_s"])
     prior_count = state.get("total_dispatches", 0)
 
     log(f"DISPATCH_PREPARE session={session_id} worker_idle_signal=no_tool_use "
-        f"prior={prior_count} issues={len(issues)} commits={len(commits)}")
+        f"prior={prior_count} issues={len(issues)} commits={len(commits)} "
+        f"gaps={len(known_gaps)} markers={len(source_markers)} "
+        f"direction={'yes' if product_direction else 'no'}")
 
     # Read API key.
     key = read_keychain(cfg["keychain_service"], cfg["keychain_account"])
@@ -1005,6 +1104,9 @@ def main() -> None:
         recent_files_changed=diff_stat,
         prior_count=prior_count,
         principles_text=principles_text,
+        product_direction=product_direction,
+        known_gaps=known_gaps,
+        source_markers=source_markers,
     )
     log(f"DISPATCH_CALL user_message_bytes={len(user_message.encode('utf-8'))}")
 
