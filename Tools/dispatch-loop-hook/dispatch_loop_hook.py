@@ -1003,8 +1003,8 @@ def call_self_extender(
     system_prompt: str,
     user_message: str,
 ) -> dict[str, Any] | None:
-    """Call DeepSeek with the SelfExtender prompt. Same mechanics as
-    call_dispatcher but uses the record_self_extend tool."""
+    """Call DeepSeek with the SelfExtender prompt. Same retry mechanics
+    as call_dispatcher (3 attempts with exponential backoff)."""
     body = {
         "model": cfg["deepseek_model"],
         "max_tokens": 8192,
@@ -1016,22 +1016,45 @@ def call_self_extender(
         "tool_choice": {"type": "function", "function": {"name": "record_self_extend"}},
     }
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        cfg["deepseek_url"],
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=cfg["deepseek_timeout_s"]) as resp:
-            raw = resp.read().decode("utf-8")
-    except Exception as e:
-        log(f"self_extender_call_error error={e}")
-        return None
-    return _parse_self_extender_response(raw)
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        req = urllib.request.Request(
+            cfg["deepseek_url"],
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=cfg["deepseek_timeout_s"]) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            log(f"self_extender_http_error code={e.code} attempt={attempt+1}/{max_attempts}")
+            if attempt < max_attempts - 1:
+                time.sleep(1.0 * (2 ** attempt))
+                continue
+            return None
+        except Exception as e:
+            log(f"self_extender_call_error error={e} attempt={attempt+1}/{max_attempts}")
+            if attempt < max_attempts - 1:
+                time.sleep(1.0 * (2 ** attempt))
+                continue
+            return None
+
+        result = _parse_self_extender_response(raw)
+        if result is not None:
+            if attempt > 0:
+                log(f"self_extender_retry_success attempt={attempt+1}")
+            return result
+
+        if attempt < max_attempts - 1:
+            log(f"self_extender_retry attempt={attempt+1}/{max_attempts} reason=parse_failed")
+            time.sleep(1.0 * (2 ** attempt))
+
+    return None
 
 
 def _parse_self_extender_response(raw: str) -> dict[str, Any] | None:
