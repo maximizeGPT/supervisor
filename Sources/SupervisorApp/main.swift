@@ -78,6 +78,11 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         trace.emit("app", "applicationDidFinishLaunching pid=\(ProcessInfo.processInfo.processIdentifier)")
 
+        // v0.8.1: single-instance guard. Kill any prior Supervisor
+        // instance so we don't get duplicate hover windows after a
+        // self-rebuild/relaunch.
+        terminatePriorInstances()
+
         // v0.2.0: "has key" now means a key exists for whatever provider
         // the user marked as active. Falls back to .anthropic for fresh
         // installs so the v0.1.x logic still holds.
@@ -433,6 +438,27 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         return nil
+    }
+
+    // MARK: - Single-instance guard
+
+    /// Kill any prior Supervisor.app instances so we don't get duplicate
+    /// hover windows after a self-rebuild/relaunch. Identifies siblings by
+    /// bundle identifier, terminates any with a different PID than ours.
+    private func terminatePriorInstances() {
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        let myBundle = Bundle.main.bundleIdentifier ?? "live.supervisor.app"
+        let siblings = NSRunningApplication.runningApplications(
+            withBundleIdentifier: myBundle
+        ).filter { $0.processIdentifier != myPID }
+
+        for app in siblings {
+            trace.emit("app", "terminating prior instance pid=\(app.processIdentifier)")
+            app.terminate()
+        }
+        if !siblings.isEmpty {
+            trace.emit("app", "terminated \(siblings.count) prior instance(s)")
+        }
     }
 
     // MARK: - Permission monitor

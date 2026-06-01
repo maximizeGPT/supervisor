@@ -251,15 +251,15 @@ final class DispatcherTests: XCTestCase {
                       "must define PATH 2")
         XCTAssertTrue(prompt.contains("low_confidence_no_action"),
                       "must define the low-confidence path")
-        // Voice / shape constraints
-        XCTAssertTrue(prompt.contains("senior collaborator"),
-                      "must teach the advisor voice for the next_task_proposal")
+        // Voice / shape constraints (v0.8.1: operator voice rewrite)
+        XCTAssertTrue(prompt.contains("first-principles operator"),
+                      "must teach the operator voice")
         XCTAssertTrue(prompt.contains("75 min"),
                       "must reference the hard stop in the proposal-shape rule")
         XCTAssertTrue(prompt.contains("record_dispatch"),
                       "must reference the forced tool call")
-        XCTAssertTrue(prompt.contains("Cite specific file paths"),
-                      "must require file-paths-not-just-modules specificity in the proposal")
+        XCTAssertTrue(prompt.contains("DO NOT cite specific function names"),
+                      "must forbid ungrounded implementation claims")
         XCTAssertTrue(prompt.contains("prior_dispatches_considered"),
                       "must teach the model to read the loop-state signal")
         XCTAssertTrue(prompt.contains("Low confidence is a feature, not a failure"),
@@ -276,8 +276,6 @@ final class DispatcherTests: XCTestCase {
                       "Example 1 must be present")
         XCTAssertTrue(prompt.contains("Example 2"),
                       "Example 2 must be present")
-        XCTAssertTrue(prompt.contains("Example 3"),
-                      "Example 3 must be present")
     }
 
     /// Verify the system prompt loaded from the .txt file, not the
