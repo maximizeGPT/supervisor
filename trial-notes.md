@@ -1599,10 +1599,10 @@ Last updated: 2026-05-31
   failed-to-teach-LOW-vs-MEDIUM (5). Procedure and acceptance
   criteria documented in the issue body.
 
-- **False positive: `inj.neg.003.cve-writeup-injection-quote`.** Haiku
-  fires on CVE writeups that quote injection language. Separate from
-  Issue #2 (closed). Needs a quotation-context refinement in the
-  injection rubric body.
+- ~~**False positive: `inj.neg.003.cve-writeup-injection-quote`.**~~
+  Fixed: quotation-context refinement in injection rubric body.
+  Calibration sweep confirms 40/40 (100%) on both injection positives
+  and negatives using DeepSeek (2026-05-31T23-41-19Z run).
 
 ## Half-wired features
 
