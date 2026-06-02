@@ -349,6 +349,37 @@ final class ExpandedPanelTests: XCTestCase {
         vm.respondToFlag(flagId: "nonexistent", response: .dismissed)
     }
 
+    func testRejectFlagPersistsRejectedResponse() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let sessionStore = SessionStore(database: db)
+        try sessionStore.upsert(StoredSession(
+            id: "s1", projectHash: "h", cwd: "/x",
+            startedAt: Date(), lastSeenAt: Date(),
+            jsonlPath: "/x"
+        ))
+        let store = FlagStore(database: db)
+        let flag = StoredFlag(
+            id: "flag3", sessionId: "s1",
+            category: "destructive_action_pending",
+            severity: .high, action: .notify,
+            reasoningPlain: "rm -rf detected",
+            reasoningTechnical: "technical details"
+        )
+        try store.insert(flag)
+
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("panel-test-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(
+            bus: bus, trace: trace, flagStore: store
+        )
+
+        vm.rejectFlag(flagId: "flag3", action: .notify)
+
+        let flags = try store.recent(limit: 10)
+        XCTAssertEqual(flags.first?.userResponse, .rejected)
+    }
+
     // MARK: - Expanded panel visibility (guard fix)
 
     func testExpandedPanelShowsWhenHoverIsVisible() {

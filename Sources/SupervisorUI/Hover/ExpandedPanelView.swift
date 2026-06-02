@@ -221,12 +221,12 @@ public struct ExpandedPanelView: View {
             // Action buttons — only show if user hasn't responded yet.
             if flag.userResponse == nil {
                 HStack(spacing: 8) {
-                    Button("Approve") {
-                        vm.respondToFlag(flagId: flag.id, response: .approved)
+                    Button(rejectLabel(flag)) {
+                        vm.rejectFlag(flagId: flag.id, action: flag.action)
                     }
-                    .font(.system(size: 9))
+                    .font(.system(size: 9, weight: .medium))
                     .buttonStyle(.borderless)
-                    .foregroundStyle(BrandColor.signal.color)
+                    .foregroundStyle(.red)
 
                     Button("Dismiss") {
                         vm.respondToFlag(flagId: flag.id, response: .dismissed)
@@ -253,11 +253,26 @@ public struct ExpandedPanelView: View {
         .background(severityBackground(flag.severity), in: RoundedRectangle(cornerRadius: 4))
     }
 
+    /// Context-dependent reject label. When Supervisor paused the session,
+    /// rejecting means "let Claude Code continue." Otherwise, rejecting
+    /// means "stop Supervisor from doing this."
+    private func rejectLabel(_ flag: StoredFlag) -> String {
+        switch flag.action {
+        case .pause:
+            return "Reject — let Claude Code continue"
+        case .kill:
+            return "Reject — session already ended"
+        default:
+            return "Reject — override Supervisor"
+        }
+    }
+
     private static func responseLabel(_ response: FlagUserResponse) -> String {
         switch response {
         case .approved: return "Approved"
         case .dismissed: return "Dismissed"
         case .falsePositive: return "Marked as false positive"
+        case .rejected: return "Rejected — overridden"
         }
     }
 
@@ -308,10 +323,6 @@ public struct ExpandedPanelView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
-
-            Text("Cost so far: \(Self.formatCost(vm.todayCostUSD()))")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.primary)
 
             if !vm.detailLabel.isEmpty {
                 Text("Now: \(vm.detailLabel)")

@@ -33,7 +33,7 @@ public enum FlagAction: String, Codable, Sendable, CaseIterable {
 }
 
 public enum FlagUserResponse: String, Codable, Sendable, CaseIterable {
-    case approved, dismissed, falsePositive = "false_positive"
+    case approved, dismissed, falsePositive = "false_positive", rejected
 }
 
 // MARK: - Session

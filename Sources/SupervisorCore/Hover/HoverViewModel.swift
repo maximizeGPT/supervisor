@@ -167,6 +167,28 @@ public final class HoverViewModel: ObservableObject {
         }
     }
 
+    /// Reject — the human override. Effect depends on current state:
+    ///   - If Supervisor PAUSED Claude Code: reject = let it continue (SIGCONT).
+    ///   - Otherwise: reject = record the override. Future dispatches/actions
+    ///     for this flag are suppressed.
+    /// Per PRINCIPLES: reject never overrides kill-level safety (a kill
+    /// already happened, the session ended — reject just records dissent).
+    public func rejectFlag(flagId: String, action: FlagAction) {
+        // Record the rejection first.
+        respondToFlag(flagId: flagId, response: .rejected)
+
+        // If the live state is paused and this is the flag that caused it,
+        // rejecting means "let Claude Code continue" — send SIGCONT.
+        if action == .pause && isPaused {
+            trace.emit("hover", "reject: releasing pause (SIGCONT) for flagId=\(flagId)")
+            resumePausedSession()
+        } else if action == .kill {
+            trace.emit("hover", "reject: kill already fired, recording dissent for flagId=\(flagId)")
+        } else {
+            trace.emit("hover", "reject: recorded override for flagId=\(flagId) action=\(action.rawValue)")
+        }
+    }
+
     // MARK: - Action recording
 
     /// Record a substantial action Supervisor just took. Triggers the
