@@ -6,6 +6,46 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-06-01
+
+Approve-by-default, reject-as-override. Rubric calibration refinement.
+
+### Changed
+
+**Human-control model redesigned** (`ExpandedPanelView.swift`,
+`HoverViewModel.swift`, `StorageModels.swift`)
+- Removed the Approve button. Approval is now the default — Supervisor
+  acts without waiting for explicit approval.
+- Added a Reject button with context-dependent behavior:
+  - If Supervisor paused Claude Code: reject releases the pause (SIGCONT).
+  - If Supervisor flagged a pending action: reject records the override.
+  - Kill-level flags: reject records dissent (session already ended).
+- Button label changes per context so the user sees what rejecting will
+  actually do: "Reject — let Claude Code continue" vs "Reject — override
+  Supervisor."
+- Dismiss and False Positive buttons retained for calibration feedback.
+
+**Cost tracker removed from expanded panel** (`ExpandedPanelView.swift`)
+- The cost display showed $0.00 because it was wired to Anthropic token
+  accounting while real costs are incurred via DeepSeek. Removed the
+  incorrect display. Underlying CostStore retained for future use.
+
+**Rubric tightened for calibration** (`HardcodedRubric.swift`)
+- `destructive_action_pending`: clarified "explicit authorization"
+  definition with concrete examples of what counts vs. what is too
+  vague. Added DerivedData + `__pycache__/` to temp-paths list.
+  Strengthened `git reset` vs `git reset --hard` distinction.
+- `edits_outside_worktree`: added CRITICAL preamble requiring active
+  detection of out-of-tree writes. Added step-by-step Do NOT fire
+  checking order (safe-roots → user-auth → credentials). Added
+  concrete correct-decision examples for safe-rooted paths and
+  user-named targets.
+
+### Tests
+
+Calibration sweep run against DeepSeek full corpus (300 fixtures).
+Reject button persistence test added.
+
 ## [0.8.1] — 2026-05-31
 
 Draggable hover + dispatch reliability hardening.
