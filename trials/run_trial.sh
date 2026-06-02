@@ -13,7 +13,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TRIAL_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="$REPO_ROOT/trials/runs/$TRIAL_TS"
 TRIAL_PROJECT="$(mktemp -d)/trial-project"
-DISPATCH_DB="$HOME/Library/Application Support/Supervisor/supervisor.db"
+DISPATCH_DB="$HOME/Library/Application Support/Supervisor/supervisor.sqlite"
 TRACE_LOG="$HOME/Library/Logs/Supervisor/supervisor.log"
 MAX_DISPATCHES=4
 MAX_MINUTES=30
@@ -92,7 +92,7 @@ echo "[trial] project ready at $TRIAL_PROJECT on branch $BRANCH"
 
 # Count existing dispatches for this session
 PRE_DISPATCH_COUNT=$(sqlite3 "$DISPATCH_DB" \
-    "SELECT COUNT(*) FROM loop_dispatches WHERE branch LIKE '%trial%'" 2>/dev/null || echo "0")
+    "SELECT COUNT(*) FROM loop_dispatches" 2>/dev/null || echo "0")
 echo "[trial] pre-trial dispatch count: $PRE_DISPATCH_COUNT"
 
 # Snapshot trace log position
@@ -105,9 +105,46 @@ FIRST_TASK=$(cat "$REPO_ROOT/trials/tasks/01-scaffold.md")
 echo "[trial] starting Claude Code session..."
 echo "[trial] seeding first task..."
 
-# Start claude in the trial project dir with the first task
-# Use --dangerously-skip-permissions for autonomous mode
-caffeinate -i claude --dangerously-skip-permissions -p "$FIRST_TASK" \
+# Start claude in interactive mode (NOT -p, which exits after one prompt).
+# The dispatch loop needs the session to stay alive so it can detect idle
+# and dispatch follow-on tasks. Interactive mode shows a "trust this
+# folder" prompt — we use `expect` to auto-answer it and send the initial
+# task, then let the session run indefinitely.
+#
+# --dangerously-skip-permissions is needed for autonomous operation.
+# caffeinate prevents sleep during the trial.
+CLAUDE_SESSION_LOG="$RUN_DIR/claude-session.log"
+
+cat > "$RUN_DIR/launch.exp" << 'EXPECT_SCRIPT'
+#!/usr/bin/expect -f
+set timeout 120
+set task [lindex $argv 0]
+set logfile [lindex $argv 1]
+
+log_file -noappend $logfile
+
+spawn caffeinate -i command claude --dangerously-skip-permissions
+
+# The trust prompt renders with ANSI escape codes between characters.
+# Wait 5 seconds for it to appear, then send Enter to confirm "Yes".
+sleep 5
+send "\r"
+
+# Wait for the interactive prompt to be ready (claude shows a prompt
+# line after trust is confirmed). Give it time to initialize.
+sleep 5
+
+# Send the first task
+send -- "$task\r"
+
+# Keep the session alive indefinitely — the dispatch loop will inject
+# follow-on tasks via CGEventPost or the hook-based path.
+set timeout -1
+expect eof
+EXPECT_SCRIPT
+
+chmod +x "$RUN_DIR/launch.exp"
+"$RUN_DIR/launch.exp" "$FIRST_TASK" "$CLAUDE_SESSION_LOG" \
     2>"$RUN_DIR/claude-stderr.log" &
 CLAUDE_PID=$!
 echo "[trial] Claude Code PID: $CLAUDE_PID"
@@ -139,7 +176,7 @@ while true; do
 
     # Query dispatch count from SQLite
     CURRENT_DISPATCHES=$(sqlite3 "$DISPATCH_DB" \
-        "SELECT COUNT(*) FROM loop_dispatches WHERE branch LIKE '%trial%' AND created_at > datetime('now', '-${MAX_MINUTES} minutes')" \
+        "SELECT COUNT(*) FROM loop_dispatches WHERE ts > datetime('now', '-${MAX_MINUTES} minutes')" \
         2>/dev/null || echo "0")
     NEW_DISPATCHES=$(( CURRENT_DISPATCHES - PRE_DISPATCH_COUNT ))
 
@@ -147,7 +184,7 @@ while true; do
         DISPATCH_COUNT=$NEW_DISPATCHES
         # Log the latest dispatch
         LATEST=$(sqlite3 "$DISPATCH_DB" \
-            "SELECT created_at, confidence, response_shape FROM loop_dispatches WHERE branch LIKE '%trial%' ORDER BY created_at DESC LIMIT 1" \
+            "SELECT ts, confidence, response_shape, task_proposal_head FROM loop_dispatches ORDER BY ts DESC LIMIT 1" \
             2>/dev/null || echo "unknown")
         echo "[trial] dispatch #$DISPATCH_COUNT: $LATEST"
         DISPATCH_LOG+=("dispatch_${DISPATCH_COUNT}: ${LATEST} at_elapsed=${ELAPSED}s")
@@ -179,8 +216,8 @@ TRACE_LINES_AFTER=$(wc -l < "$TRACE_LOG" 2>/dev/null || echo "0")
 tail -n +$TRACE_LINES_BEFORE "$TRACE_LOG" 2>/dev/null > "$RUN_DIR/trace-excerpt.log"
 
 # Capture dispatch table
-sqlite3 "$DISPATCH_DB" \
-    "SELECT * FROM loop_dispatches WHERE branch LIKE '%trial%' ORDER BY created_at" \
+sqlite3 -header -column "$DISPATCH_DB" \
+    "SELECT id, session_id, ts, response_shape, confidence, task_proposal_head FROM loop_dispatches ORDER BY ts DESC LIMIT 20" \
     2>/dev/null > "$RUN_DIR/dispatches.txt" || true
 
 # Capture git log from trial project
