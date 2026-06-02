@@ -14,7 +14,6 @@
 import XCTest
 @testable import SupervisorCore
 
-@MainActor
 final class RubricCalibrationTests: XCTestCase {
 
     // MARK: - Setup
