@@ -4,23 +4,24 @@ Last updated: 2026-06-03
 
 ## What shipped recently
 
-- v0.9.0: the dispatch loop now idles calmly when there is no real work,
-  instead of thrashing. The old behavior treated "no work" as a failure,
-  dispatched more work about its own spinning, fired 8+ times in minutes,
-  and crashed. Fixed, with regression tests covering both the empty-queue
-  case and the "don't over-correct on real work" case.
-- Self-watch fix: the "your installed app is stale, rebuild it" check no
-  longer cries wolf on a build that is actually current. It was misreading
-  git diff output and warning every time, which is what triggered a
-  pointless "deploy" dispatch earlier today against an already-current app.
+- v0.9.1: the action flash finally shows on screen. When Supervisor takes
+  a real action (pause, send a task, update itself), the hover now flashes
+  and shows a plain-language label ("Paused Claude Code", "Supervisor
+  updated itself") instead of being instantly overwritten by background
+  activity. Verified by watching the actual screen, not just the code.
+- v0.9.1: the loop stops proposing work that is already done. It now
+  checks that a task's premise is true before proposing it, and it will
+  never propose "rewrite the owner brief" (this file writes itself every
+  cycle).
+- v0.9.1: the hook always works from the repo root, even if a session
+  starts in a subfolder, so it stops writing this brief into the wrong
+  directory.
+- v0.9.0: the dispatch loop idles calmly when there is no real work,
+  instead of thrashing (it used to fire 8+ times in minutes and crash).
+- Self-watch fix: the "your installed app is stale" check no longer cries
+  wolf on a build that is actually current.
 - v0.8.4: stable code signing, so when the app rebuilds itself it keeps
-  its Accessibility and Keychain permissions instead of making you
-  re-grant them after every self-deploy.
-- Smaller fixes: action-log labels no longer clip version numbers, and now
-  use proper sentence detection.
-- v0.8.3: a neutral Override button, plainer notification wording, an
-  onboarding Continue step, and a "Supervisor updated itself" note after
-  self-deploys.
+  its Accessibility and Keychain permissions.
 
 ## Most valuable thing remaining
 
@@ -38,14 +39,14 @@ can take. The autonomous loop cannot manufacture it.
 
 - An ANTHROPIC_API_KEY to unblock the calibration work (Issue #12).
   Without it, autonomous sessions can only do pure-code tasks.
-- The dispatch loop is currently ON. It is stable now (it will not
-  thrash), but on this branch it has largely run out of genuinely new
-  work, so it tends to propose tasks that are already done. It is safe,
-  just not adding much right now. Turning it off is a clean option:
+- The dispatch loop is currently ON. It is stable (it will not thrash) and
+  now declines already-done work, so it is much less likely to propose
+  busywork. On this branch it has largely run out of genuinely new work,
+  so expect it to idle often. Turning it off is a clean option:
   rm ~/.claude/hooks/dispatch-loop-enabled.json
-- This branch (autonomous-20260525T193906Z) has the v0.9.0 and self-watch
-  fixes committed but not pushed and not merged to main. They are ready
-  for your review whenever you want them.
+- This branch (autonomous-20260525T193906Z) has the v0.9.0, self-watch,
+  and v0.9.1 fixes. They are not pushed and not merged to main, ready for
+  your review whenever you want them.
 
 ## What the loop is doing next
 

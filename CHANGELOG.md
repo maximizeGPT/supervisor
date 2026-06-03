@@ -6,6 +6,69 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-06-03
+
+Three reliability fixes: the action flash is finally visible on screen,
+the dispatcher stops proposing already-done work, and the hook always
+resolves the repo root.
+
+### Fixed
+
+**The action flash is now actually visible** (`HoverViewModel.swift`,
+`HoverView` via `HoverWindowController.swift`)
+- The flash and label existed and were correctly bound to the rendered
+  hover, but three routine label-setters overwrote the flash label within
+  milliseconds on any active session: `triageStarted`,
+  `triageFinishedNoFlag`, and `handle(event:)`'s `bashToolCall` ("Running
+  a command"). That is why it "kept getting shipped but was never seen."
+  These now hold the label while an action flash is active.
+- `recordAction` now surfaces the plain-language label ("Paused Claude
+  Code", "Sent Claude Code its next task") during the flash, not just a
+  border glow. It previously set neither label.
+- `HoverWindowController` force-shows the hover for the flash duration,
+  overriding the frontmost-terminal/session visibility gate, so a
+  substantial action is seen even when the user is not looking at a
+  terminal. This is also why the self-rebuild announcement was invisible:
+  right after a relaunch the frontmost app is rarely a terminal, so the
+  window was hidden.
+- The freshly relaunched app replays "Supervisor updated itself" on
+  startup when a self-rebuild marker is present, now with a longer hold so
+  it is readable. Verified on screen.
+
+**Dispatcher verifies the premise before proposing**
+(`dispatch_loop_hook.py`, `dispatcher-system-prompt.txt`)
+- The dispatcher kept confidently proposing already-done work (e.g.
+  "connect PRODUCT-DIRECTION.md" when it was already wired) and
+  self-referential busywork ("rewrite the owner brief", whose own next
+  step was rewriting itself). v0.9.0's breaker only caught exact repeats
+  and empty queues, not distinct already-done tasks.
+- The shared dispatcher prompt now requires verifying a proposal's premise
+  against the current tree before proposing; already-done work is not
+  actionable and returns low_confidence_no_action.
+- A code-level backstop filters owner-brief-rewrite proposals to a calm
+  idle (the brief is auto-written every dispatch, so rewriting it is never
+  a task). The filter does not catch legitimate engineering on the brief
+  generator code.
+
+**Hook pins the repo root regardless of the session's subdirectory**
+- A session started in a subdir (e.g. `Tools/dispatch-loop-hook`) made the
+  hook grep `Sources/` in the wrong place and write OWNER-BRIEF.md into the
+  subdir. `resolve_repo_root` now resolves the true root via
+  `git rev-parse --show-toplevel` (with a configured-path fallback) and all
+  canonical reads/writes use it.
+
+### Notes
+
+- The shared `dispatcher-system-prompt.txt` is read by both the Python hook
+  and the Swift Dispatcher, so the premise-verification rule applies to
+  both runtimes. The action-flash fix is Swift-only (the hover is Swift);
+  the repo-root fix is Python-hook-only.
+- New tests: Swift `ActionFlashTests` (action event drives actionFlash +
+  label, not just a logged row); Python `TestResolveRepoRoot` and the
+  owner-brief filter cases. Full suites green (Swift 322, Python 67).
+- An env-gated `SUPERVISOR_DEBUG_FLASH` affordance fires a sample flash for
+  on-screen verification; inert unless the env var is set.
+
 ## [0.9.0] — 2026-06-02
 
 The dispatch loop now idles gracefully on an empty queue instead of

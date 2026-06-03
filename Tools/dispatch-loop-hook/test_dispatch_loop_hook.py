@@ -822,6 +822,49 @@ class TestIneffectiveChangeFreshnessCheck(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestResolveRepoRoot(unittest.TestCase):
+    """#3: the hook must resolve the repo ROOT no matter which subdirectory
+    the session started in, so it reads Sources/ + gaps and writes
+    OWNER-BRIEF.md at the root, not in a subdir."""
+
+    def test_resolves_root_from_subdirectory(self):
+        import tempfile, subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            subprocess.run(["git", "init", "-q", root], check=True)
+            subdir = os.path.join(root, "Tools", "dispatch-loop-hook")
+            os.makedirs(subdir, exist_ok=True)
+            # Session started in the subdir; configured root is the repo root.
+            resolved = hook.resolve_repo_root(subdir, root)
+            self.assertEqual(os.path.realpath(resolved), root,
+                "a session started in a subdir must resolve to the repo root")
+
+    def test_root_passthrough_when_already_root(self):
+        import tempfile, subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            subprocess.run(["git", "init", "-q", root], check=True)
+            self.assertEqual(os.path.realpath(hook.resolve_repo_root(root, root)), root)
+
+    def test_fallback_to_configured_root_when_not_git(self):
+        # Non-git subdir under the configured root: fall back to the
+        # configured root rather than the subdir.
+        configured = "/Users/main/supervisor"
+        subdir = "/Users/main/supervisor/Tools/dispatch-loop-hook"
+        # If the real repo exists, git resolves to it; either way the result
+        # must be the repo root, never the subdir.
+        resolved = hook.resolve_repo_root(subdir, configured)
+        self.assertEqual(resolved, configured,
+            f"must pin to the repo root, not the subdir; got {resolved}")
+
+    def test_does_not_escape_configured_repo(self):
+        # A cwd outside the configured repo is returned as-is (the
+        # cwd_not_supervisor gate handles rejecting it upstream).
+        outside = "/tmp"
+        self.assertEqual(hook.resolve_repo_root(outside, "/Users/main/supervisor"),
+                         "/tmp")
+
+
 class TestThrashFixV090(unittest.TestCase):
     """v0.9.0: the dispatch loop must idle gracefully on an empty queue
     instead of thrashing. Covers the five fixes:
@@ -1029,6 +1072,34 @@ class TestThrashFixV090(unittest.TestCase):
                         "blocked branch must reach a clean silent_exit, not crash")
         self.assertTrue(any("blocked_proposal_filtered" in r for r in rec["exit"]))
 
+    def test_owner_brief_rewrite_is_filtered_to_idle(self):
+        """#2: a proposal to rewrite/regenerate the owner brief is a
+        self-referential no-op (the loop auto-writes it every dispatch). It
+        must be filtered to a calm idle, never dispatched."""
+        rec = self._run_main(call_side_effect=self._high(
+            "Regenerate OWNER-BRIEF.md from actual branch state",
+            justification="The owner brief is stale and needs a truthful replacement.",
+        ))
+        self.assertEqual(rec["block"], [],
+                         "owner-brief rewrite must never be dispatched")
+        self.assertEqual(rec["extend"], [],
+                         "owner-brief rewrite is a filter+stop, not a SelfExtender failure")
+        self.assertTrue(
+            any("blocked_proposal_filtered" in r and "owner_brief_rewrite" in r
+                for r in rec["exit"]),
+            f"must stop with the owner_brief_rewrite filter reason; got {rec['exit']}")
+
+    def test_real_brief_generator_codework_still_dispatches(self):
+        """The filter must NOT catch legitimate engineering on the brief
+        GENERATOR (write_owner_brief code), only rewriting the brief content."""
+        rec = self._run_main(call_side_effect=self._high(
+            "Fix a bug in the write_owner_brief function that drops the warnings section",
+            justification="write_owner_brief has a formatting bug; add a regression test.",
+        ))
+        self.assertEqual(len(rec["block"]), 1,
+                         "real code-work on the brief generator must still dispatch")
+        self.assertNotIn("owner_brief_rewrite", " ".join(rec["exit"]))
+
 
 class TestThrashHelpers(unittest.TestCase):
     """Unit coverage for the v0.9.0 helper predicates, independent of
@@ -1055,6 +1126,28 @@ class TestThrashHelpers(unittest.TestCase):
         ]:
             self.assertFalse(hook._is_thrash_meta_proposal(txt),
                              f"real product work must not be flagged: {txt!r}")
+
+    def test_owner_brief_rewrite_detected(self):
+        for txt in [
+            "Regenerate OWNER-BRIEF.md from actual branch state",
+            "Rewrite the owner brief with a truthful snapshot",
+            "Refresh the owner-brief so it is accurate",
+            "Replace the owner brief content; it is stale",
+        ]:
+            self.assertTrue(hook._is_owner_brief_proposal(txt),
+                            f"should flag owner-brief rewrite: {txt!r}")
+
+    def test_owner_brief_codework_not_flagged(self):
+        # Real engineering on the generator (and unrelated work) must pass.
+        for txt in [
+            "Fix a bug in the write_owner_brief function",
+            "Add a unit test for the owner brief format",
+            "Refactor the helper that builds OWNER-BRIEF sections",
+            "Wire the Approve button to the router",
+            "Close the calibration gap on destructive recall",
+        ]:
+            self.assertFalse(hook._is_owner_brief_proposal(txt),
+                             f"must not flag (not a content rewrite): {txt!r}")
 
     def test_repeat_proposal_trips_on_same_and_near_same(self):
         state = {}

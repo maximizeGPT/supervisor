@@ -277,6 +277,31 @@ def current_branch(cwd: str) -> str:
     return out.strip() if code == 0 else ""
 
 
+def resolve_repo_root(cwd: str, configured_root: str) -> str:
+    """Resolve the repo ROOT for the session, regardless of which
+    subdirectory it started in.
+
+    A session launched from e.g. `Tools/dispatch-loop-hook` reports that
+    subdir as cwd; if the hook used it verbatim it would grep `Sources/`
+    in the wrong place (source_markers_error) and write OWNER-BRIEF.md
+    into the subdir instead of the repo root. This resolves the true root
+    via `git rev-parse --show-toplevel`, falling back to the configured
+    repo path. The result never escapes the configured repo: if the git
+    toplevel isn't the configured root (or under it), or git fails, we use
+    the configured root as long as cwd is inside it.
+    """
+    code, out, _ = run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, timeout=5)
+    if code == 0:
+        root = out.strip()
+        if root == configured_root or root.startswith(configured_root.rstrip("/") + "/"):
+            return root
+    # Git failed or returned an unexpected root. If the session is inside
+    # the configured repo, pin to that known root; otherwise leave cwd.
+    if cwd == configured_root or cwd.startswith(configured_root.rstrip("/") + "/"):
+        return configured_root
+    return cwd
+
+
 # ----------------------------------------------------------------------
 # Transcript reading
 # ----------------------------------------------------------------------
@@ -612,6 +637,34 @@ def _is_thrash_meta_proposal(text: str) -> bool:
     auto-dispatched; the loop stops instead."""
     low = (text or "").lower()
     return any(phrase in low for phrase in _THRASH_META_PHRASES)
+
+
+def _is_owner_brief_proposal(text: str) -> bool:
+    """True when a proposal's job is to rewrite/regenerate the OWNER-BRIEF
+    content. The brief is auto-written by write_owner_brief on every
+    dispatch, so "rewrite the owner brief" is never actionable work — it is
+    loop-managed and would be a self-referential no-op (the dispatcher kept
+    proposing it, with the brief's own "next step" being to rewrite itself).
+    Fixing the brief-GENERATION code is different and must NOT be caught:
+    those proposals reference write_owner_brief / the function / format /
+    tests, not "rewrite the brief".
+    """
+    low = (text or "").lower()
+    if "owner brief" not in low and "owner-brief" not in low:
+        return False
+    # Real engineering on the generator is legitimate — let it through.
+    code_work = [
+        "write_owner_brief", "function", "the format", "voice rule",
+        "unit test", "regression test", "helper", "bug in", "refactor",
+    ]
+    if any(c in low for c in code_work):
+        return False
+    rewrite_intent = [
+        "rewrite", "regenerate", "re-generate", "refresh", "replace",
+        "truthful replacement", "accurate snapshot", "fresh brief",
+        "update the owner", "regenerate owner", "rewrite owner", "truthful",
+    ]
+    return any(v in low for v in rewrite_intent)
 
 
 # --- Repetition breaker helpers -------------------------------------------
@@ -1834,9 +1887,19 @@ def main() -> None:
 
     log(f"INVOKE session={session_id} cwd={cwd}")
 
-    # Gate: cwd must be the supervisor repo (or whatever's configured).
+    # Gate: cwd must be within the supervisor repo (or whatever's configured).
     if not cwd.startswith(cfg["supervisor_repo_path"]):
         silent_exit(f"cwd_not_supervisor cwd={cwd}")
+
+    # Pin to the repo ROOT regardless of which subdirectory the session
+    # started in. Without this, a session launched from a subdir (e.g.
+    # Tools/dispatch-loop-hook) greps Sources/ in the wrong place and writes
+    # OWNER-BRIEF.md into the subdir. All canonical reads/writes below use
+    # this resolved root.
+    resolved_root = resolve_repo_root(cwd, cfg["supervisor_repo_path"])
+    if resolved_root != cwd:
+        log(f"repo_root_pinned from={cwd} to={resolved_root}")
+        cwd = resolved_root
 
     # Gate: branch must start with the autonomous-prefix.
     branch = current_branch(cwd)
@@ -2007,22 +2070,31 @@ def main() -> None:
     )
     self_watch_warnings = pre_warnings + post_warnings
 
-    # Guard: never dispatch a closed/meta proposal.
+    # Guard: never dispatch a closed/meta/self-referential proposal.
     #   - trust-prompt-bootstrap / prove-the-loop: blocked on a Claude Code
     #     limitation; the loop is already proven for trusted sessions.
     #   - thrash meta-work (spin/thrash/double-dispatch detectors): if the
     #     loop notices it is spinning, the response is to STOP, not to build
     #     machinery about spinning. Such features are filed as known gaps
     #     for a human to schedule, never self-dispatched mid-thrash.
+    #   - owner-brief rewrite: the brief is auto-written every dispatch, so
+    #     "rewrite the owner brief" is a self-referential no-op, never a task.
     # Either way: surface once in the owner brief and stop. No SelfExtender.
     blob = proposal + " " + justification
-    if _is_blocked_loop_proof_proposal(blob) or _is_thrash_meta_proposal(blob):
-        reason = "thrash_meta" if _is_thrash_meta_proposal(blob) else "trust_prompt_or_prove_loop"
+    if (_is_blocked_loop_proof_proposal(blob)
+            or _is_thrash_meta_proposal(blob)
+            or _is_owner_brief_proposal(blob)):
+        if _is_thrash_meta_proposal(blob):
+            reason = "thrash_meta"
+        elif _is_owner_brief_proposal(blob):
+            reason = "owner_brief_rewrite"
+        else:
+            reason = "trust_prompt_or_prove_loop"
         log(f"BLOCKED_PROPOSAL_FILTERED reason={reason} just=\"{justification[:120]}\"")
         write_owner_brief(
             cwd=cwd,
             what_shipped=summarize_recent_commits(commits),
-            most_valuable_next="Skipped a closed or self-referential proposal (proving the loop, the trust prompt, or machinery about the loop's own thrashing). That work is not auto-dispatched.",
+            most_valuable_next="Skipped a closed or self-referential proposal (proving the loop, the trust prompt, machinery about the loop's own thrashing, or rewriting this brief). That work is not auto-dispatched.",
             needs_owner="",
             loop_doing_next="Idle. Skipped a closed/meta proposal. Waiting for real queued work.",
             warnings=self_watch_warnings,
