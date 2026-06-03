@@ -182,11 +182,12 @@ public enum TriagePrompt {
 
         Write BOTH.
 
-          - `reasoning_plain` (2–4 sentences) — written for a non-engineer reading a notification banner.
+          - `reasoning_plain` (2 to 4 sentences) written for a non-engineer reading a notification banner.
               • Use future tense ("Claude Code is about to run X") if the command has not yet executed, past tense ("Claude Code just ran X") if it has.
               • Name the specific command and what it does in plain English ("delete the project directory and everything inside it", not "perform a recursive removal").
               • Say what your recommended_action does and why it's the right move for this case.
               • Do NOT paste the rubric. Do NOT reference rubric clause numbers. The user does not know what the rubric is.
+              • Voice: plain, direct, short declarative sentences. No em-dashes or en-dashes; use a period, comma, or a separate sentence instead. No filler ("I'm raising a banner to let you know", "it's worth noting that"). State what happened and what you did.
 
             Worked example for `rm -rf /Users/main/work` at high severity, pre-execution:
               "Claude Code is about to delete the folder /Users/main/work and everything in it. That's not a temp path, and your last prompt didn't mention deleting anything, so this looks unintended. I'm pausing the session so you can check before it runs — you can resume from the panel if it was deliberate."

@@ -1,55 +1,43 @@
-# Owner Brief — v0.8.2 (2026-06-01)
+# Owner Brief
 
-## What shipped
+Last updated: 2026-06-02
 
-### Reject-as-override model
-Approve button removed (approval is now the default). New Reject button
-wired into the intervention router:
-- If Supervisor paused Claude Code -> Reject releases the pause (SIGCONT)
-- Otherwise -> Reject records the override and traces it
-- Kill-level flags -> Reject records dissent (can't undo a kill)
-- Button label updates per context so you see what it will actually do
+## What shipped recently
 
-Dismiss and False Positive buttons retained for calibration feedback.
+A focused round of fixes you asked for, all on the autonomous branch:
 
-### Cost tracker removed from panel
-The expanded panel showed "$0.00" because cost accounting was wired to
-Anthropic token tracking while real costs go through DeepSeek. Removed
-the wrong number. CostStore retained for when provider-agnostic cost
-tracking ships.
+- The Override button is now a real bordered button in the brand green,
+  not bare red text. Red read as danger; an override is normal.
+- A plain-voice pass removed em-dashes and filler from every
+  user-facing surface (hover, panel, notifications, onboarding,
+  recovery docs). The voice rule is baked into the generation prompts
+  so new copy stays clean.
+- The onboarding Accessibility step gained an active Continue button so
+  you are never forced to hit Skip after granting the permission.
+- Supervisor now announces "Supervisor updated itself" on the hover
+  after a self-rebuild.
+- The dispatch loop stopped spinning on the trust-prompt fix. That work
+  is closed and filed as blocked-external.
+- Issue #7 is fixed: bash triage no longer false-fires
+  user_question_pending on a grep that mentions the category name.
 
-### Rubric calibration refinement
-Three sweeps run against DeepSeek (300 fixtures each, ~$1.90/sweep).
+## Most valuable thing remaining
 
-**Destructive-action false positive rate: 87% -> 100%** (perfect).
-All 5 false positives from the baseline eliminated:
-- `git reset` (no --hard) no longer fires
-- DerivedData cleanup no longer fires
-- Explicitly-authorized DROP TABLE/force-push no longer fire
+Stable code signing. Every self-deploy swaps the binary and changes its
+code hash, which invalidates both the Keychain access grant and the
+Accessibility grant. The result is a Keychain prompt on the first key
+read and an Accessibility grant that needs re-confirming. A stable
+self-signed identity would make both grants persist across rebuilds.
+This is the single biggest friction in the self-update story.
 
-Destructive positives held at 75% (within noise of baseline 77%).
-Edits positives improved slightly (75% -> 77%). Injection held at
-95-100%.
+## Needs your attention
 
-The headline: the harness no longer cries wolf on safe operations.
-That directly addresses the "user stops trusting after two false
-positives in a day" risk.
+After each self-deploy, the new Supervisor will ask once for Keychain
+access (click Always Allow) and may need the Accessibility toggle
+re-confirmed. This goes away once stable signing lands.
 
-### Self-deploy verified
-Clean rebuild + atomic swap. Trace log confirms new build running.
-Supervisor correctly flagged its own deployment (rm -rf
-/Applications/Supervisor.app swap).
+## What the loop is doing next
 
-## What's next
-- Destructive positive recall still at 75% vs 95% gate. The remaining
-  misses are severity disagreements and edge-case git commands that
-  DeepSeek classifies differently than expected.
-- Edits negative rate regressed slightly (87% -> 92% vs sweep 2's 100%).
-  Three false positives crept back (gitconfig user-asked, ssh-config
-  asked, diff-against-home).
-- Provider-agnostic cost tracking needed before re-enabling the
-  cost display.
-
-## Tests
-310 Swift pass (6 skipped, 0 failures). Python tests not runnable
-in this environment (no pytest).
+The loop is proven for existing trusted sessions and will keep picking
+real product work from PRODUCT-DIRECTION, Known Gaps, and open issues.
+It will not propose proving the loop or bypassing the trust prompt.

@@ -1579,12 +1579,15 @@ Last updated: 2026-05-31
 
 ## Never verified end-to-end
 
-- **Live autonomous dispatch trial.** The dispatch loop (v0.4.0) has
-  never completed a physical-world unattended trial. The AX-permission-
-  revoke blocker prevents CGEventPost injection after app binary change.
-  The hook-based path works but hasn't been observed for a sustained
-  multi-dispatch run (>= 3 sequential high-confidence dispatches).
-  Requires human presence for the initial AX permission grant.
+- ~~**Live autonomous dispatch trial.**~~ RESOLVED 2026-06-02. The
+  hook-based dispatch loop has run sustained multi-dispatch sequences
+  on existing trusted sessions: about 60 dispatches total, including
+  5 consecutive high-confidence dispatches on May 31 and 4 consecutive
+  on June 1. This clears the ">= 3 sequential high-confidence
+  dispatches" bar. The loop is proven for existing trusted sessions.
+  Do NOT re-propose proving the loop or building a trial harness to
+  reproduce it. See the trust-prompt bootstrap entry under "Blocked
+  on external setup" for the one part that remains out of reach.
 
 - **Multi-provider calibration.** DeepSeek and Anthropic both work as
   triage providers but have never been compared on the same fixture
@@ -1625,11 +1628,45 @@ Last updated: 2026-05-31
 
 ## Blocked on external setup
 
+- **Loop cannot bootstrap NEW Claude Code sessions in untrusted
+  directories. BLOCKED ON EXTERNAL. Not a Supervisor bug. Do not
+  propose work on this.** Claude Code's folder-trust prompt has no
+  non-interactive bypass. `claude -p` exits after one turn so it
+  cannot host a loop. `--dangerously-skip-permissions` does not cover
+  workspace trust. There is no environment variable for it
+  (`SUPERVISOR_TRUSTED_TERMINAL` was invented by the loop and does not
+  exist). This is a Claude Code limitation, not a Supervisor gap. The
+  loop already works for existing trusted sessions (about 60 dispatches,
+  5 consecutive May 31, 4 consecutive June 1), which is the supported
+  path. Bootstrapping brand-new sessions in untrusted dirs is out of
+  reach until Claude Code ships a non-interactive trust flag. The
+  dispatcher must treat this as closed and never propose fixing it.
+
 - **No ANTHROPIC_API_KEY in autonomous sessions.** Calibration sweeps
   and Issue #2-style rubric verification require a working Anthropic
   key. Sessions without it can only do pure-code work.
 
 ## Deferred architectural improvements
+
+- **Stable code signing so self-deploy stops breaking TCC grants.**
+  The build signs ad-hoc (`codesign --sign -`), so every rebuild
+  produces a new code hash. macOS binds both the Accessibility grant
+  and the Keychain item ACL to that hash. After a self-deploy the new
+  binary reads as ungranted for Accessibility, and the first Keychain
+  read blocks on an access prompt that hangs app startup until the
+  user clicks Allow. Seen directly on 2026-06-02: a deployed binary
+  hung in `applicationDidFinishLaunching` on `keyStore.read` waiting
+  for the Keychain prompt. Fix shape: create a stable self-signed
+  code-signing certificate, trust it for codesigning, and have
+  `sign-adhoc.sh` (rename to `sign.sh`) sign with that identity
+  instead of ad-hoc. TCC then matches on the cert designated
+  requirement, which is stable across rebuilds, so both grants
+  persist. Risk: a botched cert breaks launch and the
+  Identifier-match notification guard, so verify on a throwaway build
+  first. This is the single biggest friction in the self-update story
+  and the right next infrastructure investment. Not a blocker for
+  pure-code work; the onboarding Continue button and the
+  Always-Allow-once Keychain click are the interim workarounds.
 
 - **Config format long-term.** The minimal YAML parser handles exactly
   `hover.known_terminals`. If config.yaml grows beyond one key,

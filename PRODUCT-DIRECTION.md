@@ -54,9 +54,15 @@ has to notice them.
 
 ## What "done" looks like for the next phase
 
-- The dispatch loop runs a multi-session autonomous trial (>= 3
+- ~~The dispatch loop runs a multi-session autonomous trial (>= 3
   sequential high-confidence dispatches) without user intervention
-  and without safety regression.
+  and without safety regression.~~ **DONE** (2026-06-02) on the
+  hook-based path: about 60 dispatches, 5 consecutive high-confidence
+  on May 31 and 4 consecutive on June 1, no safety regression. This
+  is proven for existing trusted sessions. Bootstrapping brand-new
+  sessions in untrusted directories is blocked on a Claude Code
+  limitation (no non-interactive folder-trust bypass) and is out of
+  scope. Do not re-propose proving the loop.
 - Calibration hits the 95/95 gate on all three rubric categories.
   (Issue #12 — blocked on ANTHROPIC_API_KEY.)
 - ~~The hover panel shows live session cost and flag history (v0.1.7

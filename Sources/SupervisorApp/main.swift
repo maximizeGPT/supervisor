@@ -199,6 +199,18 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         self.hoverWindow = hoverWindow
         hoverWindow.present()
 
+        // Self-rebuild announcement: if the deploy step left a marker, the
+        // app was just rebuilt and relaunched over a running instance.
+        // Announce it on the hover so the user sees Supervisor updated
+        // itself, then delete the marker so it only shows once.
+        let marker = paths.selfRebuildMarkerPath
+        if let version = try? String(contentsOf: marker, encoding: .utf8) {
+            let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
+            hoverVM.announceSelfRebuild(version: trimmed.isEmpty ? nil : trimmed)
+            try? FileManager.default.removeItem(at: marker)
+            trace.emit("app", "self-rebuild marker found; announced and cleared")
+        }
+
         // Watch config.yaml for live changes — FSEvents fires on write/rename.
         let watcher = ConfigWatcher(configPath: paths.configPath, trace: trace) { [weak hoverWindow] config in
             hoverWindow?.mergeUserConfig(additionalHostApps: config.additionalHostApps)

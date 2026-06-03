@@ -196,7 +196,7 @@ public final class Notifier: Notifying, @unchecked Sendable {
                 return plain + "\n\nThe session was stopped. Start a new Claude Code session to continue your work."
             }
         case .injectSucceeded:
-            return plain + "\n\nSupervisor answered the question directly — check your terminal to see the response."
+            return plain + "\n\nSupervisor answered the question directly. Check your terminal to see the response."
         case .injectDegraded(let intendedText, _):
             return plain + "\n\nSupervisor couldn't type the answer automatically. Paste this into Claude Code:\n\(intendedText)"
         case .continueFired(_, _, let promptHead):

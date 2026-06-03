@@ -525,6 +525,49 @@ def fetch_known_gaps(cwd: str) -> str:
     return "\n".join(result).strip()
 
 
+# Phrases that mark a proposal as the closed trust-prompt-bootstrap or
+# prove-the-loop work. Matched case-insensitively against the combined
+# proposal + justification text. Kept specific so real product work
+# (e.g. fixing the onboarding AX step, or a genuine trust-related
+# security feature) is not caught. The shared theme here is
+# "demonstrate the loop" or "bypass Claude Code's folder-trust prompt
+# to start new sessions", both of which are closed.
+_BLOCKED_PROPOSAL_PHRASES = [
+    "supervisor_trusted_terminal",
+    "trust prompt",
+    "trust-prompt",
+    "folder trust",
+    "folder-trust",
+    "workspace trust",
+    "untrusted dir",
+    "untrusted director",
+    "skip-permissions",
+    "prove the loop",
+    "prove the dispatch loop",
+    "proving the loop",
+    "trial harness",
+    "reproduce the historical",
+    "historical proof",
+    "demonstrate the loop",
+    "demonstrate the dispatch loop",
+    "bootstrap a new session",
+    "bootstrap new session",
+    "bootstrap new claude",
+    "verify the loop end-to-end",
+    "verify the loop end to end",
+]
+
+
+def _is_blocked_loop_proof_proposal(text: str) -> bool:
+    """True when a dispatch proposal is about proving the loop or bypassing
+    Claude Code's folder-trust prompt. Both are closed (see Known Gaps and
+    the dispatcher prompt). The loop is already proven for trusted
+    sessions; bootstrapping new untrusted sessions is blocked on a Claude
+    Code limitation, not a Supervisor gap."""
+    low = (text or "").lower()
+    return any(phrase in low for phrase in _BLOCKED_PROPOSAL_PHRASES)
+
+
 def _build_fallback_from_gaps(
     known_gaps: str,
     diff_stat: list[str],
@@ -1831,6 +1874,28 @@ def main() -> None:
     log(f"DISPATCH_RESULT confidence={confidence} path={selected_path} "
         f"prop_bytes={len(proposal)} requires_human={requires_human} "
         f"just=\"{justification[:120]}\"")
+
+    # Guard: never dispatch the trust-prompt-bootstrap / prove-the-loop
+    # proposal. It is blocked on a Claude Code limitation (no
+    # non-interactive folder-trust bypass) and the loop is already proven
+    # for trusted sessions. The dispatcher prompt tells the model not to
+    # propose it, but this is the belt-and-suspenders backstop in case it
+    # does anyway. Treat like the human gate: skip without counting as a
+    # low-confidence signal, surface it once in the owner brief, stop.
+    if _is_blocked_loop_proof_proposal(proposal + " " + justification):
+        log("BLOCKED_PROPOSAL_FILTERED reason=trust_prompt_or_prove_loop "
+            f"just=\"{justification[:120]}\"")
+        write_owner_brief(
+            cwd=cwd,
+            what_shipped=summarize_recent_commits(commits),
+            most_valuable_next="Loop is proven and the trust-prompt bootstrap is blocked on a Claude Code limitation. Filed as a known gap. Looking for other work.",
+            needs_owner="",
+            loop_doing_next="Skipped a proposal about proving the loop or the trust prompt. That work is closed.",
+            warnings=self_watch_warnings,
+        )
+        put_session_state(state_all, session_id, state)
+        save_state(state_all)
+        silent_exit("blocked_proposal_filtered reason=trust_prompt_or_prove_loop")
 
     # v0.7.0: run post-dispatch self-watch (suspicious stop — needs result).
     post_warnings = run_self_watch_post_dispatch(

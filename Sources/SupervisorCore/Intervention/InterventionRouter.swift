@@ -202,7 +202,7 @@ public final class InterventionRouter {
             _ = await notifier.postInterventionResult(
                 decision: decision,
                 outcome: .continueLowConfidence(
-                    reasoning: "Dispatcher returned high confidence with no proposal text — falling back to user pick."
+                    reasoning: "Dispatcher returned high confidence with no proposal text. Falling back to user pick."
                 )
             )
             return

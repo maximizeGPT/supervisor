@@ -295,7 +295,7 @@ public struct RecoveryDocWriter: Sendable {
                                      command: String,
                                      userPrompt: String?,
                                      recentToolCalls: ArraySlice<BashToolCallInfo>) {
-        let cwdDisplay = cwd ?? "(unknown — the session's cwd wasn't captured)"
+        let cwdDisplay = cwd ?? "(unknown, the session's cwd was not captured)"
         out.append("The Claude Code session is dead. To continue the work,")
         out.append("start a new `claude` invocation in `\(cwdDisplay)` and paste")
         out.append("this as your first message:")
@@ -344,9 +344,9 @@ public struct RecoveryDocWriter: Sendable {
     /// A future PR can LLM-summarize from the full JSONL.
     private func taskSummary(userPrompt: String?) -> String {
         guard let p = userPrompt, !p.isEmpty else {
-            return "(unknown — no recent user prompt was captured in the window)"
+            return "(unknown, no recent user prompt was captured in the window)"
         }
         let oneLine = p.replacingOccurrences(of: "\n", with: " ")
-        return "the user's most recent prompt was — \"\(String(oneLine.prefix(240)))\(oneLine.count > 240 ? "…" : "")\""
+        return "the user's most recent prompt was: \"\(String(oneLine.prefix(240)))\(oneLine.count > 240 ? "…" : "")\""
     }
 }

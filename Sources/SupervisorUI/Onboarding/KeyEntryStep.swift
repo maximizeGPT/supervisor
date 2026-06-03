@@ -85,9 +85,9 @@ struct KeyEntryStep: View {
         case .deepseek:
             return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. DeepSeek's per-token pricing is roughly 1/30th of Anthropic's, so triage cost stays under $5/month at heavy use."
         case .moonshot:
-            return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. Kimi K2 has strong tool-calling and is competitively priced — expect single-digit dollars per month at heavy use."
+            return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. Kimi K2 has strong tool-calling and is competitively priced. Expect single-digit dollars per month at heavy use."
         case .minimax:
-            return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. MiniMax's pricing varies by model — review their dashboard for current rates."
+            return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. MiniMax pricing varies by model. Review their dashboard for current rates."
         case .qwenHF:
             return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. Routed through the Hugging Face Inference router; pricing depends on the upstream provider selected. Expect higher latency than direct providers."
         }

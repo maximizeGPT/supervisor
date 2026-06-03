@@ -218,30 +218,38 @@ public struct ExpandedPanelView: View {
                 .padding(.top, 2)
             }
 
-            // Action buttons — only show if user hasn't responded yet.
+            // Action buttons. Only show if the user hasn't responded yet.
+            // Override is the primary control: a real bordered button in
+            // the brand signal color, not bare red text. It's a normal
+            // human override, not a destructive action, so it must not
+            // read as alarm-red. Dismiss and False positive stay as quiet
+            // text actions so Override is clearly the prominent one.
             if flag.userResponse == nil {
-                HStack(spacing: 8) {
-                    Button(rejectLabel(flag)) {
+                HStack(spacing: 10) {
+                    Button("Override") {
                         vm.rejectFlag(flagId: flag.id, action: flag.action)
                     }
-                    .font(.system(size: 9, weight: .medium))
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.red)
+                    .font(.system(size: 9, weight: .semibold))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(BrandColor.signal.color)
+                    .help(overrideHelp(flag))
 
                     Button("Dismiss") {
                         vm.respondToFlag(flagId: flag.id, response: .dismissed)
                     }
                     .font(.system(size: 9))
                     .buttonStyle(.borderless)
+                    .foregroundStyle(BrandColor.mute.color)
 
                     Button("False positive") {
                         vm.respondToFlag(flagId: flag.id, response: .falsePositive)
                     }
                     .font(.system(size: 9))
                     .buttonStyle(.borderless)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(BrandColor.mute.color)
                 }
-                .padding(.top, 2)
+                .padding(.top, 3)
             } else {
                 Text(Self.responseLabel(flag.userResponse!))
                     .font(.system(size: 9))
@@ -253,17 +261,16 @@ public struct ExpandedPanelView: View {
         .background(severityBackground(flag.severity), in: RoundedRectangle(cornerRadius: 4))
     }
 
-    /// Context-dependent reject label. When Supervisor paused the session,
-    /// rejecting means "let Claude Code continue." Otherwise, rejecting
-    /// means "stop Supervisor from doing this."
-    private func rejectLabel(_ flag: StoredFlag) -> String {
+    /// Tooltip text for the Override button. Says what overriding does in
+    /// this flag's context. Plain sentences, no dashes.
+    private func overrideHelp(_ flag: StoredFlag) -> String {
         switch flag.action {
         case .pause:
-            return "Reject — let Claude Code continue"
+            return "Let Claude Code continue. This resumes the paused session."
         case .kill:
-            return "Reject — session already ended"
+            return "The session already ended. This clears the flag."
         default:
-            return "Reject — override Supervisor"
+            return "Override Supervisor on this flag."
         }
     }
 
@@ -272,7 +279,7 @@ public struct ExpandedPanelView: View {
         case .approved: return "Approved"
         case .dismissed: return "Dismissed"
         case .falsePositive: return "Marked as false positive"
-        case .rejected: return "Rejected — overridden"
+        case .rejected: return "Overridden"
         }
     }
 

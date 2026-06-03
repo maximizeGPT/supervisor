@@ -6,6 +6,76 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-06-02
+
+Override button restyle, plain-voice copy pass, onboarding AX fix,
+loop guardrail, self-rebuild announcement.
+
+### Changed
+
+**Override button is a real button, not red text** (`ExpandedPanelView.swift`)
+- The reject control rendered as bare red text that read as danger.
+  Rejecting is a normal human override, not a destructive action.
+- It is now a bordered button in the brand signal color, labeled
+  "Override", with a context tooltip. Dismiss and False positive stay
+  as quiet text actions so Override is clearly the prominent one.
+
+**Plain-voice copy pass across all user-facing surfaces**
+- Removed em-dashes and filler from hover labels, panel labels,
+  notification bodies, onboarding copy, recovery doc text, and the
+  Keychain item label. Short declarative sentences.
+- Baked a no-em-dash, no-filler voice rule into the generation prompts
+  so new copy does not regenerate slop: `reasoning_plain`
+  (`TriagePrompt.swift`) and the dispatcher voice
+  (`dispatcher-system-prompt.txt`, shared by the Swift Dispatcher and
+  the Python hook).
+
+**Onboarding Accessibility step** (`AXCheckStep.swift`,
+`OnboardingScene.swift`, `OnboardingViewModel.swift`)
+- The step auto-advances when macOS reports the grant (the 1.5s poll
+  was already correct). The failure mode is macOS not reporting the
+  grant back for self-built apps after a binary swap, which left
+  "Skip" as the only way forward.
+- Added an active "Continue" button after the user is sent to System
+  Settings, so a user who enabled the grant is never forced to use the
+  muted "Skip". Honest copy that no longer overpromises auto-advance.
+
+**Self-rebuild announcement** (`HoverViewModel.swift`, `main.swift`,
+`ConfigPaths.swift`, `Scripts/deploy.sh`)
+- `Scripts/deploy.sh` writes a marker before relaunching a freshly
+  built Supervisor over the running one. The new instance reads it at
+  launch and announces "Supervisor updated itself" on the hover, then
+  clears it.
+
+### Fixed
+
+**Dispatch loop no longer spins on the trust-prompt fix**
+(`trial-notes.md` Known Gaps, `PRODUCT-DIRECTION.md`,
+`dispatcher-system-prompt.txt`, `dispatch_loop_hook.py`)
+- The loop kept re-proposing a fix for Claude Code's folder-trust
+  prompt to bootstrap new sessions. There is no non-interactive
+  bypass; this is a Claude Code limitation, not a Supervisor gap.
+- Marked the autonomous-trial goal done (the loop is proven for
+  trusted sessions: about 60 dispatches, 5 consecutive May 31, 4 on
+  June 1), filed the trust-prompt bootstrap as blocked-external, added
+  a dispatcher prompt guardrail, and added a hook-level filter that
+  refuses to dispatch prove-the-loop or trust-prompt proposals.
+
+**Issue #7: bash triage no longer surfaces user_question_pending**
+(`HardcodedRubric.swift`, `TriagePrompt.swift`)
+- Per-path prompt isolation (PRINCIPLES section 2e). The bash path now
+  passes only the bash-relevant rubric bodies into the system prompt
+  and adds a per-path scope sentence, so a grep regex that contains a
+  category name no longer triggers a false positive.
+
+### Known issues
+
+- Self-deploy invalidates the Keychain ACL and the Accessibility grant
+  because ad-hoc signing produces a new code hash each build. The new
+  instance prompts for Keychain access on first key read and needs the
+  Accessibility grant re-confirmed. Filed under Known Gaps with stable
+  signing as the durable fix.
+
 ## [0.8.2] — 2026-06-01
 
 Approve-by-default, reject-as-override. Rubric calibration refinement.

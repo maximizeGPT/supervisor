@@ -33,7 +33,7 @@ public struct KeychainAPIKeyStore: APIKeyStore, @unchecked Sendable {
     public init(service: String = KeychainAPIKeyStore.defaultService) {
         self.keychain = Keychain(service: service)
             .accessibility(.afterFirstUnlock)
-            .label("Supervisor — Anthropic API Key")
+            .label("Supervisor Anthropic API Key")
     }
 
     public func read() throws -> String? {

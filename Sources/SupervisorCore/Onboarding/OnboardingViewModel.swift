@@ -156,6 +156,28 @@ public final class OnboardingViewModel: ObservableObject {
         }
     }
 
+    /// User clicked the active "Continue" button on the AX step after
+    /// being sent to System Settings. This is the affirmative
+    /// "I enabled it" path. The 1.5s poll already auto-advances when
+    /// macOS reports the grant, so on the clean path the user never
+    /// needs this. It exists for the case the user reported: the grant
+    /// is enabled in System Settings but macOS does not report it back
+    /// to this process (the known ad-hoc-signed-app pattern, where a
+    /// binary swap leaves a stale Accessibility entry bound to the old
+    /// signature). In that case the poll never fires, and without this
+    /// button the only way forward is "Skip" — which wrongly frames a
+    /// granted permission as skipped. Continue advances the flow and
+    /// trusts the user's grant. The runtime PermissionMonitor re-checks
+    /// AX when an inject actually needs it, so nothing is lost if the
+    /// grant resolves later.
+    public func confirmAX() async {
+        guard case .axCheck = state else { return }
+        let detected = permissions.isAXGranted()
+        let status = await permissions.notificationStatus()
+        trace.emit("onboarding", "AX confirmed by user (macOS reported granted=\(detected)); advancing to notif step (notif=\(status))")
+        state = .notifCheck(status: status)
+    }
+
     /// User clicked "Skip for now" on the AX step. Matches the §6.6
     /// proceed-with-degradation philosophy (same shape as the Notifications
     /// step's denied → continue-anyway path). v0.1.0 has no Inject

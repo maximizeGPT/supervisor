@@ -195,7 +195,7 @@ public struct OnboardingScene: View {
     @ViewBuilder
     private var skipButton: some View {
         if case .axCheck = vm.state {
-            Button("Skip") {
+            Button("Skip for now") {
                 Task { await vm.skipAX() }
             }
             .buttonStyle(.plain)
@@ -217,12 +217,26 @@ public struct OnboardingScene: View {
         case .keyValidating:
             ProgressView().controlSize(.small)
 
-        case .axCheck:
-            BrandPrimaryButton("Open System Settings") {
-                NSWorkspace.shared.open(PermissionSettingsURL.accessibility)
-                vm.promptForAX()
+        case .axCheck(let prompted):
+            // Before the user has been sent to Settings, the primary
+            // action opens System Settings. After that, the primary
+            // action becomes an active "Continue" so a user who enabled
+            // the grant is never forced to use the muted "Skip" when
+            // macOS fails to report the grant back (the stale-entry
+            // ad-hoc-signing case). The 1.5s poll still auto-advances
+            // when macOS does report it.
+            if prompted {
+                BrandPrimaryButton("Continue") {
+                    Task { await vm.confirmAX() }
+                }
+                .keyboardShortcut(.defaultAction)
+            } else {
+                BrandPrimaryButton("Open System Settings") {
+                    NSWorkspace.shared.open(PermissionSettingsURL.accessibility)
+                    vm.promptForAX()
+                }
+                .keyboardShortcut(.defaultAction)
             }
-            .keyboardShortcut(.defaultAction)
 
         case .notifCheck(.notDetermined):
             BrandPrimaryButton("Request permission") {

@@ -457,11 +457,14 @@ class TestSystemPromptContainsDiffStatGuidance(unittest.TestCase):
     def test_system_prompt_mentions_recent_files_changed(self):
         prompt = hook.load_system_prompt()
         self.assertIn("recent_files_changed", prompt)
-        self.assertIn("authoritative signal", prompt)
+        # The prompt teaches the diff stat is a signal about shipped work.
+        self.assertIn("re-propose shipped work", prompt)
 
     def test_system_prompt_warns_against_partial_completion_inference(self):
         prompt = hook.load_system_prompt()
-        self.assertIn("Before inferring partial completion", prompt)
+        # Current wording: a file in the diff means that work is already
+        # in progress, so don't re-propose it.
+        self.assertIn("at least in-progress", prompt)
 
 
 class TestDetectWorkerStopped(unittest.TestCase):

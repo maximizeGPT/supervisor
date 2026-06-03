@@ -29,9 +29,9 @@ public final class HoverViewModel: ObservableObject {
     // MARK: - Published surface
 
     /// Plain-language headline a non-engineer can read at a glance.
-    /// Examples: "Watching — all clear", "Paused Claude Code — needs
+    /// Examples: "Watching. All clear", "Paused Claude Code — needs
     /// your attention", "Checking something..."
-    @Published public private(set) var plainLabel: String = "Watching — all clear"
+    @Published public private(set) var plainLabel: String = "Watching. All clear"
 
     /// Secondary detail (de-emphasized). The actual command or tool
     /// name, shown only when there's something specific to surface.
@@ -213,6 +213,37 @@ public final class HoverViewModel: ObservableObject {
         }
     }
 
+    /// Announce that Supervisor rebuilt and relaunched itself. Shows a
+    /// short hover message and flashes, so the user can see the app
+    /// updated on its own. Called at launch when a self-rebuild marker
+    /// is present (written by the deploy step). Clears back to the idle
+    /// watching label after a few seconds.
+    public func announceSelfRebuild(version: String? = nil) {
+        let label = version.map { "Supervisor updated itself to \($0)" }
+            ?? "Supervisor updated itself"
+        plainLabel = label
+
+        let record = ActionRecord(action: .selfExtend, plainDescription: label)
+        recentActions.insert(record, at: 0)
+        if recentActions.count > 20 {
+            recentActions.removeLast()
+        }
+        trace.emit("hover", "self-rebuild announced: \(label)")
+
+        actionFlash = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            self?.actionFlash = false
+        }
+        // Return to the idle watching label after a few seconds.
+        acknowledgeDebouncerTask?.cancel()
+        acknowledgeDebouncerTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.acknowledgeFlag()
+        }
+    }
+
     /// Whether the current flag is a pause that can be resumed.
     public var isPaused: Bool {
         guard case .flagged(_, .pause, _) = activity else { return false }
@@ -254,8 +285,8 @@ public final class HoverViewModel: ObservableObject {
     public func triageFinishedNoFlag() {
         activity = .idle
         plainLabel = projectName.isEmpty
-            ? "Watching — all clear"
-            : "Watching \(projectName) — all clear"
+            ? "Watching. All clear"
+            : "Watching \(projectName). All clear"
         trace.emit("hover", "activity -> idle (no flag)")
     }
 
@@ -286,8 +317,8 @@ public final class HoverViewModel: ObservableObject {
     public func acknowledgeFlag() {
         activity = .idle
         plainLabel = projectName.isEmpty
-            ? "Watching — all clear"
-            : "Watching \(projectName) — all clear"
+            ? "Watching. All clear"
+            : "Watching \(projectName). All clear"
         detailLabel = ""
         trace.emit("hover", "flag acknowledged; activity -> idle")
     }
@@ -303,12 +334,12 @@ public final class HoverViewModel: ObservableObject {
         }
         // Generic fallback per action type.
         switch action {
-        case .notify:     return "Noticed something — check the notification"
+        case .notify:     return "Noticed something. Check the notification."
         case .inject:     return "Answered a question for Claude Code"
         case .continue:   return "Sent Claude Code its next task"
         case .selfExtend: return "Helping the dispatch loop recover"
-        case .pause:      return "Paused Claude Code — needs your attention"
-        case .kill:       return "Stopped Claude Code — something looked dangerous"
+        case .pause:      return "Paused Claude Code. Needs your attention."
+        case .kill:       return "Stopped Claude Code. Something looked dangerous."
         }
     }
 
@@ -324,8 +355,8 @@ public final class HoverViewModel: ObservableObject {
             turnCount = 0
             toolCallCount = 0
             plainLabel = projectName.isEmpty
-                ? "Watching — all clear"
-                : "Watching \(projectName) — all clear"
+                ? "Watching. All clear"
+                : "Watching \(projectName). All clear"
         case .bashToolCall(let info):
             toolCallCount += 1
             // Plain headline: "Running a command"
