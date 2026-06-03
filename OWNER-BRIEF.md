@@ -1,43 +1,62 @@
 # Owner Brief
 
-Last updated: 2026-06-02
+Last updated: 2026-06-03 (session wind-down)
 
-## What shipped recently
+## Status: the loop is out of unblocked engineering work
 
-A focused round of fixes you asked for, all on the autonomous branch:
+The dispatch loop returned low_confidence_no_action. Every actionable
+item is done. The only open issue is blocked. This brief is honest
+about what that means, not a victory lap.
 
-- The Override button is now a real bordered button in the brand green,
-  not bare red text. Red read as danger; an override is normal.
-- A plain-voice pass removed em-dashes and filler from every
-  user-facing surface (hover, panel, notifications, onboarding,
-  recovery docs). The voice rule is baked into the generation prompts
-  so new copy stays clean.
-- The onboarding Accessibility step gained an active Continue button so
-  you are never forced to hit Skip after granting the permission.
-- Supervisor now announces "Supervisor updated itself" on the hover
-  after a self-rebuild.
-- The dispatch loop stopped spinning on the trust-prompt fix. That work
-  is closed and filed as blocked-external.
-- Issue #7 is fixed: bash triage no longer false-fires
-  user_question_pending on a grep that mentions the category name.
+## What shipped this session
 
-## Most valuable thing remaining
+122 commits on the branch. The substantive ones:
 
-Stable code signing. Every self-deploy swaps the binary and changes its
-code hash, which invalidates both the Keychain access grant and the
-Accessibility grant. The result is a Keychain prompt on the first key
-read and an Accessibility grant that needs re-confirming. A stable
-self-signed identity would make both grants persist across rebuilds.
-This is the single biggest friction in the self-update story.
+- v0.8.3: Override button restyle, plain-voice copy pass across all
+  user-facing surfaces, onboarding Continue button, dispatch-loop
+  trust-prompt guardrail, self-rebuild announcement.
+- v0.8.4: stable self-signed code signing so a rebuild no longer drops
+  the Accessibility grant or the Keychain ACL. This was the biggest
+  friction in the self-update story.
+- Deploy smoke test: deploy.sh now verifies Keychain read and
+  Accessibility after each deploy and exits non-zero on failure.
+- Action-label sentence detection using Foundation, fixing the "shipped
+  v0" clipping the owner caught on screen.
+- Self-watch fix: the ineffective_change warning no longer fires after
+  a fresh deploy. It now compares the deployed binary against the
+  source instead of crying wolf on every UI commit.
 
-## Needs your attention
+## What is blocked, and it is the thing that matters most
 
-After each self-deploy, the new Supervisor will ask once for Keychain
-access (click Always Allow) and may need the Accessibility toggle
-re-confirmed. This goes away once stable signing lands.
+Calibration is at 75 to 87 percent positive recall against a 95 percent
+gate (Issue #12). For a safety harness, missing a quarter of genuinely
+destructive actions is the core trust problem, not a polish item. It is
+blocked on ANTHROPIC_API_KEY, which this session does not have. No code
+change closes this. It needs a real key and a sweep.
 
-## What the loop is doing next
+## The honest read
 
-The loop is proven for existing trusted sessions and will keep picking
-real product work from PRODUCT-DIRECTION, Known Gaps, and open issues.
-It will not propose proving the loop or bypassing the trust prompt.
+122 commits, zero external users. The product has spent this session
+hardening itself, not finding anyone who needs it. The loop is good at
+producing clean, tested commits. It cannot tell that the marginal value
+of commit 123 is near zero when commits 1 through 122 have no audience.
+
+A premortem ran in chat this session. Its conclusion stands: the most
+likely way this dies is that building stays frictionless and selling
+stays hard, so the loop keeps shipping immaculate internal work while
+the market question goes unasked.
+
+## What needs you (a decision, not a code task)
+
+One of two moves, and only you can make it:
+
+1. Unblock calibration. Provide an Anthropic key and let the loop run
+   the sweep to push recall toward the 95 percent gate. This is the
+   trust contract and the one technical thing worth finishing.
+2. Run customer discovery. Find one person who is not you and who would
+   be angry if Supervisor disappeared. If that person does not exist
+   yet, that is the real work, and it is not a commit.
+
+The loop is winding down on purpose rather than inventing busywork. It
+will not dispatch again until there is genuinely unblocked work or you
+point it somewhere.

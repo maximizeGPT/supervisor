@@ -729,5 +729,62 @@ class TestBuildFallbackFromGaps(unittest.TestCase):
         self.assertIn("v0.1.7 panel", result)
 
 
+class TestIneffectiveChangeFreshnessCheck(unittest.TestCase):
+    """detect_ineffective_change must only fire when the deployed binary is
+    OLDER than the UI source. The old version fired whenever a UI file was
+    touched, so it stayed lit right after a deploy (a permanent false
+    positive that made the owner brief cry wolf)."""
+
+    def _setup(self, tmp, binary_newer: bool):
+        import time
+        # Fake repo with a touched UI source file.
+        ui_rel = "Sources/SupervisorCore/Hover/HoverViewModel.swift"
+        ui_abs = Path(tmp) / ui_rel
+        ui_abs.parent.mkdir(parents=True, exist_ok=True)
+        ui_abs.write_text("// ui")
+        # Fake deployed binary.
+        binp = Path("/Applications/Supervisor.app/Contents/MacOS/Supervisor")
+        if not binp.exists():
+            self.skipTest("no deployed Supervisor.app on this machine")
+        now = time.time()
+        if binary_newer:
+            os.utime(ui_abs, (now - 600, now - 600))   # source 10 min older
+        else:
+            os.utime(ui_abs, (now + 600, now + 600))   # source 10 min newer
+        return ui_rel
+
+    def test_no_warning_when_binary_is_newer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            ui_rel = self._setup(tmp, binary_newer=True)
+            result = hook.detect_ineffective_change(
+                tmp,
+                commits=[{"sha": "x", "subject": "fix hover", "body": ""}],
+                recent_files_changed=[ui_rel],
+            )
+            self.assertIsNone(result,
+                "must not warn when the deployed binary is newer than the UI source")
+
+    def test_warns_when_binary_is_older(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            ui_rel = self._setup(tmp, binary_newer=False)
+            result = hook.detect_ineffective_change(
+                tmp,
+                commits=[{"sha": "x", "subject": "fix hover", "body": ""}],
+                recent_files_changed=[ui_rel],
+            )
+            self.assertIsNotNone(result, "must warn when the deployed binary is stale")
+            self.assertIn("older than those edits", result)
+
+    def test_no_warning_without_ui_files(self):
+        result = hook.detect_ineffective_change(
+            "/tmp",
+            commits=[{"sha": "x", "subject": "docs", "body": ""}],
+            recent_files_changed=["README.md", "CHANGELOG.md"],
+        )
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

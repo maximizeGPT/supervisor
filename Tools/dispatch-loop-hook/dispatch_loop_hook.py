@@ -1600,11 +1600,27 @@ def detect_ineffective_change(
                 ui_files_touched.append(pat)
 
     if ui_files_touched:
-        app_path = "/Applications/Supervisor.app"
-        if Path(app_path).exists():
+        app_bin = Path("/Applications/Supervisor.app/Contents/MacOS/Supervisor")
+        if app_bin.exists():
+            # Only a real problem if the deployed binary is OLDER than the
+            # UI source it would need to reflect. If we rebuilt and
+            # redeployed after editing those files, the app already shows
+            # the change. The previous version fired unconditionally
+            # whenever a UI file appeared in the diff, so it stayed lit
+            # even right after a deploy (a permanent false positive that
+            # made the owner brief cry wolf).
+            app_mtime = app_bin.stat().st_mtime
+            newest_src = 0.0
+            for f in recent_files_changed:
+                if any(pat in f for pat in ui_file_patterns):
+                    p = Path(cwd) / f
+                    if p.exists():
+                        newest_src = max(newest_src, p.stat().st_mtime)
+            if newest_src > 0 and app_mtime >= newest_src:
+                return None  # deployed build is at least as new as the source
             return (
                 f"This session changed {', '.join(set(ui_files_touched))} "
-                f"but the installed Supervisor.app predates these changes. "
+                f"but the installed Supervisor.app is older than those edits. "
                 f"The new hover labels and notification wording won't appear "
                 f"until the app is rebuilt and relaunched."
             )
