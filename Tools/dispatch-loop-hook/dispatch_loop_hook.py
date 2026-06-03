@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -120,6 +121,12 @@ DEFAULTS = {
     "max_consecutive_low": 3,            # per §12.5 #3 — same as LoopController
     "max_loop_duration_s": 4 * 3600,      # per §12.5 #2
     "max_total_dispatches": 20,           # safety cap beyond §12.5 — outer ceiling
+    # Repetition breaker: if a new high-confidence proposal overlaps the
+    # previous dispatched proposal by at least this Jaccard fraction, it is
+    # treated as the SAME task and the loop stops (real thrashing on one
+    # thing). Two genuinely different tasks share far fewer words, so they
+    # never trip this.
+    "same_proposal_jaccard_threshold": 0.8,
     "supervisor_repo_path": "/Users/main/supervisor",
     "branch_prefix": "autonomous-",
     # Provider settings are resolved dynamically from active-provider.json.
@@ -566,6 +573,88 @@ def _is_blocked_loop_proof_proposal(text: str) -> bool:
     Code limitation, not a Supervisor gap."""
     low = (text or "").lower()
     return any(phrase in low for phrase in _BLOCKED_PROPOSAL_PHRASES)
+
+
+# Phrases that mark a proposal as meta-work about the loop's OWN dispatch
+# behaviour: detectors for the loop spinning, guards against double
+# dispatch, thrash detectors. If the loop notices it is spinning, the
+# correct response is to STOP, not to dispatch machinery about spinning.
+# Such features can be filed as known gaps for a human to schedule; they
+# are never self-dispatched mid-thrash. Kept specific so real product
+# work is not caught.
+_THRASH_META_PHRASES = [
+    "thrash guard",
+    "thrash-guard",
+    "thrash detector",
+    "anti-thrash",
+    "double-dispatch",
+    "double dispatch",
+    "in-flight guard",
+    "in-flight dispatch",
+    "single-in-flight",
+    "spin detector",
+    "spin detection",
+    "detect when the loop",
+    "loop is spinning",
+    "loop spinning",
+    "stuck-worker detector",
+    "stuck worker detector",
+    "guard against dispatch",
+    "dispatch-loop guard",
+    "detector for the loop",
+    "machinery about spinning",
+]
+
+
+def _is_thrash_meta_proposal(text: str) -> bool:
+    """True when a proposal is meta-work about the loop's own thrashing
+    (spin/thrash/double-dispatch detectors). Such proposals are never
+    auto-dispatched; the loop stops instead."""
+    low = (text or "").lower()
+    return any(phrase in low for phrase in _THRASH_META_PHRASES)
+
+
+# --- Repetition breaker helpers -------------------------------------------
+
+_PROPOSAL_STOPWORDS = {
+    "the", "and", "for", "this", "that", "with", "from", "into", "next",
+    "then", "are", "was", "has", "have", "will", "should", "must", "not",
+    "but", "you", "your", "its", "per", "via", "out", "now", "all", "any",
+}
+
+
+def _proposal_tokens(text: str) -> frozenset:
+    """Normalized significant-word token set for a proposal. Lowercase,
+    alphanumeric words of length >= 3, common stopwords dropped. Used to
+    compare two proposals for substantial sameness."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return frozenset(w for w in words if len(w) >= 3 and w not in _PROPOSAL_STOPWORDS)
+
+
+def _jaccard(a: frozenset, b: frozenset) -> float:
+    """Jaccard similarity of two token sets. 0.0 when both are empty."""
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _is_repeat_proposal(state: dict, proposal: str, threshold: float) -> bool:
+    """True when `proposal` is substantially the same as the last proposal
+    this session dispatched (token overlap >= threshold). This catches the
+    loop proposing the SAME task twice in a row. It does NOT trip on two
+    DIFFERENT tasks, which share few significant words."""
+    last = state.get("last_proposal_tokens")
+    if not last:
+        return False
+    return _jaccard(_proposal_tokens(proposal), frozenset(last)) >= threshold
+
+
+def _remember_proposal(state: dict, proposal: str) -> None:
+    """Record the proposal we are about to dispatch, so the next dispatch
+    can detect a repeat. Stored as a sorted list (JSON-serializable)."""
+    state["last_proposal_tokens"] = sorted(_proposal_tokens(proposal))
 
 
 def _build_fallback_from_gaps(
@@ -1873,10 +1962,12 @@ def main() -> None:
     )
 
     if not result:
-        # Dispatcher errored — v0.5.0: SelfExtender instead of silent_exit.
-        state["consecutive_low"] = state.get("consecutive_low", 0) + 1
-        put_session_state(state_all, session_id, state)
-        save_state(state_all)
+        # The dispatcher returned no parseable result. This is a REAL
+        # failure (network error, malformed JSON, stuck call), not an idle
+        # state, so the SelfExtender is the correct response: fix the
+        # machinery, do not invent new product work. This is the ONLY path
+        # that invokes the SelfExtender. Empty queue and low confidence are
+        # handled below as normal terminal states, never as breakage.
         try_self_extend(failure_reason="dispatcher_returned_none", **se_kwargs)
         # try_self_extend calls emit_block or silent_exit; if we reach here, something went wrong
         silent_exit("self_extend_unreachable")
@@ -1891,29 +1982,9 @@ def main() -> None:
         f"prop_bytes={len(proposal)} requires_human={requires_human} "
         f"just=\"{justification[:120]}\"")
 
-    # Guard: never dispatch the trust-prompt-bootstrap / prove-the-loop
-    # proposal. It is blocked on a Claude Code limitation (no
-    # non-interactive folder-trust bypass) and the loop is already proven
-    # for trusted sessions. The dispatcher prompt tells the model not to
-    # propose it, but this is the belt-and-suspenders backstop in case it
-    # does anyway. Treat like the human gate: skip without counting as a
-    # low-confidence signal, surface it once in the owner brief, stop.
-    if _is_blocked_loop_proof_proposal(proposal + " " + justification):
-        log("BLOCKED_PROPOSAL_FILTERED reason=trust_prompt_or_prove_loop "
-            f"just=\"{justification[:120]}\"")
-        write_owner_brief(
-            cwd=cwd,
-            what_shipped=summarize_recent_commits(commits),
-            most_valuable_next="Loop is proven and the trust-prompt bootstrap is blocked on a Claude Code limitation. Filed as a known gap. Looking for other work.",
-            needs_owner="",
-            loop_doing_next="Skipped a proposal about proving the loop or the trust prompt. That work is closed.",
-            warnings=self_watch_warnings,
-        )
-        put_session_state(state_all, session_id, state)
-        save_state(state_all)
-        silent_exit("blocked_proposal_filtered reason=trust_prompt_or_prove_loop")
-
-    # v0.7.0: run post-dispatch self-watch (suspicious stop — needs result).
+    # Post-dispatch self-watch (suspicious stop — needs the result). Computed
+    # here, before any branch below references it, so the blocked-proposal
+    # branch can no longer raise UnboundLocalError on self_watch_warnings.
     post_warnings = run_self_watch_post_dispatch(
         recent_turns=recent_turns,
         known_gaps=known_gaps,
@@ -1921,33 +1992,76 @@ def main() -> None:
     )
     self_watch_warnings = pre_warnings + post_warnings
 
-    # v0.4.1-hook: requires_human_presence gate.
-    # When the dispatcher says a task needs a human, DON'T count it as a
-    # low-confidence dispatch. Instead, skip that specific proposal and
-    # let the loop try again — there may be other actionable work.
-    # Only write the owner brief so the human sees what's waiting.
+    # Guard: never dispatch a closed/meta proposal.
+    #   - trust-prompt-bootstrap / prove-the-loop: blocked on a Claude Code
+    #     limitation; the loop is already proven for trusted sessions.
+    #   - thrash meta-work (spin/thrash/double-dispatch detectors): if the
+    #     loop notices it is spinning, the response is to STOP, not to build
+    #     machinery about spinning. Such features are filed as known gaps
+    #     for a human to schedule, never self-dispatched mid-thrash.
+    # Either way: surface once in the owner brief and stop. No SelfExtender.
+    blob = proposal + " " + justification
+    if _is_blocked_loop_proof_proposal(blob) or _is_thrash_meta_proposal(blob):
+        reason = "thrash_meta" if _is_thrash_meta_proposal(blob) else "trust_prompt_or_prove_loop"
+        log(f"BLOCKED_PROPOSAL_FILTERED reason={reason} just=\"{justification[:120]}\"")
+        write_owner_brief(
+            cwd=cwd,
+            what_shipped=summarize_recent_commits(commits),
+            most_valuable_next="Skipped a closed or self-referential proposal (proving the loop, the trust prompt, or machinery about the loop's own thrashing). That work is not auto-dispatched.",
+            needs_owner="",
+            loop_doing_next="Idle. Skipped a closed/meta proposal. Waiting for real queued work.",
+            warnings=self_watch_warnings,
+        )
+        put_session_state(state_all, session_id, state)
+        save_state(state_all)
+        silent_exit(f"blocked_proposal_filtered reason={reason}")
+
+    # v0.4.1-hook: requires_human_presence gate. The dispatcher says this
+    # task needs a human, so we surface it and stop. Terminal, not a
+    # failure, so no SelfExtender.
     if requires_human:
         log(f"HUMAN_GATE skipping proposal, not counting as low")
-        # Don't increment consecutive_low — this isn't a signal problem,
-        # it's just one task that needs a human. The next dispatch may
-        # find different work.
         write_owner_brief(
             cwd=cwd,
             what_shipped=summarize_recent_commits(commits),
             most_valuable_next=proposal[:300] if proposal else justification[:300],
             needs_owner=f"This task needs you at the keyboard: {justification}",
-            loop_doing_next="Skipped human-required task; will look for other work on next idle.",
+            loop_doing_next="Skipped human-required task; idle until you take it or queue other work.",
             warnings=self_watch_warnings,
         )
         put_session_state(state_all, session_id, state)
         save_state(state_all)
         silent_exit(f"GATE_FAIL reason=requires_human_presence path={selected_path}")
 
-    if confidence == "high" and selected_path != "low_confidence_no_action" and proposal:
+    actionable = selected_path != "low_confidence_no_action" and bool(proposal)
+
+    if confidence == "high" and actionable:
+        # Repetition breaker: if this is substantially the SAME task the
+        # loop dispatched last time, that is real thrashing on one thing.
+        # Stop with a calm idle brief instead of dispatching it again. Two
+        # genuinely DIFFERENT tasks share few significant words and do not
+        # trip this, so legitimate multi-task work keeps flowing.
+        if _is_repeat_proposal(state, proposal, cfg["same_proposal_jaccard_threshold"]):
+            log("CIRCUIT_BREAKER reason=repeated_proposal")
+            write_owner_brief(
+                cwd=cwd,
+                what_shipped=summarize_recent_commits(commits),
+                most_valuable_next="The loop proposed the same task twice in a row, so it stopped instead of spinning on one thing. Give it a new direction or add new items to the queue.",
+                needs_owner="The loop is repeating itself. It needs a new direction or a refilled queue.",
+                loop_doing_next="Stopped: repeated the same proposal. Idle until there is new direction.",
+                warnings=self_watch_warnings,
+            )
+            state["consecutive_low"] = 0
+            put_session_state(state_all, session_id, state)
+            save_state(state_all)
+            silent_exit("breaker_repeated_proposal")
+
+        # Genuine new actionable work. Remember it (for next-dispatch repeat
+        # detection) and dispatch.
         state["consecutive_low"] = 0
+        _remember_proposal(state, proposal)
         put_session_state(state_all, session_id, state)
         save_state(state_all)
-        # v0.7.0: write owner brief on successful dispatch.
         write_owner_brief(
             cwd=cwd,
             what_shipped=summarize_recent_commits(commits),
@@ -1957,58 +2071,48 @@ def main() -> None:
             warnings=self_watch_warnings,
         )
         prefixed = (
-            "[dispatch-loop-hook v0.7.0 — auto-dispatched by Stop hook; "
+            "[dispatch-loop-hook v0.9.0 — auto-dispatched by Stop hook; "
             f"justification: {justification.strip()}]\n\n{proposal.strip()}"
         )
         emit_block(prefixed)
-    else:
-        # Low confidence or non-actionable path. Before giving up, check
-        # if Known Gaps has actionable work that the dispatcher missed.
-        consecutive = state.get("consecutive_low", 0) + 1
-        state["consecutive_low"] = consecutive
 
-        # v0.8.0: deferred-work fallback. If the dispatcher returned low
-        # confidence but there's real unblocked work in Known Gaps or
-        # deferred items, build a fallback dispatch from that work instead
-        # of stopping the loop.
-        if consecutive >= 2 and known_gaps:
-            fallback = _build_fallback_from_gaps(known_gaps, diff_stat, commits)
-            if fallback:
-                log(f"FALLBACK_DISPATCH from known_gaps consecutive_was={consecutive}")
-                state["consecutive_low"] = 0
-                put_session_state(state_all, session_id, state)
-                save_state(state_all)
-                write_owner_brief(
-                    cwd=cwd,
-                    what_shipped=summarize_recent_commits(commits),
-                    most_valuable_next="Picked up deferred work from Known Gaps.",
-                    needs_owner="",
-                    loop_doing_next=f"Dispatching fallback: {fallback[:200]}...",
-                    warnings=self_watch_warnings,
-                )
-                prefixed = (
-                    "[dispatch-loop-hook v0.8.0 — fallback dispatch from Known Gaps; "
-                    f"the dispatcher returned low confidence but real work remains]\n\n{fallback}"
-                )
-                emit_block(prefixed)
-
-        put_session_state(state_all, session_id, state)
-        save_state(state_all)
-        # v0.7.0: write owner brief on low confidence.
+    elif confidence == "medium" and actionable:
+        # Propose-and-wait: medium confidence surfaces a proposal for the
+        # owner but does NOT auto-dispatch. Terminal, not escalation.
+        log("PROPOSE_AND_WAIT confidence=medium")
         write_owner_brief(
             cwd=cwd,
             what_shipped=summarize_recent_commits(commits),
-            most_valuable_next="The loop couldn't decide what to do next with enough confidence.",
-            needs_owner="Tell the loop what to work on, or add items to the issue queue." if not known_gaps else "",
-            loop_doing_next="Trying the SelfExtender to recover...",
+            most_valuable_next=proposal[:300],
+            needs_owner=f"The loop has a medium-confidence proposal waiting for your call: {justification}",
+            loop_doing_next="Holding a medium-confidence proposal for your decision. Not auto-dispatching.",
             warnings=self_watch_warnings,
         )
-        # v0.5.0: SelfExtender on non-high confidence instead of silent_exit.
-        try_self_extend(
-            failure_reason=f"non_high_confidence confidence={confidence} path={selected_path}",
-            **se_kwargs,
+        put_session_state(state_all, session_id, state)
+        save_state(state_all)
+        silent_exit("propose_and_wait_medium")
+
+    else:
+        # EMPTY QUEUE / LOW CONFIDENCE is a valid TERMINAL state, not a
+        # failure. The loop stops calmly. It does NOT escalate to the
+        # SelfExtender (that is only for real machinery breakage) and it
+        # does NOT second-guess the dispatcher with a gaps-fallback (the
+        # dispatcher already read the gaps). Stopping here with no
+        # emit_block breaks the thrash chain: nothing re-triggers the Stop
+        # hook, so an empty queue produces calm idle, not a dispatch storm.
+        log(f"IDLE_TERMINAL reason=no_queued_work confidence={confidence} path={selected_path}")
+        state["consecutive_low"] = 0
+        put_session_state(state_all, session_id, state)
+        save_state(state_all)
+        write_owner_brief(
+            cwd=cwd,
+            what_shipped=summarize_recent_commits(commits),
+            most_valuable_next="No queued work the loop can act on right now.",
+            needs_owner="Loop idle, waiting for direction. Add items to the issue queue or tell the loop what to work on.",
+            loop_doing_next="Idle. No actionable unblocked work. Waiting for direction.",
+            warnings=self_watch_warnings,
         )
-        silent_exit("self_extend_unreachable")
+        silent_exit("idle_no_work")
 
 
 if __name__ == "__main__":

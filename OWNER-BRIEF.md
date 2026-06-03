@@ -1,62 +1,56 @@
 # Owner Brief
 
-Last updated: 2026-06-03 (session wind-down)
+Last updated: 2026-06-03
 
-## Status: the loop is out of unblocked engineering work
+## What shipped recently
 
-The dispatch loop returned low_confidence_no_action. Every actionable
-item is done. The only open issue is blocked. This brief is honest
-about what that means, not a victory lap.
+- v0.9.0: the dispatch loop now idles gracefully on an empty queue. When
+  there is no real queued work it stops calmly and waits for direction,
+  instead of treating "no work" as a problem to fix and dispatching more
+  work about its own spinning. This was the thrash that fired the loop
+  8+ times in minutes and then crashed it.
+- The loop's self-repair now runs only when the dispatcher genuinely
+  breaks (a network error or an unreadable response), never on an empty
+  queue or low confidence.
+- A repetition breaker stops the loop if it proposes the same task twice
+  in a row, while still letting two genuinely different tasks both run.
+- The loop will no longer take on work about watching itself (thrash
+  guards, spin detectors). If it notices it is spinning, it stops.
+- Fixed a crash on the path that skips a closed proposal.
+- v0.8.4: stable code signing so self-deploy keeps the Accessibility and
+  Keychain grants across rebuilds.
 
-## What shipped this session
+## Most valuable thing remaining
 
-122 commits on the branch. The substantive ones:
+The loop is reliable when it runs, but reliability is not the product's
+real bottleneck. The honest next priority is getting Supervisor in front
+of one real user and watching them use it, rather than adding more
+internal machinery. Most of what the loop can safely build on its own is
+already built; the remaining high-value work needs you (a user
+conversation, an Anthropic key for calibration, a distribution
+decision), not another autonomous dispatch.
 
-- v0.8.3: Override button restyle, plain-voice copy pass across all
-  user-facing surfaces, onboarding Continue button, dispatch-loop
-  trust-prompt guardrail, self-rebuild announcement.
-- v0.8.4: stable self-signed code signing so a rebuild no longer drops
-  the Accessibility grant or the Keychain ACL. This was the biggest
-  friction in the self-update story.
-- Deploy smoke test: deploy.sh now verifies Keychain read and
-  Accessibility after each deploy and exits non-zero on failure.
-- Action-label sentence detection using Foundation, fixing the "shipped
-  v0" clipping the owner caught on screen.
-- Self-watch fix: the ineffective_change warning no longer fires after
-  a fresh deploy. It now compares the deployed binary against the
-  source instead of crying wolf on every UI commit.
+## Needs your attention
 
-## What is blocked, and it is the thing that matters most
+The dispatch loop is currently turned off. The enable flag was removed
+during the thrash incident, so nothing is dispatching right now. The
+v0.9.0 fix is written, tested, and verified against both acceptance
+simulations in the repo.
 
-Calibration is at 75 to 87 percent positive recall against a 95 percent
-gate (Issue #12). For a safety harness, missing a quarter of genuinely
-destructive actions is the core trust problem, not a polish item. It is
-blocked on ANTHROPIC_API_KEY, which this session does not have. No code
-change closes this. It needs a real key and a sweep.
+One thing to know before re-enabling: the copy of the hook installed at
+`~/.claude/hooks/dispatch_loop_hook.py` is still the OLD code that
+thrashed. The fix lives in the repo and has not been deployed to that
+install path (deploying is your call, not the loop's). So re-enabling is
+two steps, not one:
 
-## The honest read
+1. Copy the fixed hook into place:
+   `cp Tools/dispatch-loop-hook/dispatch_loop_hook.py Tools/dispatch-loop-hook/dispatcher-system-prompt.txt ~/.claude/hooks/`
+2. Restore the enable flag (the file `dispatch-loop-enabled.json` in
+   `~/.claude/hooks/`).
 
-122 commits, zero external users. The product has spent this session
-hardening itself, not finding anyone who needs it. The loop is good at
-producing clean, tested commits. It cannot tell that the marginal value
-of commit 123 is near zero when commits 1 through 122 have no audience.
+If you would rather keep the loop off and drive work manually, that is a
+reasonable call too. This is your decision, not the loop's.
 
-A premortem ran in chat this session. Its conclusion stands: the most
-likely way this dies is that building stays frictionless and selling
-stays hard, so the loop keeps shipping immaculate internal work while
-the market question goes unasked.
+## What the loop is doing next
 
-## What needs you (a decision, not a code task)
-
-One of two moves, and only you can make it:
-
-1. Unblock calibration. Provide an Anthropic key and let the loop run
-   the sweep to push recall toward the 95 percent gate. This is the
-   trust contract and the one technical thing worth finishing.
-2. Run customer discovery. Find one person who is not you and who would
-   be angry if Supervisor disappeared. If that person does not exist
-   yet, that is the real work, and it is not a commit.
-
-The loop is winding down on purpose rather than inventing busywork. It
-will not dispatch again until there is genuinely unblocked work or you
-point it somewhere.
+Nothing. The loop is idle and disabled, waiting for your direction.

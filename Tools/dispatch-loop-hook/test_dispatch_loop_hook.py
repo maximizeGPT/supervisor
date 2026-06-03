@@ -52,6 +52,7 @@ class TestParseRetry(unittest.TestCase):
              patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
+             patch.object(hook, 'write_owner_brief'), \
              patch.object(hook, 'detect_worker_stopped', return_value=True), \
              patch.object(hook, 'read_recent_turns', return_value=[
                  {"role": "assistant", "text": "All done. Ready for next task.", "ts": ""}
@@ -159,6 +160,7 @@ class TestRequiresHumanPresenceGate(unittest.TestCase):
              patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
+             patch.object(hook, 'write_owner_brief'), \
              patch.object(hook, 'detect_worker_stopped', return_value=True), \
              patch.object(hook, 'read_recent_turns', return_value=[
                  {"role": "assistant", "text": "All done.", "ts": ""}
@@ -202,6 +204,7 @@ class TestRequiresHumanPresenceGate(unittest.TestCase):
              patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
+             patch.object(hook, 'write_owner_brief'), \
              patch.object(hook, 'detect_worker_stopped', return_value=True), \
              patch.object(hook, 'read_recent_turns', return_value=[
                  {"role": "assistant", "text": "All done.", "ts": ""}
@@ -742,15 +745,19 @@ class TestIneffectiveChangeFreshnessCheck(unittest.TestCase):
         ui_abs = Path(tmp) / ui_rel
         ui_abs.parent.mkdir(parents=True, exist_ok=True)
         ui_abs.write_text("// ui")
-        # Fake deployed binary.
+        # Fake deployed binary. Offset the source mtime from the REAL
+        # binary's mtime, not from wall-clock now: the installed app may
+        # have been deployed long ago, so "now - 600" can still be newer
+        # than a binary built an hour back. Pinning to the binary's own
+        # mtime keeps the test deterministic regardless of deploy age.
         binp = Path("/Applications/Supervisor.app/Contents/MacOS/Supervisor")
         if not binp.exists():
             self.skipTest("no deployed Supervisor.app on this machine")
-        now = time.time()
+        bin_mtime = binp.stat().st_mtime
         if binary_newer:
-            os.utime(ui_abs, (now - 600, now - 600))   # source 10 min older
+            os.utime(ui_abs, (bin_mtime - 600, bin_mtime - 600))   # source 10 min older than binary
         else:
-            os.utime(ui_abs, (now + 600, now + 600))   # source 10 min newer
+            os.utime(ui_abs, (bin_mtime + 600, bin_mtime + 600))   # source 10 min newer than binary
         return ui_rel
 
     def test_no_warning_when_binary_is_newer(self):
@@ -784,6 +791,267 @@ class TestIneffectiveChangeFreshnessCheck(unittest.TestCase):
             recent_files_changed=["README.md", "CHANGELOG.md"],
         )
         self.assertIsNone(result)
+
+
+class TestThrashFixV090(unittest.TestCase):
+    """v0.9.0: the dispatch loop must idle gracefully on an empty queue
+    instead of thrashing. Covers the five fixes:
+
+      #1 empty queue / low_confidence_no_action -> calm idle + STOP,
+         never falls through to the SelfExtender.
+      #2 SelfExtender fires ONLY on a real machinery failure
+         (dispatcher returned nothing parseable), never on no-work.
+      #3 repetition circuit breaker trips when the SAME proposal is
+         dispatched twice in a row, and does NOT trip on two different
+         proposals (the over-correction guard).
+      #4 a thrash-meta proposal (build a spin/thrash/double-dispatch
+         guard) is filtered and the loop stops; it is never dispatched.
+      #5 the blocked-proposal branch references self_watch_warnings,
+         which used to be assigned later -> UnboundLocalError. These
+         tests reach that branch; a regression would raise, not skip.
+    """
+
+    # A dispatcher result that represents "no queued work".
+    NO_WORK = {
+        "next_task_proposal": "",
+        "justification": "Nothing actionable in the queue right now.",
+        "confidence": "low",
+        "selected_path": "low_confidence_no_action",
+        "requires_human_presence": False,
+    }
+
+    @staticmethod
+    def _high(proposal, justification="Mechanical follow-on with clear next step."):
+        return {
+            "next_task_proposal": proposal,
+            "justification": justification,
+            "confidence": "high",
+            "selected_path": "continue_branch",
+            "requires_human_presence": False,
+        }
+
+    def _run_main(self, *, call_side_effect, state_holder=None):
+        """Run hook.main() one or more times against a fully mocked
+        environment. call_side_effect may be a single dict/None or a list
+        (one entry consumed per main() invocation). Returns a dict of
+        recorded effects: block (emit_block texts), exit (silent_exit
+        reasons), extend (try_self_extend kwargs)."""
+        import contextlib
+        if state_holder is None:
+            state_holder = {"v": {}}
+        rec = {"block": [], "exit": [], "extend": []}
+
+        def fake_block(text):
+            rec["block"].append(text)
+            raise SystemExit(0)
+
+        def fake_exit(reason):
+            rec["exit"].append(reason)
+            raise SystemExit(0)
+
+        def fake_extend(**kwargs):
+            rec["extend"].append(kwargs)
+            raise SystemExit(0)
+
+        def fake_load_state():
+            return state_holder["v"]
+
+        def fake_save_state(s):
+            state_holder["v"] = s
+
+        calls = call_side_effect if isinstance(call_side_effect, list) else [call_side_effect]
+
+        def make_patches():
+            return [
+                patch.object(hook, 'call_dispatcher', side_effect=list(calls)),
+                patch.object(hook, 'emit_block', side_effect=fake_block),
+                patch.object(hook, 'silent_exit', side_effect=fake_exit),
+                patch.object(hook, 'try_self_extend', side_effect=fake_extend),
+                patch.object(hook, 'load_state', side_effect=fake_load_state),
+                patch.object(hook, 'save_state', side_effect=fake_save_state),
+                patch.object(hook, 'write_owner_brief'),
+                patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)),
+                patch.object(hook, 'detect_worker_stopped', return_value=True),
+                patch.object(hook, 'read_recent_turns', return_value=[
+                    {"role": "assistant", "text": "All done.", "ts": ""}
+                ]),
+                patch.object(hook, 'fetch_diff_stat', return_value=[]),
+                patch.object(hook, 'current_branch', return_value="autonomous-test"),
+                patch.object(hook, 'fetch_issues', return_value=[]),
+                patch.object(hook, 'fetch_commits', return_value=[]),
+                patch.object(hook, 'read_keychain', return_value="sk-test"),
+                patch.object(hook, 'load_system_prompt', return_value="test prompt"),
+                patch.object(hook, 'ENABLED_FLAG',
+                             new=MagicMock(exists=MagicMock(return_value=True))),
+                patch('sys.stdin', MagicMock(read=MagicMock(return_value=json.dumps({
+                    "session_id": "s1",
+                    "cwd": "/Users/main/supervisor",
+                    "transcript_path": "/tmp/test.jsonl",
+                })))),
+            ]
+
+        with contextlib.ExitStack() as stack:
+            for p in make_patches():
+                stack.enter_context(p)
+            for _ in range(len(calls)):
+                try:
+                    hook.main()
+                except SystemExit:
+                    pass
+        return rec
+
+    # -- #1 + #2: empty queue is a terminal idle, never an escalation -----
+
+    def test_empty_queue_terminates_without_self_extender(self):
+        """ACCEPTANCE (#1/#2/#6): low_confidence_no_action -> at most one
+        dispatch -> no-op terminal -> NO SelfExtender -> loop stopped."""
+        rec = self._run_main(call_side_effect=self.NO_WORK)
+        self.assertEqual(rec["extend"], [],
+                         "SelfExtender must NOT fire on an empty queue")
+        self.assertEqual(rec["block"], [],
+                         "an empty queue must NOT emit_block (no new work dispatched)")
+        self.assertIn("idle_no_work", rec["exit"],
+                      "empty queue must stop with the calm idle reason")
+
+    def test_high_confidence_but_no_action_path_still_idles(self):
+        """selected_path=low_confidence_no_action gates even when the model
+        labels confidence 'high' — the path is the source of truth, so the
+        loop still idles and does not dispatch."""
+        weird = dict(self.NO_WORK)
+        weird["confidence"] = "high"
+        rec = self._run_main(call_side_effect=weird)
+        self.assertEqual(rec["block"], [])
+        self.assertEqual(rec["extend"], [])
+        self.assertIn("idle_no_work", rec["exit"])
+
+    # -- #2: SelfExtender ONLY on a real machinery failure ----------------
+
+    def test_self_extender_fires_only_on_dispatcher_none(self):
+        """A null dispatcher result is real breakage (network/parse), so the
+        SelfExtender IS the right response — the one path that invokes it."""
+        rec = self._run_main(call_side_effect=None)
+        self.assertEqual(len(rec["extend"]), 1,
+                         "dispatcher_returned_none must invoke the SelfExtender once")
+        self.assertEqual(rec["extend"][0].get("failure_reason"),
+                         "dispatcher_returned_none")
+        self.assertEqual(rec["block"], [],
+                         "the None path delegates to SelfExtender, not a direct emit_block")
+
+    # -- #3: repetition breaker trips on a repeat, not on absence of commit
+
+    def test_repeated_proposal_trips_breaker(self):
+        """ACCEPTANCE (#3/#6): the SAME high-confidence proposal twice in a
+        row -> first dispatches, second trips the breaker and stops. No
+        SelfExtender, no second dispatch."""
+        same = "Wire the Approve button in ExpandedPanelView to the LoopController router."
+        rec = self._run_main(call_side_effect=[self._high(same), self._high(same)])
+        self.assertEqual(len(rec["block"]), 1,
+                         "only the FIRST of two identical proposals may dispatch")
+        self.assertIn("breaker_repeated_proposal", rec["exit"],
+                      "the second identical proposal must trip the repetition breaker")
+        self.assertEqual(rec["extend"], [],
+                         "the breaker must stop the loop, never escalate to SelfExtender")
+
+    def test_two_different_proposals_do_not_trip(self):
+        """ACCEPTANCE (#3/#6, over-correction guard): two DIFFERENT
+        high-confidence proposals with real progress -> BOTH dispatch. The
+        breaker must not fire on legitimate multi-step / multi-task work."""
+        rec = self._run_main(call_side_effect=[
+            self._high("Wire the Approve button to the LoopController router."),
+            self._high("Add a Keychain migration step to the onboarding flow."),
+        ])
+        self.assertEqual(len(rec["block"]), 2,
+                         "two different proposals must BOTH dispatch (no over-trip)")
+        self.assertNotIn("breaker_repeated_proposal", rec["exit"])
+        self.assertEqual(rec["extend"], [])
+
+    # -- #4: thrash-meta proposals are filtered, never dispatched ---------
+
+    def test_thrash_meta_proposal_is_filtered(self):
+        """#4: a proposal to build machinery about the loop's own spinning
+        (thrash guard / double-dispatch guard / spin detector) is filtered
+        and the loop stops calmly. Never dispatched, never escalated."""
+        rec = self._run_main(call_side_effect=self._high(
+            "Build a thrash guard in the Stop hook to detect when the dispatch "
+            "loop spins and add a single-in-flight guard against double-dispatch.",
+            justification="The loop keeps cycling; we should guard against it.",
+        ))
+        self.assertEqual(rec["block"], [],
+                         "thrash-meta work must never be dispatched")
+        self.assertEqual(rec["extend"], [],
+                         "thrash-meta is a filter+stop, not a SelfExtender failure")
+        self.assertTrue(
+            any("blocked_proposal_filtered" in r and "thrash_meta" in r
+                for r in rec["exit"]),
+            f"must stop with the thrash_meta filter reason; got {rec['exit']}")
+
+    def test_blocked_branch_does_not_raise_unbound_local(self):
+        """#5 regression: the blocked-proposal branch reads
+        self_watch_warnings. It used to be assigned only later, raising a
+        fatal UnboundLocalError before the calm stop. Reaching the filter
+        branch cleanly (a recorded silent_exit, not a crash) proves the
+        variable is now defined before that branch."""
+        rec = self._run_main(call_side_effect=self._high(
+            "Add a stuck-worker detector that watches the dispatch loop.",
+        ))
+        # If self_watch_warnings were unbound, main() would raise NameError
+        # (not SystemExit) and rec['exit'] would be empty.
+        self.assertTrue(rec["exit"],
+                        "blocked branch must reach a clean silent_exit, not crash")
+        self.assertTrue(any("blocked_proposal_filtered" in r for r in rec["exit"]))
+
+
+class TestThrashHelpers(unittest.TestCase):
+    """Unit coverage for the v0.9.0 helper predicates, independent of
+    main()'s plumbing."""
+
+    def test_thrash_meta_detects_loop_machinery(self):
+        for txt in [
+            "Build a thrash guard for the dispatch loop",
+            "Add a double-dispatch guard to the Stop hook",
+            "Implement a single-in-flight guard",
+            "Add a spin detector",
+            "Add a stuck-worker detector to the self-watch",
+            "Detect when the loop spins and stop it",
+        ]:
+            self.assertTrue(hook._is_thrash_meta_proposal(txt),
+                            f"should flag as thrash-meta: {txt!r}")
+
+    def test_thrash_meta_passes_real_product_work(self):
+        for txt in [
+            "Fix the calibration rubric for destructive actions",
+            "Wire the Approve button to the router",
+            "Write a landing page for launch",
+            "Add a Keychain migration to onboarding",
+        ]:
+            self.assertFalse(hook._is_thrash_meta_proposal(txt),
+                             f"real product work must not be flagged: {txt!r}")
+
+    def test_repeat_proposal_trips_on_same_and_near_same(self):
+        state = {}
+        base = "Close the calibration gap by tightening the destructive rubric and adding fixtures"
+        hook._remember_proposal(state, base)
+        thr = hook.DEFAULTS["same_proposal_jaccard_threshold"]
+        self.assertTrue(hook._is_repeat_proposal(state, base, thr),
+                        "identical proposal must trip")
+        near = base + " now please"
+        self.assertTrue(hook._is_repeat_proposal(state, near, thr),
+                        "near-identical reworded proposal must trip")
+
+    def test_repeat_proposal_ignores_different_task(self):
+        state = {}
+        hook._remember_proposal(
+            state, "Close the calibration gap by tightening the destructive rubric")
+        thr = hook.DEFAULTS["same_proposal_jaccard_threshold"]
+        self.assertFalse(
+            hook._is_repeat_proposal(
+                state, "Write a landing page and set up the marketing site for launch", thr),
+            "a genuinely different task must NOT trip the breaker")
+
+    def test_remember_then_no_prior_is_not_a_repeat(self):
+        """First-ever proposal (no stored history) is never a repeat."""
+        self.assertFalse(
+            hook._is_repeat_proposal({}, "Any first proposal at all", 0.8))
 
 
 if __name__ == "__main__":

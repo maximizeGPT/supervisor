@@ -6,6 +6,71 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-06-02
+
+The dispatch loop now idles gracefully on an empty queue instead of
+thrashing. Previously, when the Dispatcher had no real queued work it
+returned `low_confidence_no_action`, which fell through to the
+SelfExtender; the SelfExtender treated "no work" as breakage and
+dispatched MORE work (including meta-work about the loop's own
+spinning), each emit_block re-triggered the Stop hook, and the cycle
+fired 8+ times in minutes, ending in a fatal `UnboundLocalError`.
+
+### Fixed
+
+**Empty queue is now a terminal idle, not an escalation**
+(`Tools/dispatch-loop-hook/dispatch_loop_hook.py`)
+- `low_confidence_no_action` (or any non-actionable path) now stops the
+  session calmly: it writes a plain "loop idle, waiting for direction"
+  owner brief and exits silently. It no longer falls through to the
+  SelfExtender. "No work" is a valid terminal state, and stopping here
+  (no emit_block) breaks the thrash chain, because nothing re-triggers
+  the Stop hook.
+
+**SelfExtender fires only on real machinery failure**
+- The SelfExtender now runs on exactly one condition: the Dispatcher
+  returned nothing parseable (`dispatcher_returned_none`, a network
+  error, malformed JSON, or stuck call). It no longer fires on an empty
+  queue or low confidence. Self-repair is for broken machinery, not for
+  the absence of work.
+
+**Repetition circuit breaker**
+- The loop now trips a calm stop when the Dispatcher proposes
+  substantially the SAME task two dispatches in a row (token-Jaccard
+  similarity >= 0.8 against the previous proposal). It does NOT trip on
+  a dispatch that did real work but produced no commit, nor on two
+  genuinely different proposals, so legitimate multi-step and
+  multi-task work keeps flowing. Tuned by the new
+  `same_proposal_jaccard_threshold` config key.
+
+**Never dispatch meta-work about the loop's own thrashing**
+- A proposal to build a thrash guard, double-dispatch guard,
+  single-in-flight guard, spin detector, or stuck-worker detector is
+  now filtered before dispatch: the loop stops instead of building
+  machinery about its own spinning. The shared
+  `dispatcher-system-prompt.txt` also instructs the model to return
+  `low_confidence_no_action` rather than propose such work. Legitimate
+  guard features are filed as known gaps for a human to schedule.
+
+**Fatal `UnboundLocalError` on the blocked-proposal path**
+- `self_watch_warnings` was referenced in the blocked-proposal branch
+  before its assignment further down `main()`. The post-dispatch
+  self-watch is now computed immediately after the result is parsed, so
+  the variable is always defined before any branch reads it.
+
+### Notes
+
+- The Swift `LoopController` never had this storm: it has no
+  SelfExtender, so on low confidence it degrades to a plain notify and
+  stops at 3 consecutive lows rather than dispatching more work. The
+  shared Dispatcher prompt (the thrash-meta rule) is the cross-runtime
+  sync point. Swift's lack of a same-proposal breaker is filed under
+  Deferred architectural improvements in `trial-notes.md`.
+- 12 new regression tests cover all five fixes, including the two
+  acceptance simulations: empty-queue produces a single dispatch, a
+  no-op terminal, no SelfExtender, and a stopped loop; two different
+  proposals both dispatch (no over-trip).
+
 ## [0.8.4] — 2026-06-03
 
 Stable code signing so self-deploy stops breaking TCC and Keychain

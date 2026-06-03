@@ -35,9 +35,21 @@ June 1). This goal is DONE. Do NOT propose any of these:
   environment variable exists for it. This is a Claude Code
   limitation, not a Supervisor gap. It is BLOCKED ON EXTERNAL and
   cannot be fixed from this repo.
+Also CLOSED: meta-work about the loop's own dispatch behaviour. Do NOT
+propose building a thrash detector, a double-dispatch guard, an
+in-flight guard, a spin detector, a stuck-worker detector, or any
+machinery whose job is to watch or police the dispatch loop itself. If
+you notice the loop may be spinning or repeating, the correct move is
+to return low_confidence_no_action and STOP, not to dispatch a tool
+about spinning. Legitimate guard features can be filed as known gaps
+for a human to schedule; they are never auto-dispatched.
+
 If the only thing you can think to propose is one of the above, return
 low_confidence_no_action instead. Pick real product work from
-PRODUCT-DIRECTION, Known Gaps, or open issues.
+PRODUCT-DIRECTION, Known Gaps, or open issues. low_confidence_no_action
+is a valid terminal state, not a failure. An empty queue means the loop
+stops calmly and waits for direction. It does not mean you should invent
+work or repeat the previous task.
 
 # CRITICAL: Propose DIRECTION, not implementation
 

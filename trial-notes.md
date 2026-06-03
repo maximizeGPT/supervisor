@@ -1569,6 +1569,156 @@ One build-time fix: EventBus method is `publish`, not `emit`
 
 ---
 
+# Session 10 — dispatch loop thrash fix (v0.9.0)
+
+Directed task (Mohammed in chat, loop disabled). Spec: when the
+dispatch loop has no queued work it must idle gracefully, not
+thrash. Five fixes + two acceptance simulations. Operating under
+PRINCIPLES (restraint §1d, test-the-artifact §2b, prompt-is-code
+§2c, honest-failure §4, hard-stops §12) and the cardinal rule
+(never ship without chat approval).
+
+## Reads (this session)
+- AUTONOMOUS_SESSION_PROMPT.md v2 (the opener this prompt points
+  to). Noted it is the open-ended discovery contract; this task is
+  fully specified, so the "propose 2-3 candidates" phase does not
+  apply. Branch already exists; trial-notes already present.
+- Confirmed loop is DISABLED (no `dispatch-loop-enabled.json`), so
+  this prompt is a direct chat directive, not the loop firing.
+
+## Root cause
+`low_confidence_no_action` fell through to the `else` branch in
+`main()`, which called `try_self_extend(failure_reason="non_high_
+confidence")`. The SelfExtender never silent_exits — it emit_blocks
+a fix prompt — so "no work" produced MORE dispatched work, each
+emit_block re-triggered the Stop hook, and the loop stormed. Two
+amplifiers: the dispatcher would propose meta-work about its own
+spinning, and `self_watch_warnings` was referenced in the blocked-
+proposal branch before its assignment (fatal UnboundLocalError).
+
+## Log
+
+### Fixes (Python hook — `dispatch_loop_hook.py`)
+- **#1 + #2.** Rewrote the result-handling control flow. The
+  terminal `else` (empty queue / low confidence / non-actionable
+  path) now writes a calm idle owner brief and `silent_exit(
+  "idle_no_work")`. It no longer calls the SelfExtender or the
+  gaps-fallback. The ONLY remaining `try_self_extend` call is on
+  `if not result:` (dispatcher returned nothing parseable =
+  `dispatcher_returned_none`), which is genuine machinery breakage.
+- **#3.** Repetition breaker. New helpers `_proposal_tokens`
+  (regex word-split, drop stopwords, len>=3), `_jaccard`,
+  `_is_repeat_proposal`, `_remember_proposal` (stores
+  `state["last_proposal_tokens"]`). On a high-confidence actionable
+  proposal, if token-Jaccard vs the previous proposal >= 0.8 (new
+  config key `same_proposal_jaccard_threshold`), trip a calm stop
+  (`breaker_repeated_proposal`). Two DIFFERENT proposals share few
+  significant tokens, so they don't trip. A productive dispatch with
+  no commit is NOT treated as a no-op (the breaker keys on proposal
+  similarity, not on diff/commit presence).
+- **#4.** New `_THRASH_META_PHRASES` + `_is_thrash_meta_proposal`.
+  A proposal about thrash guards / double-dispatch guards / spin or
+  stuck-worker detectors is filtered before dispatch (shares the
+  existing blocked-proposal branch) and stops the loop. Also added
+  a CLOSED rule to `dispatcher-system-prompt.txt` so the model
+  returns `low_confidence_no_action` instead of proposing such work.
+- **#5.** Moved `self_watch_warnings = pre_warnings + post_warnings`
+  to immediately after the result parse, before any branch reads it.
+  Also added the missing `import re`.
+
+### Decision — do NOT build the Swift repetition breaker (§1d)
+The Swift `LoopController` is structurally immune to this storm: it
+has no SelfExtender, so on low confidence it degrades to a plain
+notify and stops at 3 consecutive lows. It never dispatches more
+work on no-work. The shared `dispatcher-system-prompt.txt` is read
+live by BOTH the Python hook and `Dispatcher.swift` (verified at
+`Dispatcher.swift:452`), so the #4 prompt rule is synced by
+construction. The one real divergence — Swift lacks a same-proposal
+Jaccard breaker — is FILED under "Deferred architectural
+improvements" rather than built, because it needs SQLite schema +
+actor state + its own tests (a human-scheduled change, not loop
+self-tooling). This is the restraint principle applied: file the
+feature, don't build it mid-task.
+
+### Test hygiene bug found + fixed
+The pre-existing `TestRequiresHumanPresenceGate` ran real `main()`
+without mocking `write_owner_brief`, so every test run clobbered the
+repo's real `OWNER-BRIEF.md` with the "Run the physical-world
+trial" fixture. Added `write_owner_brief` to both tests' mock sets.
+Also fixed `TestIneffectiveChangeFreshnessCheck`, which pinned the
+fake source mtime to wall-clock `now` and so failed whenever the
+installed binary was older than 10 min; now offsets from the real
+binary mtime.
+
+### Verification
+- 58/58 Python tests pass (was 46; +12 new in `TestThrashFixV090`
+  and `TestThrashHelpers`).
+- Simulation 1 (empty queue): `test_empty_queue_terminates_without_
+  self_extender` — asserts at-most-one dispatch, no emit_block, no
+  SelfExtender, `idle_no_work` stop. PASS.
+- Simulation 2 (no over-trip): `test_two_different_proposals_do_not_
+  trip` — two different high-confidence proposals BOTH emit_block,
+  no breaker. PASS.
+- Controls: repeated proposal trips the breaker; thrash-meta is
+  filtered; SelfExtender fires only on `dispatcher_returned_none`;
+  blocked branch reaches a clean silent_exit (no UnboundLocalError).
+  All PASS.
+
+## Post-mortem
+
+### What I tried to ship
+The v0.9.0 dispatch-loop thrash fix: empty queue idles instead of
+escalating; SelfExtender only on real breakage; repetition breaker;
+no meta-work dispatch; UnboundLocalError fixed.
+
+### What actually shipped (pending commit approval)
+Working-tree changes, not yet committed (cardinal rule — awaiting
+chat approval):
+- `Tools/dispatch-loop-hook/dispatch_loop_hook.py` (control-flow
+  rewrite + helpers + `import re`)
+- `Tools/dispatch-loop-hook/dispatcher-system-prompt.txt` (#4 rule)
+- `Tools/dispatch-loop-hook/test_dispatch_loop_hook.py` (+12 tests,
+  +2 hygiene fixes)
+- `CHANGELOG.md` (v0.9.0), `OWNER-BRIEF.md` (clean), `trial-notes.md`
+  (this entry + Swift gap filed)
+
+### What didn't ship and why
+- The fix was NOT deployed to `~/.claude/hooks/` and the loop was
+  NOT re-enabled. Deploying + re-enabling is out of scope for the
+  task (fix/test/document/verify) and is Mohammed's decision,
+  especially since he deliberately disabled the loop. The installed
+  hook is still the stale buggy code; the owner brief documents the
+  two-step safe re-enable.
+- The Swift same-proposal breaker (filed as a gap, see above).
+
+### Honest mistakes
+- My first pass left the owner brief saying "restore the flag" to
+  re-enable, which would have run the stale buggy installed hook —
+  a footgun I created. Fixed: the brief now states the installed
+  copy is stale and gives the two-step (sync then enable) procedure.
+- I forgot `import re` in the first edit; the helper raised
+  NameError on the first manual check. Caught immediately.
+
+### What surprised me
+`Dispatcher.swift` loads the prompt .txt from a hardcoded absolute
+repo path at runtime, not a bundled copy — so prompt edits are
+shared with the Swift path for free, but only when running from the
+repo working dir (the inline fallback "should never fire").
+
+### Open questions for Mohammed
+- Do you want the fix deployed to `~/.claude/hooks/` and the loop
+  re-enabled, or kept off for now? (My default: leave off; you
+  decide.)
+- Should the Swift same-proposal breaker be scheduled, or is the
+  3-consecutive-low stop enough for the in-app path?
+
+### Calibration / cost summary
+- API spend this session: $0 (pure code + tests, no live calls).
+- Sweeps run: none.
+- Tests passing locally: 58/58 Python hook (was 46; +12).
+
+---
+
 # Known Gaps
 
 Standing record of unfinished, unticketed, or blocked work. The
@@ -1647,6 +1797,21 @@ Last updated: 2026-05-31
   key. Sessions without it can only do pure-code work.
 
 ## Deferred architectural improvements
+
+- **Swift LoopController has no same-proposal repetition breaker.** The
+  Python Stop-hook loop gained one in v0.9.0 (token-Jaccard >= 0.8 over
+  the previous proposal trips a calm stop). The Swift LoopController
+  stops on 4-hour wall-clock and on 3 consecutive low-confidence
+  results, but has no notion of "the dispatcher proposed the SAME task
+  twice." Swift cannot produce the v0.9.0 escalation storm (it has no
+  SelfExtender — on low confidence it degrades to a plain notify and
+  never dispatches more work), so this is not urgent. But for true
+  parity it should persist the last accepted proposal per session in
+  `loop_dispatches` and short-circuit a near-identical high-confidence
+  repeat to a stop, the same way the hook does. Filed, not auto-built:
+  it needs SQLite schema + actor state + its own tests, which is a
+  human-scheduled change, not loop self-tooling. Do NOT dispatch this
+  as loop work.
 
 - ~~**Stable code signing so self-deploy stops breaking TCC grants.**~~
   RESOLVED 2026-06-03. Ad-hoc signing gave a `cdhash H"..."` designated
