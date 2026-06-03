@@ -1648,25 +1648,30 @@ Last updated: 2026-05-31
 
 ## Deferred architectural improvements
 
-- **Stable code signing so self-deploy stops breaking TCC grants.**
-  The build signs ad-hoc (`codesign --sign -`), so every rebuild
-  produces a new code hash. macOS binds both the Accessibility grant
-  and the Keychain item ACL to that hash. After a self-deploy the new
-  binary reads as ungranted for Accessibility, and the first Keychain
-  read blocks on an access prompt that hangs app startup until the
-  user clicks Allow. Seen directly on 2026-06-02: a deployed binary
-  hung in `applicationDidFinishLaunching` on `keyStore.read` waiting
-  for the Keychain prompt. Fix shape: create a stable self-signed
-  code-signing certificate, trust it for codesigning, and have
-  `sign-adhoc.sh` (rename to `sign.sh`) sign with that identity
-  instead of ad-hoc. TCC then matches on the cert designated
-  requirement, which is stable across rebuilds, so both grants
-  persist. Risk: a botched cert breaks launch and the
-  Identifier-match notification guard, so verify on a throwaway build
-  first. This is the single biggest friction in the self-update story
-  and the right next infrastructure investment. Not a blocker for
-  pure-code work; the onboarding Continue button and the
-  Always-Allow-once Keychain click are the interim workarounds.
+- ~~**Stable code signing so self-deploy stops breaking TCC grants.**~~
+  RESOLVED 2026-06-03. Ad-hoc signing gave a `cdhash H"..."` designated
+  requirement that changed every build, so macOS dropped the
+  Accessibility grant and the Keychain ACL on each self-deploy. Fix
+  shipped: `Scripts/setup-signing-identity.sh` creates a stable
+  self-signed code-signing cert ("Supervisor Self-Signed") and imports
+  it; `Scripts/sign-adhoc.sh` signs with that identity when present and
+  falls back to ad-hoc otherwise. The cert does NOT need system trust:
+  codesign signs by name and the requirement is cert-based regardless,
+  so no admin and no password dialog. Verified: the designated
+  requirement is now `identifier "live.supervisor.app" and certificate
+  leaf = H"33eff90..."`, identical across two genuinely different
+  binaries (a throwaway probe at cdhash 4d59fcf and Supervisor at
+  444a95b both produced the same cert leaf), so it is binary
+  independent by construction. The Identifier-matches-CFBundleIdentifier
+  notification guard still passes, and `codesign --verify` reports
+  "satisfies its Designated Requirement". Deployed the stably-signed
+  build; it launched, read the Keychain key with no hang, and is
+  triaging normally. One-time transition cost: the move from the old
+  ad-hoc requirement to the cert requirement still needs the
+  Accessibility grant confirmed once for the cert-signed app (the
+  onboarding Continue button handles this); after that, rebuilds keep
+  the grant. Run `Scripts/setup-signing-identity.sh` once per machine
+  before building.
 
 - **Config format long-term.** The minimal YAML parser handles exactly
   `hover.known_terminals`. If config.yaml grows beyond one key,

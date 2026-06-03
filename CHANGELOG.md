@@ -6,6 +6,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-06-03
+
+Stable code signing so self-deploy stops breaking TCC and Keychain
+grants.
+
+### Fixed
+
+**Self-deploy no longer drops the Accessibility grant or the Keychain
+ACL** (`Scripts/setup-signing-identity.sh`, `Scripts/sign-adhoc.sh`)
+- Ad-hoc signing produced a designated requirement of `cdhash H"..."`,
+  which changed every build. macOS treated each rebuild as a different
+  program and dropped both the Accessibility grant and the Keychain
+  access ACL, forcing the user to re-grant Accessibility and click
+  through a Keychain prompt that hung startup after every self-deploy.
+- `setup-signing-identity.sh` creates a stable self-signed code-signing
+  certificate and imports it. `sign-adhoc.sh` signs with that identity
+  when present and falls back to ad-hoc otherwise. The cert needs no
+  system trust and no admin: codesign signs by name and the requirement
+  is cert-based regardless.
+- The designated requirement is now `identifier "live.supervisor.app"
+  and certificate leaf = H"..."`, which is the same across rebuilds, so
+  the grants persist. Verified identical across two different binaries.
+  `codesign --verify` passes and the Identifier guard still holds.
+- One-time transition: the move from the old ad-hoc requirement to the
+  cert requirement needs the Accessibility grant confirmed once for the
+  cert-signed app. After that, rebuilds keep it.
+
 ## [0.8.3] — 2026-06-02
 
 Override button restyle, plain-voice copy pass, onboarding AX fix,
