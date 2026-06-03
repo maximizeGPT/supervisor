@@ -760,29 +760,58 @@ class TestIneffectiveChangeFreshnessCheck(unittest.TestCase):
             os.utime(ui_abs, (bin_mtime + 600, bin_mtime + 600))   # source 10 min newer than binary
         return ui_rel
 
+    # recent_files_changed comes from `git diff --stat`, whose lines carry
+    # a stat column ("path | 45 +++"). The freshness check must resolve the
+    # real path out of that line. Each format below must produce the same
+    # verdict; the decorated form is what actually flows in production.
+    @staticmethod
+    def _formats(ui_rel):
+        return [
+            ui_rel,                          # bare path
+            f"{ui_rel} | 45 ++++++---",      # `git diff --stat` line (real)
+            f" {ui_rel} | 2 +-",             # leading-space variant
+        ]
+
     def test_no_warning_when_binary_is_newer(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             ui_rel = self._setup(tmp, binary_newer=True)
-            result = hook.detect_ineffective_change(
-                tmp,
-                commits=[{"sha": "x", "subject": "fix hover", "body": ""}],
-                recent_files_changed=[ui_rel],
-            )
-            self.assertIsNone(result,
-                "must not warn when the deployed binary is newer than the UI source")
+            for entry in self._formats(ui_rel):
+                result = hook.detect_ineffective_change(
+                    tmp,
+                    commits=[{"sha": "x", "subject": "fix hover", "body": ""}],
+                    recent_files_changed=[entry],
+                )
+                self.assertIsNone(result,
+                    f"must not warn when binary is newer; format={entry!r} "
+                    f"(regression: diff-stat line failed to resolve, bypassing "
+                    f"the freshness guard and crying wolf)")
 
     def test_warns_when_binary_is_older(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             ui_rel = self._setup(tmp, binary_newer=False)
-            result = hook.detect_ineffective_change(
-                tmp,
-                commits=[{"sha": "x", "subject": "fix hover", "body": ""}],
-                recent_files_changed=[ui_rel],
-            )
-            self.assertIsNotNone(result, "must warn when the deployed binary is stale")
-            self.assertIn("older than those edits", result)
+            for entry in self._formats(ui_rel):
+                result = hook.detect_ineffective_change(
+                    tmp,
+                    commits=[{"sha": "x", "subject": "fix hover", "body": ""}],
+                    recent_files_changed=[entry],
+                )
+                self.assertIsNotNone(result,
+                    f"must warn when the binary is stale; format={entry!r}")
+                self.assertIn("older than those edits", result)
+
+    def test_no_warning_when_path_unresolvable(self):
+        """If a UI file matches but its path can't be resolved on disk, we
+        cannot prove staleness, so we must stay quiet rather than warn — the
+        old code defaulted to warning whenever newest_src stayed 0."""
+        result = hook.detect_ineffective_change(
+            "/tmp/nonexistent-repo-xyz",
+            commits=[{"sha": "x", "subject": "fix hover", "body": ""}],
+            recent_files_changed=["Sources/SupervisorCore/Hover/HoverViewModel.swift | 9 +++"],
+        )
+        self.assertIsNone(result,
+            "unresolvable source path must not cry wolf")
 
     def test_no_warning_without_ui_files(self):
         result = hook.detect_ineffective_change(

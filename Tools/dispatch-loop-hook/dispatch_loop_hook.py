@@ -1702,10 +1702,25 @@ def detect_ineffective_change(
             newest_src = 0.0
             for f in recent_files_changed:
                 if any(pat in f for pat in ui_file_patterns):
-                    p = Path(cwd) / f
+                    # recent_files_changed entries are `git diff --stat`
+                    # lines like "Sources/.../HoverViewModel.swift | 45 +++".
+                    # The stat column must be stripped before resolving, or
+                    # Path(cwd)/f never exists, newest_src stays 0, and the
+                    # freshness guard below is silently bypassed — which made
+                    # this warning fire even when the binary was already
+                    # newer than the source (the exact false positive that
+                    # dispatched a pointless rebuild).
+                    path_part = f.rsplit("|", 1)[0].strip()
+                    if "=>" in path_part:                # rename: "old => new"
+                        path_part = path_part.split("=>")[-1].strip().rstrip("} ")
+                    p = Path(cwd) / path_part
                     if p.exists():
                         newest_src = max(newest_src, p.stat().st_mtime)
-            if newest_src > 0 and app_mtime >= newest_src:
+            # Warn ONLY on positive evidence: a resolved source file is newer
+            # than the deployed binary. If no source mtime resolved
+            # (newest_src == 0) we cannot claim staleness, so stay quiet
+            # rather than cry wolf.
+            if newest_src == 0.0 or app_mtime >= newest_src:
                 return None  # deployed build is at least as new as the source
             return (
                 f"This session changed {', '.join(set(ui_files_touched))} "
