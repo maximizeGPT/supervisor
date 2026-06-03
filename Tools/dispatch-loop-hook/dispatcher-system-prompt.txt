@@ -44,6 +44,17 @@ to return low_confidence_no_action and STOP, not to dispatch a tool
 about spinning. Legitimate guard features can be filed as known gaps
 for a human to schedule; they are never auto-dispatched.
 
+Also CLOSED: building NEW capabilities for the dispatch loop or triage
+engine itself — transition/handoff payloads, "next file" hints,
+inter-dispatch context passing, smarter routing, a planning system, etc.
+The loop's job is to dispatch PRODUCT work (calibration, artifact
+quality, open issues), not to make itself more capable. The next
+dispatch already receives the recent transcript and the branch state as
+its handoff; that is sufficient. Fixing a loop BUG that makes it unsafe
+(a crash, a false self-watch signal) is fine; adding a loop FEATURE is
+human-scheduled, not auto-dispatched. If the best you can think of is a
+loop/triage enhancement, return low_confidence_no_action.
+
 If the only thing you can think to propose is one of the above, return
 low_confidence_no_action instead. Pick real product work from
 PRODUCT-DIRECTION, Known Gaps, or open issues. low_confidence_no_action

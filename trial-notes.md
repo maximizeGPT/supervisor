@@ -1798,6 +1798,23 @@ Last updated: 2026-05-31
 
 ## Deferred architectural improvements
 
+- **Inter-dispatch transition payload ("next file hint").** Idea (loop
+  self-proposed, NOT auto-dispatched per the prompt's CLOSED rule): when a
+  dispatcher finishes a task and the next one logically continues it, let
+  it write a small advisory hint (task id, file path, line, one-line
+  rationale) to e.g. `state/supervisor/transition-note.json`; the next
+  dispatcher reads + deletes it, lands on that file, and proceeds (advisory
+  — proceed normally if absent). Mirror in the Python hook if pursued.
+  Status: DEFERRED, human-scheduled. Rationale for not building it now:
+  (a) it is loop-internal machinery (the premortem trap — making the loop
+  more capable while the product has zero users); (b) the premise is
+  overstated — the next dispatch already receives the recent transcript
+  (the implicit handoff) and a `continue_branch` path exists, and no real
+  multi-dispatch chain has actually been blocked for lack of a file hint;
+  (c) it is speculative ("covers the common case" that has not manifested).
+  Do NOT dispatch this as loop work; a human decides if/when it is worth
+  the Swift LoopController + SQLite/file surface it adds.
+
 - **Swift LoopController has no same-proposal repetition breaker.** The
   Python Stop-hook loop gained one in v0.9.0 (token-Jaccard >= 0.8 over
   the previous proposal trips a calm stop). The Swift LoopController
