@@ -327,8 +327,16 @@ public final class HoverViewModel: ObservableObject {
     public static func plainLabelForFlag(action: FlagAction, reasoningPlain: String?) -> String {
         // If we have a plain reasoning, use a short version of it.
         if let plain = reasoningPlain, !plain.isEmpty {
-            // Take the first sentence, capped at 60 chars for the hover.
-            let firstSentence = plain.split(separator: ".", maxSplits: 1).first.map(String.init) ?? plain
+            // Take the first sentence. Split on ". " (period followed by a
+            // space) so a decimal point inside a version like "v0.8.3" is
+            // not treated as a sentence boundary. The old split on a bare
+            // "." clipped "shipping v0.8.3" down to "shipping v0".
+            let firstSentence: String
+            if let r = plain.range(of: ". ") {
+                firstSentence = String(plain[..<r.lowerBound])
+            } else {
+                firstSentence = plain
+            }
             let capped = firstSentence.count > 60 ? String(firstSentence.prefix(57)) + "..." : firstSentence
             return capped
         }
