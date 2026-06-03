@@ -26,13 +26,34 @@ final class HoverLabelTests: XCTestCase {
                        "label must not clip to 'v0'; got: \(label)")
     }
 
-    /// First sentence ends at ". " (period + space), not at a decimal.
-    func testFirstSentenceSplitsOnPeriodSpace() {
+    /// First sentence is taken whole (including its terminating period),
+    /// and the second sentence is dropped.
+    func testFirstSentenceOnly() {
         let label = HoverViewModel.plainLabelForFlag(
             action: .pause,
             reasoningPlain: "Paused Claude Code. It needs your attention."
         )
-        XCTAssertEqual(label, "Paused Claude Code")
+        XCTAssertEqual(label, "Paused Claude Code.")
+    }
+
+    /// Abbreviations like "e.g." must not be treated as sentence ends.
+    func testAbbreviationDoesNotSplit() {
+        let label = HoverViewModel.plainLabelForFlag(
+            action: .continue,
+            reasoningPlain: "Run e.g. the calibration sweep next. Then report."
+        )
+        XCTAssertTrue(label.contains("e.g. the calibration sweep"),
+                      "abbreviation must not split the sentence; got: \(label)")
+    }
+
+    /// File paths with dots must not split the sentence.
+    func testFilePathDoesNotSplit() {
+        let label = HoverViewModel.plainLabelForFlag(
+            action: .inject,
+            reasoningPlain: "Edited config.yaml in the repo. Rebuilt after."
+        )
+        XCTAssertTrue(label.contains("config.yaml in the repo"),
+                      "file path must not split the sentence; got: \(label)")
     }
 
     /// No ". " in the text means the whole string is the first sentence

@@ -327,16 +327,11 @@ public final class HoverViewModel: ObservableObject {
     public static func plainLabelForFlag(action: FlagAction, reasoningPlain: String?) -> String {
         // If we have a plain reasoning, use a short version of it.
         if let plain = reasoningPlain, !plain.isEmpty {
-            // Take the first sentence. Split on ". " (period followed by a
-            // space) so a decimal point inside a version like "v0.8.3" is
-            // not treated as a sentence boundary. The old split on a bare
-            // "." clipped "shipping v0.8.3" down to "shipping v0".
-            let firstSentence: String
-            if let r = plain.range(of: ". ") {
-                firstSentence = String(plain[..<r.lowerBound])
-            } else {
-                firstSentence = plain
-            }
+            // Take the first sentence using Foundation's sentence boundary
+            // detection. A naive split on "." breaks on any embedded period:
+            // version numbers ("v0.8.3"), abbreviations ("e.g."), file paths
+            // ("config.yaml"). ICU's sentence tokenizer handles all of those.
+            let firstSentence = Self.firstSentence(of: plain)
             let capped = firstSentence.count > 60 ? String(firstSentence.prefix(57)) + "..." : firstSentence
             return capped
         }
@@ -349,6 +344,27 @@ public final class HoverViewModel: ObservableObject {
         case .pause:      return "Paused Claude Code. Needs your attention."
         case .kill:       return "Stopped Claude Code. Something looked dangerous."
         }
+    }
+
+    /// First sentence of `text`, using Foundation's sentence boundary
+    /// detection (ICU). Robust against embedded periods (versions,
+    /// abbreviations, file paths) that a naive split on "." would treat
+    /// as sentence ends. Returns the whole string if no sentence boundary
+    /// is found.
+    static func firstSentence(of text: String) -> String {
+        var result: String?
+        let ns = text as NSString
+        ns.enumerateSubstrings(
+            in: NSRange(location: 0, length: ns.length),
+            options: .bySentences
+        ) { substring, _, _, stop in
+            if let s = substring?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !s.isEmpty {
+                result = s
+                stop.pointee = true
+            }
+        }
+        return result ?? text
     }
 
     // MARK: - Event subscription
