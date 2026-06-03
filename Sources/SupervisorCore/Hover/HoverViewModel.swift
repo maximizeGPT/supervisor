@@ -100,6 +100,9 @@ public final class HoverViewModel: ObservableObject {
     public let flagStore: FlagStore?
     private var busCancellable: AnyCancellable?
     private var acknowledgeDebouncerTask: Task<Void, Never>?
+    /// Cancels the in-flight "turn the flash off" timer when a newer action
+    /// arrives, so back-to-back actions don't clip each other's flash.
+    private var flashOffTask: Task<Void, Never>?
     /// How long to hold the flagged state before auto-acknowledging.
     /// Resets on each new flag.
     public let acknowledgeDebounceDuration: TimeInterval
@@ -205,12 +208,13 @@ public final class HoverViewModel: ObservableObject {
         }
         trace.emit("hover", "action recorded: \(action.rawValue) — \(description)")
 
-        // Trigger the transient flash.
-        actionFlash = true
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 2_000_000_000) // 2s flash
-            self?.actionFlash = false
-        }
+        // Flash AND surface the plain-language label, so the user sees — in
+        // the moment — WHAT Supervisor did ("Paused Claude Code", "Sent
+        // Claude its next task"), not just a border glow. The label settles
+        // back to the activity label after the hold. HoverWindowController
+        // observes actionFlash and forces the hover visible for the
+        // duration, so this is seen even when no terminal is frontmost.
+        beginActionFlash(label: description, holdSeconds: 2.5)
     }
 
     /// Announce that Supervisor rebuilt and relaunched itself. Shows a
@@ -221,7 +225,6 @@ public final class HoverViewModel: ObservableObject {
     public func announceSelfRebuild(version: String? = nil) {
         let label = version.map { "Supervisor updated itself to \($0)" }
             ?? "Supervisor updated itself"
-        plainLabel = label
 
         let record = ActionRecord(action: .selfExtend, plainDescription: label)
         recentActions.insert(record, at: 0)
@@ -230,17 +233,50 @@ public final class HoverViewModel: ObservableObject {
         }
         trace.emit("hover", "self-rebuild announced: \(label)")
 
+        // Longer hold than a normal action: the hover window is recreated on
+        // relaunch and the frontmost app right after a self-deploy is almost
+        // never a terminal, so the normal visibility gate would hide this.
+        // The controller force-shows while actionFlash is true; a 5s hold
+        // gives the user (and on-screen verification) time to actually see
+        // "Supervisor updated itself" before it settles back.
+        beginActionFlash(label: label, holdSeconds: 5.0)
+    }
+
+    /// Drive the action flash: surface `label`, glow/scale the hover (via
+    /// `actionFlash`), then settle the label back to the live activity after
+    /// `holdSeconds`. Centralized so recordAction and announceSelfRebuild
+    /// behave identically. HoverWindowController observes `actionFlash` and
+    /// forces the hover visible for the hold, so the flash is seen even when
+    /// no terminal is frontmost.
+    private func beginActionFlash(label: String, holdSeconds: Double) {
+        plainLabel = label
+        detailLabel = ""   // clear any stale command detail for a clean flash
         actionFlash = true
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            self?.actionFlash = false
-        }
-        // Return to the idle watching label after a few seconds.
+
+        flashOffTask?.cancel()
         acknowledgeDebouncerTask?.cancel()
-        acknowledgeDebouncerTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            guard !Task.isCancelled else { return }
-            self?.acknowledgeFlag()
+        let holdNanos = UInt64(max(0, holdSeconds) * 1_000_000_000)
+        flashOffTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: holdNanos)
+            guard !Task.isCancelled, let self else { return }
+            self.actionFlash = false
+            self.plainLabel = self.labelForCurrentActivity()
+        }
+    }
+
+    /// The plain label that matches the current `activity` — used to settle
+    /// the hover after a transient action flash without reverting an active
+    /// pause/flag to "all clear".
+    private func labelForCurrentActivity() -> String {
+        switch activity {
+        case .idle:
+            return projectName.isEmpty
+                ? "Watching. All clear"
+                : "Watching \(projectName). All clear"
+        case .triaging:
+            return "Checking something..."
+        case let .flagged(_, action, reasoningPlain):
+            return Self.plainLabelForFlag(action: action, reasoningPlain: reasoningPlain)
         }
     }
 
@@ -276,6 +312,15 @@ public final class HoverViewModel: ObservableObject {
 
     /// Called by TriageEngine when it starts a Haiku call.
     public func triageStarted() {
+        // Don't stomp an active action flash. On a busy session the triage
+        // engine fires constantly; without this guard it overwrites the
+        // "Paused Claude Code" / "Supervisor updated itself" label (and the
+        // dot) milliseconds after the flash sets it, so the user never sees
+        // the action. The flash owns the hover for its brief duration.
+        guard !actionFlash else {
+            trace.emit("hover", "triage started — label held (action flash active)")
+            return
+        }
         activity = .triaging
         plainLabel = "Checking something..."
         trace.emit("hover", "activity -> triaging")
@@ -283,6 +328,10 @@ public final class HoverViewModel: ObservableObject {
 
     /// Called by TriageEngine when a Haiku batch finishes without flags.
     public func triageFinishedNoFlag() {
+        guard !actionFlash else {
+            trace.emit("hover", "triage idle — label held (action flash active)")
+            return
+        }
         activity = .idle
         plainLabel = projectName.isEmpty
             ? "Watching. All clear"
@@ -378,11 +427,18 @@ public final class HoverViewModel: ObservableObject {
             // Reset per-session metrics on new session.
             turnCount = 0
             toolCallCount = 0
-            plainLabel = projectName.isEmpty
-                ? "Watching. All clear"
-                : "Watching \(projectName). All clear"
+            // Don't stomp an active action flash (see triageStarted). On a
+            // busy session these bus events fire constantly and were the main
+            // reason the flash/announce label was never seen — they
+            // overwrote it within milliseconds.
+            if !actionFlash {
+                plainLabel = projectName.isEmpty
+                    ? "Watching. All clear"
+                    : "Watching \(projectName). All clear"
+            }
         case .bashToolCall(let info):
             toolCallCount += 1
+            guard !actionFlash else { break }   // hold the flash label
             // Plain headline: "Running a command"
             // Detail (secondary, de-emphasized): the actual command
             let head = info.command
@@ -392,7 +448,7 @@ public final class HoverViewModel: ObservableObject {
             plainLabel = "Running a command"
             detailLabel = String(head.prefix(80))
         case .bashToolResult(let info):
-            if info.isError {
+            if info.isError && !actionFlash {
                 detailLabel += " (errored)"
             }
         case .userPrompt:

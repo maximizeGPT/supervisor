@@ -66,7 +66,15 @@ public final class HoverWindowController {
     private var pollTimer: Timer?
     private var currentlyVisible: Bool = false
     private var expandedCancellable: AnyCancellable?
+    private var flashCancellable: AnyCancellable?
     private var frameObserver: NSObjectProtocol?
+
+    /// True while the VM's actionFlash is lit. The hover is force-shown for
+    /// the duration so a substantial action (pause/kill/inject/dispatch/
+    /// self-extend/self-rebuild) is ALWAYS seen, even when the frontmost app
+    /// isn't a terminal — e.g. right after a self-deploy relaunch, when the
+    /// "Supervisor updated itself" announcement fires.
+    private var forcedVisibleByFlash: Bool = false
 
     /// Once the user drags the hover, don't auto-position it anymore.
     private var userHasRepositioned: Bool = false
@@ -145,6 +153,24 @@ public final class HoverWindowController {
                 }
             }
 
+        // Observe vm.actionFlash: force the hover visible for the duration
+        // of a substantial action's flash, then revert to the normal
+        // frontmost-terminal/session visibility gate. Without this, the
+        // flash (and the self-rebuild announcement) fire into a hidden
+        // window whenever a terminal isn't frontmost, which is why the user
+        // never saw it.
+        self.flashCancellable = vm.$actionFlash
+            .removeDuplicates()
+            .sink { [weak self] flashing in
+                guard let self else { return }
+                self.forcedVisibleByFlash = flashing
+                if flashing {
+                    self.forceShowForFlash()
+                } else {
+                    self.applyVisibility()
+                }
+            }
+
         // Observe hover panel frame changes — re-anchor expanded panel
         // when the hover is dragged to a new position.
         self.frameObserver = NotificationCenter.default.addObserver(
@@ -206,7 +232,27 @@ public final class HoverWindowController {
 
     // MARK: - Visibility logic (Gap 8)
 
+    /// Bring the hover forward for an action flash, overriding the normal
+    /// frontmost-terminal/session gate. Visibility reverts to that gate when
+    /// the flash ends.
+    private func forceShowForFlash() {
+        if !userHasRepositioned {
+            positionTopRight()
+        }
+        panel.orderFrontRegardless()
+        currentlyVisible = true
+    }
+
     private func applyVisibility() {
+        // While a substantial action is flashing, keep the hover up no
+        // matter what — the whole point is that the user sees Supervisor
+        // act. The poll timer and workspace observer both route here, so
+        // this guard also stops them hiding the hover mid-flash.
+        if forcedVisibleByFlash {
+            if !currentlyVisible { forceShowForFlash() }
+            return
+        }
+
         let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontmostHostsClaudeCode = frontmostBundleID.map(claudeCodeHostApps.contains) ?? false
         let sessionActive = isAnySessionActive()

@@ -211,6 +211,29 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             trace.emit("app", "self-rebuild marker found; announced and cleared")
         }
 
+        // Debug affordance: SUPERVISOR_DEBUG_FLASH=1 fires a sample action
+        // flash every few seconds after launch, so the action-flash
+        // animation can be verified on screen without waiting for a real
+        // pause/kill. Inert unless the env var is set. This is how to
+        // confirm the flash that "kept getting shipped but was never seen."
+        if ProcessInfo.processInfo.environment["SUPERVISOR_DEBUG_FLASH"] == "1" {
+            trace.emit("app", "DEBUG_FLASH enabled; holding a continuous sample flash")
+            Task { @MainActor [weak hoverVM] in
+                // Re-trigger faster than the 2.5s auto-off so the flash stays
+                // lit continuously for ~90s, making on-screen verification
+                // timing-independent (any capture in the window shows it).
+                for i in 0..<60 {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    guard let vm = hoverVM else { return }
+                    vm.recordAction(
+                        action: .pause,
+                        description: "Paused Claude Code. Needs your attention."
+                    )
+                    if i == 0 { trace.emit("app", "DEBUG_FLASH holding continuous flash") }
+                }
+            }
+        }
+
         // Watch config.yaml for live changes — FSEvents fires on write/rename.
         let watcher = ConfigWatcher(configPath: paths.configPath, trace: trace) { [weak hoverWindow] config in
             hoverWindow?.mergeUserConfig(additionalHostApps: config.additionalHostApps)
