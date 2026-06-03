@@ -1618,11 +1618,40 @@ def summarize_recent_commits(commits: list[dict[str, str]], limit: int = 10) -> 
 # Self-Watch (Capability 2 — catch mismatches, fix them)
 # ----------------------------------------------------------------------
 
+def _newest_swift_mtime(cwd: str, rel_path: str) -> float:
+    """Newest mtime among .swift files under rel_path (a file or directory),
+    resolved relative to cwd. 0.0 if nothing resolves."""
+    p = Path(cwd) / rel_path
+    try:
+        if p.is_file():
+            return p.stat().st_mtime
+        if p.is_dir():
+            newest = 0.0
+            for f in p.rglob("*.swift"):
+                try:
+                    newest = max(newest, f.stat().st_mtime)
+                except Exception:
+                    pass
+            return newest
+    except Exception:
+        pass
+    return 0.0
+
+
 def detect_stale_build(cwd: str, timeout: float) -> tuple[str | None, float]:
-    """Detect when committed code changes user-facing behavior but the
-    running Supervisor.app predates those commits. Returns (warning, commit_time)
-    or (None, 0). The commit_time is used for deduplication — same commit_time
-    means same staleness, no need to re-warn."""
+    """Detect when UI source files were EDITED more recently than the
+    deployed Supervisor.app was built, so the running app can't reflect
+    them.
+
+    Compares the deployed bundle's mtime to the newest UI SOURCE FILE
+    mtime, NOT to git commit times. The normal workflow is build-then-
+    commit, so a commit timestamp is ALWAYS newer than the binary even when
+    the binary was built from that exact code — using commit time produced
+    a guaranteed false "stale build" after every commit, which kept
+    dispatching pointless rebuilds. File mtimes only move when a file is
+    actually edited, so newest_src > app_mtime means a real post-build edit.
+
+    Returns (warning, newest_src_mtime) for dedup, or (None, 0)."""
     app_path = "/Applications/Supervisor.app/Contents/Info.plist"
     if not Path(app_path).exists():
         return None, 0
@@ -1637,28 +1666,22 @@ def detect_stale_build(cwd: str, timeout: float) -> tuple[str | None, float]:
         "Sources/SupervisorCore/Intervention/Notifier.swift",
         "Sources/SupervisorCore/Hover/HoverViewModel.swift",
     ]
-    latest_commit_time = 0
+    newest_src = 0.0
     for ui_path in ui_paths:
-        code, out, _ = run(
-            ["git", "log", "-1", "--format=%ct", "--", ui_path],
-            cwd=cwd,
-            timeout=timeout,
-        )
-        if code == 0 and out.strip():
-            try:
-                t = int(out.strip())
-                if t > latest_commit_time:
-                    latest_commit_time = t
-            except ValueError:
-                pass
+        newest_src = max(newest_src, _newest_swift_mtime(cwd, ui_path))
 
-    if latest_commit_time > 0 and latest_commit_time > app_mtime:
+    # Only warn on positive evidence: a UI source file is genuinely newer
+    # than the deployed app (edited after the last build/deploy). The
+    # `timeout` arg is retained for signature compatibility (git no longer
+    # consulted here).
+    _ = timeout
+    if newest_src > 0 and newest_src > app_mtime:
         return (
             "The running Supervisor app is older than recent code changes "
             "to the hover label, notifications, or UI. The new wording "
             "won't be visible until you rebuild and relaunch. "
             "Run build-app.sh and do the atomic swap to /Applications."
-        ), latest_commit_time
+        ), newest_src
     return None, 0
 
 

@@ -865,6 +865,56 @@ class TestResolveRepoRoot(unittest.TestCase):
                          "/tmp")
 
 
+class TestStaleBuildFreshness(unittest.TestCase):
+    """detect_stale_build must compare against source FILE mtimes, not git
+    COMMIT times. The old version compared to commit time, which is always
+    newer than the binary after the normal build-then-commit workflow, so it
+    fired a guaranteed false 'stale build' after every commit and kept
+    dispatching pointless rebuilds."""
+
+    def _app_mtime(self):
+        p = Path("/Applications/Supervisor.app/Contents/Info.plist")
+        if not p.exists():
+            self.skipTest("no deployed Supervisor.app on this machine")
+        return p.stat().st_mtime
+
+    def _make_ui_source(self, tmp, offset_from_binary):
+        ui_abs = Path(tmp) / "Sources/SupervisorCore/Hover/HoverViewModel.swift"
+        ui_abs.parent.mkdir(parents=True, exist_ok=True)
+        ui_abs.write_text("// ui")
+        t = self._app_mtime() + offset_from_binary
+        os.utime(ui_abs, (t, t))
+        return t
+
+    def test_no_warning_when_binary_newer_than_source(self):
+        """The build-then-commit case: source edited BEFORE the build (so its
+        mtime is older than the binary), then committed. Committing does not
+        change the file mtime, so this must NOT warn."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_ui_source(tmp, offset_from_binary=-600)
+            warning, _ = hook.detect_stale_build(tmp, timeout=5)
+            self.assertIsNone(warning,
+                "must not warn when the binary is newer than the source")
+
+    def test_warns_when_source_newer_than_binary(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_ui_source(tmp, offset_from_binary=+600)
+            warning, key = hook.detect_stale_build(tmp, timeout=5)
+            self.assertIsNotNone(warning, "must warn when a source is genuinely newer")
+            self.assertGreater(key, 0)
+
+    def test_dedup_key_is_source_mtime_not_commit_time(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            newer = self._make_ui_source(tmp, offset_from_binary=+600)
+            warning, key = hook.detect_stale_build(tmp, timeout=5)
+            self.assertIsNotNone(warning)
+            # The dedup key is the source FILE mtime we set, not a git commit ts.
+            self.assertAlmostEqual(key, newer, delta=2)
+
+
 class TestThrashFixV090(unittest.TestCase):
     """v0.9.0: the dispatch loop must idle gracefully on an empty queue
     instead of thrashing. Covers the five fixes:

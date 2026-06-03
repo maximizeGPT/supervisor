@@ -57,6 +57,15 @@ resolves the repo root.
   `git rev-parse --show-toplevel` (with a configured-path fallback) and all
   canonical reads/writes use it.
 
+**Self-watch `detect_stale_build` no longer false-fires after a commit**
+- It compared the deployed binary's mtime to the latest git COMMIT time.
+  The normal workflow is build-then-commit, so the commit timestamp is
+  always newer than the binary even when the binary was built from that
+  exact code: a guaranteed false "stale build" after every commit, which
+  kept dispatching pointless rebuilds. It now compares against the newest
+  UI SOURCE FILE mtime (positive evidence of a post-build edit), the same
+  discipline as the `detect_ineffective_change` fix.
+
 ### Notes
 
 - The shared `dispatcher-system-prompt.txt` is read by both the Python hook
