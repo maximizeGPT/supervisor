@@ -307,7 +307,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // (QuestionAnswerer nil → plain notify on user_question_pending;
         // Dispatcher nil → plain notify on worker_idle_post_completion).
         let questionAnswerer = loadQuestionAnswerer(client: client, trace: trace)
-        let dispatcher = loadDispatcher(client: client, trace: trace)
+        let dispatcher = loadDispatcher(client: client, trace: trace, dispatchHistory: loopDispatchStore)
         // LoopController is always constructed (loop hard stops are
         // pure logic — no external deps). LoopDispatchStore was set up
         // in step 1 above. Both are passed into the engine; tests
@@ -572,7 +572,11 @@ private func loadQuestionAnswerer(client: LLMClient, trace: TraceLog) -> Questio
 /// failure — Dispatcher MUST work without gh per the v0.4.0 Part B
 /// spec.
 @MainActor
-private func loadDispatcher(client: LLMClient, trace: TraceLog) -> Dispatcher? {
+private func loadDispatcher(
+    client: LLMClient,
+    trace: TraceLog,
+    dispatchHistory: (any DispatchHistoryReading)? = nil
+) -> Dispatcher? {
     let candidates: [URL] = [
         Bundle.main.url(forResource: "PRINCIPLES", withExtension: "md"),
         Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
@@ -589,6 +593,7 @@ private func loadDispatcher(client: LLMClient, trace: TraceLog) -> Dispatcher? {
                 principlesPath: url,
                 issueFetcher: GitHubIssueFetcher(trace: trace),
                 commitFetcher: GitBranchCommitFetcher(trace: trace),
+                dispatchHistory: dispatchHistory,
                 trace: trace
             )
         }

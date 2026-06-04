@@ -504,3 +504,57 @@ final class DispatcherPremiseTests: XCTestCase {
         XCTAssertFalse(rejected("Review the rubric corpus and journal the verdict."))
     }
 }
+
+/// Stale-loop guard: the dispatcher must degrade a proposal that repeats work
+/// it already dispatched this run (the "calibrate Issue #12 three times"
+/// failure), while never blocking genuinely new or sequential work.
+final class DispatcherStalenessTests: XCTestCase {
+
+    private func stale(_ p: String, _ recent: [String]) -> Bool {
+        Dispatcher.stalenessRejection(proposal: p, against: recent) != nil
+    }
+
+    func testRejectsNearVerbatimRepeat() {
+        let recent = ["Calibrate the Issue #12 positive-recall gap with a Haiku sweep"]
+        // Exact repeat.
+        XCTAssertTrue(stale("Calibrate the Issue #12 positive-recall gap with a Haiku sweep", recent))
+        // Light rewording (tense/filler) — same task, still caught.
+        XCTAssertTrue(stale("Re-calibrate the Issue 12 positive recall gap using a Haiku sweep now", recent))
+    }
+
+    func testAllowsGenuinelyNewWork() {
+        let recent = ["Calibrate the Issue #12 positive-recall gap with a Haiku sweep"]
+        XCTAssertFalse(stale("Fix the inject locator so it targets the right session of two", recent))
+        XCTAssertFalse(stale("Add a unit test for the broadcast-kill catch", recent))
+    }
+
+    func testAllowsSequentialNumberedWork() {
+        // Numbers carry identity, so consecutive sub-tasks differing only by an
+        // index must NOT be treated as a repeat.
+        let recent = ["Diagnose Issue #12 sub-bucket 1 fixtures and journal the verdict"]
+        XCTAssertFalse(stale("Diagnose Issue #12 sub-bucket 2 fixtures and journal the verdict", recent))
+    }
+
+    func testEmptyHistoryAndShortProposalsAreNeverStale() {
+        XCTAssertFalse(stale("Calibrate the Issue #12 positive-recall gap", []))
+        XCTAssertFalse(stale("Fix it", ["Fix it"]))   // <4 significant tokens → not judged
+    }
+
+    func testUserMessageSurfacesRecentProposals() {
+        let ctx = SessionContext(
+            sessionUUID: "sess-stale",
+            cwd: "/Users/test/supervisor",
+            gitBranch: "autonomous-test",
+            lastNTurns: [],
+            openIssues: [],
+            currentBranchCommits: [],
+            priorDispatchesConsidered: 2,
+            recentDispatchProposals: ["Calibrate the Issue #12 positive-recall gap"]
+        )
+        let msg = Dispatcher.userMessage(context: ctx, principles: "(stub)")
+        XCTAssertTrue(msg.contains("ALREADY dispatched"),
+                      "user message must surface the do-not-repeat section")
+        XCTAssertTrue(msg.contains("Calibrate the Issue #12 positive-recall gap"),
+                      "user message must list the recent proposal so Haiku can avoid it")
+    }
+}

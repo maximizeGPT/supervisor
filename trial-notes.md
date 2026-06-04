@@ -2742,3 +2742,38 @@ incl. the corpus-wide negative guard (neg.041/042/031/032 still non-fires).
 
 Per owner: committed on autonomous-20260525T193906Z, pushed for CI, NOT deployed
 — ship in batch. Budget (§9e): $0 (no API).
+
+## 2026-06-04 — stale-loop fix: dispatcher was amnesiac about its own proposals
+
+Owner (experiencing it from inside the loop): "if its giving u stale loops, u
+need to fix that." Diagnosed from the live DB + logs: the in-app loop dispatched
+the SAME already-done task repeatedly ("calibrate Issue #12" 3×; the "4
+model-didn't-recognize fixtures" review re-dispatched after it shipped). Root
+cause: `Dispatcher.userMessage` fed the model only `prior_dispatches_considered:
+<count>` — NOT the content of its prior proposals. So every cycle it re-read the
+same Known Gaps / Issues and re-proposed completed work, with no memory it had
+already typed that task and the worker had pushed back.
+
+Fix mirrors the proven `premiseRejection` two-layer shape:
+1. PRIMARY (prompt): new `DispatchHistoryReading` injected into the Dispatcher
+   (LoopDispatchStore conforms; reads recent `ready` proposal heads). userMessage
+   now lists "Proposals you ALREADY dispatched this run (do NOT repeat)" and
+   tells the model to return low-confidence rather than re-word a done task.
+2. BACKSTOP (deterministic `stalenessRejection`): if the model repeats anyway,
+   Jaccard ≥ 0.85 over prefix-6-stemmed significant tokens (numbers KEPT, so
+   "bucket 1" vs "bucket 2" stays distinct at 0.80 and is allowed) degrades to
+   low-confidence. That feeds the 3-consecutive-low hard stop, so a stuck-
+   repeating loop STOPS ITSELF instead of re-typing at the worker — exactly the
+   "never needs to be stopped" property the owner asked for earlier.
+
+Threshold is deliberately HIGH (0.85 = near-verbatim only): the prompt handles
+re-worded repeats (it can tell "do bucket 2" from "re-do bucket 1"); the
+deterministic guard only catches the model ignoring the instruction outright. A
+false-reject costs one idle cycle; a missed repeat re-types stale work — the
+asymmetry favors the high-precision backstop + the prompt doing the semantic work.
+
+Touched: Dispatcher.swift (protocol+field+SessionContext+userMessage+dispatch+2
+static fns), LoopDispatchStore.swift (conformance), main.swift (wiring).
+DispatcherTests: +5 (DispatcherStalenessTests), all 20 dispatcher tests green.
+NOT deployed; not yet mirrored to the Python Stop-hook (separate dispatcher —
+assessed next). Budget (§9e): $0 (no API).

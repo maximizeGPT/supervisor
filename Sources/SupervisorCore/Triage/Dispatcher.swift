@@ -113,6 +113,20 @@ public enum SelectedPath: String, Sendable, Equatable {
 /// The bundle the Dispatcher needs to make its call. The TriageEngine
 /// assembles this at idle-flag time and hands it to the Dispatcher; the
 /// Dispatcher is pure with respect to the bundle.
+/// Read-only access to the recent `next_task_proposal` heads the dispatcher
+/// already produced for a session. Injected into the Dispatcher so it can see
+/// — and not re-propose — work it dispatched earlier this run. Without this the
+/// dispatcher is amnesiac: it re-reads the same Known Gaps / Issues every cycle
+/// and re-proposes already-completed work (the stale-loop failure the owner
+/// hit — "calibrate Issue #12" dispatched three times). `LoopDispatchStore`
+/// conforms in production; tests pass a canned array or nil.
+public protocol DispatchHistoryReading: Sendable {
+    /// Recent ready-dispatch proposal heads for `sessionId`, newest first.
+    /// Implementations skip low-confidence / error rows (they carry no
+    /// proposal). At most `limit` entries.
+    func recentProposalHeads(sessionId: String, limit: Int) -> [String]
+}
+
 public struct SessionContext: Sendable {
     public let sessionUUID: String
     public let cwd: String?
@@ -138,6 +152,11 @@ public struct SessionContext: Sendable {
     public let sourceMarkers: [String]
     /// `git diff --stat main..HEAD` output lines.
     public let recentFilesChanged: [String]
+    /// Proposal heads the dispatcher already produced this run (newest
+    /// first). Surfaced to the model so it doesn't re-propose them, and used
+    /// by the deterministic `stalenessRejection` backstop. Empty for a fresh
+    /// loop or when no history reader is wired.
+    public let recentDispatchProposals: [String]
 
     public init(
         sessionUUID: String,
@@ -150,7 +169,8 @@ public struct SessionContext: Sendable {
         productDirection: String = "",
         knownGaps: String = "",
         sourceMarkers: [String] = [],
-        recentFilesChanged: [String] = []
+        recentFilesChanged: [String] = [],
+        recentDispatchProposals: [String] = []
     ) {
         self.sessionUUID = sessionUUID
         self.cwd = cwd
@@ -163,6 +183,7 @@ public struct SessionContext: Sendable {
         self.knownGaps = knownGaps
         self.sourceMarkers = sourceMarkers
         self.recentFilesChanged = recentFilesChanged
+        self.recentDispatchProposals = recentDispatchProposals
     }
 }
 
@@ -275,6 +296,7 @@ public final class Dispatcher: Dispatching, Sendable {
     private let principlesPath: URL?
     private let issueFetcher: (any IssueFetching)?
     private let commitFetcher: (any BranchCommitFetching)?
+    private let dispatchHistory: (any DispatchHistoryReading)?
     private let trace: TraceLog
 
     /// `principlesText` is the fallback PRINCIPLES.md body. If
@@ -291,6 +313,7 @@ public final class Dispatcher: Dispatching, Sendable {
         principlesPath: URL? = nil,
         issueFetcher: (any IssueFetching)? = nil,
         commitFetcher: (any BranchCommitFetching)? = nil,
+        dispatchHistory: (any DispatchHistoryReading)? = nil,
         trace: TraceLog = .shared
     ) {
         self.client = client
@@ -298,6 +321,7 @@ public final class Dispatcher: Dispatching, Sendable {
         self.principlesPath = principlesPath
         self.issueFetcher = issueFetcher
         self.commitFetcher = commitFetcher
+        self.dispatchHistory = dispatchHistory
         self.trace = trace
     }
 
@@ -351,6 +375,12 @@ public final class Dispatcher: Dispatching, Sendable {
         }()
         let issues = await issuesFut
         let commits = await commitsFut
+        // Recent proposals this loop already produced for THIS session, so the
+        // model (and the deterministic backstop) can avoid re-proposing them.
+        // Synchronous + best-effort: a nil reader or a read error yields [].
+        let recentProposals = dispatchHistory?.recentProposalHeads(
+            sessionId: sessionUUID, limit: 6
+        ) ?? []
 
         let context = SessionContext(
             sessionUUID: sessionUUID,
@@ -359,7 +389,8 @@ public final class Dispatcher: Dispatching, Sendable {
             lastNTurns: lastNTurns,
             openIssues: issues,
             currentBranchCommits: commits,
-            priorDispatchesConsidered: priorDispatchesConsidered
+            priorDispatchesConsidered: priorDispatchesConsidered,
+            recentDispatchProposals: recentProposals
         )
         return await dispatch(context: context)
     }
@@ -434,6 +465,19 @@ public final class Dispatcher: Dispatching, Sendable {
                 trace.emit("dispatch", "PREMISE_REJECT \(reject) — degrading to low-confidence idle (proposal builds/wires already-existing machinery)")
                 return .lowConfidence(reasoning: "Premise rejected (\(reject)): the proposal builds or wires a component that already exists. Idling instead of dispatching already-done, self-referential work.")
             }
+            // STALE-LOOP BACKSTOP. The model is shown its recent proposals (see
+            // userMessage) and told not to repeat them, but if it re-proposes a
+            // near-duplicate of work it already dispatched this run, degrade to
+            // low-confidence. That idles the cycle AND feeds the consecutive-low
+            // hard stop, so a stuck-repeating loop STOPS itself instead of
+            // re-typing the same task at the worker — the failure the owner saw
+            // ("calibrate Issue #12" dispatched three times). The prompt handles
+            // re-worded repeats; this catches the case where the model ignores
+            // the instruction outright.
+            if let stale = Self.stalenessRejection(proposal: prompt, against: context.recentDispatchProposals) {
+                trace.emit("dispatch", "STALE_REJECT \(stale) — degrading to low-confidence idle (proposal repeats a recent dispatch)")
+                return .lowConfidence(reasoning: "Stale dispatch (\(stale)): this proposal repeats work already dispatched this run. Idling instead of re-typing the same task; if this recurs the consecutive-low stop will pause the loop.")
+            }
             trace.emit("dispatch", "ready confidence=\(confidence.rawValue) path=\(path.rawValue) issue=\(issueN.map(String.init) ?? "-") prior_echoed=\(priorEchoed.map(String.init) ?? "-") requires_human=\(requiresHuman) prompt_bytes=\(prompt.utf8.count) just=\"\(justification.prefix(120))\"")
             return .ready(
                 prompt: prompt,
@@ -487,6 +531,21 @@ public final class Dispatcher: Dispatching, Sendable {
 
         lines.append("# Loop state")
         lines.append("prior_dispatches_considered: \(context.priorDispatchesConsidered)")
+        lines.append("")
+
+        lines.append("# Proposals you ALREADY dispatched this run (do NOT repeat)")
+        if context.recentDispatchProposals.isEmpty {
+            lines.append("(none yet — first dispatch of the run)")
+        } else {
+            lines.append("You already typed these into the worker. Do NOT propose any of them again,")
+            lines.append("and do NOT re-word the same task. If the worker pushed back on one as")
+            lines.append("already-done, believe it. If the single most useful move you can find")
+            lines.append("duplicates one of these, the work is already underway or complete — return")
+            lines.append("confidence=low (selected_path=low_confidence_no_action) instead of repeating.")
+            for (idx, p) in context.recentDispatchProposals.enumerated() {
+                lines.append("\(idx + 1). \(p)")
+            }
+        }
         lines.append("")
 
         // Product direction — the north star
@@ -727,6 +786,63 @@ public final class Dispatcher: Dispatching, Sendable {
             }
         }
         return nil
+    }
+
+    /// Deterministic backstop against the stale-loop failure: the dispatcher
+    /// re-proposing work it already dispatched this run. Returns a reason if
+    /// `proposal` substantially repeats any entry in `recent` (recent
+    /// ready-proposal heads), else nil. A hit degrades the dispatch to
+    /// low-confidence — same shape as `premiseRejection` — which idles the
+    /// cycle and feeds the consecutive-low hard stop.
+    ///
+    /// Similarity = Jaccard over prefix-stemmed significant tokens. Threshold
+    /// 0.85 — deliberately HIGH, so this is a narrow backstop for near-verbatim
+    /// repeats only. The PRIMARY fix is the prompt grounding (it sees the recent
+    /// proposals and can tell "do bucket 2" from "re-do bucket 1"); this catches
+    /// the case where the model ignores that and re-types essentially the same
+    /// proposal. Numbers are kept as identity-bearing tokens, so sequential
+    /// numbered work ("bucket 1" vs "bucket 2") stays well under threshold and
+    /// is NOT blocked. Both sides need ≥4 significant tokens — too-short heads
+    /// are not judged.
+    static func stalenessRejection(proposal: String, against recent: [String]) -> String? {
+        let target = significantTokens(proposal)
+        guard target.count >= 4 else { return nil }
+        for prior in recent {
+            let priorTokens = significantTokens(prior)
+            guard priorTokens.count >= 4 else { continue }
+            let overlap = target.intersection(priorTokens).count
+            let union = target.union(priorTokens).count
+            guard union > 0 else { continue }
+            let jaccard = Double(overlap) / Double(union)
+            if jaccard >= 0.85 {
+                let pct = Int((jaccard * 100).rounded())
+                return "\(pct)% overlap with recent dispatch \"\(prior.prefix(56))\""
+            }
+        }
+        return nil
+    }
+
+    /// Lowercased, prefix-6 stemmed significant tokens for similarity. Strips
+    /// punctuation/markdown and generic stopwords, and collapses morphological
+    /// variants crudely via a 6-char prefix so "calibrate"/"calibration" both
+    /// stem to "calibr". Numbers are KEPT regardless of length — "12", "2", "7"
+    /// carry task identity (Issue #12, bucket 2, step 7), and keeping them is
+    /// what lets sequential numbered work stay distinct. Deterministic; no model.
+    static func significantTokens(_ s: String) -> Set<String> {
+        let cleaned = s.lowercased().map { ($0.isLetter || $0.isNumber) ? $0 : " " }
+        let words = String(cleaned).split(separator: " ").map(String.init)
+        // Generic loop/instruction filler that carries no task identity.
+        let stop: Set<String> = [
+            "the", "and", "for", "with", "this", "that", "into", "its", "you",
+            "next", "task", "direction", "please", "lets", "let", "then", "run",
+            "now", "your", "from", "have", "has", "will", "should", "make", "via",
+            "per", "all", "any", "out", "use", "using", "still", "just", "not",
+        ]
+        return Set(
+            words
+                .filter { ($0.count >= 3 || $0.allSatisfy(\.isNumber)) && !stop.contains($0) }
+                .map { String($0.prefix(6)) }
+        )
     }
 
     /// Decode the record_dispatch tool call into a DispatchResult.

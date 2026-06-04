@@ -53,3 +53,22 @@ public struct LoopDispatchStore: Sendable {
         }
     }
 }
+
+// MARK: - DispatchHistoryReading (stale-loop guard)
+
+extension LoopDispatchStore: DispatchHistoryReading {
+    /// Recent `ready` proposal heads for the session, newest first, capped at
+    /// `limit`. Only ready dispatches carry a real `next_task_proposal` — low/
+    /// error rows have an empty head and are skipped. Over-fetches (×4) before
+    /// filtering so a run heavy on low-confidence idles still surfaces the last
+    /// few real proposals. A read error degrades to [] (best-effort context).
+    public func recentProposalHeads(sessionId: String, limit: Int) -> [String] {
+        guard let rows = try? recent(sessionId: sessionId, limit: max(limit * 4, limit)) else {
+            return []
+        }
+        return rows
+            .filter { $0.responseShape == "ready" && !$0.taskProposalHead.isEmpty }
+            .prefix(limit)
+            .map { $0.taskProposalHead }
+    }
+}
