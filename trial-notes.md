@@ -2812,3 +2812,35 @@ currently blocking the live loop from even attempting the inject-targeting work.
 
 NOT deployed — the live hook in ~/.claude/hooks/ is still the old copy; the fix
 only takes effect on deploy. Budget (§9e): $0 (no API).
+
+## 2026-06-04 — DEFECT 3: dispatcher fabricates an UNBLOCKING PRECONDITION
+
+Owner: "u need to fix that immediately!" — the env-fact hallucination I flagged.
+The dispatcher justified a blocked task with a false precondition: "The
+ANTHROPIC_API_KEY is set; calibration sweeps are unblocked" when the key was
+absent (verified `ANTHROPIC_API_KEY: ABSENT` all session). This is a 3rd
+fabrication mode distinct from naming a nonexistent code symbol — the existing
+symbol-grounder can't catch it (it's an environment claim, not a code symbol).
+
+Fix in BOTH dispatchers (mirror of the symbol-grounder + premise/staleness
+guards):
+- Python hook (authoritative — spawned by the worker, so os.environ matches what
+  a real sweep sees): `_ground_environment_claims` + `_ENV_AVAILABILITY_RE`,
+  wired into the dispatch gate next to `_ground_proposal`; a false claim →
+  silent_exit, never dispatched. +4 tests, full hook suite 90/90.
+- Swift Dispatcher (conservative backstop — Supervisor.app may lack the worker's
+  shell env, so absence isn't proof; we still reject because a false-reject just
+  declines to AUTO-dispatch an expensive sweep, while a miss dispatches
+  fabricated work): `environmentClaimRejection` (+ injectable key param for
+  tests) + `assertsEnvironmentAvailability`, called in dispatch() after
+  stalenessRejection. +4 tests; swift build clean.
+
+Precision: the regex REQUIRES subject+is/are+positive-predicate adjacency, so
+the honest negated inverse ("the key is NOT set", "sweeps are still blocked")
+does NOT match — the guard never fires on a truthful "it's blocked" statement
+(verified in both test suites). When the key IS present, a true claim passes.
+
+DEPLOYED the Python hook this time (owner said "immediately" + "do whatever you
+think is best"; live hook is the source of the fabrication). Old hook backed up
+first; reversible. Supervisor.app stays batched (the Swift guard ships with it).
+Budget (§9e): $0 (no API).

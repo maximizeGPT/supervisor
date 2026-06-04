@@ -873,6 +873,44 @@ def _ground_proposal(cwd: str, proposal: str, justification: str, timeout: float
     return True, ""
 
 
+# --- Environment-claim grounding (2026-06-04) ------------------------------
+#
+# DEFECT 3: a SECOND fabrication mode, distinct from naming a nonexistent code
+# symbol. The dispatcher asserts a falsifiable UNBLOCKING PRECONDITION to
+# justify work that is actually blocked. Observed verbatim: "The
+# ANTHROPIC_API_KEY is set; calibration sweeps are unblocked" — when the key
+# was absent and the sweep had been blocked all session. `_ground_proposal`
+# can't catch this (it's not a code symbol). This hook is spawned by the worker
+# (Claude Code Stop hook), so os.environ here matches what an actual sweep
+# would see — making the hook the authoritative place to verify the claim.
+
+# Positive assertions that the API key / live sweep is AVAILABLE. The required
+# adjacency (subject + is/are/'s + optional adverb + positive predicate) makes
+# the negated TRUE inverse — "the key is NOT set", "sweeps are still blocked" —
+# fail to match (the negator breaks the adjacency), so we never fire on an
+# honest "it's blocked" statement.
+_ENV_AVAILABILITY_RE = re.compile(
+    r"\b(anthropic[_ ]?api[_ ]?key|api[_ ]?key|the key|keys|sweep|sweeps|calibration|live[ -]?api)\b"
+    r"\s+(?:is|are|'s|was|were)\s+(?:now\s+|finally\s+|already\s+)?"
+    r"(set|present|available|configured|enabled|unblocked)\b",
+    re.IGNORECASE,
+)
+
+
+def _ground_environment_claims(proposal: str, justification: str) -> tuple[bool, str]:
+    """Verify a falsifiable environment precondition the proposal asserts.
+    Today: a claim that the ANTHROPIC_API_KEY / live calibration sweep is
+    AVAILABLE, checked against os.environ (this hook inherits the worker's
+    shell env, so it sees what the sweep would). A claim that the key is
+    ABSENT/blocked is the truth here and passes. Returns (grounded, reason)."""
+    blob = (proposal or "") + " " + (justification or "")
+    if _ENV_AVAILABILITY_RE.search(blob):
+        if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+            return False, ("false_env_claim=proposal_asserts_key/sweep_available_"
+                           "but_ANTHROPIC_API_KEY_absent")
+    return True, ""
+
+
 # --- Repetition breaker helpers -------------------------------------------
 
 _PROPOSAL_STOPWORDS = {
@@ -2410,6 +2448,29 @@ def main() -> None:
             put_session_state(state_all, session_id, state)
             save_state(state_all)
             silent_exit(f"ungrounded_proposal {gr_reason}")
+
+        # Environment-claim grounding (DEFECT 3): a proposal may not justify
+        # itself with a false UNBLOCKING PRECONDITION — e.g. "the
+        # ANTHROPIC_API_KEY is set; sweeps are unblocked" when the key is
+        # absent. Unlike code-symbol grounding, this checks the real env
+        # (this hook runs in the worker's process tree, so os.environ matches
+        # what the sweep would see). Discard and idle — never dispatch work
+        # whose unblocking premise is fabricated.
+        env_ok, env_reason = _ground_environment_claims(proposal, justification)
+        if not env_ok:
+            log(f"UNGROUNDED_ENV_CLAIM {env_reason} just=\"{justification[:120]}\"")
+            write_owner_brief(
+                cwd=cwd,
+                what_shipped=summarize_recent_commits(commits),
+                most_valuable_next="The dispatcher justified work with a false environment claim (e.g. 'the API key is set / sweeps are unblocked') that is not true right now. It was discarded. If the precondition is real, set it; otherwise the work stays blocked.",
+                needs_owner="Loop idle: the dispatcher fabricated an unblocking precondition (API key / sweep availability). Set the precondition or leave it idle.",
+                loop_doing_next="Idle. Discarded a proposal whose unblocking premise (key/sweep available) is false. Waiting for direction.",
+                warnings=self_watch_warnings,
+            )
+            state["consecutive_low"] = 0
+            put_session_state(state_all, session_id, state)
+            save_state(state_all)
+            silent_exit(f"ungrounded_env_claim {env_reason}")
 
         # Genuine new actionable work. Remember it (for next-dispatch repeat
         # detection) and dispatch.

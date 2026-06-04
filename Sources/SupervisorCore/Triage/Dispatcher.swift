@@ -478,6 +478,14 @@ public final class Dispatcher: Dispatching, Sendable {
                 trace.emit("dispatch", "STALE_REJECT \(stale) — degrading to low-confidence idle (proposal repeats a recent dispatch)")
                 return .lowConfidence(reasoning: "Stale dispatch (\(stale)): this proposal repeats work already dispatched this run. Idling instead of re-typing the same task; if this recurs the consecutive-low stop will pause the loop.")
             }
+            // ENV-CLAIM BACKSTOP. The dispatcher must not justify work with a
+            // false UNBLOCKING PRECONDITION — "the ANTHROPIC_API_KEY is set;
+            // sweeps are unblocked" when the key is absent (the live failure
+            // 2026-06-04). Mirror of the Python hook's _ground_environment_claims.
+            if let envReject = Self.environmentClaimRejection(proposal: prompt, justification: justification) {
+                trace.emit("dispatch", "ENV_CLAIM_REJECT \(envReject) — degrading to low-confidence idle (fabricated unblocking precondition)")
+                return .lowConfidence(reasoning: "Environment claim rejected (\(envReject)): the proposal asserts an unblocking precondition (API key / sweep available) that is not true. Idling instead of dispatching blocked work.")
+            }
             trace.emit("dispatch", "ready confidence=\(confidence.rawValue) path=\(path.rawValue) issue=\(issueN.map(String.init) ?? "-") prior_echoed=\(priorEchoed.map(String.init) ?? "-") requires_human=\(requiresHuman) prompt_bytes=\(prompt.utf8.count) just=\"\(justification.prefix(120))\"")
             return .ready(
                 prompt: prompt,
@@ -843,6 +851,44 @@ public final class Dispatcher: Dispatching, Sendable {
                 .filter { ($0.count >= 3 || $0.allSatisfy(\.isNumber)) && !stop.contains($0) }
                 .map { String($0.prefix(6)) }
         )
+    }
+
+    /// Deterministic guard against the dispatcher fabricating an UNBLOCKING
+    /// PRECONDITION to justify blocked work — the live failure on 2026-06-04:
+    /// "The ANTHROPIC_API_KEY is set; calibration sweeps are unblocked" when the
+    /// key was absent and the sweep had been blocked all session. Mirror of the
+    /// Python hook's `_ground_environment_claims`. Returns a reason if the
+    /// proposal asserts the key/sweep is AVAILABLE but `anthropicKey` is empty.
+    ///
+    /// `anthropicKey` defaults to this process's env, but CAVEAT: Supervisor.app
+    /// may launch without the worker's shell env, so absence here isn't proof
+    /// the sweep would lack a key. We still reject — the asymmetry favors it: a
+    /// false-reject merely declines to AUTO-dispatch an expensive sweep (the
+    /// owner can trigger it), while a miss dispatches fabricated-premise work.
+    /// The Python hook (worker-env-accurate) is the authoritative check; this is
+    /// Supervisor.app's conservative backstop. The param is injectable for tests.
+    static func environmentClaimRejection(
+        proposal: String,
+        justification: String,
+        anthropicKey: String? = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"]
+    ) -> String? {
+        guard assertsEnvironmentAvailability(proposal + " " + justification) else { return nil }
+        if (anthropicKey ?? "").trimmingCharacters(in: .whitespaces).isEmpty {
+            return "key/sweep asserted available but ANTHROPIC_API_KEY absent"
+        }
+        return nil
+    }
+
+    /// True if `text` POSITIVELY asserts the API key / live sweep is available.
+    /// The required adjacency (subject + is/are/'s + optional adverb + positive
+    /// predicate) means the honest negated inverse — "the key is NOT set",
+    /// "sweeps are still blocked" — does NOT match, so the guard never fires on
+    /// a truthful "it's blocked" statement. Mirrors the Python `_ENV_AVAILABILITY_RE`.
+    static func assertsEnvironmentAvailability(_ text: String) -> Bool {
+        let pattern = #"(?i)\b(anthropic[_ ]?api[_ ]?key|api[_ ]?key|the key|keys|sweep|sweeps|calibration|live[ -]?api)\b\s+(?:is|are|'s|was|were)\s+(?:now\s+|finally\s+|already\s+)?(set|present|available|configured|enabled|unblocked)\b"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return false }
+        let range = NSRange(text.startIndex..., in: text)
+        return re.firstMatch(in: text, range: range) != nil
     }
 
     /// Decode the record_dispatch tool call into a DispatchResult.

@@ -558,3 +558,43 @@ final class DispatcherStalenessTests: XCTestCase {
                       "user message must list the recent proposal so Haiku can avoid it")
     }
 }
+
+/// Env-claim guard: the dispatcher must not justify work with a false
+/// unblocking precondition ("the ANTHROPIC_API_KEY is set; sweeps are
+/// unblocked" when the key is absent). The key is injected so the test is
+/// deterministic regardless of CI env.
+final class DispatcherEnvironmentClaimTests: XCTestCase {
+
+    private func reject(_ p: String, _ j: String, key: String?) -> Bool {
+        Dispatcher.environmentClaimRejection(proposal: p, justification: j, anthropicKey: key) != nil
+    }
+
+    func testFabricatedKeyClaimRejectedWhenAbsent() {
+        XCTAssertTrue(reject("Run the Issue #12 calibration sweep",
+                             "The ANTHROPIC_API_KEY is set; calibration sweeps are unblocked.",
+                             key: nil))
+        XCTAssertTrue(reject("Do the targeted re-sweep",
+                             "Keys are set now and the sweeps are available.", key: ""))
+        XCTAssertTrue(reject("Calibrate the gap", "The live-API is now enabled.", key: "   "))
+    }
+
+    func testHonestBlockedStatementPasses() {
+        // The negated/honest inverse must NOT trip the guard.
+        XCTAssertFalse(reject("Journal and wait",
+                              "The ANTHROPIC_API_KEY is not set; sweeps are still blocked.", key: nil))
+        XCTAssertFalse(reject("Skip the sweep",
+                              "The key is absent, so calibration is blocked.", key: nil))
+    }
+
+    func testUnrelatedProposalPasses() {
+        XCTAssertFalse(reject("Fix the inject locator for multi-session",
+                              "It targets the wrong window when two sessions share the app.", key: nil))
+    }
+
+    func testTrueClaimPassesWhenKeyPresent() {
+        XCTAssertFalse(reject("Run the sweep",
+                              "The ANTHROPIC_API_KEY is set; sweeps are unblocked.",
+                              key: "sk-ant-not-real"),
+                       "a TRUE availability claim must pass when the key is present")
+    }
+}

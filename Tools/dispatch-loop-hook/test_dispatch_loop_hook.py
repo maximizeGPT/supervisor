@@ -1315,6 +1315,55 @@ class TestGrounding(unittest.TestCase):
             hook._symbol_exists_in_repo("/Users/main/supervisor", "WidgetFrobnicatorXYZ", 10))
 
 
+class TestEnvironmentClaimGrounding(unittest.TestCase):
+    """D3: a proposal may not justify itself with a false unblocking
+    precondition — e.g. 'the ANTHROPIC_API_KEY is set; sweeps are unblocked'
+    when the key is absent. Verified against the real env."""
+
+    def setUp(self):
+        self._saved = os.environ.get("ANTHROPIC_API_KEY")
+        os.environ.pop("ANTHROPIC_API_KEY", None)  # simulate the absent state
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = self._saved
+
+    def test_fabricated_key_claim_rejected_when_absent(self):
+        for prop, just in [
+            ("Run the Issue #12 calibration sweep",
+             "The ANTHROPIC_API_KEY is set; calibration sweeps are unblocked."),
+            ("Do the targeted re-sweep", "Keys are set now, sweeps are available."),
+            ("Calibrate the gap", "The live-API is now enabled."),
+        ]:
+            ok, reason = hook._ground_environment_claims(prop, just)
+            self.assertFalse(ok, f"should reject false claim: {just!r}")
+            self.assertIn("false_env_claim", reason)
+
+    def test_honest_blocked_statement_passes(self):
+        # The negated/honest inverse must NOT trip the guard.
+        for just in [
+            "The ANTHROPIC_API_KEY is not set; sweeps are still blocked.",
+            "The key is absent, so calibration is blocked. Journal and wait.",
+            "No key available; the sweep stays blocked.",
+        ]:
+            ok, _ = hook._ground_environment_claims("Journal the diagnosis", just)
+            self.assertTrue(ok, f"honest 'blocked' statement must pass: {just!r}")
+
+    def test_unrelated_proposal_passes(self):
+        ok, _ = hook._ground_environment_claims(
+            "Fix the inject locator for multi-session targeting",
+            "It targets the wrong window when two sessions share the app.")
+        self.assertTrue(ok)
+
+    def test_true_claim_passes_when_key_present(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test-not-real"
+        ok, _ = hook._ground_environment_claims(
+            "Run the sweep", "The ANTHROPIC_API_KEY is set; sweeps are unblocked.")
+        self.assertTrue(ok, "a TRUE availability claim must pass when the key is present")
+
+
 class TestApplyIdleReset(unittest.TestCase):
     """Fresh-session reset on resume after a long idle gap: an overnight
     pause should NOT leave the loop stuck at four_hours_elapsed."""
