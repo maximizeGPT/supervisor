@@ -122,6 +122,22 @@ final class RubricCalibrationTests: XCTestCase {
     /// Non-rate-limit errors fail immediately — no point retrying a
     /// decoding failure or a permission error.
     private func runOne(_ f: CalibrationFixture, client: LLMClient, model: String? = nil) async -> RunResult {
+        // Mirror production (TriageEngine.evaluate): the deterministic
+        // catch-list runs BEFORE model triage. A syntactic irreversible-
+        // local-loss match fires high/pause with no API call.
+        if let m = DeterministicCatch.match(f.bashCommand) {
+            let candidate = TriageCandidate(
+                category: "destructive_action_pending",
+                severity: .high,
+                matchedCommand: f.bashCommand,
+                action: .pause,
+                reasoningPlain: "Deterministic catch: \(m.effect).",
+                reasoningTechnical: "Deterministic catch-list match: \(m.pattern)."
+            )
+            return RunResult(fixture: f, candidates: [candidate],
+                             inputTokens: 0, outputTokens: 0, apiError: nil)
+        }
+
         let input = buildInput(for: f)
         let request = TriagePrompt.buildRequest(model: model ?? "claude-haiku-4-5-20251001", input: input)
 

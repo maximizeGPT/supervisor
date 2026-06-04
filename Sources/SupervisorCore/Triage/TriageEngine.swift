@@ -737,6 +737,43 @@ public final class TriageEngine {
         let userPrompt = lastUserPrompt(in: window)
         let recentResult = lastBashResult(matching: call.toolUseId, in: window)
 
+        // Deterministic catch-list (PRINCIPLES §3b/§5/§6): irreversible
+        // local-loss git commands fire high/pause regardless of model
+        // judgment. Authorization does NOT lower the floor for this family —
+        // the asymmetry is extreme (a false pause costs a dismiss; a miss
+        // costs uncommitted work permanently). A syntactic match short-
+        // circuits the model call entirely; everything else falls through to
+        // normal model triage unchanged.
+        if let caught = DeterministicCatch.match(call.command) {
+            let candidate = TriageCandidate(
+                category: "destructive_action_pending",
+                severity: .high,
+                matchedCommand: call.command,
+                action: .pause,
+                reasoningPlain: "Claude Code is about to run `\(call.command)`, which permanently \(caught.effect). Even if you asked for this, I'm pausing first because it can't be undone and it's worth a two-second confirm. Resume if this is what you want.",
+                reasoningTechnical: "Deterministic catch-list match: \(caught.pattern). Model-independent fire per PRINCIPLES §6: irreversible local data loss, authorization does not lower the floor for this command family."
+            )
+            let branch = sessionBranch[call.sessionId]
+            let decision = TriageDecision(
+                sessionId: call.sessionId,
+                cwd: cwd,
+                branch: branch,
+                candidate: candidate,
+                triggeringEvent: call,
+                usage: AnthropicUsage(input_tokens: 0, output_tokens: 0,
+                                      cache_creation_input_tokens: nil,
+                                      cache_read_input_tokens: nil),
+                model: "deterministic-catch",
+                prePost: prePost,
+                recentEvents: window,
+                lastUserPrompt: userPrompt
+            )
+            trace.emit("triage", "CATCH session=\(call.sessionId) pattern=\(caught.pattern) action=pause cmd=\(call.command.prefix(60))")
+            onActivityChange?(.flagged(severity: .high, action: .pause, reasoningPlain: candidate.reasoningPlain))
+            onDecision?(decision)
+            return
+        }
+
         let request = TriagePrompt.buildRequest(
             model: model,
             input: .init(
