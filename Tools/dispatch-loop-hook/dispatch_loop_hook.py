@@ -678,6 +678,45 @@ def _is_thrash_meta_proposal(text: str) -> bool:
     return any(phrase in low for phrase in _THRASH_META_PHRASES)
 
 
+def _is_build_existing_proposal(text: str) -> bool:
+    """True if the proposal builds/wires a component that ALREADY EXISTS, or
+    makes a false "X is not wired/built/missing" claim about one. Mirrors the
+    Swift Dispatcher.premiseRejection — the root-cause guard against the loop
+    proposing to build ITSELF (Dispatcher, LoopController, triage engine, the
+    inject path, the catch-list), the exact self-referential runaway.
+
+    Precise: a build verb must appear in the window just BEFORE the component
+    (so "build the CGEventPost-based Dispatcher" is caught) but is skipped when
+    a preposition makes the component a modifier ("a test FOR the dispatcher").
+    """
+    t = (text or "").lower()
+    existing = [
+        "dispatch loop", "dispatcher", "loopcontroller", "loop controller", "loopconfig",
+        "triage engine", "triageengine", "inject path", "injector", "interventionrouter",
+        "intervention router", "dispatch engine", "dispatch queue", "self-extender",
+        "selfextender", "dispatch hook", "deterministic catch", "deterministiccatch",
+        "questionanswerer", "question answerer", "hardcodedrubric",
+    ]
+    build_verbs = ["build ", "implement ", "wire up ", "wire the ", "stand up ",
+                   "introduce ", "create the ", "create a ", "write the ", "design the "]
+    prepositions = [" for ", " of ", " to ", " about ", " on ", " with ", " in ", " into "]
+    missing_suffixes = [" is not wired", " is not built", " is missing", " does not exist",
+                        " doesn't exist", " isn't wired", " is not implemented",
+                        " is not yet wired", " is not yet built", " needs to be built",
+                        " needs to be wired"]
+    for comp in existing:
+        idx = t.find(comp)
+        if idx < 0:
+            continue
+        before = t[max(0, idx - 40):idx]
+        if any(v in before for v in build_verbs) and not any(p in before for p in prepositions):
+            return True
+        after = t[idx + len(comp): idx + len(comp) + 18]
+        if any(s in after for s in missing_suffixes):
+            return True
+    return False
+
+
 def _is_owner_brief_proposal(text: str) -> bool:
     """True when a proposal's job is to rewrite/regenerate the OWNER-BRIEF
     content. The brief is auto-written by write_owner_brief on every
@@ -2252,11 +2291,14 @@ def main() -> None:
     blob = proposal + " " + justification
     if (_is_blocked_loop_proof_proposal(blob)
             or _is_thrash_meta_proposal(blob)
-            or _is_owner_brief_proposal(blob)):
+            or _is_owner_brief_proposal(blob)
+            or _is_build_existing_proposal(blob)):
         if _is_thrash_meta_proposal(blob):
             reason = "thrash_meta"
         elif _is_owner_brief_proposal(blob):
             reason = "owner_brief_rewrite"
+        elif _is_build_existing_proposal(blob):
+            reason = "build_existing_machinery"
         else:
             reason = "trust_prompt_or_prove_loop"
         log(f"BLOCKED_PROPOSAL_FILTERED reason={reason} just=\"{justification[:120]}\"")

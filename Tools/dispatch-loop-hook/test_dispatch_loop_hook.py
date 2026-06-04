@@ -1344,5 +1344,33 @@ class TestApplyIdleReset(unittest.TestCase):
         self.assertTrue(hook.apply_idle_reset(state, now, self.THRESHOLD))
 
 
+class TestBuildExistingProposalFilter(unittest.TestCase):
+    """Root-cause guard: reject 'build the <existing component>' proposals
+    (the self-referential runaway), never block real product work."""
+
+    def test_rejects_building_existing_machinery(self):
+        for p in [
+            "Build the CGEventPost-based Dispatcher + LoopController that watches the dispatch queue.",
+            "Implement the dispatch loop that reads the queue and dispatches.",
+            "Wire up the LoopController hard-stops.",
+            "Build and ship the deterministic catch for irreversible commands.",
+            "Stand up the triage engine.",
+            "The dispatch engine is not wired yet.",
+            "The Injector is missing.",
+        ]:
+            self.assertTrue(hook._is_build_existing_proposal(p), f"should reject: {p}")
+
+    def test_allows_real_product_work(self):
+        for p in [
+            "Fix the flag counter so it resets per work-window in HoverViewModel.",
+            "Add a unit test for the dispatcher's grounding so regressions are caught.",
+            "Close the Issue #12 calibration gap by correcting fixture expectations.",
+            "Improve the injector's reliability on Electron hosts.",
+            "Fix the dispatcher so it stops proposing already-done work.",
+            "Review the rubric corpus and journal the verdict.",
+        ]:
+            self.assertFalse(hook._is_build_existing_proposal(p), f"should allow: {p}")
+
+
 if __name__ == "__main__":
     unittest.main()
