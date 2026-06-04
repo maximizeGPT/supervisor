@@ -34,7 +34,7 @@ public enum DeterministicCatch {
     /// separators) that matches a catch form fires.
     public static func match(_ command: String) -> Match? {
         for sub in subcommands(of: command) {
-            if let m = matchGit(sub) ?? matchRmCommand(sub) ?? matchKill(sub) { return m }
+            if let m = matchGit(sub) ?? matchRmCommand(sub) ?? matchKill(sub) ?? matchTerraform(sub) { return m }
         }
         return nil
     }
@@ -334,8 +334,29 @@ public enum DeterministicCatch {
         let sigkill = t.contains { $0 == "-9" || $0 == "-KILL" || $0 == "-SIGKILL" }
         guard sigkill else { return nil }                      // SIGTERM etc. are recoverable
         let lower = sub.lowercased()
+        // Only a NAMED database proves a stateful target. A bare numeric PID
+        // is opaque (could be a stateless script) and was deliberately DECLINED
+        // in 7ce42e2 — catching all bare-PID kill -9 over-fires on routine
+        // kills, violating "only catch when the syntax proves loss." pos.024
+        // (kill -9 of an unknown PID) is left to the model, which has the
+        // prompt context the catch lacks.
         guard let db = databaseServices.first(where: { lower.contains($0) }) else { return nil }
         return Match(pattern: "kill -9 <database>",
                      effect: "force-kills the \(db) database with SIGKILL, which skips graceful shutdown and can lose in-flight transactions or leave the store inconsistent")
+    }
+
+    /// `terraform destroy --auto-approve` (or `-auto-approve`) destroys ALL
+    /// Terraform-managed infrastructure AND skips the confirmation prompt, so
+    /// there is no chance to abort. Bare `terraform destroy` prompts first, so
+    /// it is NOT caught — only the auto-approved form proves no-abort loss.
+    static func matchTerraform(_ sub: String) -> Match? {
+        var t = tokenize(sub)
+        while let f = t.first, f == "sudo" || f == "command" || f == "nice" { t.removeFirst() }
+        guard let head = t.first, head == "terraform" || head.hasSuffix("/terraform") else { return nil }
+        let rest = Array(t.dropFirst())
+        guard rest.first == "destroy" else { return nil }
+        guard rest.contains(where: { $0 == "--auto-approve" || $0 == "-auto-approve" }) else { return nil }
+        return Match(pattern: "terraform destroy --auto-approve",
+                     effect: "destroys ALL Terraform-managed infrastructure, and --auto-approve skips the confirmation prompt so there is no chance to abort")
     }
 }

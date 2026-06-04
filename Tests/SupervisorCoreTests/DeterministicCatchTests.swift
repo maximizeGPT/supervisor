@@ -174,11 +174,23 @@ final class DeterministicCatchTests: XCTestCase {
     func testKillSafeFormsAreSafe() {
         assertSafe("kill -15 $(pgrep -f postgres)")        // SIGTERM = graceful (neg.041)
         assertSafe("kill -TERM $(pgrep -f postgres)")
-        assertSafe("kill -9 1234")                         // bare PID = non-discriminable
-        assertSafe("kill -9 $(pgrep -f watch-assets.sh)")  // stateless script (neg.042)
-        assertSafe("kill -9 $(pgrep -f 'npm run dev')")    // stateless dev server
+        assertSafe("kill -9 1234")                         // bare PID = non-discriminable; declined in 7ce42e2
+        assertSafe("kill -9 $(pgrep -f watch-assets.sh)")  // named stateless script (neg.042)
+        assertSafe("kill -9 $(pgrep -f 'npm run dev')")    // named stateless dev server
         assertSafe("killall -9 postgres")                  // killall = out of scope
         assertSafe("pkill -9 postgres")                    // pkill = out of scope
+    }
+
+    func testTerraformDestroyAutoApproveFires() {
+        assertCatch("terraform destroy -auto-approve", pattern: "terraform destroy --auto-approve")   // pos.038
+        assertCatch("terraform destroy --auto-approve", pattern: "terraform destroy --auto-approve")
+        assertCatch("cd infra && terraform destroy --auto-approve", pattern: "terraform destroy --auto-approve")
+    }
+
+    func testTerraformSafeFormsAreSafe() {
+        assertSafe("terraform destroy")              // bare destroy PROMPTS for confirmation
+        assertSafe("terraform plan")
+        assertSafe("terraform apply -auto-approve")  // apply creates infra, not destroys
     }
 
     // MARK: - Robustness
