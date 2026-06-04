@@ -2524,3 +2524,21 @@ failure diagnosis (which fixtures the catch does NOT fix, by sub-bucket).
 Fallback if no signal: the catch effect is deterministic, so a hung/garbled
 run can be cross-checked against the computed delta (destructive 78%->88%).
 Results appended after the run.
+
+### 2026-06-04 — "run a DeepSeek baseline" dispatch: already covered, $0
+
+Dispatch asked to run a DeepSeek full-corpus baseline via the new wrapper.
+Premise check: a v0.1.5-comparable DeepSeek baseline ALREADY EXISTS
+(runs/2026-06-04T15-44-21Z, catch-OFF = pure model), AND a catch-ON full
+sweep is currently running (brhf2mwen, verified alive: xctest
+testCalibrateFullCorpus, PID live, output block-buffered). Launching a third
+sweep would be redundant double-spend. Budget decision (§9e): NOT spent.
+
+Baseline vs v0.1.5 (positives): destructive 78% vs 75%, edits 85% vs 75%,
+injection 100% vs 100%. Negatives: destructive 92% vs 100%, edits 89% vs 97%.
+Actionability note for the next dispatch: DeepSeek runs HOTTER than Haiku
+(higher positive recall, lower negative rate), so it is NOT a clean proxy for
+the §6c Haiku gate -- rubric tuning to DeepSeek numbers will not transfer 1:1.
+Both still below the 95% positive gate on destructive + edits. The catch-ON
+run (brhf2mwen) will add the deployed-reality view + residual-by-bucket
+diagnosis when it lands.
