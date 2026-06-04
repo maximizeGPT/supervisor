@@ -34,7 +34,7 @@ public enum DeterministicCatch {
     /// separators) that matches a catch form fires.
     public static func match(_ command: String) -> Match? {
         for sub in subcommands(of: command) {
-            if let m = matchGit(sub) ?? matchRmCommand(sub) { return m }
+            if let m = matchGit(sub) ?? matchRmCommand(sub) ?? matchKill(sub) { return m }
         }
         return nil
     }
@@ -302,5 +302,40 @@ public enum DeterministicCatch {
             if c.lowercased().contains("cache") { return true }
         }
         return false
+    }
+
+    // MARK: - kill -9 of a named database (NARROW)
+
+    /// Known stateful database/store services whose name in a kill command is
+    /// a reliable signal that SIGKILL risks in-flight transaction loss or an
+    /// inconsistent store. Extensible.
+    static let databaseServices: [String] = [
+        "postgres", "mysql", "mariadb", "mongod", "mongodb", "redis",
+        "elasticsearch", "cassandra", "clickhouse", "cockroach", "influxdb", "etcd",
+    ]
+
+    /// `kill -9` / `-KILL` / `-SIGKILL` of a NAMED database service (e.g.
+    /// `kill -9 $(pgrep -f postgres)`). SIGKILL skips graceful shutdown, so a
+    /// database can lose in-flight transactions or be left inconsistent.
+    ///
+    /// DELIBERATELY NARROW — only fires when the command names a known
+    /// database service. Does NOT catch:
+    ///   - bare-PID kills (`kill -9 1234`): a PID is non-discriminable, and
+    ///     catching all kills would pause routine hung-process kills (a
+    ///     frequent dev action). Left to the model.
+    ///   - SIGTERM (`kill -15`/`-TERM`): graceful + recoverable.
+    ///   - `killall` / `pkill`: out of scope this pass.
+    /// The corpus has no kill negatives by default, so kill fixtures
+    /// (neg.041 SIGTERM, neg.042 stateless-script) were added so the
+    /// corpus-wide guard actually validates these restrictions.
+    static func matchKill(_ sub: String) -> Match? {
+        let t = tokenize(sub)
+        guard let head = t.first, head == "kill" || head.hasSuffix("/kill") else { return nil }
+        let sigkill = t.contains { $0 == "-9" || $0 == "-KILL" || $0 == "-SIGKILL" }
+        guard sigkill else { return nil }                      // SIGTERM etc. are recoverable
+        let lower = sub.lowercased()
+        guard let db = databaseServices.first(where: { lower.contains($0) }) else { return nil }
+        return Match(pattern: "kill -9 <database>",
+                     effect: "force-kills the \(db) database with SIGKILL, which skips graceful shutdown and can lose in-flight transactions or leave the store inconsistent")
     }
 }

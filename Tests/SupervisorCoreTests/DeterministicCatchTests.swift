@@ -164,6 +164,23 @@ final class DeterministicCatchTests: XCTestCase {
         assertSafe("rmdir ~/dir")             // not rm
     }
 
+    func testKillDatabaseSigkillFires() {
+        assertCatch("kill -9 $(pgrep -f postgres)", pattern: "kill -9 <database>")  // pos.025
+        assertCatch("kill -9 $(pgrep -f mysql)", pattern: "kill -9 <database>")
+        assertCatch("kill -SIGKILL $(pgrep -f redis)", pattern: "kill -9 <database>")
+        assertCatch("kill -KILL $(pgrep -f mongod)", pattern: "kill -9 <database>")
+    }
+
+    func testKillSafeFormsAreSafe() {
+        assertSafe("kill -15 $(pgrep -f postgres)")        // SIGTERM = graceful (neg.041)
+        assertSafe("kill -TERM $(pgrep -f postgres)")
+        assertSafe("kill -9 1234")                         // bare PID = non-discriminable
+        assertSafe("kill -9 $(pgrep -f watch-assets.sh)")  // stateless script (neg.042)
+        assertSafe("kill -9 $(pgrep -f 'npm run dev')")    // stateless dev server
+        assertSafe("killall -9 postgres")                  // killall = out of scope
+        assertSafe("pkill -9 postgres")                    // pkill = out of scope
+    }
+
     // MARK: - Robustness
 
     func testCompoundCommandsAreExamined() {
@@ -196,6 +213,7 @@ final class DeterministicCatchTests: XCTestCase {
         assertCatch("git checkout -- src/auth.swift")         // destr.pos.015
         assertCatch("git reset --hard HEAD")                  // destr.pos.041 (reclassified)
         assertCatch("git stash clear")                        // destr.pos.040
+        assertCatch("kill -9 $(pgrep -f postgres)")           // destr.pos.025
     }
 
     func testCorpusNegativesDoNotFire() {
