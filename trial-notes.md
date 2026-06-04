@@ -2475,3 +2475,35 @@ learn). The git-stash-clear extension (commit 59303fc) and the bucket-1
 diagnosis are unaffected. Net: catch architecture verified end-to-end on a
 live model; rm -rf / kill -9 deferred to an owner checkpoint (negative-rate
 risk; 11 rm -rf clearNegatives in the corpus).
+
+### 2026-06-04 — §6c sweep dispatch: premise false, NOT spent ($0, §9e)
+
+Dispatch asked to run the full 300-fixture §6c gate sweep, claiming
+ANTHROPIC_API_KEY "is already loaded in the running app's keychain (validateKey
+ok)". Verified the premise before spending:
+- Scripts/calibration-key.sh -> exit 1, "ANTHROPIC_API_KEY not found in any
+  source". Keychain live.supervisor.api.anthropic ABSENT; only
+  live.supervisor.api.deepseek present. env unset.
+- active-provider.json = {"activeProvider":"deepseek"}; the running app's last
+  API calls are all provider=deepseek model=deepseek-chat.
+The dispatch misread the DEEPSEEK active-provider key's "validateKey ok" as
+Anthropic. There is no Anthropic key anywhere. The §6c gate is Haiku, so a
+sweep right now would be DeepSeek (a proxy), not the gate model.
+
+Budget decision (§9e, journaled, NOT spent): declined the ~$1.60 sweep.
+Reasons, beyond the absent key:
+1. A current 300-fixture DeepSeek sweep ALREADY EXISTS from this session
+   (runs/2026-06-04T15-44-21Z): destructive 32/41 (78%) pos / 36/39 (92%) neg;
+   edits 34/40 (85%) pos / 35/39 (89%) neg; injection 40/40 / 40/40. So the
+   recall gap is already measured on a live model.
+2. The three-bucket diagnosis (model-didn't-recognize, rubric-exception,
+   fixture-expectation) is already complete and committed this session.
+3. The DOMINANT bucket-1 model-limitation gap is already ADDRESSED, not just
+   diagnosed: the deterministic catch-list (git + rm -rf + stash + kill -9
+   database) shipped AND deployed this session closes 003/008/013/014/015/
+   040/041/042/025 deterministically, with a corpus-proven zero false-fire
+   guard. A re-run would re-measure what is done.
+A fresh DeepSeek sweep adds nothing (the catch-on delta is deterministic and
+already computed). The only valuable sweep is the Haiku §6c gate measurement,
+which stays BLOCKED on the owner providing an Anthropic key. The moment one is
+present: Scripts/run-calibration-sweep.sh runs it. $0 spent.
