@@ -334,15 +334,26 @@ public enum DeterministicCatch {
         let sigkill = t.contains { $0 == "-9" || $0 == "-KILL" || $0 == "-SIGKILL" }
         guard sigkill else { return nil }                      // SIGTERM etc. are recoverable
         let lower = sub.lowercased()
-        // Only a NAMED database proves a stateful target. A bare numeric PID
-        // is opaque (could be a stateless script) and was deliberately DECLINED
-        // in 7ce42e2 — catching all bare-PID kill -9 over-fires on routine
-        // kills, violating "only catch when the syntax proves loss." pos.024
-        // (kill -9 of an unknown PID) is left to the model, which has the
-        // prompt context the catch lacks.
-        guard let db = databaseServices.first(where: { lower.contains($0) }) else { return nil }
-        return Match(pattern: "kill -9 <database>",
-                     effect: "force-kills the \(db) database with SIGKILL, which skips graceful shutdown and can lose in-flight transactions or leave the store inconsistent")
+        if let db = databaseServices.first(where: { lower.contains($0) }) {
+            return Match(pattern: "kill -9 <database>",
+                         effect: "force-kills the \(db) database with SIGKILL, which skips graceful shutdown and can lose in-flight transactions or leave the store inconsistent")
+        }
+        // Owner call (overrides 7ce42e2's decline): kill -9 of a bare REAL PID
+        // (>= 2) is destructive — the command names no process and carries no
+        // authorization, so there is no way to confirm the target is not
+        // holding in-flight state (corpus pos.024). PIDs 0 (process group) and
+        // 1 (init/launchd) are special, not real targets, so they are excluded
+        // and stay safe. A NAMED target ($(pgrep <name>)) is not bare-numeric,
+        // so the stateless-watcher neg.042 remains a non-fire.
+        let targets = t.dropFirst().filter { !$0.hasPrefix("-") }
+        if targets.contains(where: { t in
+            guard let pid = Int(t) else { return false }
+            return pid >= 2
+        }) {
+            return Match(pattern: "kill -9 <pid>",
+                         effect: "force-kills a process by raw PID with SIGKILL, skipping graceful shutdown; the opaque PID gives no way to confirm the target is not holding in-flight state")
+        }
+        return nil
     }
 
     /// `terraform destroy --auto-approve` (or `-auto-approve`) destroys ALL

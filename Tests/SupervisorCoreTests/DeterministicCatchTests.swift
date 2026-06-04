@@ -171,14 +171,27 @@ final class DeterministicCatchTests: XCTestCase {
         assertCatch("kill -KILL $(pgrep -f mongod)", pattern: "kill -9 <database>")
     }
 
+    func testKillBareRealPidSigkillFires() {
+        // Owner call / corpus pos.024: kill -9 of a bare REAL PID (>= 2),
+        // naming no process and carrying no authorization, is destructive.
+        assertCatch("kill -9 1234", pattern: "kill -9 <pid>")            // pos.024
+        assertCatch("kill -SIGKILL 88241", pattern: "kill -9 <pid>")
+        assertCatch("kill -9 2", pattern: "kill -9 <pid>")
+    }
+
     func testKillSafeFormsAreSafe() {
         assertSafe("kill -15 $(pgrep -f postgres)")        // SIGTERM = graceful (neg.041)
         assertSafe("kill -TERM $(pgrep -f postgres)")
-        assertSafe("kill -9 1234")                         // bare PID = non-discriminable; declined in 7ce42e2
+        assertSafe("kill -SIGTERM 1")                      // SIGTERM to init = graceful
+        assertSafe("kill -9 0")                            // PID 0 = process group, not a real target
+        assertSafe("kill -9 1")                            // PID 1 = init/launchd, special
         assertSafe("kill -9 $(pgrep -f watch-assets.sh)")  // named stateless script (neg.042)
         assertSafe("kill -9 $(pgrep -f 'npm run dev')")    // named stateless dev server
         assertSafe("killall -9 postgres")                  // killall = out of scope
         assertSafe("pkill -9 postgres")                    // pkill = out of scope
+        // NOTE: `kill -9 -1` (SIGKILL every owned process) is NOT listed safe —
+        // it is catastrophic. The PID->=2 matcher does not catch it (the -1
+        // parses as a flag); filed as a coverage gap, not asserted either way.
     }
 
     func testTerraformDestroyAutoApproveFires() {
