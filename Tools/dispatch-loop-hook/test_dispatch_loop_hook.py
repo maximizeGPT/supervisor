@@ -1150,6 +1150,37 @@ class TestThrashFixV090(unittest.TestCase):
                          "real code-work on the brief generator must still dispatch")
         self.assertNotIn("owner_brief_rewrite", " ".join(rec["exit"]))
 
+    # -- D2: grounding — cannot dispatch a task naming a non-existent symbol
+
+    def test_ungrounded_proposal_discarded_to_idle(self):
+        """ACCEPTANCE (D2-a): a high-confidence proposal that names a symbol
+        which does not exist in the code (the stale_binary hallucination)
+        must be discarded to a calm idle — nothing emitted, no SelfExtender,
+        no fabricated dispatch. (Grounding runs a real git grep against the
+        repo cwd the harness passes.)"""
+        rec = self._run_main(call_side_effect=self._high(
+            "Fix the stale_binary self-watch check, the untested sibling of the others",
+            justification="stale_binary may have the same false-positive pattern.",
+        ))
+        self.assertEqual(rec["block"], [],
+                         "an ungrounded (fabricated-symbol) proposal must NOT dispatch")
+        self.assertEqual(rec["extend"], [],
+                         "ungrounded proposal is idle, not a SelfExtender failure")
+        self.assertTrue(any("ungrounded_proposal" in r for r in rec["exit"]),
+                        f"must stop with ungrounded_proposal; got {rec['exit']}")
+
+    def test_grounded_proposal_still_dispatches(self):
+        """ACCEPTANCE (D2-b): a high-confidence proposal naming only symbols
+        that DO exist still dispatches — grounding must not overcorrect into
+        never dispatching."""
+        rec = self._run_main(call_side_effect=self._high(
+            "Improve detect_stale_build mtime handling in the hook",
+            justification="detect_stale_build is the right place for this.",
+        ))
+        self.assertEqual(len(rec["block"]), 1,
+                         "a grounded proposal (real symbols) must still dispatch")
+        self.assertFalse(any("ungrounded" in r for r in rec["exit"]))
+
 
 class TestThrashHelpers(unittest.TestCase):
     """Unit coverage for the v0.9.0 helper predicates, independent of
@@ -1224,6 +1255,43 @@ class TestThrashHelpers(unittest.TestCase):
         """First-ever proposal (no stored history) is never a repeat."""
         self.assertFalse(
             hook._is_repeat_proposal({}, "Any first proposal at all", 0.8))
+
+
+class TestGrounding(unittest.TestCase):
+    """D2: a proposal cannot name a code symbol that does not exist."""
+
+    def test_extract_code_symbols(self):
+        syms = set(hook._extract_code_symbols(
+            "Fix detect_stale_build and LoopController in dispatch_loop_hook.py"))
+        self.assertIn("detect_stale_build", syms)   # snake_case
+        self.assertIn("LoopController", syms)        # CamelCase
+        self.assertIn("dispatch_loop_hook.py", syms) # file.ext
+
+    def test_extract_ignores_plain_prose(self):
+        syms = hook._extract_code_symbols("Write a landing page and improve the launch copy")
+        self.assertEqual(syms, [], f"plain English must yield no symbols; got {syms}")
+
+    def test_ground_flags_hallucinated_symbol(self):
+        grounded, reason = hook._ground_proposal(
+            "/Users/main/supervisor",
+            "Fix the frobnicate_the_widget helper",  # exists nowhere
+            "", timeout=10)
+        self.assertFalse(grounded)
+        self.assertIn("frobnicate_the_widget", reason)
+
+    def test_ground_passes_real_symbol(self):
+        grounded, _ = hook._ground_proposal(
+            "/Users/main/supervisor",
+            "Fix detect_stale_build in the hook",   # real function
+            "", timeout=10)
+        self.assertTrue(grounded)
+
+    def test_ground_passes_pure_prose(self):
+        grounded, _ = hook._ground_proposal(
+            "/Users/main/supervisor",
+            "Close the calibration gap on destructive recall",
+            "", timeout=10)
+        self.assertTrue(grounded, "a prose proposal naming no code symbols is grounded")
 
 
 if __name__ == "__main__":

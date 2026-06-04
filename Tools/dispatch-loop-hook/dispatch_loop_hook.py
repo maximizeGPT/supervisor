@@ -667,6 +667,102 @@ def _is_owner_brief_proposal(text: str) -> bool:
     return any(v in low for v in rewrite_intent)
 
 
+# --- Grounding: a proposal cannot name a symbol that does not exist --------
+#
+# DEFECT 2: the dispatcher repeatedly emitted high-confidence tasks with
+# false premises — most starkly "fix the <X> check" where <X> was a symbol
+# that DOES NOT EXIST anywhere in the code (a pure hallucination). Grounding
+# moves the reality check INTO the hook: before a proposal is dispatched,
+# every concrete code symbol it names (snake_case identifier, CamelCase
+# type, file.ext) must actually appear in the repo as real code. If any
+# named symbol is absent, the premise is fabricated and the proposal is
+# discarded — the loop idles instead of dispatching garbage.
+
+# Tokens that look code-shaped but are ordinary words / proper nouns the
+# dispatcher uses in prose — never treat these as "must exist" symbols.
+_GROUNDING_STOPWORDS = frozenset({
+    "claude_code", "product_direction", "owner_brief", "known_gaps",
+    "self_watch", "low_confidence_no_action", "high_confidence",
+    "no_action", "trial_notes", "product-direction.md", "owner-brief.md",
+    "changelog.md", "principles.md", "readme.md", "trial-notes.md",
+})
+
+# File extensions whose tokens we treat as path references.
+_GROUNDING_FILE_EXTS = ("swift", "py", "json", "md", "sh", "txt", "yaml", "yml", "plist")
+
+
+def _extract_code_symbols(text: str) -> list[str]:
+    """Extract concrete code-symbol-like tokens a proposal claims exist:
+    snake_case identifiers, multi-word CamelCase types, and file.ext paths.
+    Plain English words and single-capitalized words are NOT symbols."""
+    text = text or ""
+    syms: set[str] = set()
+    # snake_case: at least one underscore joining alphanumerics.
+    for m in re.findall(r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+", text):
+        syms.add(m)
+    # CamelCase types: two or more capitalized segments (LoopController).
+    for m in re.findall(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b", text):
+        syms.add(m)
+    # file.ext references (Foo.swift, dispatch_loop_hook.py).
+    for m in re.findall(r"\b[\w/.-]+\.(?:" + "|".join(_GROUNDING_FILE_EXTS) + r")\b", text):
+        syms.add(m)
+    # Backtick-quoted code tokens.
+    for m in re.findall(r"`([^`]+)`", text):
+        t = m.strip()
+        if re.fullmatch(r"[\w./-]+", t) and ("_" in t or "." in t or re.search(r"[a-z][A-Z]", t)):
+            syms.add(t)
+    return [s for s in syms if s.lower() not in _GROUNDING_STOPWORDS]
+
+
+# Pathspecs excluded from the symbol search: a symbol mentioned only in
+# prose (markdown docs, the owner brief, the changelog, trial notes) or in a
+# test fixture is NOT proof it exists as real code. We search code only.
+_GROUNDING_EXCLUDES = [
+    ":(exclude,glob)**/*.md",
+    ":(exclude,glob)**/*test*",
+    ":(exclude,glob)**/*Test*",
+    ":(exclude,glob)OWNER-BRIEF*",
+    ":(exclude,glob)CHANGELOG*",
+    ":(exclude,glob)trial-notes*",
+]
+
+
+def _symbol_exists_in_repo(cwd: str, symbol: str, timeout: float) -> bool:
+    """True if `symbol` exists as real CODE in the repo. Files are checked
+    on disk; identifiers via `git grep -F` over code only (docs, the owner
+    brief / changelog / trial-notes, and tests are excluded — a symbol
+    mentioned in prose or a test string is not proof it exists)."""
+    if symbol.endswith(tuple("." + e for e in _GROUNDING_FILE_EXTS)) or "/" in symbol:
+        if (Path(cwd) / symbol).exists():
+            return True
+        base = symbol.rsplit("/", 1)[-1]
+        code, out, _ = run(
+            ["git", "grep", "-l", "-F", base, "--"] + _GROUNDING_EXCLUDES,
+            cwd=cwd, timeout=timeout,
+        )
+        if code == 0 and out.strip():
+            return True
+    code, out, _ = run(
+        ["git", "grep", "-I", "-l", "-F", symbol, "--"] + _GROUNDING_EXCLUDES,
+        cwd=cwd, timeout=timeout,
+    )
+    return code == 0 and bool(out.strip())
+
+
+def _ground_proposal(cwd: str, proposal: str, justification: str, timeout: float) -> tuple[bool, str]:
+    """Verify a proposal's premise against the real tree. Returns
+    (grounded, reason). Ungrounded = it names a concrete code symbol
+    (function/type/file) that does not exist anywhere in the repo. This is
+    what makes it IMPOSSIBLE to dispatch "fix <X>" when <X> is a symbol that
+    exists nowhere in the code."""
+    blob = (proposal or "") + " " + (justification or "")
+    symbols = _extract_code_symbols(blob)
+    missing = [s for s in symbols if not _symbol_exists_in_repo(cwd, s, timeout)]
+    if missing:
+        return False, "missing_symbols=" + ",".join(sorted(missing)[:5])
+    return True, ""
+
+
 # --- Repetition breaker helpers -------------------------------------------
 
 _PROPOSAL_STOPWORDS = {
@@ -2165,6 +2261,31 @@ def main() -> None:
             put_session_state(state_all, session_id, state)
             save_state(state_all)
             silent_exit("breaker_repeated_proposal")
+
+        # Grounding (DEFECT 2): a proposal may not name a code symbol that
+        # does not exist. The dispatcher repeatedly fabricated work (e.g.
+        # "fix the <X> check" naming a symbol that exists nowhere). Verify
+        # every concrete symbol/file the proposal names actually appears in
+        # the tree as code; if any is missing, the premise is hallucinated —
+        # discard and idle, never dispatch. "no work" is the correct,
+        # confident answer here.
+        grounded, gr_reason = _ground_proposal(
+            cwd, proposal, justification, cfg["git_log_timeout_s"]
+        )
+        if not grounded:
+            log(f"UNGROUNDED_PROPOSAL {gr_reason} just=\"{justification[:120]}\"")
+            write_owner_brief(
+                cwd=cwd,
+                what_shipped=summarize_recent_commits(commits),
+                most_valuable_next="The dispatcher proposed work referencing something that does not exist in the code (a fabricated premise). It was discarded. The queue is effectively empty; add real direction.",
+                needs_owner="Loop idle: the dispatcher fabricated a task. Add real queued work or leave it idle.",
+                loop_doing_next="Idle. Discarded an ungrounded proposal (named a symbol that does not exist). Waiting for direction.",
+                warnings=self_watch_warnings,
+            )
+            state["consecutive_low"] = 0
+            put_session_state(state_all, session_id, state)
+            save_state(state_all)
+            silent_exit(f"ungrounded_proposal {gr_reason}")
 
         # Genuine new actionable work. Remember it (for next-dispatch repeat
         # detection) and dispatch.
