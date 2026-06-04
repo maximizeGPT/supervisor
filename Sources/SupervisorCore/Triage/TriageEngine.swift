@@ -891,7 +891,8 @@ public final class TriageEngine {
             var enriched = await enrichWithSecondaryAnswer(
                 candidate: candidate,
                 question: info.text,
-                sessionId: info.sessionId
+                sessionId: info.sessionId,
+                cwd: cwd
             )
             // v0.3.1 (Issue #6): if cwd is unresolvable, the inject
             // path can't run (locator needs cwd → PID). Downgrade
@@ -952,7 +953,8 @@ public final class TriageEngine {
     private func enrichWithSecondaryAnswer(
         candidate: TriageCandidate,
         question: String,
-        sessionId: String
+        sessionId: String,
+        cwd: String?
     ) async -> TriageCandidate {
         guard candidate.category == "user_question_pending",
               let answerer = questionAnswerer else {
@@ -963,7 +965,19 @@ public final class TriageEngine {
         switch qt {
         case "engineering":
             do {
-                let answer = try await answerer.answerEngineering(question: question)
+                // Ground the answer in the live repo state (branch, recent
+                // commits, uncommitted changes) so a routine commit/push
+                // question gets a concrete, context-based answer rather than
+                // a generic one. cwd is required to reach git; without it
+                // the answerer falls back to PRINCIPLES.md only.
+                let repoContext = cwd.map { c in c.isEmpty ? "" : c } ?? ""
+                let context = repoContext.isEmpty
+                    ? ""
+                    : await gatherRepoContextForAnswer(cwd: repoContext, branch: nil, trace: trace)
+                let answer = try await answerer.answerEngineering(
+                    question: question,
+                    repoContext: context
+                )
                 if answer.confidence == .low || answer.answer.isEmpty {
                     // Degrade: PRINCIPLES didn't have a clear answer.
                     // Rewrite as taste and surface to user.

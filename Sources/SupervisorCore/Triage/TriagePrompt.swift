@@ -82,7 +82,7 @@ public enum TriagePrompt {
                                     "enum": .array([
                                         .string("engineering"), .string("safety"), .string("taste")
                                     ]),
-                                    "description": .string("v0.3.0: REQUIRED when category=user_question_pending; omit otherwise. engineering = answer derivable from a written document (PRINCIPLES.md, project conventions); safety = the action behind the question is destructive/irreversible; taste = depends on user values, aesthetics, naming, copy. Default to safety when uncertain between engineering and safety; default to taste when uncertain between engineering and taste.")
+                                    "description": .string("REQUIRED when category=user_question_pending; omit otherwise. engineering = answerable from context Supervisor has (PRINCIPLES.md, project conventions, AND the live repo state: branch, recent commits, what shipped) — this INCLUDES routine reversible dev decisions: commit, push to a feature/working branch, 'proceed?', A-or-B implementation choices. safety = the action is genuinely destructive/irreversible (protected branch like main, data loss, credentials, money, prod). taste = genuine user values/aesthetics/naming/copy. Default routine dev-workflow questions to engineering (Supervisor answers from repo context so the human does not have to); use safety ONLY for genuinely destructive/irreversible actions; use taste only for values calls.")
                                 ]),
                                 "confidence": .object([
                                     "type": .string("string"),

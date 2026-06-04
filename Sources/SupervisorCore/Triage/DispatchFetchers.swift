@@ -355,6 +355,72 @@ func resolveDiffRange(
     return "HEAD~20..HEAD"
 }
 
+// MARK: - Repo context for question answering (D1)
+
+/// Gather a compact snapshot of the repo state for the QuestionAnswerer:
+/// current branch (flagged protected vs working), recent commits, and the
+/// uncommitted changes a "should I commit this?" refers to. This is what
+/// lets Supervisor answer a routine commit/push question from ACTUAL
+/// context instead of escalating it to the human. Bounded by `timeout`;
+/// returns whatever it could gather (empty only if git is unavailable).
+func gatherRepoContextForAnswer(
+    cwd: String,
+    branch: String?,
+    gitPath: String = "/usr/bin/env",
+    timeout: TimeInterval = 5,
+    trace: TraceLog = .shared
+) async -> String {
+    var sections: [String] = []
+
+    var resolvedBranch = branch
+    if resolvedBranch?.isEmpty != false {
+        if let r = try? await runProcess(
+            executable: gitPath,
+            args: ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd: cwd, timeout: timeout
+        ), r.exitCode == 0 {
+            resolvedBranch = String(data: r.stdout, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+    if let b = resolvedBranch, !b.isEmpty {
+        let isProtected = (b == "main" || b == "master")
+        let note = isProtected
+            ? " (PROTECTED branch — never auto-commit/push/merge here; that is a human call)"
+            : " (working branch — routine commits and pushes are fine and reversible)"
+        sections.append("Current branch: \(b)\(note)")
+    }
+
+    if let r = try? await runProcess(
+        executable: gitPath,
+        args: ["git", "log", "-8", "--pretty=format:%h %s"],
+        cwd: cwd, timeout: timeout
+    ), r.exitCode == 0 {
+        let log = String(data: r.stdout, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !log.isEmpty { sections.append("Recent commits:\n\(log)") }
+    }
+
+    if let r = try? await runProcess(
+        executable: gitPath,
+        args: ["git", "status", "--short"],
+        cwd: cwd, timeout: timeout
+    ), r.exitCode == 0 {
+        let status = String(data: r.stdout, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if status.isEmpty {
+            sections.append("Working tree: clean (nothing staged or uncommitted).")
+        } else {
+            let count = status.split(separator: "\n").count
+            sections.append("Uncommitted changes (\(count) file(s)):\n\(String(status.prefix(800)))")
+        }
+    }
+
+    let result = sections.joined(separator: "\n\n")
+    trace.emit("triage.answer", "repo_context gathered bytes=\(result.utf8.count) branch=\(resolvedBranch ?? "?")")
+    return result
+}
+
 // MARK: - Process runner (the shared internals)
 
 struct ProcessResult {

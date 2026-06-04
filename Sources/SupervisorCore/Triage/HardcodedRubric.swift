@@ -532,25 +532,45 @@ public enum HardcodedRubric {
           REQUIRED on every user_question_pending verdict. Classify the
           question into exactly ONE of:
 
-          - "engineering": the answer is derivable from a written
-            document — PRINCIPLES.md, project conventions, language
+          - "engineering": the answer is derivable from context Supervisor
+            already has — PRINCIPLES.md, project conventions, language
             defaults, framework idioms, the codebase's own existing
-            patterns. Examples:
+            patterns, AND the live repo state (current branch, what just
+            shipped/the diff, recent commits, PRODUCT-DIRECTION, the
+            project's workflow conventions). This includes the ROUTINE
+            dev-workflow decisions a human engineer-in-the-middle would
+            just answer, not relay: commit/push/merge decisions on a
+            non-protected branch, "do you want me to proceed", and A-or-B
+            implementation choices. A routine commit, or a push to a
+            feature/autonomous branch, is reversible and grounded in the
+            branch state — Supervisor answers it; it does NOT leave the
+            human holding a question it can ground in context. Examples:
+              * "Should I commit this?" / "Commit with that message?"
+                (yes/no + message, grounded in the diff and §1e granularity)
+              * "Should I push?" (decide from the branch: push a
+                feature/autonomous branch for CI; do NOT push if the branch
+                isn't ready or it would touch a protected branch)
+              * "Do you want me to proceed / move on to the next step?"
               * "Should I use sysctl or lsof to find the PID?"
               * "Want me to rename this enum to match the new shape?"
               * "Tests in the same file or in a separate file?"
               * "Add Yams as a dependency or hand-parse the YAML?"
               * "Tab width 2 or 4?"
 
-          - "safety": the action behind the question is destructive,
-            irreversible, or modifies the user's environment in a
-            non-trivial way. Safety questions are values questions even
-            when they look engineering-shaped, because the user must
-            sign off before the action runs. Examples:
-              * "Should I delete this directory?"
-              * "OK to force-push to main?"
-              * "Should I revoke this credential?"
-              * "Want me to rm -rf the old project?"
+          - "safety": the action behind the question is genuinely
+            destructive, irreversible, or hard to undo — data loss, a
+            protected branch, credentials, money, or the user's wider
+            environment. Safety questions are values questions even when
+            they look engineering-shaped, because the user must sign off
+            before the action runs. This is NARROW: a routine commit or a
+            push to a feature/autonomous branch is NOT safety (it is
+            reversible and routine — that is engineering). Reserve safety
+            for the genuinely-destructive cases. Examples:
+              * "Should I delete this directory?" / "rm -rf the old project?"
+              * "OK to force-push to main?" / "Merge straight into main?"
+                (a PROTECTED branch — escalate; a feature branch is routine)
+              * "Should I revoke this credential?" / "Push the API key?"
+              * "Should I deploy to production?" / "Run this against prod?"
 
           - "taste": the answer depends on user values, aesthetics,
             product priorities, naming, copy, design. Examples:
@@ -587,12 +607,23 @@ public enum HardcodedRubric {
           from it. Once you've decided question_type, the action
           is mechanical — do not second-guess it.
 
-          Default to "safety" when uncertain between engineering and
-          safety. Default to "taste" when uncertain between engineering
-          and taste. Erring toward the user reaches them rather than
-          fabricating an answer. **Apply these defaults at the
-          classification step, NOT at the action step.** Once you've
-          committed to engineering, the action is inject — period.
+          Default rule (this is the product's core promise — Supervisor
+          answers routine questions so the human does not have to):
+            - For ROUTINE, reversible dev-workflow decisions (commit, push
+              to a feature/autonomous branch, "proceed?", A-or-B
+              implementation choices), default to "engineering". Supervisor
+              grounds the answer in the repo state and conventions and
+              injects it. Do NOT escalate these to the human — that is the
+              exact failure this category exists to prevent.
+            - Default to "safety" ONLY when the action is genuinely
+              destructive/irreversible (a protected branch, data loss,
+              credentials, money, prod). When truly uncertain whether an
+              action is destructive, prefer safety.
+            - Default to "taste" only for genuine user-values/aesthetic
+              calls (naming, copy, product priorities).
+          **Apply these defaults at the classification step, NOT at the
+          action step.** Once you've committed to engineering, the action
+          is inject — period.
 
           The `matched_command` field on the verdict carries the
           assistant's question verbatim (up to ~200 chars) so the

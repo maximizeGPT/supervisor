@@ -67,7 +67,10 @@ public final class QuestionAnswerer: Sendable {
 
     // MARK: - Engineering path
 
-    public func answerEngineering(question: String) async throws -> EngineeringAnswer {
+    public func answerEngineering(
+        question: String,
+        repoContext: String = ""
+    ) async throws -> EngineeringAnswer {
         let req = AnthropicMessageRequest(
             model: client.provider.defaultTriageModel,
             max_tokens: 600,
@@ -75,7 +78,8 @@ public final class QuestionAnswerer: Sendable {
             messages: [
                 .init(role: "user", content: .string(Self.engineeringUserMessage(
                     question: question,
-                    principles: principlesText
+                    principles: principlesText,
+                    repoContext: repoContext
                 )))
             ],
             tools: [Self.recordAnswerTool],
@@ -117,43 +121,67 @@ public final class QuestionAnswerer: Sendable {
     // MARK: - Prompts
 
     static let engineeringSystemPrompt: String = """
-    You are Supervisor's engineering-question answerer. Your job is to
-    answer technical questions that Claude Code has asked the user, by
-    drawing on PRINCIPLES.md — Supervisor's operating manual — and
-    nothing else.
+    You are Supervisor's engineering-question answerer. Claude Code paused
+    mid-session and asked the user a routine dev question. Your job is to
+    answer it the way a senior engineer sitting next to the user would —
+    so the user does NOT have to. You ground the answer in two sources:
+    PRINCIPLES.md (the operating manual) AND the live repo context you are
+    given (branch, recent commits, what just shipped, conventions).
+
+    This includes deciding routine, reversible workflow questions:
+      - "Should I commit this?" → "Yes, commit it" (add a message if the
+        question asked for one), grounded in the diff and the project's
+        commit-granularity convention. Say no only if the work is clearly
+        unfinished.
+      - "Should I push?" → decide from the BRANCH in the repo context. A
+        feature/autonomous branch: "Yes, push the branch" (or "push for CI
+        if you want a signal"). Never tell it to push to or merge into a
+        protected branch (main/master) — that is a human call; if that is
+        what it is asking, return low confidence so it escalates.
+      - "Do you want me to proceed?" / A-or-B implementation choices →
+        pick the option the conventions and existing patterns support.
 
     Output rules:
-      - One short line, ≤200 characters. Supervisor will type this
-        verbatim into the user's terminal as the response Claude Code
-        is waiting for.
-      - Plain prose. No markdown, no code fences, no preamble. Just the
-        answer text Claude Code should read.
-      - If PRINCIPLES.md gives a clear answer, return it with confidence
-        "high" and cite the section ("§1c", "§6f", etc.).
-      - If PRINCIPLES.md hints at an answer but doesn't enumerate it,
-        return your best read with confidence "medium" and cite the
-        nearest relevant section.
-      - If PRINCIPLES.md doesn't address the question, return confidence
-        "low" and answer "(no clear answer in PRINCIPLES.md)". DO NOT
-        fabricate. Supervisor will degrade to surfacing the question to
-        the user when confidence is low.
+      - One short line, ≤200 characters. Supervisor types this verbatim
+        into the user's terminal as the response Claude Code is waiting
+        for. Plain prose, no markdown, no preamble — just the answer.
+      - Be decisive. The whole point is to spare the user a routine
+        decision; "it depends" defeats it. Commit to an answer.
+      - Confidence "high" when the repo context + conventions clearly
+        support an answer; "medium" when you are reading the nearest
+        convention; "low" ONLY when the question is genuinely a
+        human/values/high-stakes call (touching a protected branch,
+        destructive, money, credentials) or you truly cannot ground it.
+        On low, answer "(needs your call)" and Supervisor surfaces it to
+        the user. DO NOT fabricate, and DO NOT hedge a routine question to
+        low just because it feels consequential.
 
-    Call `record_answer` with your answer.
+    Call `record_answer` with your answer (cite the principle or the
+    repo-context fact that grounded it).
     """
 
-    static func engineeringUserMessage(question: String, principles: String) -> String {
+    static func engineeringUserMessage(
+        question: String,
+        principles: String,
+        repoContext: String = ""
+    ) -> String {
         """
         # The question
         Claude Code asked the user:
 
         > \(question)
 
+        # Repo context (the live state — branch, recent commits, what shipped)
+
+        \(repoContext.isEmpty ? "(no repo context available)" : repoContext)
+
         # PRINCIPLES.md (operating manual)
 
         \(principles)
 
         # Task
-        Answer the question above, drawing on PRINCIPLES.md. Output via
+        Answer the question above the way an engineer-in-the-middle would,
+        grounded in the repo context and PRINCIPLES.md. Output via
         record_answer exactly once.
         """
     }
