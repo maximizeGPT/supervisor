@@ -105,8 +105,8 @@ final class LoopControllerTests: XCTestCase {
         guard case let .stopped(reason) = final else {
             return XCTFail("expected .stopped after 3 lows, got \(final)")
         }
-        XCTAssertTrue(reason.contains("three_consecutive_low_confidence"),
-                      "stop reason must name the trigger")
+        XCTAssertTrue(reason.contains("no clear next step"),
+                      "stop reason must explain the trigger in plain language")
 
         let snap = await lc.snapshot(sessionId: "s-1")
         XCTAssertEqual(snap?.stopReason, .threeConsecutiveLow)

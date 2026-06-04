@@ -65,6 +65,20 @@ public enum LoopStopReason: String, Sendable, Equatable {
     case fourHoursElapsed = "four_hours_elapsed"
     case threeConsecutiveLow = "three_consecutive_low_confidence"
     case explicitStop = "explicit_stop"
+
+    /// Human-readable, shown to the owner (the raw value is for logs/traces).
+    public var display: String {
+        switch self {
+        case .killFired:
+            return "Claude Code is no longer running, so there's nothing to dispatch into."
+        case .fourHoursElapsed:
+            return "it's been running for 4 hours straight. It resets on its own after a couple of hours idle (or relaunch Supervisor to reset now)."
+        case .threeConsecutiveLow:
+            return "three dispatches in a row found no clear next step, so it's waiting for new direction."
+        case .explicitStop:
+            return "it was stopped manually."
+        }
+    }
 }
 
 public enum LoopPauseReason: String, Sendable, Equatable {
@@ -191,9 +205,9 @@ public actor LoopController {
 
         // .stopped sticks. Check it before anything else.
         if state.stopped {
-            let reason = state.stopReason?.rawValue ?? "unknown"
             sessions[sessionId] = state
-            return .stopped(reason: "Loop previously stopped: \(reason).")
+            let why = state.stopReason?.display ?? "an earlier stop."
+            return .stopped(reason: "Supervisor paused: \(why)")
         }
 
         // 4-hour budget check.
@@ -202,7 +216,7 @@ public actor LoopController {
             state.stopReason = .fourHoursElapsed
             sessions[sessionId] = state
             trace.emit("loop", "STOPPED session=\(sessionId) reason=four_hours_elapsed elapsed=\(Int(nowTs.timeIntervalSince(state.loopStartedAt)))s")
-            return .stopped(reason: "Loop exceeded 4-hour wall-clock budget.")
+            return .stopped(reason: "Supervisor paused: \(LoopStopReason.fourHoursElapsed.display)")
         }
 
         // Paused (transient — clearable by an explicit resume call).

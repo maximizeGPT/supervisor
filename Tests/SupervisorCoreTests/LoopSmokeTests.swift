@@ -333,8 +333,8 @@ final class LoopSmokeTests: XCTestCase {
         guard case let .stopped(reason) = fourth else {
             return XCTFail("expected .stopped after three lows, got \(fourth)")
         }
-        XCTAssertTrue(reason.contains("three_consecutive_low_confidence"),
-                      "stop reason should name the §12.5 trigger")
+        XCTAssertTrue(reason.contains("no clear next step"),
+                      "stop reason should explain the §12.5 trigger in plain language")
     }
 
     // MARK: - Helpers
