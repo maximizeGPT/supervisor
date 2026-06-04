@@ -34,7 +34,7 @@ public enum DeterministicCatch {
     /// separators) that matches a catch form fires.
     public static func match(_ command: String) -> Match? {
         for sub in subcommands(of: command) {
-            if let m = matchGit(sub) { return m }
+            if let m = matchGit(sub) ?? matchRmCommand(sub) { return m }
         }
         return nil
     }
@@ -71,14 +71,28 @@ public enum DeterministicCatch {
     /// Whitespace tokenizer with minimal surrounding-quote stripping. git
     /// destructive args rarely need shell quoting; exotic quoting just
     /// under-matches, which is safe.
+    /// Quote-aware whitespace tokenizer: keeps `"a b/c"` together as one
+    /// token (so a quoted path with spaces — e.g. a cache dir — is not split
+    /// and mis-classified). Quotes are consumed, not kept.
     static func tokenize(_ s: String) -> [String] {
-        s.split { $0 == " " || $0 == "\t" }.map { t -> String in
-            var x = String(t)
-            if x.count >= 2, let f = x.first, (f == "\"" || f == "'"), x.last == f {
-                x = String(x.dropFirst().dropLast())
+        var toks: [String] = []
+        var cur = ""
+        var quote: Character? = nil
+        var hadContent = false
+        for c in s {
+            if let q = quote {
+                if c == q { quote = nil } else { cur.append(c) }
+            } else if c == "\"" || c == "'" {
+                quote = c; hadContent = true
+            } else if c == " " || c == "\t" {
+                if hadContent { toks.append(cur) }
+                cur = ""; hadContent = false
+            } else {
+                cur.append(c); hadContent = true
             }
-            return x
-        }.filter { !$0.isEmpty }
+        }
+        if hadContent { toks.append(cur) }
+        return toks
     }
 
     // MARK: - git dispatch
@@ -232,5 +246,61 @@ public enum DeterministicCatch {
         case "drop":  return Match(pattern: "git stash drop", effect: "permanently deletes a stashed change, with no way to recover it")
         default:      return nil
         }
+    }
+
+    // MARK: - rm -rf
+
+    static func matchRmCommand(_ sub: String) -> Match? {
+        var t = tokenize(sub)
+        while let f = t.first, f == "sudo" || f == "command" || f == "nice" { t.removeFirst() }
+        guard let head = t.first, head == "rm" || head.hasSuffix("/rm") else { return nil }
+        return matchRm(Array(t.dropFirst()))
+    }
+
+    /// `rm -rf <path>` permanently deletes a tree. Fires ONLY when the target
+    /// is an absolute or home (`~` / `$HOME`) path that is NOT a temp / build
+    /// / cache location — i.e. a user-data, system, or home path. Deliberately
+    /// conservative:
+    ///   - Relative paths (`./x`, bare `x`, even `../x`) are NOT caught: they
+    ///     are at or near cwd, the worktree, which the model handles. Better
+    ///     to miss than to false-fire.
+    ///   - Temp/build/cache paths are excluded (mirrors HardcodedRubric's
+    ///     Do-NOT-fire list, plus any path component containing "cache").
+    /// Like the git family, authorization does NOT lower the floor.
+    ///
+    /// Residual production risk (honest): the safe-path space is unbounded, so
+    /// a novel safe target outside the exclusion list will occasionally
+    /// false-pause (a dismiss). The asymmetry — a dismiss vs permanent loss of
+    /// ~/Documents or ~/.ssh — justifies firing. The corpus-wide guard proves
+    /// zero false-fires across all 300 known clearNegatives.
+    static func matchRm(_ a: [String]) -> Match? {
+        let s = shortFlags(a), l = longFlags(a)
+        let recursive = s.contains("r") || s.contains("R") || l.contains("recursive")
+        let force = s.contains("f") || l.contains("force")
+        guard recursive && force else { return nil }          // only the rm -rf class
+        guard let path = nonFlagArgs(a).first else { return nil }   // no path (e.g. piped via xargs)
+        guard isAbsoluteOrHome(path), !isTempBuildCachePath(path) else { return nil }
+        return Match(pattern: "rm -rf",
+                     effect: "permanently deletes \(path) and everything inside it, with no way to recover it")
+    }
+
+    static func isAbsoluteOrHome(_ path: String) -> Bool {
+        path.hasPrefix("/") || path.hasPrefix("~") || path.hasPrefix("$HOME")
+    }
+
+    /// Temp / build / cache exclusions, by path COMPONENT (so "/buildings" is
+    /// NOT treated as "build"). Any component that is a known ephemeral dir,
+    /// or contains "cache" (case-insensitive), marks the whole path safe.
+    static func isTempBuildCachePath(_ path: String) -> Bool {
+        if path.hasPrefix("/var/folders") { return true }     // macOS per-user temp
+        let ephemeral: Set<String> = [
+            "tmp", "build", "dist", "target", "node_modules", ".pytest_cache",
+            "__pycache__", ".next", ".nuxt", "DerivedData", ".gradle", "Caches", ".cache",
+        ]
+        for c in path.split(separator: "/").map(String.init) {
+            if ephemeral.contains(c) { return true }
+            if c.lowercased().contains("cache") { return true }
+        }
+        return false
     }
 }

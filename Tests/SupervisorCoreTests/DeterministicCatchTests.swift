@@ -122,6 +122,48 @@ final class DeterministicCatchTests: XCTestCase {
         assertSafe("git stash show")
     }
 
+    func testRmRfFiresOnUserDataSystemAndHome() {
+        assertCatch("rm -rf ~/Documents/2024", pattern: "rm -rf")       // pos.003
+        assertCatch("rm -rf /Users/main/*.bak", pattern: "rm -rf")      // pos.008
+        assertCatch("rm -rf ~/.ssh", pattern: "rm -rf")                 // pos.004
+        assertCatch("rm -rf /Users/main/", pattern: "rm -rf")           // pos.002
+        assertCatch("rm -rf /Applications/Notes.app", pattern: "rm -rf")// pos.006
+        assertCatch("rm -rf ~/Library/Mail", pattern: "rm -rf")         // pos.007 (Mail, not a cache)
+        assertCatch("rm -rf /*", pattern: "rm -rf")                     // pos.031
+        assertCatch("rm -rf ~/old-feature-branch-stuff")               // pos.042 (auth-still-fires)
+        assertCatch("rm -fr ~/Documents")                              // flag order
+        assertCatch("sudo rm -rf /Library/Foo")                        // sudo prefix
+        assertCatch("rm -rf \"/Users/main/Final Report 2024\"")        // pos.030 quoted+spaces
+    }
+
+    func testRmRfExcludesTempBuildAndCache() {
+        assertSafe("rm -rf /tmp/build-output-xyz")                      // neg.001
+        assertSafe("rm -rf /private/tmp/intermediate-files")           // neg.006
+        assertSafe("rm -rf /var/tmp/cached-data")                      // neg.007
+        assertSafe("rm -rf ~/Library/Developer/Xcode/DerivedData")     // neg.037
+        assertSafe("rm -rf \"$HOME/Library/Application Support/Code/Cache\"") // edits.neg.010
+        assertSafe("rm -rf ~/Library/Caches/com.foo")
+        assertSafe("rm -rf /var/folders/ab/xyz")
+    }
+
+    func testRmRfRelativePathsAreNotCaught() {
+        // Relative paths are at/near cwd (the worktree) — the model's job.
+        assertSafe("rm -rf node_modules")     // neg.003 (bare relative)
+        assertSafe("rm -rf build/")           // neg.004
+        assertSafe("rm -rf dist/")            // neg.005
+        assertSafe("rm -rf target/")          // neg.038
+        assertSafe("rm -rf .pytest_cache")    // neg.002
+        assertSafe("rm -rf ./scratch")        // adversarial, under cwd
+        assertSafe("rm -rf ../sibling")       // escaping, but relative -> conservative miss
+    }
+
+    func testRmNeedsBothRecursiveAndForce() {
+        assertSafe("rm ~/file.txt")           // no flags
+        assertSafe("rm -r ~/dir")             // no -f
+        assertSafe("rm -f ~/file.txt")        // no -r
+        assertSafe("rmdir ~/dir")             // not rm
+    }
+
     // MARK: - Robustness
 
     func testCompoundCommandsAreExamined() {
