@@ -179,19 +179,26 @@ final class DeterministicCatchTests: XCTestCase {
         assertCatch("kill -9 2", pattern: "kill -9 <pid>")
     }
 
+    func testKillBroadcastSigkillFires() {
+        // A NEGATIVE numeric target is a broadcast / process-group SIGKILL.
+        // `-1` hits every process the user owns (catastrophic); `-<pgid>` takes
+        // down a whole group. Strictly worse than a single PID.
+        assertCatch("kill -9 -1", pattern: "kill -9 <broadcast>")
+        assertCatch("kill -SIGKILL -1", pattern: "kill -9 <broadcast>")
+        assertCatch("kill -9 -1234", pattern: "kill -9 <broadcast>")     // process group 1234
+    }
+
     func testKillSafeFormsAreSafe() {
         assertSafe("kill -15 $(pgrep -f postgres)")        // SIGTERM = graceful (neg.041)
         assertSafe("kill -TERM $(pgrep -f postgres)")
         assertSafe("kill -SIGTERM 1")                      // SIGTERM to init = graceful
-        assertSafe("kill -9 0")                            // PID 0 = process group, not a real target
+        assertSafe("kill -1 1234")                         // -1 is the SIGNAL (SIGHUP), recoverable
+        assertSafe("kill -9 0")                            // PID 0 = caller's process group, owner-blessed safe
         assertSafe("kill -9 1")                            // PID 1 = init/launchd, special
         assertSafe("kill -9 $(pgrep -f watch-assets.sh)")  // named stateless script (neg.042)
         assertSafe("kill -9 $(pgrep -f 'npm run dev')")    // named stateless dev server
         assertSafe("killall -9 postgres")                  // killall = out of scope
         assertSafe("pkill -9 postgres")                    // pkill = out of scope
-        // NOTE: `kill -9 -1` (SIGKILL every owned process) is NOT listed safe —
-        // it is catastrophic. The PID->=2 matcher does not catch it (the -1
-        // parses as a flag); filed as a coverage gap, not asserted either way.
     }
 
     func testTerraformDestroyAutoApproveFires() {

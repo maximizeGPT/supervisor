@@ -331,23 +331,41 @@ public enum DeterministicCatch {
     static func matchKill(_ sub: String) -> Match? {
         let t = tokenize(sub)
         guard let head = t.first, head == "kill" || head.hasSuffix("/kill") else { return nil }
-        let sigkill = t.contains { $0 == "-9" || $0 == "-KILL" || $0 == "-SIGKILL" }
-        guard sigkill else { return nil }                      // SIGTERM etc. are recoverable
+        let signalForms: Set<String> = ["-9", "-KILL", "-SIGKILL"]
+        guard let sigIdx = t.firstIndex(where: { signalForms.contains($0) }) else {
+            return nil                                         // SIGTERM etc. are recoverable
+        }
         let lower = sub.lowercased()
         if let db = databaseServices.first(where: { lower.contains($0) }) {
             return Match(pattern: "kill -9 <database>",
                          effect: "force-kills the \(db) database with SIGKILL, which skips graceful shutdown and can lose in-flight transactions or leave the store inconsistent")
         }
+        // Per kill(1) grammar `kill -SIG pid ...`, every token AFTER the signal
+        // is a PID target. Scanning post-signal (not all tokens) keeps the
+        // signal flag itself (`-9`) from being mistaken for a negative target.
+        let targets = Array(t[(sigIdx + 1)...])
+        // Broadcast / process-group SIGKILL: a NEGATIVE numeric target. `-1`
+        // SIGKILLs every process the user owns (takes down the whole session and
+        // any unsaved work in it); `-<pgid>` SIGKILLs a whole process group.
+        // Strictly worse than a single PID and never recoverable, so it fires
+        // ahead of the bare-PID rule. (`kill -1 <pid>` — where -1 is the SIGNAL
+        // SIGHUP, not a target — never reaches here: it sets no SIGKILL signal.)
+        if targets.contains(where: { tok in
+            guard let n = Int(tok) else { return false }
+            return n < 0
+        }) {
+            return Match(pattern: "kill -9 <broadcast>",
+                         effect: "force-kills an entire process group with SIGKILL; a target of -1 hits every process you own, taking down your whole session and any unsaved work in it, with no graceful shutdown")
+        }
         // Owner call (overrides 7ce42e2's decline): kill -9 of a bare REAL PID
         // (>= 2) is destructive — the command names no process and carries no
         // authorization, so there is no way to confirm the target is not
-        // holding in-flight state (corpus pos.024). PIDs 0 (process group) and
-        // 1 (init/launchd) are special, not real targets, so they are excluded
-        // and stay safe. A NAMED target ($(pgrep <name>)) is not bare-numeric,
-        // so the stateless-watcher neg.042 remains a non-fire.
-        let targets = t.dropFirst().filter { !$0.hasPrefix("-") }
-        if targets.contains(where: { t in
-            guard let pid = Int(t) else { return false }
+        // holding in-flight state (corpus pos.024). PIDs 0 (caller's process
+        // group) and 1 (init/launchd) are special, not real targets, so they
+        // are excluded and stay safe. A NAMED target ($(pgrep <name>)) is not
+        // bare-numeric, so the stateless-watcher neg.042 remains a non-fire.
+        if targets.contains(where: { tok in
+            guard let pid = Int(tok) else { return false }
             return pid >= 2
         }) {
             return Match(pattern: "kill -9 <pid>",

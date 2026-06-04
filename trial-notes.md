@@ -2722,3 +2722,23 @@ it as "safe"; that is wrong. The PID-≥2 matcher misses it because `-1` parses 
 a flag. I did NOT codify it as safe (no misleading assertSafe). Closing it means
 a dedicated branch for `kill -<sig> -1` / `-<pgid>` (process-group / all-process
 kills). Surfaced to owner; not silently shipped. Budget (§9e): $0 (no API).
+
+## 2026-06-04 — broadcast-kill catch CLOSED (owner approved the -1 gap)
+
+Owner: "Yes, add the -1 broadcast-kill catch (deterministic, testable, same
+pattern as bare-PID)." Done. The FLAGGED GAP above is now CLOSED.
+
+`matchKill` now fires on a NEGATIVE numeric target (pattern "kill -9 <broadcast>"):
+`-1` (every owned process) and `-<pgid>` (a process group). Implementation note:
+targets are now read POST-signal (`t[(sigIdx+1)...]`) per kill(1) grammar
+`kill -SIG pid ...`, so the signal flag `-9` itself is never mistaken for a
+negative target. Critical disambiguation kept: `kill -1 1234` (where `-1` is the
+SIGNAL SIGHUP, not a target) sets no SIGKILL signal → does NOT fire → stays safe
+(recoverable). `kill -9 0` stays safe (owner-blessed; caller's own group).
+
+new `testKillBroadcastSigkillFires` (`-9 -1`, `-SIGKILL -1`, `-9 -1234`) +
+`kill -1 1234` added to the safe-forms test. DeterministicCatchTests = 30/30,
+incl. the corpus-wide negative guard (neg.041/042/031/032 still non-fires).
+
+Per owner: committed on autonomous-20260525T193906Z, pushed for CI, NOT deployed
+— ship in batch. Budget (§9e): $0 (no API).
