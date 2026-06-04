@@ -25,15 +25,26 @@ if [[ ! -d "$SRC" ]]; then
     exit 1
 fi
 
-atomic_swap() {
+swap_bundle() {
     local src="$1" dest="$2"
     [[ -d "$src" ]] || return 0
-    local tmp="${dest}.tmp"
-    rm -rf "$tmp"
-    cp -R "$src" "$tmp"
-    rm -rf "$dest"
-    mv "$tmp" "$dest"
-    echo "[deploy] swapped $(basename "$dest")"
+    if [[ -d "$dest" ]]; then
+        # Update the bundle IN PLACE instead of `rm -rf dest && mv`. Deleting
+        # and recreating the bundle makes macOS treat it as a brand-new app
+        # and PRUNES its TCC grants (Accessibility, Keychain), so the
+        # owner-granted Accessibility permission silently drops on every
+        # self-deploy even though the Settings toggle still shows "on".
+        # rsync --delete syncs the new contents and removes stale files
+        # WITHOUT ever deleting the bundle the grant is attached to, so a
+        # cert-based grant survives the deploy. The running app is already
+        # stopped (step 1), so in-place mutation is safe. The signed
+        # contents are copied faithfully, so the signature stays valid.
+        rsync -a --delete "$src"/ "$dest"/
+        echo "[deploy] updated $(basename "$dest") in place (preserves TCC grants)"
+    else
+        cp -R "$src" "$dest"
+        echo "[deploy] installed $(basename "$dest")"
+    fi
 }
 
 # 1. Stop the running instances.
@@ -43,8 +54,8 @@ pkill -f "/Applications/SupervisorStatusBar.app" 2>/dev/null || true
 sleep 1
 
 # 2. Atomic swap both bundles.
-atomic_swap "$SRC" "$DEST"
-atomic_swap "$SRC_STATUSBAR" "$DEST_STATUSBAR"
+swap_bundle "$SRC" "$DEST"
+swap_bundle "$SRC_STATUSBAR" "$DEST_STATUSBAR"
 
 # 3. Record the self-rebuild so the new instance announces it.
 mkdir -p "$APP_SUPPORT"
