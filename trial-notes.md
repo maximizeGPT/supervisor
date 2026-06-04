@@ -1865,3 +1865,6 @@ Last updated: 2026-05-31
   JSON repair handles finish_reason=length truncation. Combined, the
   effective success rate is near 100%.
 
+
+### 2026-06-04 — live verification note
+Confirmed ax=true after the in-place-deploy fix and the owner re-grant. Running the DEFECT 1 live inject test (does Supervisor type a commit/push answer into the terminal).
