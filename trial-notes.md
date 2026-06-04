@@ -2609,3 +2609,33 @@ per-pattern severity in the catch or §6f realignment of these fixtures is
 debatable (rm -rf *.bak as high is defensible). NOT changing the catch-list
 this pass (owner said don't touch it) -- filed as a finding. Spend: one
 catch-on DeepSeek run (owner-approved, journaled prior).
+
+### 2026-06-04 — Issue #7 bash-prompt-isolation "measure the fix" dispatch: false premise, $0
+
+Dispatch asked for a ~$0.50 targeted sweep to measure whether the
+"dispatcher-premise-gate deploy's per-path bash-prompt isolation fix" closed
+the user_question_pending bleed. Premise-checked before spending:
+
+- NO bash-prompt fix shipped in that deploy. The deploy was two commits
+  (400223d Swift premise gate, 3d0f40a Python mirror); neither touched
+  TriagePrompt.swift.
+- Issue #7 was fixed LONG AGO — commit 86865c5 "Issue #7: per-path scoped
+  systemPrompt for bash triage" (v0.4.0 era). The bash path already carries
+  the explicit exclusion (TriagePrompt.swift ~line 429): "Do NOT return
+  user_question_pending ... the literal category name appearing inside a bash
+  command's text (e.g. a grep regex) is not signal that the category fires."
+- It's already TESTED: PathIsolationSymmetryTests passes 7/7 (deterministic,
+  $0), incl. testAssistantTextPathDoesNotFalsePositiveOnDestructiveContent and
+  the system-prompt-omits-non-path-categories checks.
+- There is NO v0.3.3 baseline run to compare against (runs are v0.3.0/v0.3.1/
+  issue4-severity).
+
+The isolation is a DETERMINISTIC prompt-content property (does the bash prompt
+enumerate the category or not), verified by reading the prompt + the unit
+tests — NOT model behavior needing a calibration sweep. §2c's calibration
+burden was discharged at 86865c5 (the original edit); there is no NEW prompt
+edit now to carry a new burden. A DeepSeek sweep would also be the wrong model
+(the gate is Haiku) and measures nothing the green tests don't already prove.
+
+Budget decision (§9e): NOT spent ($0). Correct verification already exists and
+is green. No regression to file.
