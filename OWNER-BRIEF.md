@@ -4,6 +4,13 @@ Last updated: 2026-06-03
 
 ## What shipped recently
 
+- v0.9.3: self-deploy no longer silently drops the Accessibility
+  permission. The deploy was deleting and recreating the app bundle each
+  time, which made macOS treat it as a new app and forget the permission
+  you granted (so the keystroke-into-terminal path was blocked even though
+  Settings still showed it on). The deploy now updates the app in place and
+  keeps the grant. See "Needs your attention" for the one-time step to
+  restore it.
 - v0.9.2: Supervisor now answers Claude Code's routine mid-session
   questions from context instead of leaving you to. A commit/push/A-or-B
   question is decided from the live branch + recent commits + conventions
@@ -41,6 +48,13 @@ autonomous loop cannot manufacture that.
 
 ## Needs your attention
 
+- ONE-TIME: re-grant Accessibility to Supervisor so it can type answers
+  into the terminal. The old grant was broken by past deploys. In System
+  Settings > Privacy & Security > Accessibility, remove the "Supervisor"
+  entry (the minus button) and re-add /Applications/Supervisor.app with the
+  toggle on. This is a security toggle only you can flip; I can't do it for
+  you. After this once, the deploy fix keeps the grant across future
+  rebuilds. (Until then, answers surface as banners instead of being typed.)
 - The dispatch loop is now OFF. I turned it off: over six straight
   dispatches it produced no genuine work (already-done tasks, proposals to
   build itself features, and finally a request to fix a self-watch check

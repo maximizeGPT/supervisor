@@ -6,6 +6,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-06-03
+
+Self-deploy stops silently dropping the Accessibility grant.
+
+### Fixed
+
+**Self-deploy no longer prunes TCC grants** (`Scripts/deploy.sh`)
+- The running app reported `ax=false` (Accessibility not trusted), which
+  blocks the keystroke-inject path, even though the owner had granted
+  Accessibility. Root cause: the deploy did `rm -rf /Applications/
+  Supervisor.app && mv tmp dest` on every self-deploy. Deleting and
+  recreating the bundle makes macOS treat it as a brand-new app and prune
+  its TCC grants — the grant flip-flops true/false across rebuilds even
+  though the cert-based Designated Requirement is stable (leaf 33eff905
+  throughout) and the AX check (`AXIsProcessTrusted()` in the injecting
+  main app) is correct. So it was neither a wrong-process check (#2 ruled
+  out) nor an unstable cert — it was the bundle deletion.
+- `swap_bundle` now updates the bundle IN PLACE (`rsync -a --delete`),
+  never deleting it, so a cert-based grant survives the deploy. Verified:
+  signature stays valid and satisfies its DR, and the Keychain grant (also
+  TCC) survives where `rm -rf` dropped it.
+
+### Notes — one-time re-grant required
+
+This preserves grants going FORWARD. The CURRENT Accessibility grant was
+already broken by earlier `rm -rf` deploys (and likely predates the stable
+cert), so it must be re-granted ONCE to the cert-signed binary: in System
+Settings > Privacy & Security > Accessibility, remove the stale
+"Supervisor" entry and re-add `/Applications/Supervisor.app`, toggled on.
+Granting Accessibility is a user-only security action — a tool cannot do
+it. After that one re-grant, the stable cert + in-place deploy keep the
+grant across rebuilds and the inject path goes live. The fully robust path
+(no transition cost at all) would be a Developer ID certificate +
+notarization, which this self-signed build does not have.
+
 ## [0.9.2] — 2026-06-03
 
 Two core-promise defects: Supervisor now answers Claude Code's routine
