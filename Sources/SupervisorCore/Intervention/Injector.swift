@@ -123,13 +123,30 @@ public final class CGEventInjector: Injector {
             throw InjectError.targetUnresolvable(reason: "no_host_pid")
         }
 
-        // 3. TARGETED delivery — post each event DIRECTLY to the host app's
-        //    process via CGEventPostToPid, NOT the global frontmost focus.
-        //    THE INVARIANT: this function never calls post(tap:). We also do
-        //    NOT activate the host (no focus steal): the owner keeps using
-        //    their frontmost app while the keystrokes flow to the supervised
-        //    session's host in the background. If a keystroke can't be built
-        //    we throw rather than partially-post — targeted-or-don't.
+        // 3. Claude desktop is Electron — it DROPS synthesized keystrokes
+        //    while backgrounded, so a background post types a partial message
+        //    that breaks the instant the owner switches away. The only
+        //    reliable delivery is to bring its OWN window forward, PASTE the
+        //    text atomically (not char-by-char), Return, then restore the
+        //    owner's prior frontmost app. Brief focus flicker — only when the
+        //    owner isn't already in Claude Code — never a partial spray into
+        //    another app, never a global post.
+        if bundleID == "com.anthropic.claudefordesktop" {
+            return try await injectViaForegroundPaste(text: text, hostApp: hostApp, hostPid: hostPid)
+        }
+
+        // 4. Terminals accept TARGETED background posts (CGEventPostToPid),
+        //    which ARE focus-independent — the owner keeps using their
+        //    frontmost app while the keystrokes flow to the session's host.
+        //    THE INVARIANT: never post(tap:) (global); targeted-or-throw.
+        let bytes = try postKeystrokes(text: text, hostPid: hostPid, bundleID: bundleID)
+        trace.emit("inject", "fired method=postToPid host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) bytes=\(bytes)")
+        return bytes
+    }
+
+    /// Char-by-char targeted keystroke synthesis via CGEventPostToPid. For
+    /// terminal hosts, which accept background posts (focus-independent).
+    private func postKeystrokes(text: String, hostPid: pid_t, bundleID: String) throws -> Int {
         let source = CGEventSource(stateID: .hidSystemState)
         var bytes = 0
         for ch in text.unicodeScalars {
@@ -147,17 +164,68 @@ public final class CGEventInjector: Injector {
             usleep(interCharDelayMicros / 3)
             bytes += String(ch).utf8.count
         }
-
-        // Return — virtualKey 36, also targeted.
         if let downRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
            let upRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) {
             downRet.postToPid(hostPid)
             usleep(interCharDelayMicros)
             upRet.postToPid(hostPid)
         }
-
-        trace.emit("inject", "fired method=postToPid host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) bytes=\(bytes)")
         return bytes
+    }
+
+    /// Electron delivery: save the owner's frontmost app + clipboard, bring
+    /// the host forward, paste (Cmd-V) + Return targeted to the now-frontmost
+    /// host, then restore clipboard and the prior frontmost app. Atomic, so it
+    /// can never be truncated mid-message by an app switch. If the owner is
+    /// already in Claude Code, `prior` is Claude Code itself, so there's no
+    /// visible flicker.
+    private func injectViaForegroundPaste(text: String, hostApp: NSRunningApplication, hostPid: pid_t) async throws -> Int {
+        let pasteboard = NSPasteboard.general
+        let savedClipboard = pasteboard.string(forType: .string)
+        let prior = NSWorkspace.shared.frontmostApplication
+
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+
+        guard hostApp.activate(options: []) else {
+            restoreClipboard(savedClipboard, pasteboard)
+            trace.emit("inject", "degraded reason=electron_activate_failed host=com.anthropic.claudefordesktop")
+            throw InjectError.targetUnresolvable(reason: "electron_activate_failed")
+        }
+        try? await Task.sleep(nanoseconds: focusSettleNanos)
+
+        let source = CGEventSource(stateID: .hidSystemState)
+        postChord(source: source, virtualKey: 9, flags: .maskCommand, hostPid: hostPid)  // Cmd-V (paste)
+        usleep(interCharDelayMicros * 2)
+        // SUPERVISOR_INJECT_NO_SUBMIT lets a verification run paste WITHOUT
+        // submitting (so an on-screen test doesn't fire a real message).
+        // Unset in production — the Return submits the answer/dispatch.
+        if ProcessInfo.processInfo.environment["SUPERVISOR_INJECT_NO_SUBMIT"] == nil {
+            postChord(source: source, virtualKey: 36, flags: [], hostPid: hostPid)        // Return
+        }
+        try? await Task.sleep(nanoseconds: focusSettleNanos / 2)
+
+        restoreClipboard(savedClipboard, pasteboard)
+        prior?.activate(options: [])
+
+        trace.emit("inject", "fired method=foreground_paste host=com.anthropic.claudefordesktop host_pid=\(hostPid) bytes=\(text.utf8.count) restored=\(prior?.bundleIdentifier ?? "?")")
+        return text.utf8.count
+    }
+
+    private func restoreClipboard(_ saved: String?, _ pasteboard: NSPasteboard) {
+        pasteboard.clearContents()
+        if let saved { pasteboard.setString(saved, forType: .string) }
+    }
+
+    /// Post a single key chord (key + modifier flags) targeted to a pid.
+    private func postChord(source: CGEventSource?, virtualKey: CGKeyCode, flags: CGEventFlags, hostPid: pid_t) {
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: false) else { return }
+        down.flags = flags
+        up.flags = flags
+        down.postToPid(hostPid)
+        usleep(interCharDelayMicros)
+        up.postToPid(hostPid)
     }
 
     // MARK: - AX window targeting (Issue #9)
