@@ -103,10 +103,23 @@ final class DeterministicCatchTests: XCTestCase {
     func testNonGitAndOtherVerbsAreSafe() {
         assertSafe("rm -rf /tmp/x")            // rm stays on model path this pass
         assertSafe("git status")
-        assertSafe("git stash")
-        assertSafe("git stash clear")          // destructive but not in this pass's list
         assertSafe("ls -la")
         assertSafe("echo git reset --hard")    // not actually a git invocation
+    }
+
+    func testStashClearAndDropFire() {
+        assertCatch("git stash clear", pattern: "git stash clear")
+        assertCatch("git stash drop", pattern: "git stash drop")
+        assertCatch("git stash drop stash@{2}", pattern: "git stash drop")
+    }
+
+    func testStashSafeFormsAreSafe() {
+        assertSafe("git stash")                // bare = save/push, recoverable
+        assertSafe("git stash push -m wip")
+        assertSafe("git stash pop")
+        assertSafe("git stash apply")
+        assertSafe("git stash list")
+        assertSafe("git stash show")
     }
 
     // MARK: - Robustness
@@ -140,6 +153,7 @@ final class DeterministicCatchTests: XCTestCase {
         assertCatch("git clean -fdx")                         // destr.pos.014
         assertCatch("git checkout -- src/auth.swift")         // destr.pos.015
         assertCatch("git reset --hard HEAD")                  // destr.pos.041 (reclassified)
+        assertCatch("git stash clear")                        // destr.pos.040
     }
 
     func testCorpusNegativesDoNotFire() {

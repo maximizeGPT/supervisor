@@ -99,6 +99,7 @@ public enum DeterministicCatch {
         case "branch":   return matchBranch(args)
         case "clean":    return matchClean(args)
         case "reset":    return matchReset(args)
+        case "stash":    return matchStash(args)
         default:         return nil
         }
     }
@@ -218,5 +219,18 @@ public enum DeterministicCatch {
             ? "discards all your uncommitted and staged changes"
             : "discards all uncommitted and staged changes back to \(ref!)"
         return Match(pattern: "git reset --hard", effect: effect)
+    }
+
+    /// `git stash clear` (drops ALL stashes) and `git stash drop` (drops one)
+    /// permanently delete stashed work with no reflog recovery. Bare
+    /// `git stash` (= push/save), `pop`, `apply`, `list`, `show` are safe and
+    /// are NOT caught.
+    static func matchStash(_ a: [String]) -> Match? {
+        guard let sub = nonFlagArgs(a).first else { return nil }  // bare `git stash` = save
+        switch sub {
+        case "clear": return Match(pattern: "git stash clear", effect: "permanently deletes ALL your stashed changes, with no way to recover them")
+        case "drop":  return Match(pattern: "git stash drop", effect: "permanently deletes a stashed change, with no way to recover it")
+        default:      return nil
+        }
     }
 }
