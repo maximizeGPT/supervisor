@@ -58,7 +58,7 @@ final class DispatcherTests: XCTestCase {
 
     /// Canned Haiku response — record_dispatch with the supplied fields.
     private static func haikuDispatchResponse(
-        proposal: String = "Continue Part B's dispatcher. Wire the InterventionRouter's .continue handler and write 6 integration tests. Stop at 21:59 UTC per §12.",
+        proposal: String = "Pick up Issue #7: fix the per-path triage isolation gap and add 6 integration tests for it. Stop at 21:59 UTC per §12.",
         justification: String = "Mechanical follow-on from the dispatcher commit; tests are the obvious next unit per §6.",
         confidence: String = "high",
         selectedPath: String = "continue_branch",
@@ -471,4 +471,36 @@ private final class DispatcherMockURLProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+/// Root-cause guard: the dispatcher must reject proposals to build/wire
+/// machinery that already exists (the self-referential runaway), but must
+/// never block genuine product work.
+final class DispatcherPremiseTests: XCTestCase {
+
+    private func rejected(_ p: String, _ j: String = "advances the project") -> Bool {
+        Dispatcher.premiseRejection(proposal: p, justification: j) != nil
+    }
+
+    func testRejectsBuildingExistingMachinery() {
+        // The exact runaway and its kin.
+        XCTAssertTrue(rejected("Build the CGEventPost-based Dispatcher + LoopController that watches the dispatch queue and types the next prompt."))
+        XCTAssertTrue(rejected("Implement the dispatch loop that reads the queue and dispatches."))
+        XCTAssertTrue(rejected("Wire up the LoopController hard-stops."))
+        XCTAssertTrue(rejected("Build and ship the deterministic catch for irreversible commands."))
+        XCTAssertTrue(rejected("Stand up the triage engine."))
+        // False "it's not there" claims about existing components.
+        XCTAssertTrue(rejected("The dispatch engine is not wired yet.", "the loop_dispatches table exists but the engine is not wired"))
+        XCTAssertTrue(rejected("The Injector is missing."))
+    }
+
+    func testAllowsRealProductWork() {
+        // Genuine product work that merely MENTIONS a component must pass.
+        XCTAssertFalse(rejected("Fix the flag counter so it resets per work-window in HoverViewModel."))
+        XCTAssertFalse(rejected("Add a unit test for the dispatcher's grounding so regressions are caught."))
+        XCTAssertFalse(rejected("Close the Issue #12 calibration gap by correcting fixture expectations."))
+        XCTAssertFalse(rejected("Improve the injector's reliability on Electron hosts."))
+        XCTAssertFalse(rejected("Fix the dispatcher so it stops proposing already-done work."))
+        XCTAssertFalse(rejected("Review the rubric corpus and journal the verdict."))
+    }
 }

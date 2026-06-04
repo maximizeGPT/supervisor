@@ -421,6 +421,19 @@ public final class Dispatcher: Dispatching, Sendable {
             trace.emit("dispatch", "low-confidence dispatch (selected_path=low_confidence_no_action) reasoning=\"\(justification.prefix(160))\"")
             return .lowConfidence(reasoning: justification)
         case let .ready(prompt, justification, confidence, path, issueN, priorEchoed, requiresHuman):
+            // ROOT-CAUSE PREMISE VERIFICATION. The in-app loop must not type a
+            // proposal whose premise is false in the current tree. The runaway
+            // was the dispatcher proposing to BUILD the loop / Dispatcher /
+            // triage engine itself — machinery that already exists. The Python
+            // Stop-hook grounds its proposals; the in-app loop never did, so it
+            // dispatched "build the Dispatcher" raw. A rejected proposal
+            // degrades to low-confidence (idle), which also feeds the
+            // consecutive-low hard-stop, so a stuck dispatcher STOPS instead of
+            // spinning — no manual kill needed.
+            if let reject = Self.premiseRejection(proposal: prompt, justification: justification) {
+                trace.emit("dispatch", "PREMISE_REJECT \(reject) — degrading to low-confidence idle (proposal builds/wires already-existing machinery)")
+                return .lowConfidence(reasoning: "Premise rejected (\(reject)): the proposal builds or wires a component that already exists. Idling instead of dispatching already-done, self-referential work.")
+            }
             trace.emit("dispatch", "ready confidence=\(confidence.rawValue) path=\(path.rawValue) issue=\(issueN.map(String.init) ?? "-") prior_echoed=\(priorEchoed.map(String.init) ?? "-") requires_human=\(requiresHuman) prompt_bytes=\(prompt.utf8.count) just=\"\(justification.prefix(120))\"")
             return .ready(
                 prompt: prompt,
@@ -651,6 +664,70 @@ public final class Dispatcher: Dispatching, Sendable {
     }
 
     // MARK: - Parser
+
+    /// Root-cause premise verification. Returns a rejection reason if the
+    /// proposal's premise is false in the current tree, else nil.
+    ///
+    /// The recurring runaway: the dispatcher proposing to BUILD / WIRE the
+    /// dispatch loop, the Dispatcher, the triage engine, the inject path — all
+    /// of which already exist — i.e. the loop describing itself as work. This
+    /// is the discipline the worker applies by hand ("verify the premise: is
+    /// this already done?"), now enforced deterministically so the in-app loop
+    /// can never type already-done, self-referential work.
+    ///
+    /// PRECISE by construction (phrase-anchored, not bag-of-words) so it
+    /// rejects "build the Dispatcher" but NEVER "add a test for the
+    /// dispatcher" or "fix the dispatcher's grounding" — only a build/wire verb
+    /// applied directly to an existing component, or a false "X is not
+    /// wired/built/missing" claim about one.
+    static func premiseRejection(proposal: String, justification: String) -> String? {
+        let text = (proposal + " ⋄ " + justification).lowercased()
+
+        // Core machinery that ALREADY EXISTS in this repo. Proposing to build
+        // or wire any of these is a false premise (and the loop's CLOSED rule:
+        // it dispatches PRODUCT work, never builds itself).
+        let existing = [
+            "dispatch loop", "dispatcher", "loopcontroller", "loop controller", "loopconfig",
+            "triage engine", "triageengine", "inject path", "injector", "interventionrouter",
+            "intervention router", "dispatch engine", "dispatch queue", "self-extender",
+            "selfextender", "dispatch hook", "deterministic catch", "deterministiccatch",
+            "questionanswerer", "question answerer", "hardcodedrubric",
+        ]
+        // Build-from-scratch verbs (NOT fix/improve/add-test/review/close — those
+        // are legitimate work ON existing code).
+        let buildVerbs = ["build ", "implement ", "wire up ", "wire the ", "stand up ",
+                          "introduce ", "create the ", "create a ", "write the ", "design the "]
+        // Prepositions that, between a build verb and a component, make the
+        // component a MODIFIER, not the thing being built ("a test FOR the
+        // dispatcher"). Bias toward allowing when one is present.
+        let prepositions = [" for ", " of ", " to ", " about ", " on ", " with ", " in ", " into "]
+        // False "it's not there" claims directly after a component.
+        let missingSuffixes = [" is not wired", " is not built", " is missing", " does not exist",
+                              " doesn't exist", " isn't wired", " is not implemented",
+                              " is not yet wired", " is not yet built", " needs to be built",
+                              " needs to be wired"]
+
+        for comp in existing {
+            guard let r = text.range(of: comp) else { continue }
+            // Window just BEFORE the component: a build verb here (and no
+            // intervening preposition) means the component is the build object.
+            // Catches "build the CGEventPost-based Dispatcher" (adjectives in
+            // between) but not "build a test for the dispatcher".
+            let winStart = text.index(r.lowerBound, offsetBy: -40, limitedBy: text.startIndex) ?? text.startIndex
+            let before = String(text[winStart..<r.lowerBound])
+            if buildVerbs.contains(where: { before.contains($0) }),
+               !prepositions.contains(where: { before.contains($0) }) {
+                return "build_existing(\(comp.replacingOccurrences(of: " ", with: "_")))"
+            }
+            // Window just AFTER the component: a false "not there" claim.
+            let winEnd = text.index(r.upperBound, offsetBy: 18, limitedBy: text.endIndex) ?? text.endIndex
+            let after = String(text[r.upperBound..<winEnd])
+            if missingSuffixes.contains(where: { after.contains($0) }) {
+                return "false_missing(\(comp.replacingOccurrences(of: " ", with: "_")))"
+            }
+        }
+        return nil
+    }
 
     /// Decode the record_dispatch tool call into a DispatchResult.
     /// Returns nil if the response shape is unusable (no tool call /
