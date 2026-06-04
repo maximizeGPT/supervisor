@@ -2252,3 +2252,52 @@ Last updated: 2026-05-31
 
 ### 2026-06-04 — live verification note
 Confirmed ax=true after the in-place-deploy fix and the owner re-grant. Running the DEFECT 1 live inject test (does Supervisor type a commit/push answer into the terminal).
+
+### 2026-06-04 — Issue #12 live-sweep enablement: scripts written, sweep BLOCKED on key
+
+Direction: write a script that resolves ANTHROPIC_API_KEY (env / 1Password /
+.env) and triggers a targeted regression sweep on the unresolved bucket-1/2
+fixtures, landing a report in Tests/Calibration/runs/<ISO>/. If no key is
+obtainable, journal and stop without fabricating access.
+
+BUILT (the reusable enabler, useful regardless of today's key state):
+- `Scripts/calibration-key.sh` — resolves ANTHROPIC_API_KEY from, in order,
+  the environment, the macOS Keychain (service `live.supervisor.api.
+  anthropic`), a gitignored `.env`, then 1Password (`op read`, only if `op`
+  is installed and signed in). It EXPORTS the key (never prints the value)
+  and is both source-able and runnable. Closes a real gap: the test's
+  resolveKey() (RubricCalibrationTests.swift:25) reads the key ONLY from an
+  env var, so a key sitting in the Keychain or 1Password was previously
+  unusable without manual export. On no key it prints per-source setup
+  instructions and returns 1.
+- `Scripts/run-calibration-sweep.sh [filter]` — sources the resolver, and
+  on success runs `SUPERVISOR_LIVE_API=1 swift test --filter <filter>`
+  (default `testIssue4TargetedSweep`, the existing targeted test; the Swift
+  test writes the run dir per section 6b). On no key it aborts before
+  spending anything.
+
+OUTCOME — KEY NOT OBTAINABLE FROM ANY SOURCE, so per direction I stopped and
+did NOT run a sweep:
+- env ANTHROPIC_API_KEY: unset.
+- macOS Keychain `live.supervisor.api.anthropic`: absent.
+- `.env` (repo root and the other checked paths): none exist.
+- 1Password CLI `op`: NOT installed, so `op read` is unavailable.
+Both scripts were RUN to verify behavior: the resolver and the runner each
+correctly detected no key, printed the instructions, and exited non-zero
+before any `swift test` / API call. No fabrication, no sweep, $0 spend.
+
+A DeepSeek key DOES exist in the Keychain (`live.supervisor.api.deepseek`),
+and resolveKey() would accept DEEPSEEK_API_KEY — but DeepSeek is a different
+model. The section 6c 95% gate is measured against Anthropic Haiku (test
+header line 3), so a DeepSeek sweep would not verify the gate and could
+mislead. Deliberately not used.
+
+STATUS: this is the same blocker named at the close of buckets 1-3 — the
+calibration gate cannot be verified without an Anthropic/Haiku key, and that
+key is the owner's to provide (consistent with OWNER-BRIEF). All three
+sub-buckets are diagnosed; the gate-verification sweep is the one remaining
+step and it is now a single command away the moment a key is present:
+`Scripts/run-calibration-sweep.sh`. A bucket-1/2-specific 6-fixture targeted
+test is the natural follow-up, to be added and validated WHEN a key exists
+(not added now — shipping a sweep test that cannot be run would be untested
+code). Report not produced: blocked on the key, by design. $0.
