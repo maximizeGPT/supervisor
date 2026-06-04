@@ -1294,5 +1294,55 @@ class TestGrounding(unittest.TestCase):
         self.assertTrue(grounded, "a prose proposal naming no code symbols is grounded")
 
 
+class TestApplyIdleReset(unittest.TestCase):
+    """Fresh-session reset on resume after a long idle gap: an overnight
+    pause should NOT leave the loop stuck at four_hours_elapsed."""
+
+    THRESHOLD = 2 * 3600  # 2 hours
+
+    def test_first_invocation_never_resets(self):
+        # No prior last_seen_at — no gap yet, so no reset; but last_seen_at
+        # and loop_started_at are stamped for next time.
+        state = {}
+        self.assertFalse(hook.apply_idle_reset(state, 1000.0, self.THRESHOLD))
+        self.assertEqual(state["last_seen_at"], 1000.0)
+        self.assertEqual(state["loop_started_at"], 1000.0)
+
+    def test_short_gap_does_not_reset(self):
+        # Active work: a sub-threshold gap leaves clock + counters intact.
+        state = {"last_seen_at": 1000.0, "loop_started_at": 500.0,
+                 "total_dispatches": 7, "stopped": False}
+        self.assertFalse(hook.apply_idle_reset(state, 1000.0 + 600, self.THRESHOLD))
+        self.assertEqual(state["loop_started_at"], 500.0)      # unchanged
+        self.assertEqual(state["total_dispatches"], 7)         # unchanged
+        self.assertEqual(state["last_seen_at"], 1600.0)        # advanced
+
+    def test_long_gap_resets_clock_and_counters(self):
+        state = {"last_seen_at": 1000.0, "loop_started_at": 500.0,
+                 "total_dispatches": 19, "consecutive_low": 2, "stopped": False}
+        now = 1000.0 + self.THRESHOLD + 1
+        self.assertTrue(hook.apply_idle_reset(state, now, self.THRESHOLD))
+        self.assertEqual(state["loop_started_at"], now)        # clock restarted
+        self.assertEqual(state["total_dispatches"], 0)         # fresh budget
+        self.assertEqual(state["consecutive_low"], 0)
+        self.assertEqual(state["last_seen_at"], now)
+
+    def test_long_gap_unsticks_a_four_hours_stop(self):
+        # The exact reported case: hit the 4h cap, slept, came back.
+        state = {"last_seen_at": 1000.0, "loop_started_at": 500.0,
+                 "stopped": True, "stop_reason": "four_hours_elapsed",
+                 "total_dispatches": 12}
+        now = 1000.0 + 8 * 3600   # overnight
+        self.assertTrue(hook.apply_idle_reset(state, now, self.THRESHOLD))
+        self.assertFalse(state["stopped"])                     # un-stuck
+        self.assertIsNone(state["stop_reason"])
+        self.assertEqual(state["loop_started_at"], now)
+
+    def test_gap_exactly_at_threshold_resets(self):
+        state = {"last_seen_at": 1000.0, "loop_started_at": 500.0}
+        now = 1000.0 + self.THRESHOLD   # boundary is inclusive (>=)
+        self.assertTrue(hook.apply_idle_reset(state, now, self.THRESHOLD))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -88,8 +88,18 @@ public actor LoopController {
     /// queue, not signal that we should keep trying.
     public static let defaultConsecutiveLowThreshold: Int = 3
 
+    /// Fresh-session reset threshold: if the worker has been idle for at
+    /// least this long, the human stepped away (closed the laptop, slept),
+    /// so the next dispatch attempt is treated as a BRAND-NEW Supervisor
+    /// session — the 4-hour budget restarts instead of ticking through an
+    /// overnight pause. Chosen longer than the 75-min single-task cap (§12)
+    /// so it never trips mid-work, and far shorter than a sleep. Mirrors
+    /// apply_idle_reset in the Python dispatch hook.
+    public static let defaultSessionResetIdle: TimeInterval = 2 * 60 * 60
+
     private struct SessionState {
-        let loopStartedAt: Date
+        var loopStartedAt: Date
+        var lastSeenAt: Date
         var consecutiveLowCount: Int
         var totalDispatches: Int
         var paused: Bool
@@ -101,6 +111,7 @@ public actor LoopController {
     private var sessions: [String: SessionState] = [:]
 
     private let maxLoopDuration: TimeInterval
+    private let sessionResetIdle: TimeInterval
     private let consecutiveLowThreshold: Int
     private let trace: TraceLog
     private let now: @Sendable () -> Date
@@ -108,12 +119,14 @@ public actor LoopController {
 
     public init(
         maxLoopDuration: TimeInterval = LoopController.defaultMaxLoopDuration,
+        sessionResetIdle: TimeInterval = LoopController.defaultSessionResetIdle,
         consecutiveLowThreshold: Int = LoopController.defaultConsecutiveLowThreshold,
         now: @escaping @Sendable () -> Date = { Date() },
         trace: TraceLog = .shared,
         loopStore: LoopDispatchStore? = nil
     ) {
         self.maxLoopDuration = maxLoopDuration
+        self.sessionResetIdle = sessionResetIdle
         self.consecutiveLowThreshold = consecutiveLowThreshold
         self.trace = trace
         self.now = now
@@ -146,6 +159,7 @@ public actor LoopController {
             let seeded = seedCount?(sessionId) ?? 0
             state = SessionState(
                 loopStartedAt: nowTs,
+                lastSeenAt: nowTs,
                 consecutiveLowCount: 0,
                 totalDispatches: seeded,
                 paused: false,
@@ -157,6 +171,23 @@ public actor LoopController {
                 trace.emit("loop", "SEEDED session=\(sessionId) totalDispatches=\(seeded) from store")
             }
         }
+
+        // Fresh-session reset: a long idle gap means the human stepped away,
+        // so this resume is a BRAND-NEW Supervisor session — restart the
+        // 4-hour clock and clear the sticky stop + counters rather than keep
+        // ticking through an overnight pause. Runs BEFORE the .stopped check
+        // so it un-sticks a prior four_hours_elapsed stop. (Mirrors
+        // apply_idle_reset in the Python hook.) A new session has
+        // lastSeenAt == nowTs, so its gap is 0 and it never resets here.
+        if nowTs.timeIntervalSince(state.lastSeenAt) >= sessionResetIdle {
+            trace.emit("loop", "session_reset_after_idle session=\(sessionId) idle_gap=\(Int(nowTs.timeIntervalSince(state.lastSeenAt)))s was_stopped=\(state.stopped)")
+            state.loopStartedAt = nowTs
+            state.stopped = false
+            state.stopReason = nil
+            state.totalDispatches = 0
+            state.consecutiveLowCount = 0
+        }
+        state.lastSeenAt = nowTs
 
         // .stopped sticks. Check it before anything else.
         if state.stopped {
@@ -197,6 +228,7 @@ public actor LoopController {
         let nowTs = now()
         var state = sessions[sessionId] ?? SessionState(
             loopStartedAt: nowTs,
+            lastSeenAt: nowTs,
             consecutiveLowCount: 0,
             totalDispatches: seedCount?(sessionId) ?? 0,
             paused: false,
@@ -240,6 +272,7 @@ public actor LoopController {
     public func notePause(sessionId: String, reason: LoopPauseReason) {
         var state = sessions[sessionId] ?? SessionState(
             loopStartedAt: now(),
+            lastSeenAt: now(),
             consecutiveLowCount: 0,
             totalDispatches: seedCount?(sessionId) ?? 0,
             paused: false,
@@ -290,6 +323,7 @@ public actor LoopController {
     public func stop(sessionId: String, reason: LoopStopReason) {
         var state = sessions[sessionId] ?? SessionState(
             loopStartedAt: now(),
+            lastSeenAt: now(),
             consecutiveLowCount: 0,
             totalDispatches: seedCount?(sessionId) ?? 0,
             paused: false,
@@ -309,6 +343,7 @@ public actor LoopController {
         guard let state = sessions[sessionId] else { return nil }
         return LoopSnapshot(
             loopStartedAt: state.loopStartedAt,
+            lastSeenAt: state.lastSeenAt,
             consecutiveLowCount: state.consecutiveLowCount,
             totalDispatches: state.totalDispatches,
             paused: state.paused,
@@ -323,6 +358,7 @@ public actor LoopController {
 /// post-mortems + future UI surfacing.
 public struct LoopSnapshot: Sendable, Equatable {
     public let loopStartedAt: Date
+    public let lastSeenAt: Date
     public let consecutiveLowCount: Int
     public let totalDispatches: Int
     public let paused: Bool

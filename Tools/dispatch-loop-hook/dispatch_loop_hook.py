@@ -121,6 +121,14 @@ DEFAULTS = {
     "max_consecutive_low": 3,            # per §12.5 #3 — same as LoopController
     "max_loop_duration_s": 4 * 3600,      # per §12.5 #2
     "max_total_dispatches": 20,           # safety cap beyond §12.5 — outer ceiling
+    # Fresh-session reset: the 4-hour budget bounds a CONTINUOUS autonomous
+    # run, not wall-clock through an overnight pause. If the worker has been
+    # idle (no Stop-hook activity) for at least this long, the human stepped
+    # away — closed the laptop, slept — so the next resume is treated as a
+    # brand-new Supervisor session: the clock and counters reset. Chosen
+    # longer than the 75-min single-task cap (§12) so it never trips
+    # mid-work, and far shorter than a sleep.
+    "session_reset_idle_s": 2 * 3600,    # 2h idle → resume is a fresh session
     # Repetition breaker: if a new high-confidence proposal overlaps the
     # previous dispatched proposal by at least this Jaccard fraction, it is
     # treated as the SAME task and the loop stops (real thrashing on one
@@ -230,6 +238,37 @@ def get_session_state(state: dict[str, Any], session_id: str) -> dict[str, Any]:
 
 def put_session_state(state: dict[str, Any], session_id: str, new: dict[str, Any]) -> None:
     state[session_id] = new
+
+
+def apply_idle_reset(state: dict[str, Any], now_s: float, idle_threshold_s: float) -> bool:
+    """Fresh-session reset on resume after a long idle gap.
+
+    If the worker has been idle (no Stop-hook activity) for at least
+    `idle_threshold_s`, the human stepped away — closed the laptop, slept —
+    so the next resume is treated as a BRAND-NEW Supervisor session: restart
+    the 4-hour clock, clear the sticky stop, and reset the per-session
+    counters. Always stamps `last_seen_at = now_s`. Returns True iff a reset
+    happened.
+
+    The 4-hour budget (§12.5 #2) bounds a CONTINUOUS autonomous run; it must
+    not keep ticking through an overnight pause. The threshold is chosen
+    longer than the 75-min single-task cap (§12) so it never trips mid-work,
+    and far shorter than a sleep. The very first invocation (no prior
+    last_seen_at) never resets — there is no gap yet.
+    """
+    last_seen = state.get("last_seen_at")
+    did_reset = False
+    if last_seen is not None and (now_s - last_seen) >= idle_threshold_s:
+        state["loop_started_at"] = now_s
+        state["stopped"] = False
+        state["stop_reason"] = None
+        state["total_dispatches"] = 0
+        state["consecutive_low"] = 0
+        did_reset = True
+    state["last_seen_at"] = now_s
+    if "loop_started_at" not in state:
+        state["loop_started_at"] = now_s
+    return did_reset
 
 
 # ----------------------------------------------------------------------
@@ -2036,11 +2075,22 @@ def main() -> None:
     state = get_session_state(state_all, session_id)
     now_s = time.time()
 
+    # Fresh-session reset on resume after a long idle gap (apply_idle_reset /
+    # DEFAULTS["session_reset_idle_s"]). Runs BEFORE the sticky-stopped check
+    # so an overnight pause un-sticks a four_hours_elapsed stop. Persisted
+    # immediately so last_seen_at survives the early-exit paths below.
+    last_seen = state.get("last_seen_at")
+    was_stopped = bool(state.get("stopped"))
+    if apply_idle_reset(state, now_s, cfg["session_reset_idle_s"]):
+        log(f"session_reset_after_idle session={session_id} "
+            f"idle_gap_s={int(now_s - last_seen)} "
+            f"threshold_s={int(cfg['session_reset_idle_s'])} "
+            f"was_stopped={was_stopped}")
+    put_session_state(state_all, session_id, state)
+    save_state(state_all)
+
     if state.get("stopped"):
         silent_exit(f"loop_already_stopped reason={state.get('stop_reason')}")
-
-    if "loop_started_at" not in state:
-        state["loop_started_at"] = now_s
 
     if (now_s - state["loop_started_at"]) >= cfg["max_loop_duration_s"]:
         state["stopped"] = True

@@ -31,10 +31,12 @@ final class LoopControllerTests: XCTestCase {
         clock: ClockHolder,
         consecutiveLowThreshold: Int = LoopController.defaultConsecutiveLowThreshold,
         maxLoopDuration: TimeInterval = LoopController.defaultMaxLoopDuration,
+        sessionResetIdle: TimeInterval = LoopController.defaultSessionResetIdle,
         loopStore: LoopDispatchStore? = nil
     ) -> LoopController {
         LoopController(
             maxLoopDuration: maxLoopDuration,
+            sessionResetIdle: sessionResetIdle,
             consecutiveLowThreshold: consecutiveLowThreshold,
             now: { clock.now },
             trace: TraceLog(path: FileManager.default.temporaryDirectory
@@ -166,6 +168,46 @@ final class LoopControllerTests: XCTestCase {
         XCTAssertTrue(reason.contains("4-hour wall-clock budget") ||
                       reason.contains("hour"),
                       "reason should explain the budget trigger: \(reason)")
+    }
+
+    func testLongIdleGapResetsSessionAndClearsFourHourStop() async {
+        // The reported case: hit the 4-hour cap, step away (sleep), come back.
+        // A long idle gap makes the resume a fresh Supervisor session, so the
+        // sticky four_hours_elapsed stop clears and the loop proceeds again.
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock, maxLoopDuration: 3600, sessionResetIdle: 7200)
+
+        _ = await lc.canDispatch(sessionId: "s-1")   // init the timer
+        clock.advance(by: 3601)                       // exceed the 1h budget
+        if case .stopped = await lc.canDispatch(sessionId: "s-1") { /* expected */ } else {
+            return XCTFail("expected .stopped after exceeding the budget")
+        }
+
+        clock.advance(by: 7200)                       // idle gap >= reset threshold
+        let resumed = await lc.canDispatch(sessionId: "s-1")
+        guard case .proceed = resumed else {
+            return XCTFail("a long idle gap must reset the session and proceed, got \(resumed)")
+        }
+        let snap = await lc.snapshot(sessionId: "s-1")
+        XCTAssertEqual(snap?.stopped, false, "fresh session must clear the stop")
+        XCTAssertNil(snap?.stopReason)
+        XCTAssertEqual(snap?.totalDispatches, 0, "fresh session restarts the dispatch budget")
+    }
+
+    func testShortGapDoesNotResetAStoppedSession() async {
+        // A break shorter than the reset threshold must NOT un-stick a
+        // legitimately-hit 4-hour stop (runaway protection still holds during
+        // continuous work).
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock, maxLoopDuration: 3600, sessionResetIdle: 7200)
+
+        _ = await lc.canDispatch(sessionId: "s-1")
+        clock.advance(by: 3601)
+        _ = await lc.canDispatch(sessionId: "s-1")    // -> stopped
+        clock.advance(by: 600)                         // 10 min, below threshold
+        if case .stopped = await lc.canDispatch(sessionId: "s-1") { /* expected */ } else {
+            XCTFail("a short gap must NOT reset a stopped session")
+        }
     }
 
     func testExplicitStopKillFiredSticks() async {
