@@ -792,16 +792,25 @@ def _extract_code_symbols(text: str) -> list[str]:
     return [s for s in syms if s.lower() not in _GROUNDING_STOPWORDS]
 
 
-# Pathspecs excluded from the symbol search: a symbol mentioned only in
-# prose (markdown docs, the owner brief, the changelog, trial notes) or in a
-# test fixture is NOT proof it exists as real code. We search code only.
-_GROUNDING_EXCLUDES = [
+# Pathspecs that exclude PROSE only — markdown docs, the owner brief, the
+# changelog, trial notes. A symbol that appears only in prose is not proof it
+# exists as real code.
+_GROUNDING_DOC_EXCLUDES = [
     ":(exclude,glob)**/*.md",
-    ":(exclude,glob)**/*test*",
-    ":(exclude,glob)**/*Test*",
     ":(exclude,glob)OWNER-BRIEF*",
     ":(exclude,glob)CHANGELOG*",
     ":(exclude,glob)trial-notes*",
+]
+
+# Primary search excludes prose AND tests: a symbol mentioned only in a test
+# STRING literal isn't proof of real production code. But a test CLASS/helper
+# (e.g. `TriageEngineTests`) IS real code that lives in a test file — see the
+# tests-fallback in `_symbol_exists_in_repo`, which stops the grounder from
+# silent-rejecting valid "fix the failing <X>Tests" proposals (the live loop
+# stall observed 2026-06-04: missing_symbols=TriageEngineTests).
+_GROUNDING_EXCLUDES = _GROUNDING_DOC_EXCLUDES + [
+    ":(exclude,glob)**/*test*",
+    ":(exclude,glob)**/*Test*",
 ]
 
 
@@ -824,7 +833,30 @@ def _symbol_exists_in_repo(cwd: str, symbol: str, timeout: float) -> bool:
         ["git", "grep", "-I", "-l", "-F", symbol, "--"] + _GROUNDING_EXCLUDES,
         cwd=cwd, timeout=timeout,
     )
+    if code == 0 and out.strip():
+        return True
+    # Tests-fallback — ONLY for symbols that are THEMSELVES test identifiers
+    # (a `...Tests` class or a `test_foo`/`testFoo` method). Those legitimately
+    # live only in test files, which the primary search excludes, so without
+    # this a valid "fix the failing TriageEngineTests" proposal false-rejects
+    # and the loop silent-exits (the live stall on 2026-06-04). We do NOT fall
+    # back for arbitrary symbols: a non-test symbol found only inside a test
+    # file is a fixture STRING, not proof of production code — keeping the
+    # anti-hallucination guard intact.
+    if not _is_test_symbol(symbol):
+        return False
+    code, out, _ = run(
+        ["git", "grep", "-I", "-l", "-F", symbol, "--"] + _GROUNDING_DOC_EXCLUDES,
+        cwd=cwd, timeout=timeout,
+    )
     return code == 0 and bool(out.strip())
+
+
+def _is_test_symbol(symbol: str) -> bool:
+    """True if `symbol` is itself a test identifier — a CamelCase test type
+    ending in `Test`/`Tests`, or a `test_foo` / `testFoo` method. Such symbols
+    live only in test files, so the grounder may search test code for them."""
+    return bool(re.search(r"Tests?$", symbol) or re.match(r"test[_A-Z]", symbol))
 
 
 def _ground_proposal(cwd: str, proposal: str, justification: str, timeout: float) -> tuple[bool, str]:

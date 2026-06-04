@@ -1293,6 +1293,27 @@ class TestGrounding(unittest.TestCase):
             "", timeout=10)
         self.assertTrue(grounded, "a prose proposal naming no code symbols is grounded")
 
+    def test_ground_passes_test_class_symbol(self):
+        # Regression (2026-06-04 live stall): a proposal naming a real test
+        # class was judged ungrounded because the symbol search excluded test
+        # files, so the loop silent-exited on valid "fix the failing tests"
+        # work. A test class IS real code — it must ground.
+        for sym in ("TriageEngineTests", "PathIsolationSymmetryTests"):
+            self.assertTrue(
+                hook._symbol_exists_in_repo("/Users/main/supervisor", sym, 10),
+                f"{sym} is a real test class and must ground via the tests-fallback")
+        grounded, reason = hook._ground_proposal(
+            "/Users/main/supervisor",
+            "Fix the 4 failing TriageEngineTests that the rm -rf catch short-circuits",
+            "they assert the Haiku path", timeout=10)
+        self.assertTrue(grounded, f"test-fix proposal must ground; got reason={reason!r}")
+
+    def test_ground_still_flags_hallucinated_camelcase(self):
+        # The tests-fallback must NOT weaken the anti-hallucination guard: a
+        # CamelCase type that exists nowhere (not even in tests) stays rejected.
+        self.assertFalse(
+            hook._symbol_exists_in_repo("/Users/main/supervisor", "WidgetFrobnicatorXYZ", 10))
+
 
 class TestApplyIdleReset(unittest.TestCase):
     """Fresh-session reset on resume after a long idle gap: an overnight

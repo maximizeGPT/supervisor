@@ -2777,3 +2777,38 @@ static fns), LoopDispatchStore.swift (conformance), main.swift (wiring).
 DispatcherTests: +5 (DispatcherStalenessTests), all 20 dispatcher tests green.
 NOT deployed; not yet mirrored to the Python Stop-hook (separate dispatcher —
 assessed next). Budget (§9e): $0 (no API).
+
+## 2026-06-04 — Python hook was silent-rejecting its OWN valid proposals
+
+Assessing the Python Stop-hook (the LIVE dispatcher — Supervisor.app is the old
+binary) revealed a DIFFERENT, live failure than the Swift stale-repeat: it was
+the actual reason "supervisor hasn't done anything." Log (14:42, mid-session):
+`DISPATCH_RESULT confidence=high ... "the inject-targeting bug is the single most
+impactful unblocked issue"` → immediately `UNGROUNDED_PROPOSAL
+missing_symbols=AppleScript` → `silent_exit`. Earlier: `missing_symbols=
+TriageEngineTests`. The loop proposed REAL work (incl. the multi-session inject
+bug the owner wants) and killed its own proposal.
+
+Root cause: `_symbol_exists_in_repo` searches code with `_GROUNDING_EXCLUDES`
+that excludes ALL test files (`**/*test*`, `**/*Test*`). So a proposal naming a
+real test class (`TriageEngineTests`) found the symbol nowhere → "ungrounded" →
+discarded. But a test class IS real code.
+
+Fix: split the excludes into `_GROUNDING_DOC_EXCLUDES` (prose only) and add a
+tests-fallback in `_symbol_exists_in_repo` — when the code-only search misses
+AND the symbol is itself a test identifier (`_is_test_symbol`: ends `Test`/
+`Tests`, or `test_foo`/`testFoo`), re-search including test code. NARROW on
+purpose: a non-test symbol found only in a test file is a fixture STRING, not
+proof of production code, so the anti-hallucination guard stays intact (verified:
+`WidgetFrobnicatorXYZ` / `frobnicate_the_widget` still rejected even though they
+now live in the test file). test_dispatch_loop_hook: +2; full suite 86/86 green.
+
+RESIDUAL (not fixed, surfaced): `missing_symbols=AppleScript` is a DIFFERENT
+false-reject — `_extract_code_symbols` treats any CamelCase prose word (Apple
++ Script) as a must-exist code symbol, so framework/proper nouns (AppleScript,
+Electron) ungroundedly reject valid proposals. Fuzzier fix (curated proper-noun
+exemptions or down-weighting bare CamelCase); deserves its own unit. This is
+currently blocking the live loop from even attempting the inject-targeting work.
+
+NOT deployed — the live hook in ~/.claude/hooks/ is still the old copy; the fix
+only takes effect on deploy. Budget (§9e): $0 (no API).
