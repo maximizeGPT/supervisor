@@ -6,6 +6,58 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-06-03
+
+Two core-promise defects: Supervisor now answers Claude Code's routine
+mid-session questions from context, and the dispatcher can no longer
+fabricate work that names a non-existent symbol.
+
+### Fixed
+
+**DEFECT 1 — answer routine questions from repo context, don't escalate**
+(`HardcodedRubric.swift`, `QuestionAnswerer.swift`, `DispatchFetchers.swift`,
+`TriageEngine.swift`, `TriagePrompt.swift`)
+- Supervisor's core promise is to answer the agent's question from context
+  so the human doesn't have to. It wasn't happening for commit/push/A-or-B
+  questions: the rubric defaulted them to "safety" (escalate to the human),
+  and even the engineering answer path drew on PRINCIPLES.md "and nothing
+  else" — no branch, no diff, no commits — so it couldn't decide "should I
+  commit/push this".
+- Classification: "engineering" now covers routine, reversible dev-workflow
+  decisions (commit, push to a feature/working branch, "proceed?", A-or-B)
+  and grounds them in the live repo state. Routine dev questions default to
+  engineering (answer + inject). "safety" narrowed to genuinely
+  destructive/irreversible (protected branch, data loss, credentials,
+  money, prod) — force-push-to-main, rm -rf, reset --hard, publish-to-prod
+  stay safety. Safety gates intact.
+- Context: a new `gatherRepoContextForAnswer` collects branch (flagged
+  protected vs working), recent commits, and uncommitted changes; the
+  answerer receives it and decides a commit/push concretely (e.g. "yes,
+  commit it" / "push the branch for CI" / "(needs your call)" only for a
+  genuine human/high-stakes call).
+- This is the Swift always-running app path (the question answerer), not
+  the Python turn-end hook.
+
+**DEFECT 2 — dispatcher cannot dispatch a non-existent symbol**
+(`dispatch_loop_hook.py`, `dispatcher-system-prompt.txt`)
+- The dispatcher repeatedly emitted high-confidence tasks with fabricated
+  premises (e.g. "fix the `<X>` check" naming a symbol that exists nowhere).
+  Grounding lived in the executor, so garbage left the dispatcher every
+  time. Moved grounding INTO the hook: before dispatch, every concrete code
+  symbol a proposal names is grep-verified to exist as real code (docs,
+  owner brief, changelog, trial-notes, and tests excluded). Any missing
+  symbol → the proposal is discarded and the loop idles.
+- The shared dispatcher prompt now enforces this and states that no_work is
+  the correct, confident answer on an empty queue — never fabricate a task.
+
+### Notes
+
+- D1 is Swift-side (the live question path); D2's grep enforcement is
+  Python-hook-side with the shared prompt covering the Swift Dispatcher.
+- New tests: Swift `QuestionContextTests` (7); Python grounding + main-level
+  ungrounded-discard / grounded-dispatch (+7). Suites: Swift green, Python
+  77.
+
 ## [0.9.1] — 2026-06-03
 
 Three reliability fixes: the action flash is finally visible on screen,

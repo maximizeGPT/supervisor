@@ -4,6 +4,18 @@ Last updated: 2026-06-03
 
 ## What shipped recently
 
+- v0.9.2: Supervisor now answers Claude Code's routine mid-session
+  questions from context instead of leaving you to. A commit/push/A-or-B
+  question is decided from the live branch + recent commits + conventions
+  (e.g. "yes, commit it", "push the branch for CI"), and only genuinely
+  high-stakes calls (a protected branch, deleting data, credentials) are
+  escalated to you. NOTE: typing the answer straight into the terminal
+  needs Accessibility permission granted to Supervisor (currently not
+  granted); without it the answer surfaces as a banner instead.
+- v0.9.2: the dispatcher can no longer fabricate work. Every function or
+  file a proposal names is checked against the real code before it runs;
+  if it names something that does not exist (the hallucinated-symbol bug),
+  the proposal is discarded and the loop idles.
 - v0.9.1: the action flash is visible on screen. A real action (pause,
   send a task, self-update) now flashes the hover and shows a plain label
   ("Paused Claude Code", "Supervisor updated itself") instead of being
