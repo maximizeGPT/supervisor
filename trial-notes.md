@@ -2542,3 +2542,43 @@ the §6c Haiku gate -- rubric tuning to DeepSeek numbers will not transfer 1:1.
 Both still below the 95% positive gate on destructive + edits. The catch-ON
 run (brhf2mwen) will add the deployed-reality view + residual-by-bucket
 diagnosis when it lands.
+
+### 2026-06-04 — Task 1 inject-targeting DISCOVERY (awaiting owner sign-off to wire)
+
+REAL BUG: Injector.swift posts keystrokes on the GLOBAL HID tap
+(`CGEvent.post(tap: .cghidEventTap)`, lines 145/147/155/157) after
+`hostApp.activate(options:[])` (line 116, a focus-steal). The global tap
+delivers to whatever is frontmost at post-time, so when the owner switches
+apps the text lands in THAT app. Confirmed by the owner's symptom and the
+file's own header ("posted into whichever app is frontmost at post-time").
+
+LOOP MISDIAGNOSIS (corrected): the auto-dispatch claimed Injector.swift uses
+`NSWorkspace.shared.runningApplications` to find the target pid and "silently
+degrades to notify." Both wrong: (a) the injector walks the process tree
+(`NSRunningApplication(processIdentifier:)` + `proc_pidinfo`); the only
+`NSWorkspace.runningApplications` use is ProcessLocator.swift:185 (resolving
+the host, not the target pid). (b) The bug is OVER-posting into the wrong
+app, not silent degradation.
+
+TARGET-PID SOURCE (multi-session safe): router resolves the supervised
+session via `locator.locate(targetCwd:)` -> handle.pid (ProcessLocator,
+matched by CWD, so concurrent CC sessions are disambiguated), then
+`inject(claudeCodePID: handle.pid)`. inject walks to the hosting app;
+`hostApp.processIdentifier` is the keystroke target. Both pids are available
+at inject time -- no new plumbing.
+
+SURFACES (bundleID-keyed): AppleScript-capable = Terminal.app, iTerm2;
+postToPid = Ghostty/Warp/Alacritty; Electron = claudefordesktop.
+
+EXISTING FALLBACK: InterventionRouter catches InjectError -> postInjectDegraded
+(notify), already degrading on no_cwd / locator_nil. So "hold + notify when
+unresolvable" is wired; the fix makes inject THROW instead of global-posting.
+
+PROPOSED FIX (presented to owner, NOT yet wired -- their checkpoint):
+per-surface targeted delivery -- postToPid(hostPid) as the core, AppleScript
+write-text to the tty-matched session for Terminal/iTerm2, Electron
+bring-forward-then-restore fallback. THE GUARD: zero `post(tap:)` global
+posts; if no targeted path resolves, throw target_unresolvable -> notify.
+Every degrade path gets a distinct trace tag per §4b
+(reason=target_unresolvable | applescript_failed | postToPid_unconfirmed |
+unsupported_host_<id> | no_hosting_app). $0 (read-only discovery).
