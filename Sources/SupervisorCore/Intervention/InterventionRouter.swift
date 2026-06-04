@@ -123,6 +123,7 @@ public final class InterventionRouter {
             case .unsupportedHost(let b):     reason = "unsupported_host_\(b)"
             case .activationFailed(let b):    reason = "activation_failed_\(b)"
             case .eventCreationFailed:        reason = "event_creation_failed"
+            case .targetUnresolvable(let r):  reason = "target_unresolvable_\(r)"
             }
             trace.emit("router", "intervention.inject.degraded reason=\(reason) pid=\(handle.pid) cwd=\(cwd)")
             await postInjectDegraded(decision, intendedText: text, reason: reason)
@@ -233,6 +234,7 @@ public final class InterventionRouter {
             case .unsupportedHost(let b):     reason = "unsupported_host_\(b)"
             case .activationFailed(let b):    reason = "activation_failed_\(b)"
             case .eventCreationFailed:        reason = "event_creation_failed"
+            case .targetUnresolvable(let r):  reason = "target_unresolvable_\(r)"
             }
             trace.emit("router", "intervention.continue.degraded reason=\(reason) pid=\(handle.pid) cwd=\(cwd)")
             await continueDegradeToMedium(decision, proposal: proposal, justification: justification)

@@ -303,6 +303,28 @@ final class InterventionRouterTests: XCTestCase {
         }
     }
 
+    func testInjectTargetUnresolvableDegradesWithSpecificReason() async {
+        // The invariant's failure path: when the specific target can't be
+        // resolved, inject throws targetUnresolvable and the router degrades to
+        // notify with a DISTINCT, specific trace reason (§4b) — never a global
+        // post, never a generic "fell back to notify".
+        let injector = MockInjector()
+        injector.errorToThrow = .targetUnresolvable(reason: "no_host_pid")
+        let (router, notifier, sender, recorder) = makeRouter(injector: injector)
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            suggestedInjectText: "Answer text"
+        ))
+        XCTAssertEqual(recorder.calls.count, 1, "injector must be called before it errors")
+        XCTAssertTrue(sender.sent.isEmpty, "must NOT fall back to any send/post on an unresolved target")
+        if case let .injectDegraded(_, reason) = notifier.calls.first?.outcome {
+            XCTAssertEqual(reason, "target_unresolvable_no_host_pid",
+                           "degrade reason must name the specific failure")
+        } else {
+            XCTFail("expected injectDegraded(target_unresolvable_no_host_pid), got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
     func testInjectUnsupportedHostDegrades() async {
         let injector = MockInjector()
         injector.errorToThrow = .unsupportedHost(bundleID: "com.example.weird")

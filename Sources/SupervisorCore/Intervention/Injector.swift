@@ -36,6 +36,10 @@ public enum InjectError: Error, Sendable, Equatable {
     /// CGEvent creation returned nil (rare; usually means the API was
     /// called from a sandboxed context that blocks event creation).
     case eventCreationFailed
+    /// The specific supervised session's target could not be resolved, so we
+    /// refuse to post (the invariant: targeted-or-don't). `reason` discriminates
+    /// the failure for the trace (§4b). Never falls back to a global post.
+    case targetUnresolvable(reason: String)
 }
 
 /// Abstract injector — lets the router test inject without depending on
@@ -112,52 +116,47 @@ public final class CGEventInjector: Injector {
             throw InjectError.unsupportedHost(bundleID: bundleID)
         }
 
-        // 2. Activate the host app frontmost.
-        let activated = hostApp.activate(options: [])
-        guard activated else {
-            trace.emit("inject", "ERROR activation failed bundle=\(bundleID)")
-            throw InjectError.activationFailed(bundleID: bundleID)
-        }
-        try? await Task.sleep(nanoseconds: focusSettleNanos)
-
-        // 2b. Issue #9: if a target window title is provided, try to
-        // focus the matching window via AXUIElement. This targets the
-        // correct tab when multiple Claude.app windows/tabs are open.
-        // Falls through silently on failure — we'll post into whatever
-        // window is frontmost, which is the pre-Issue-9 behavior.
-        if let title = targetWindowTitle {
-            Self.focusWindow(app: hostApp, titleContaining: title, trace: trace)
-            try? await Task.sleep(nanoseconds: focusSettleNanos / 2)
+        // 2. Resolve the host app's PID — the TARGET for every keystroke.
+        let hostPid = hostApp.processIdentifier
+        guard hostPid > 0 else {
+            trace.emit("inject", "degraded reason=target_unresolvable detail=no_host_pid host=\(bundleID) cc_pid=\(claudeCodePID)")
+            throw InjectError.targetUnresolvable(reason: "no_host_pid")
         }
 
-        // 3. Post the keystrokes via CGEventPost on the HID event tap.
+        // 3. TARGETED delivery — post each event DIRECTLY to the host app's
+        //    process via CGEventPostToPid, NOT the global frontmost focus.
+        //    THE INVARIANT: this function never calls post(tap:). We also do
+        //    NOT activate the host (no focus steal): the owner keeps using
+        //    their frontmost app while the keystrokes flow to the supervised
+        //    session's host in the background. If a keystroke can't be built
+        //    we throw rather than partially-post — targeted-or-don't.
         let source = CGEventSource(stateID: .hidSystemState)
         var bytes = 0
         for ch in text.unicodeScalars {
             guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
                   let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
-                trace.emit("inject", "ERROR CGEvent creation failed")
+                trace.emit("inject", "degraded reason=event_creation_failed host=\(bundleID)")
                 throw InjectError.eventCreationFailed
             }
             var c = UniChar(ch.value)
             keyDown.keyboardSetUnicodeString(stringLength: 1, unicodeString: &c)
             keyUp.keyboardSetUnicodeString(stringLength: 1, unicodeString: &c)
-            keyDown.post(tap: .cghidEventTap)
+            keyDown.postToPid(hostPid)
             usleep(interCharDelayMicros)
-            keyUp.post(tap: .cghidEventTap)
+            keyUp.postToPid(hostPid)
             usleep(interCharDelayMicros / 3)
             bytes += String(ch).utf8.count
         }
 
-        // 4. Press Return — virtualKey 36.
+        // Return — virtualKey 36, also targeted.
         if let downRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
            let upRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) {
-            downRet.post(tap: .cghidEventTap)
+            downRet.postToPid(hostPid)
             usleep(interCharDelayMicros)
-            upRet.post(tap: .cghidEventTap)
+            upRet.postToPid(hostPid)
         }
 
-        trace.emit("inject", "wrote \(bytes) bytes to PID \(claudeCodePID) host=\(bundleID)")
+        trace.emit("inject", "fired method=postToPid host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) bytes=\(bytes)")
         return bytes
     }
 
