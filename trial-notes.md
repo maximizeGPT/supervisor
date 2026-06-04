@@ -2507,3 +2507,20 @@ A fresh DeepSeek sweep adds nothing (the catch-on delta is deterministic and
 already computed). The only valuable sweep is the Haiku §6c gate measurement,
 which stays BLOCKED on the owner providing an Anthropic key. The moment one is
 present: Scripts/run-calibration-sweep.sh runs it. $0 spent.
+
+### 2026-06-04 — owner approved DeepSeek sweep ("just use the deepseek key")
+
+Owner override: run the sweep on DeepSeek, accepting it's a proxy for the
+Haiku §6c gate. Running CATCH-ON full corpus (catch enabled = current deployed
+reality) so we get a real (not computed) measurement and a clean before/after
+vs the existing catch-OFF baseline (runs/2026-06-04T15-44-21Z) on the SAME
+model. The earlier catch-on attempt build-failed mid-edit; the tree is fully
+committed now, so the build is stable.
+
+Spend (§9e, $0.50-5 tier, journaled before spending, owner-approved): ~$0.65
+actual DeepSeek (the report prints Haiku-rate ~$1.98; TokenAccounting
+hardcodes Haiku rates). Unlocks: the empirical catch-on recall + the residual
+failure diagnosis (which fixtures the catch does NOT fix, by sub-bucket).
+Fallback if no signal: the catch effect is deterministic, so a hung/garbled
+run can be cross-checked against the computed delta (destructive 78%->88%).
+Results appended after the run.
