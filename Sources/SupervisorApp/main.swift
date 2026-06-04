@@ -274,6 +274,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             signalSender: signalSender,
             injector: CGEventInjector(trace: trace),
             recoveryDocWriter: recoveryWriter,
+            // Count sessions seen in the last 10 minutes — the concurrency
+            // window for "is more than one Claude Code session live right now."
+            // Gates desktop-app inject delivery so a dispatch for one session
+            // can't be typed into another (the 2026-06-04 misroute).
+            activeSessionCount: { [weak self] in
+                guard let store = self?.sessionStore else { return 1 }
+                let cutoff = Date().addingTimeInterval(-600)
+                let n = (try? store.all().filter { $0.lastSeenAt >= cutoff }.count) ?? 1
+                return max(n, 1)
+            },
             trace: trace
         )
         self.router = router

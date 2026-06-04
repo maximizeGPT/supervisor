@@ -2844,3 +2844,37 @@ DEPLOYED the Python hook this time (owner said "immediately" + "do whatever you
 think is best"; live hook is the source of the fabrication). Old hook backed up
 first; reversible. Supervisor.app stays batched (the Swift guard ships with it).
 Budget (§9e): $0 (no API).
+
+## 2026-06-04 — Bug A CONFIRMED LIVE + fixed: cross-session inject misroute
+
+The multi-session bug stopped being theoretical: a dispatch meant for Mohammed's
+OTHER session (the waitlist landing page — `/tmp/shotter/shot.js` targets
+localhost:3000, writes /tmp/supervisor-shots/) was injected into THIS session
+(the Supervisor macOS repo). I declined to write the requested HERO-REVIEW.md —
+no such variants/captures exist here; writing it would fabricate an artifact.
+Owner: "it put the prompt for my other claude code session... here. fix!!"
+
+Mechanism: for a dispatch targeting session B (cwd_B), `locator.locate(cwd_B)`
+can't find a CLI process in cwd_B (B runs in the Claude desktop app, not a
+terminal), so it returns the `findClaudeDesktopAppPID()` FALLBACK — the shared
+desktop PID (94716, cwd "/"). The router then foreground-pastes into the desktop
+app's FRONTMOST tab = whatever session Mohammed is looking at (session A). AX
+confirms the desktop app has ONE window titled "Claude" (sessions are tabs), so
+window-raising can't disambiguate — there's no per-session target available.
+
+Fix (safety-first, at the router): `activeSessionCount` injected into
+InterventionRouter; both inject paths (answer + dispatch) now degrade to a notify
+banner when `sessionCount > 1 && handle.cwd != targetCwd` — i.e. >1 session live
+AND the locator fell back to the shared host (couldn't pin THIS session). A
+precise per-session CLI match (handle.cwd == targetCwd, terminal sessions) still
+injects regardless of count; single-session still injects via the fallback (only
+one place it can go) — no regression. main.swift counts sessions seen in the last
+10 min from the sessions table. InterventionRouterTests +3 (misroute→degrade,
+single→inject, precise→inject); 29 router-path tests green.
+
+Tradeoff (honest): for 2+ desktop-app sessions, auto-answer degrades to a banner
+(the answer still surfaces; Mohammed pastes it) — correct safety call: a banner
+in the right session beats an auto-paste in the WRONG one. True per-tab targeting
+would need a Claude-desktop affordance that doesn't exist (the window title is
+just "Claude"). The fix is in Supervisor.app (router) — needs the .app deploy to
+go live; the running binary can still misroute until then. Budget (§9e): $0.

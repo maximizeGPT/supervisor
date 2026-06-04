@@ -113,7 +113,8 @@ final class InterventionRouterTests: XCTestCase {
     private func makeRouter(
         handle: ProcessHandle? = ProcessHandle(pid: 4242, execPath: "/path/claude", cwd: "/tmp/test-cwd"),
         sender: CapturingSignalSender = CapturingSignalSender(),
-        injector: MockInjector = MockInjector()
+        injector: MockInjector = MockInjector(),
+        activeSessionCount: @escaping () -> Int = { 1 }
     ) -> (router: InterventionRouter, notifier: MockNotifier, sender: CapturingSignalSender, injector: MockInjector) {
         let notifier = MockNotifier()
         let router = InterventionRouter(
@@ -121,6 +122,7 @@ final class InterventionRouterTests: XCTestCase {
             locator: StubLocator(handle: handle),
             signalSender: sender,
             injector: injector,
+            activeSessionCount: activeSessionCount,
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("router-test-\(UUID().uuidString).log"))
         )
@@ -252,6 +254,46 @@ final class InterventionRouterTests: XCTestCase {
         } else {
             XCTFail("expected injectSucceeded outcome, got \(String(describing: notifier.calls.first?.outcome))")
         }
+    }
+
+    // MARK: - Multi-session misroute guard (2026-06-04)
+
+    /// The exact bug: >1 session live AND the locator fell back to the shared
+    /// Claude desktop host (handle.cwd "/" != the decision cwd) — pasting into
+    /// the frontmost tab could hit the WRONG session. Must degrade to notify,
+    /// never inject.
+    func testMultiSessionUnconfirmedTargetDegradesWithoutInjecting() async {
+        let fallback = ProcessHandle(pid: 94716, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+        let (router, notifier, _, recorder) = makeRouter(handle: fallback, activeSessionCount: { 2 })
+        await router.dispatch(decision: makeDecision(action: .inject, suggestedInjectText: "Answer for session A"))
+        XCTAssertTrue(recorder.calls.isEmpty, "must NOT inject when the target session can't be confirmed across multiple sessions")
+        if case let .injectDegraded(intended, reason) = notifier.calls.first?.outcome {
+            XCTAssertEqual(reason, "multi_session_unconfirmed_target")
+            XCTAssertEqual(intended, "Answer for session A", "the intended text must still surface as a banner")
+        } else {
+            XCTFail("expected injectDegraded, got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    /// Single session: even the desktop fallback is safe (only one place it can
+    /// go), so the gate must NOT fire — no regression for single-session users.
+    func testSingleSessionWithFallbackTargetStillInjects() async {
+        let fallback = ProcessHandle(pid: 94716, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+        let injector = MockInjector(); injector.bytesToReturn = 10
+        let (router, _, _, recorder) = makeRouter(handle: fallback, injector: injector, activeSessionCount: { 1 })
+        await router.dispatch(decision: makeDecision(action: .inject, suggestedInjectText: "x"))
+        XCTAssertEqual(recorder.calls.count, 1, "single session is unambiguous — inject must proceed")
+    }
+
+    /// Multiple sessions but the locator PINNED this session's own process
+    /// (handle.cwd == the decision cwd, e.g. a terminal session). Precise
+    /// targeting is safe regardless of how many sessions are live.
+    func testMultiSessionWithPreciseTargetStillInjects() async {
+        let precise = ProcessHandle(pid: 4242, execPath: "/path/claude", cwd: "/tmp/test-cwd")
+        let injector = MockInjector(); injector.bytesToReturn = 10
+        let (router, _, _, recorder) = makeRouter(handle: precise, injector: injector, activeSessionCount: { 5 })
+        await router.dispatch(decision: makeDecision(action: .inject, suggestedInjectText: "x"))
+        XCTAssertEqual(recorder.calls.count, 1, "a precise per-session match is safe even with many sessions live")
     }
 
     func testInjectWithNoSuggestedTextDegradesToPlainNotify() async {

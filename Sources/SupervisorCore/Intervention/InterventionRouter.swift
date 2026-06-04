@@ -32,6 +32,14 @@ public final class InterventionRouter {
     private let signalSender: any SignalSender
     private let injector: any Injector
     private let recoveryDocWriter: RecoveryDocWriter?
+    /// How many Claude Code sessions Supervisor currently considers live.
+    /// Used to gate inject delivery: when >1 session is active AND the locator
+    /// could not pin THIS session's own process (it fell back to the shared
+    /// Claude desktop host, whose single window multiplexes sessions as tabs),
+    /// a paste-to-frontmost could land in the WRONG session. Defaults to a
+    /// single-session world `{ 1 }`, which disables the gate for tests and
+    /// single-session users (no behavior change).
+    private let activeSessionCount: () -> Int
     private let trace: TraceLog
 
     public init(
@@ -40,6 +48,7 @@ public final class InterventionRouter {
         signalSender: any SignalSender = DarwinSignalSender(),
         injector: any Injector,
         recoveryDocWriter: RecoveryDocWriter? = nil,
+        activeSessionCount: @escaping () -> Int = { 1 },
         trace: TraceLog = .shared
     ) {
         self.notifier = notifier
@@ -47,7 +56,19 @@ public final class InterventionRouter {
         self.signalSender = signalSender
         self.injector = injector
         self.recoveryDocWriter = recoveryDocWriter
+        self.activeSessionCount = activeSessionCount
         self.trace = trace
+    }
+
+    /// The 2026-06-04 misroute guard. True when delivering into the resolved
+    /// target risks the WRONG session: the locator fell back to a shared host
+    /// (`handle.cwd != targetCwd` — a precise CLI match sets cwd == targetCwd,
+    /// the Claude.app fallback sets cwd "/") AND more than one session is live.
+    /// In that case paste-to-frontmost cannot be trusted to hit the session the
+    /// dispatch is FOR — a landing-page dispatch once landed in the supervisor
+    /// repo session. The caller degrades to a notify banner instead.
+    private func targetUnconfirmedAcrossSessions(_ handle: ProcessHandle, targetCwd: String, sessionCount: Int) -> Bool {
+        sessionCount > 1 && handle.cwd != targetCwd
     }
 
     /// Dispatch a triage decision through the right executor. Always
@@ -107,6 +128,12 @@ public final class InterventionRouter {
         guard let handle = locator.locate(targetCwd: cwd) else {
             trace.emit("router", "intervention.inject.degraded reason=locator_nil cwd=\(cwd)")
             await postInjectDegraded(decision, intendedText: text, reason: "locator_nil")
+            return
+        }
+        let sessionCount = activeSessionCount()
+        if targetUnconfirmedAcrossSessions(handle, targetCwd: cwd, sessionCount: sessionCount) {
+            trace.emit("router", "intervention.inject.degraded reason=multi_session_unconfirmed_target sessions=\(sessionCount) cwd=\(cwd) handle_cwd=\(handle.cwd)")
+            await postInjectDegraded(decision, intendedText: text, reason: "multi_session_unconfirmed_target")
             return
         }
         do {
@@ -216,6 +243,12 @@ public final class InterventionRouter {
         }
         guard let handle = locator.locate(targetCwd: cwd) else {
             trace.emit("router", "intervention.continue.degraded reason=locator_nil cwd=\(cwd)")
+            await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+            return
+        }
+        let sessionCount = activeSessionCount()
+        if targetUnconfirmedAcrossSessions(handle, targetCwd: cwd, sessionCount: sessionCount) {
+            trace.emit("router", "intervention.continue.degraded reason=multi_session_unconfirmed_target sessions=\(sessionCount) cwd=\(cwd) handle_cwd=\(handle.cwd)")
             await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
             return
         }
