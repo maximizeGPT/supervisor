@@ -69,6 +69,21 @@ if [ -z "$_calib_source" ] && command -v op >/dev/null 2>&1 && op whoami >/dev/n
     unset _v
 fi
 
+# 5. Interactive fallback — ONLY on a real terminal. A non-TTY stdin
+#    (autonomous loop, CI, piped) must NEVER hang waiting for input, so the
+#    -t guards skip straight to the printed instructions below. The owner
+#    enters their own key here; this script never supplies one itself.
+if [ -z "$_calib_source" ] && [ -t 0 ] && [ -t 1 ]; then
+    printf '[calib-key] paste ANTHROPIC_API_KEY (hidden), or press Enter to skip: ' >&2
+    read -rs _v
+    printf '\n' >&2
+    if [ -n "$_v" ]; then
+        export ANTHROPIC_API_KEY="$_v"
+        _calib_source="manual entry (this shell only)"
+    fi
+    unset _v
+fi
+
 if [ -n "$_calib_source" ]; then
     echo "[calib-key] ANTHROPIC_API_KEY resolved from: $_calib_source"
     _calib_rc=0

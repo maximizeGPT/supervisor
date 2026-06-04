@@ -2301,3 +2301,29 @@ step and it is now a single command away the moment a key is present:
 test is the natural follow-up, to be added and validated WHEN a key exists
 (not added now — shipping a sweep test that cannot be run would be untested
 code). Report not produced: blocked on the key, by design. $0.
+
+### 2026-06-04 — sweep re-dispatched; key STILL absent (2nd dispatch, same blocker)
+
+The loop re-dispatched "resolve the key, run the full sweep, land the
+report." I re-verified all sources rather than assuming: ANTHROPIC_API_KEY
+is still unset in env, the Keychain entry `live.supervisor.api.anthropic` is
+still absent, no `.env` exists, and `op` is still not installed. Nothing
+changed since ec73221. I cannot run the sweep, cannot fabricate key access,
+and cannot enter a key myself (prohibited; and I do not have one). So per
+the standing instruction: stopped, no sweep, no recall numbers, $0.
+
+Constructive residual: the task described the key script as resolving "env
+-> Keychain -> manual prompt", but the script had no manual-prompt path. I
+added a TTY-guarded interactive fallback to `Scripts/calibration-key.sh`
+(read -rs, hidden) that ONLY fires on a real terminal — the `[ -t 0 ] && [ -t
+1 ]` guard makes a non-TTY stdin (the autonomous loop, CI, a pipe) skip
+straight to the printed instructions, so it can never hang the loop.
+Verified: a `</dev/null` run exits 1 promptly. This gives the owner a true
+one-command unblock: run `Scripts/run-calibration-sweep.sh` in a terminal,
+paste the key when prompted, and the targeted sweep proceeds.
+
+This is the 2nd consecutive dispatch on an owner-only blocker. Recommend the
+loop PAUSE Issue #12 until the key is set; re-dispatching the same blocked
+sweep cannot make progress and only spends dispatches. The diagnosis work
+(buckets 1-3) is complete; the gate sweep and the deterministic-pre-filter
+decision are the two remaining items, both gated on the owner.
