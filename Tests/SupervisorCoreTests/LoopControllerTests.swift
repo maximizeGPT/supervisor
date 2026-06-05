@@ -153,6 +153,34 @@ final class LoopControllerTests: XCTestCase {
         if case .stopped = decision { XCTFail("clearPause must not stop the loop") }
     }
 
+    func testUserMessageClearsThreeConsecutiveLowStopAndReEngages() async {
+        // The 2026-06-04 anti-thrash fix: a 3-low stop STICKS (no longer
+        // cleared on every idle), and is cleared only by NEW DIRECTION — a
+        // user message. After the human messages and the worker resumes, the
+        // loop must re-engage rather than stay stuck until the 2h idle reset.
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock)
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "1"))
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "2"))
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "3"))
+        guard case .stopped = await lc.canDispatch(sessionId: "s-1") else {
+            return XCTFail("precondition: stopped after 3 lows")
+        }
+        // New direction clears the stop (and pauses until the worker resumes).
+        await lc.notePause(sessionId: "s-1", reason: .userMessage)
+        let snap = await lc.snapshot(sessionId: "s-1")
+        XCTAssertNil(snap?.stopReason, "user message must clear the three-low stop")
+        XCTAssertEqual(snap?.consecutiveLowCount, 0, "counter resets on new direction")
+        if case .stopped = await lc.canDispatch(sessionId: "s-1") {
+            XCTFail("must not stay stopped after new user direction")
+        }
+        // Worker resumes → loop proceeds again.
+        await lc.clearPause(sessionId: "s-1")
+        if case .stopped = await lc.canDispatch(sessionId: "s-1") {
+            XCTFail("loop must re-engage after new direction + resume")
+        }
+    }
+
     func testFourHourBudgetTripsStop() async {
         let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
         // Use a 1-hour budget for the test so the clock-advance is small.

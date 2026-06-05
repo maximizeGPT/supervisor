@@ -533,14 +533,14 @@ public final class TriageEngine {
                let dispatcher = self.dispatcher {
                 let loopDecision: LoopDecision
                 if let lc = loopController {
-                    // v0.8.0: clear a three-consecutive-low stop before
-                    // checking canDispatch. The idle detection firing
-                    // means the worker just completed work — the
-                    // underlying problem (broken diff, transient API
-                    // failures) that caused three consecutive lows is
-                    // likely resolved. Let the loop try again. Kill and
-                    // 4-hour stops are NOT cleared — those are terminal.
-                    await lc.clearConsecutiveLowStop(sessionId: sessionId)
+                    // Do NOT clear the three-consecutive-low stop on every
+                    // idle. Idle fires whenever the worker stops — that is NOT
+                    // proof new work exists. Clearing here defeated the hard
+                    // stop entirely: stop → next idle clears it → re-dispatch →
+                    // 3 more lows → stop → clear … a banner every ~60s forever
+                    // (the 2026-06-04 thrash). The stop now STICKS; it clears
+                    // only on genuine new direction (a user message — see
+                    // LoopController.notePause) or the long-idle session reset.
                     loopDecision = await lc.canDispatch(sessionId: sessionId)
                 } else {
                     loopDecision = .proceed(priorDispatchesConsidered: 0)
@@ -557,27 +557,20 @@ public final class TriageEngine {
                         priorDispatchesConsidered: priorCount
                     )
                 case let .paused(reason):
-                    trace.emit("loop", "skip dispatch session=\(sessionId) state=paused reason=\(reason)")
-                    finalCandidate = reconfigure(
-                        candidate,
-                        action: .notify,
-                        reasoningPlain: "Supervisor saw the worker go idle, but the loop is paused (\(reason)). Resume by sending the worker a new task yourself.",
-                        asymmetryNote: "Loop paused: \(reason)",
-                        suggestedInjectText: nil,
-                        nextTaskProposal: nil,
-                        confidence: "low"
-                    )
+                    // Loop paused (the human is in the chat). Stay SILENT — re-
+                    // posting an "idle but paused" banner on every idle tick is
+                    // noise while the owner is actively working.
+                    trace.emit("loop", "skip dispatch session=\(sessionId) state=paused reason=\(reason) (silent)")
+                    onActivityChange?(.idle)
+                    return
                 case let .stopped(reason):
-                    trace.emit("loop", "skip dispatch session=\(sessionId) state=stopped reason=\(reason)")
-                    finalCandidate = reconfigure(
-                        candidate,
-                        action: .notify,
-                        reasoningPlain: "Supervisor's autonomous loop has stopped (\(reason)). No further dispatches will fire for this session.",
-                        asymmetryNote: "Loop stopped: \(reason)",
-                        suggestedInjectText: nil,
-                        nextTaskProposal: nil,
-                        confidence: "low"
-                    )
+                    // Loop stopped (e.g. 3 consecutive lows = queue exhausted).
+                    // The dispatch that TRIPPED the stop already posted its low-
+                    // confidence banner explaining why, so go SILENT now instead
+                    // of re-announcing "still stopped" on every idle tick.
+                    trace.emit("loop", "skip dispatch session=\(sessionId) state=stopped reason=\(reason) (silent)")
+                    onActivityChange?(.idle)
+                    return
                 }
             } else {
                 finalCandidate = candidate

@@ -2878,3 +2878,33 @@ in the right session beats an auto-paste in the WRONG one. True per-tab targetin
 would need a Claude-desktop affordance that doesn't exist (the window title is
 just "Claude"). The fix is in Supervisor.app (router) — needs the .app deploy to
 go live; the running binary can still misroute until then. Budget (§9e): $0.
+
+## 2026-06-04 — anti-thrash: the 3-low hard stop was cleared on every idle
+
+Owner: "dont think supervisor's working. it keeps saying it sent instructions for
+smth it never did." Diagnosed from the live log: the safety gates ARE working
+(zero injects fired since relaunch; misroute gate + env-claim guard both firing
+correctly), but the in-app loop was posting a banner every ~60s. Root cause:
+`TriageEngine` cleared the three-consecutive-low stop UNCONDITIONALLY before every
+`canDispatch` (the old "idle fired = worker finished work, retry" assumption). But
+idle fires whenever the worker stops — not proof of new work. So: stop fires →
+next idle (~45s) clears it → re-dispatch → 3 more lows → stop → clear, forever.
+The log shows the exact loop: `STOPPED (3/3)` → `CLEARED … resuming` → `recorded
+ready high` → 3 lows → repeat. The hard stop was real but never held.
+
+Fix (3 edits, one unit):
+1. TriageEngine: removed the per-idle `clearConsecutiveLowStop` — the stop now
+   STICKS.
+2. TriageEngine: `.stopped` / `.paused` idle ticks now go SILENT (trace +
+   activity→idle, no banner). The dispatch that TRIPS the stop already posts its
+   low-confidence "queue empty" banner; re-announcing "still stopped" every tick
+   was half the spam.
+3. LoopController.notePause: a user message clears a `threeConsecutiveLow` stop
+   (NEW DIRECTION re-engages the loop) — kill/4-hour stops stay terminal. Without
+   this the stop would stick until the 2h idle reset.
+
+LoopControllerTests +1 (`testUserMessageClearsThreeConsecutiveLowStopAndReEngages`)
+= 19/19. Build clean. The 6 TriageEngineTests failures are PRE-EXISTING (the
+rm -rf catch short-circuits old Haiku-path assertions) — unrelated to loop logic,
+flagged earlier as a separate test-debt unit. DEPLOYED (the live loop was actively
+thrashing; the fix only helps once live). Budget (§9e): $0 (no API).

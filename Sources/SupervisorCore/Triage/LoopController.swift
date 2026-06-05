@@ -294,8 +294,17 @@ public actor LoopController {
             stopped: false,
             stopReason: nil
         )
-        // Don't override .stopped — once stopped, paused is meaningless.
-        if state.stopped { return }
+        // A three-consecutive-low stop means the loop ran out of grounded
+        // work. A fresh user message is NEW DIRECTION — clear that (and ONLY
+        // that) stop so the loop re-engages after the human's input. Kill and
+        // 4-hour stops are terminal and stay.
+        if state.stopped {
+            guard state.stopReason == .threeConsecutiveLow else { return }
+            state.stopped = false
+            state.stopReason = nil
+            state.consecutiveLowCount = 0
+            trace.emit("loop", "cleared three_consecutive_low stop on new user direction session=\(sessionId)")
+        }
         state.paused = true
         state.pauseReason = reason.rawValue
         sessions[sessionId] = state
