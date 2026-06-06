@@ -607,6 +607,7 @@ private func loadDispatcher(
                 issueFetcher: GitHubIssueFetcher(trace: trace),
                 commitFetcher: GitBranchCommitFetcher(trace: trace),
                 dispatchHistory: dispatchHistory,
+                grounder: RepoProposalGrounder(trace: trace),
                 trace: trace
             )
         }

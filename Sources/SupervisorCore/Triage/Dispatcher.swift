@@ -297,6 +297,7 @@ public final class Dispatcher: Dispatching, Sendable {
     private let issueFetcher: (any IssueFetching)?
     private let commitFetcher: (any BranchCommitFetching)?
     private let dispatchHistory: (any DispatchHistoryReading)?
+    private let grounder: (any ProposalGrounding)?
     private let trace: TraceLog
 
     /// `principlesText` is the fallback PRINCIPLES.md body. If
@@ -314,6 +315,7 @@ public final class Dispatcher: Dispatching, Sendable {
         issueFetcher: (any IssueFetching)? = nil,
         commitFetcher: (any BranchCommitFetching)? = nil,
         dispatchHistory: (any DispatchHistoryReading)? = nil,
+        grounder: (any ProposalGrounding)? = nil,
         trace: TraceLog = .shared
     ) {
         self.client = client
@@ -322,6 +324,7 @@ public final class Dispatcher: Dispatching, Sendable {
         self.issueFetcher = issueFetcher
         self.commitFetcher = commitFetcher
         self.dispatchHistory = dispatchHistory
+        self.grounder = grounder
         self.trace = trace
     }
 
@@ -485,6 +488,25 @@ public final class Dispatcher: Dispatching, Sendable {
             if let envReject = Self.environmentClaimRejection(proposal: prompt, justification: justification) {
                 trace.emit("dispatch", "ENV_CLAIM_REJECT \(envReject) — degrading to low-confidence idle (fabricated unblocking precondition)")
                 return .lowConfidence(reasoning: "Environment claim rejected (\(envReject)): the proposal asserts an unblocking precondition (API key / sweep available) that is not true. Idling instead of dispatching blocked work.")
+            }
+            // TASK 2: CROSS-PROJECT GROUNDING. The proposal must be about THIS
+            // session's project. Verify every code symbol it names exists in the
+            // repo at the session's cwd; a proposal that references another
+            // project's code (a contaminated transcript proposing landing-page
+            // work for the supervisor repo) fails to ground and is discarded.
+            // Makes transcript contamination inert without scrubbing history.
+            if let grounder {
+                let cwd = context.cwd ?? ""
+                if cwd.isEmpty {
+                    trace.emit("dispatch", "CROSS_PROJECT_REJECT reason=no_cwd — cannot ground proposal; discarding")
+                    return .lowConfidence(reasoning: "Cannot ground the proposal — this session's cwd is unresolved. Idling rather than dispatching ungrounded work.")
+                }
+                let missing = await grounder.missingSymbols(inProposal: prompt, cwd: cwd)
+                if !missing.isEmpty {
+                    let head = missing.prefix(5).joined(separator: ",")
+                    trace.emit("dispatch", "CROSS_PROJECT_REJECT cwd=\(cwd) missing_symbols=\(head) — proposal names code absent from this session's repo; discarding")
+                    return .lowConfidence(reasoning: "Cross-project proposal rejected: it references \(head), which does not exist in this session's repo (\(cwd)). Idling instead of dispatching another project's work into this session.")
+                }
             }
             trace.emit("dispatch", "ready confidence=\(confidence.rawValue) path=\(path.rawValue) issue=\(issueN.map(String.init) ?? "-") prior_echoed=\(priorEchoed.map(String.init) ?? "-") requires_human=\(requiresHuman) prompt_bytes=\(prompt.utf8.count) just=\"\(justification.prefix(120))\"")
             return .ready(
