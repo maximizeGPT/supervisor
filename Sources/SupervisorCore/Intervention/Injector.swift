@@ -1,13 +1,19 @@
-// Injector.swift — v0.3.0.
+// Injector.swift — v0.3.0 (targeting corrected v0.6+).
 //
-// Delivers text into the terminal hosting a Claude Code session via
-// CGEventPost on the HID event tap. The v0.3.0 design uses the
-// universal CGEventPost path — works regardless of which terminal
-// emulator (Terminal.app, iTerm2, Ghostty, Warp) hosts the session,
-// because the keystrokes are posted into whichever app is frontmost
-// at post-time. The injector activates the hosting app first via
-// NSWorkspace.activate, waits a beat for focus to settle, then sends
-// the keystrokes followed by Return.
+// Delivers text into the SPECIFIC app hosting a Claude Code session.
+// TARGETED, never global: the injector resolves the session pid to its
+// hosting app (findHostingApp), then either
+//   - posts keystrokes with CGEvent.postToPid(hostPid) for terminals
+//     (Terminal.app, iTerm2, Ghostty, Warp) — focus-independent, so the
+//     text lands in that terminal even if a DIFFERENT app is frontmost, and
+//   - for the Electron desktop app, brings that host forward, pastes, then
+//     restores the prior frontmost app.
+// If the host can't be resolved (no hosting app / unsupported bundle / no
+// pid) it THROWS — it never falls back to a global frontmost post. That is
+// the no-leak guard: text cannot spray into whatever app happens to be
+// frontmost. (The earlier v0.3.0 universal-CGEventPost-to-frontmost design,
+// described in prior revisions of this header, was the leak source and is
+// gone.)
 //
 // Per the spike note (spikes/cgevent-bypass-ax-spike-README.md) and
 // the v0.3.0 A1 scratch test, CGEventPost(.cghidEventTap) for mouse
