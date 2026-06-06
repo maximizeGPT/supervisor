@@ -452,6 +452,18 @@ public final class TriageEngine {
         // before the worker is idle.
         let cwd = lastSessionCWD(in: window) ?? sessionCwd[sessionId]
         let branch = lastSessionBranch(in: window) ?? sessionBranch[sessionId]
+
+        // TASK 1 gate: a session whose cwd can't be resolved must NOT be
+        // dispatched to. Without the project root we cannot ground a proposal
+        // against the right repo (Task 2), so a proposal here would risk
+        // cross-project leakage. Skip the idle dispatch silently — safety triage
+        // (the bash-command path) is unaffected.
+        if cwd == nil || cwd == "<resolving>" || cwd == "<unknown>" || cwd?.isEmpty == true {
+            trace.emit("triage", "idle skip session=\(sessionId): cwd unresolved (\(cwd ?? "nil")) — not dispatching")
+            onActivityChange?(.idle)
+            return
+        }
+
         let userPrompt = lastUserPrompt(in: window)
 
         let state = idleStates[sessionId]

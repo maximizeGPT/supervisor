@@ -59,12 +59,17 @@ public final class EventParser: Sendable {
 
         var emitted: [SupervisorEvent] = []
 
-        // sessionStart on first line we successfully parse (regardless of
-        // type — queue-operation is usually first in real session files).
+        // sessionStart on the first event that actually CARRIES a cwd. The
+        // lead-in lines in a real session file (ai-title, mode, queue-operation,
+        // last-prompt) have no cwd — emitting sessionStart on those produced
+        // cwd="<unknown>" and never updated, so the session stayed unresolved
+        // and the dispatcher proposed cross-project work (2026-06-05). cwd (and
+        // gitBranch) live on user/assistant/system events; require cwd before
+        // emitting so sessionStart surfaces the REAL project.
         if !emittedSessionStart,
            let sessionId = obj["sessionId"] as? String,
+           let cwd = obj["cwd"] as? String, !cwd.isEmpty,
            let ts = parseTS(obj["timestamp"]) ?? parseTS(obj["timestamp"] as? String) {
-            let cwd = (obj["cwd"] as? String) ?? "<unknown>"
             let gitBranch = obj["gitBranch"] as? String
             emitted.append(.sessionStart(.init(
                 sessionId: sessionId,
