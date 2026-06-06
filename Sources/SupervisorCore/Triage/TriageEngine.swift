@@ -531,6 +531,19 @@ public final class TriageEngine {
             let finalCandidate: TriageCandidate
             if candidate.category == "worker_idle_post_completion",
                let dispatcher = self.dispatcher {
+                // KILL-SWITCH: a marker file disables the auto-dispatch loop
+                // WITHOUT a rebuild. When present the worker_idle path goes
+                // fully SILENT (no dispatch, no banner). Added 2026-06-04 after
+                // session-context contamination produced wrong-session task
+                // proposals (a landing-page task labeled for the supervisor
+                // session). Safety detection (destructive_action_pending →
+                // pause/notify) is a DIFFERENT category and is unaffected.
+                // Re-enable by deleting the marker — no restart needed.
+                if Self.autoDispatchDisabled {
+                    trace.emit("loop", "auto-dispatch DISABLED by marker — worker_idle silent (safety detection unaffected) session=\(sessionId)")
+                    onActivityChange?(.idle)
+                    return
+                }
                 let loopDecision: LoopDecision
                 if let lc = loopController {
                     // Do NOT clear the three-consecutive-low stop on every
@@ -604,6 +617,16 @@ public final class TriageEngine {
     ///                       (router demotes to a notify-with-reason banner)
     ///   .error            → action=.notify, confidence=low, proposal=nil, asymmetry=<err>
     ///                       (engine falls back to a plain idle notify)
+    /// Auto-dispatch kill-switch. True when the marker file
+    /// `Application Support/Supervisor/dispatch-disabled.marker` exists. Read
+    /// per idle tick so it toggles live without a restart. Disables ONLY the
+    /// worker_idle auto-dispatch loop; safety triage is a different path.
+    nonisolated static var autoDispatchDisabled: Bool {
+        let marker = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Supervisor/dispatch-disabled.marker")
+        return FileManager.default.fileExists(atPath: marker.path)
+    }
+
     private func dispatchAndRemap(
         candidate: TriageCandidate,
         dispatcher: any Dispatching,

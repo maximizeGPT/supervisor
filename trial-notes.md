@@ -2908,3 +2908,34 @@ LoopControllerTests +1 (`testUserMessageClearsThreeConsecutiveLowStopAndReEngage
 rm -rf catch short-circuits old Haiku-path assertions) — unrelated to loop logic,
 flagged earlier as a separate test-debt unit. DEPLOYED (the live loop was actively
 thrashing; the fix only helps once live). Budget (§9e): $0 (no API).
+
+## 2026-06-04 — SECOND misroute is dispatch-CONTENT contamination, not delivery
+
+Owner: a landing-page prompt appeared in the supervisor session AGAIN, even after
+the delivery-misroute gate. Log proof (23:35): `FLAG session=32576705 (supervisor
+session) next_task="Build the landing page body below the wordmark…"`. So
+Supervisor GENERATED a landing-page task and labeled it for THIS session. The
+router gate guards WHERE an inject lands; it can't catch the dispatcher producing
+wrong-session CONTENT — when that content is high-confidence it delivers "here"
+correctly (it genuinely thinks the task is for this session).
+
+Mechanism (a feedback loop the original delivery-misroutes seeded): the early
+misroutes pasted landing-page prompts into 32576705's transcript; the dispatcher
+reads the session's recent turns, sees landing-page material, and proposes more of
+it. NOT primarily cwd: the JSONL DOES carry cwd on user/assistant/system events
+(=/Users/main/supervisor); the contamination is the transcript content the
+dispatcher reads. The DB `cwd=<resolving>` is a separate cosmetic gap (triage
+resolves cwd from the event window, not the DB row).
+
+No clean 1am fix for content-contamination-resistant dispatch. Per owner ("keep
+going" on the disable recommendation): added an auto-dispatch KILL-SWITCH —
+`TriageEngine.autoDispatchDisabled` checks a marker file
+(`Application Support/Supervisor/dispatch-disabled.marker`, read per idle, toggles
+live, no rebuild). When set, the worker_idle path goes fully SILENT via the same
+return as the .stopped case — no dispatch, no banner. Safety detection
+(destructive_action_pending → pause/notify) is a DIFFERENT category, unaffected.
+Marker armed + deployed. Re-enable = delete the marker.
+
+REAL FIX (deferred to a fresh effort, not 1am): per-session dispatch-context
+isolation so a contaminated transcript can't make the dispatcher cross-propose —
+plus making the DB cwd actually resolve. Budget (§9e): $0 (no API).
