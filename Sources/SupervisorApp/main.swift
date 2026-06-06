@@ -170,9 +170,12 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // 2. Bus + Hover
         let bus = EventBus(trace: trace)
         self.bus = bus
-        // Seed flagCount from SQLite history so the badge persists across
-        // launches (Known Gap since v0.1.4).
-        let historicFlagCount = (try? flagStore?.count()) ?? 0
+        // Seed the badge with the CURRENT WORK WINDOW's flag count, not the
+        // all-time total. The all-time count (13k+ after months of use) is not
+        // a useful "what just happened" badge; the work-window count resets
+        // after an idle gap so a fresh launch shows a sane number (often 0).
+        // All-time data stays in the DB — this scopes the DISPLAY, not the data.
+        let historicFlagCount = (try? flagStore?.countCurrentWorkWindow(now: Date())) ?? 0
         // v0.1.7: pass stores + model name for the expanded panel.
         let activeProviderForHover = (try? activeProviderStore.read()) ?? .anthropic
         let hoverVM = HoverViewModel(

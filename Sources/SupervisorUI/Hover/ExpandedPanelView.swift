@@ -368,7 +368,7 @@ public struct ExpandedPanelView: View {
     private var footer: some View {
         HStack {
             Spacer()
-            Text("\(vm.flagCount) flags total")
+            Text("\(vm.flagCount) flags this session")
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
             Spacer()
