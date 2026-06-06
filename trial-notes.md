@@ -2939,3 +2939,40 @@ Marker armed + deployed. Re-enable = delete the marker.
 REAL FIX (deferred to a fresh effort, not 1am): per-session dispatch-context
 isolation so a contaminated transcript can't make the dispatcher cross-propose —
 plus making the DB cwd actually resolve. Budget (§9e): $0 (no API).
+
+## 2026-06-06 — Multi-session loop rework (the real fix, owner-directed)
+
+Owner hard rule: "disable the loop is NOT a fix." Kill-switch stays armed ONLY
+while building the real fix; removed + proven across two sessions in TASK 5.
+
+- TASK -0.5 (flag counter): the per-work-window reset was NEVER committed (git log
+  confirms); the badge seeded from flagStore.count() (all-time = 13,530). Added
+  FlagStore.countCurrentWorkWindow (contiguous run, 60-min idle gap); badge now
+  shows the work window. VERIFIED ON SCREEN: hover badge reads "2" (was 13,530).
+  Commit 2206675.
+- TASK 0 (inject gate): PASSES. Injector resolves the host pid and delivers via
+  postToPid (terminals) / bring-forward-paste (Electron), or THROWS — no global
+  frontmost post, so text can't leak into a random app. Multi-session gate
+  degrades to notify when it can't confirm the target. 27/27. Stale header that
+  described the removed global-post path corrected. Commit baa83f7.
+- TASK 1 (cwd resolution): EventParser emitted sessionStart on the first line
+  "regardless of type" → real files lead with ai-title/queue-operation (no cwd)
+  → cwd="<unknown>", never updated. Now require cwd before emitting (resolves
+  from the first user/assistant/system event). SessionStore.updateResolvedCwd +
+  SessionTail persist the real cwd. evaluateIdle GATE: unresolved cwd → no
+  dispatch (can't ground). +1 test. Commit c1f5c3e.
+- TASK 2 (cross-project grounding — the core defense): RepoProposalGrounder
+  (Swift mirror of the Python _ground_proposal + test-symbol fallback) grounds
+  every proposal's code symbols against the SESSION's own cwd repo via git grep.
+  A landing-page proposal names page.tsx/Hero absent from the supervisor repo →
+  dropped. Contamination becomes inert WITHOUT scrubbing history. +4 tests
+  (incl. real throwaway-git cross-project drop). Commit 36c5d23.
+- TASK 3 (per-session state): ALREADY per-session, NO change. Quoted:
+  LoopController.swift:125 `sessions:[String:SessionState]` (circuit-breaker +
+  counts + pause/stop), TriageEngine.swift:76/102 perSessionWindow/idleStates
+  `[String:…]`, LoopDispatchStore.swift:38 every query filters session_id,
+  Dispatcher stateless per-call. No `currentSession` anywhere. Two sessions
+  cannot share a circuit breaker or confuse repetition detection.
+
+NEXT: TASK 4 (remove marker) reached only inside TASK 5 (two-session live verify).
+Budget (§9e): $0 (no API).
