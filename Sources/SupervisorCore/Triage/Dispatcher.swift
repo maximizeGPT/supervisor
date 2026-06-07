@@ -549,20 +549,32 @@ public final class Dispatcher: Dispatching, Sendable {
     /// update both. The .txt file is what the Python hook reads at
     /// runtime; this static is what the Swift in-app path uses.
     static let systemPrompt: String = {
-        // Try to load from the .txt file at the known repo-relative path.
-        // Falls back to a minimal inline prompt if the file isn't found
-        // (e.g. when running from a built .app bundle without the repo).
+        // Resolve the prompt file on ANY checkout. The previous hardcoded
+        // /Users/main/... path broke CI — the runner lives under
+        // /Users/runner/work/..., so the load silently fell back to the stub
+        // and every "prompt must contain X" test failed. `#filePath` is this
+        // source file's location at COMPILE time, so we derive the repo root
+        // from it portably (works on the runner, the owner's machine, and any
+        // future clone). The file is git-tracked, so it's always in-tree.
+        let rel = "Tools/dispatch-loop-hook/dispatcher-system-prompt.txt"
+        let repoRoot = URL(fileURLWithPath: #filePath)  // <repo>/Sources/SupervisorCore/Triage/Dispatcher.swift
+            .deletingLastPathComponent()   // Triage/
+            .deletingLastPathComponent()   // SupervisorCore/
+            .deletingLastPathComponent()   // Sources/
+            .deletingLastPathComponent()   // <repo>/
         let candidates = [
-            // Repo-relative (dev builds, autonomous sessions)
-            URL(fileURLWithPath: "/Users/main/supervisor/Tools/dispatch-loop-hook/dispatcher-system-prompt.txt"),
+            repoRoot.appendingPathComponent(rel),                                            // any checkout (CI, dev, clone)
+            URL(fileURLWithPath: "/Users/main/supervisor/").appendingPathComponent(rel),     // owner's machine, belt-and-suspenders
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(rel),                                                // run-from-repo-root
         ]
         for url in candidates {
             if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
                 return text
             }
         }
-        // Fallback: minimal inline version. Should never fire in practice
-        // since the dispatch loop only runs in the repo working directory.
+        // Fallback: minimal inline version. Should never fire now that the
+        // path is checkout-relative.
         return "You are the dispatcher for an autonomous Claude Code session. Pick the next task and write the prompt. Call record_dispatch exactly once."
     }()
 
