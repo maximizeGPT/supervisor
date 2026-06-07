@@ -120,14 +120,21 @@ case "inject-test":
     }
     let text = args[3]
     let sem = DispatchSemaphore(value: 0)
-    var result = "ERROR: did not run"
+    // `result` is written on @MainActor and read here after sem.signal();
+    // the semaphore is the happens-before edge. Using a reference box instead
+    // of a captured `var` keeps this concurrency-clean — strict concurrency
+    // (Swift 6, which CI's toolchain enforces) rejects mutating a captured var
+    // from concurrently-executing code. Local `swift test` never caught it
+    // because it doesn't build this dev-tools target.
+    final class ResultBox: @unchecked Sendable { var value = "ERROR: did not run" }
+    let result = ResultBox()
     Task { @MainActor in
         let injector = CGEventInjector()
         do {
             let n = try await injector.inject(text: text, claudeCodePID: pid, targetWindowTitle: nil)
-            result = "ok: injected \(n) bytes targeting host of pid \(pid)"
+            result.value = "ok: injected \(n) bytes targeting host of pid \(pid)"
         } catch {
-            result = "degraded/threw: \(error)"
+            result.value = "degraded/threw: \(error)"
         }
         sem.signal()
     }
@@ -136,7 +143,7 @@ case "inject-test":
     while sem.wait(timeout: .now()) == .timedOut {
         RunLoop.main.run(until: Date().addingTimeInterval(0.02))
     }
-    print(result)
+    print(result.value)
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)
