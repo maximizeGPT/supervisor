@@ -3073,3 +3073,27 @@ deployed", commit fd237c1c, "Deployments directory"). Nothing grounds a
 deploy-state assertion, so the dispatcher can still fabricate them. The env-claim
 guard covers API-key/sweep claims; a deploy-state/commit-existence guard would
 close this. Budget (§9e): $0 (no API — deterministic catch, git/ps only).
+
+## 2026-06-07 — Loop reads the backlog + deploy-state guard (owner-directed)
+
+Owner: "yes ofc build that" (re: why the loop fabricated "deploy the kill-catch"
+instead of proposing the real next task). Root: the in-app dispatcher couldn't
+SEE the backlog. Two parts shipped:
+
+A. Known Gaps wiring (86d124c). The Swift dispatchForIdleSession built
+   SessionContext from issues + commits + window only — knownGaps was always ""
+   (the live dispatcher literally reasoned "Known Gaps is empty"). So a task
+   flagged in trial-notes.md was invisible, and with no clear issue/commit move
+   the loop FABRICATED one. readKnownGaps(cwd:) (mirror of the Python hook's
+   fetch_known_gaps) now populates context.knownGaps. Flagging work in
+   trial-notes.md's "# Known Gaps" now surfaces it as a real dispatch.
+
+B. Deploy-state guard (a5d58d2). Backstop for the deploy-state fabrication class
+   (the dispatch cited commits fd237c1c + fd14c87c that don't exist).
+   RepoProposalGrounder.missingCommits extracts hash-shaped tokens (only under a
+   commit/deploy claim) and `git cat-file -e <hash>^{commit}` each; a fabricated
+   hash → DEPLOY_STATE_REJECT. Closes the residual flagged in 96d5147 (grounding
+   covered code symbols + env claims but not deploy-state/commit claims).
+
+Tests: DispatcherKnownGapsTests +3, ProposalGroundingTests +2; full dispatcher
+suites green. Deploying so the loop uses both. Budget (§9e): $0 (no API).
