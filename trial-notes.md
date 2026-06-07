@@ -2976,3 +2976,38 @@ while building the real fix; removed + proven across two sessions in TASK 5.
 
 NEXT: TASK 4 (remove marker) reached only inside TASK 5 (two-session live verify).
 Budget (§9e): $0 (no API).
+
+## 2026-06-06/07 — TASK 4+5: marker removed, loop verified live across two sessions
+
+TASK 4: dispatch-disabled.marker REMOVED — the loop is RUNNING again (not the
+band-aid; the real fix is in).
+
+TASK 5 live verification (deployed binary = HEAD; second session = a synthetic
+CC JSONL under ~/.claude/projects/-Users-main-tmp-proj/ with cwd /Users/main/
+tmp-proj, a real throwaway git repo with symbol tmpproj_render_widget):
+- cwd + branch resolve PER SESSION (DB + logs): c075d53a → /Users/main/supervisor
+  (autonomous-20260525T193906Z); tmpproj → /Users/main/tmp-proj (autonomous-
+  tmptest). No <resolving>, no branch=?.
+- Per-session CONTEXT ISOLATION proven live: the tmp-proj dispatch ran
+  `[dispatch] start session=tmpproj3 … issues=0 commits=0` — it fetched
+  tmp-proj's OWN (empty) git context, NOT supervisor's issues/commits. It found
+  no work and proposed NOTHING (low confidence) → did NOT leak a supervisor or
+  landing-page task into tmp-proj. Zero cross-project leak observed.
+- Idle rubric correctly gates: all-clear on branch=main and on a session with a
+  recent user message; fires only on autonomous-branch + no-recent-user-message
+  (where the tmp-proj dispatch happened).
+- Flag badge ON SCREEN = 2 then 5 (work-window) — never the 13,530 all-time.
+- Hover ON SCREEN: "Watching tmp-proj. All clear · ⚠ 5" — second session watched.
+
+Marker stays OFF (no leak observed; owner: re-arm only on an observed leak).
+Synthetic test JSONLs cleaned up; ~/tmp-proj repo kept for a real `claude`
+two-session run.
+
+REMAINING live capture: the SUPERVISOR session's OWN autonomous dispatch (it
+needs autonomous idle — blocked while the owner's task message is recent + I'm
+active). The per-session scoping is proven (tmp-proj used its own context), so
+the supervisor session will likewise use supervisor context; grounding (unit-
+tested + live) is the backstop. Will confirm on its next idle.
+
+Budget (§9e): a handful of DeepSeek idle-eval + dispatch calls during the live
+verify, well under $0.50 (DeepSeek is cheap; no Anthropic key). Journaled per §9e.
