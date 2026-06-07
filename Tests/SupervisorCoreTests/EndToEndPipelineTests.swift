@@ -132,7 +132,10 @@ final class EndToEndPipelineTests: XCTestCase {
         // -- Drive the wire: write a Bash tool_use line to a JSONL ----
 
         let sessionId = "e2e-session-1"
-        let bashCommand = "rm -rf /Users/test/important"
+        // chmod -R 000 is destructive (recursively unreadable) but NOT on the
+        // deterministic catch-list, so the full pipeline runs the mocked Haiku
+        // call instead of short-circuiting on the catch before the model.
+        let bashCommand = "chmod -R 000 /Users/test/important"
         let jsonl = projectHashDir.appendingPathComponent("\(sessionId).jsonl")
         let lines = [
             #"{"type":"queue-operation","timestamp":"2026-05-21T19:36:19Z","sessionId":"\#(sessionId)","cwd":"/Users/test","gitBranch":"main"}"#,
@@ -153,7 +156,7 @@ final class EndToEndPipelineTests: XCTestCase {
         XCTAssertEqual(persisted?.severity, .high)
         XCTAssertEqual(persisted?.action, .pause,
                        "Haiku's recommended_action 'pause' must land on flag.action, not the v0.1.0 hardcoded .notify")
-        XCTAssertTrue(persisted?.reasoningPlain.contains("delete") ?? false,
+        XCTAssertTrue(persisted?.reasoningPlain.contains("permission") ?? false,
                       "reasoning_plain should describe the action in plain English; got: \(persisted?.reasoningPlain ?? "(nil)")")
         XCTAssertTrue(persisted?.reasoningTechnical.contains("rubric") ?? false,
                       "reasoning_technical should cite the rubric; got: \(persisted?.reasoningTechnical ?? "(nil)")")
@@ -179,7 +182,7 @@ final class EndToEndPipelineTests: XCTestCase {
         let bannerBody = notifier.body(for: routed.decisions[0])
         XCTAssertTrue(bannerBody.hasPrefix(Notifier.bannerPrefix),
                       "notifier body must start with the brand prefix, got: \(bannerBody)")
-        XCTAssertTrue(bannerBody.contains("delete"),
+        XCTAssertTrue(bannerBody.contains("permission"),
                       "notifier body should surface the plain-English description, got: \(bannerBody)")
         XCTAssertFalse(bannerBody.contains("rubric"),
                        "notifier body must NOT surface technical reasoning, got: \(bannerBody)")
@@ -209,11 +212,11 @@ final class EndToEndPipelineTests: XCTestCase {
                     "candidates": [[
                         "category": "destructive_action_pending",
                         "severity": "high",
-                        "matched_command": "rm -rf /Users/test/important",
+                        "matched_command": "chmod -R 000 /Users/test/important",
                         "recommended_action": "pause",
-                        "reasoning_plain": "Claude Code is about to delete /Users/test/important and everything in it. That's not a temp path, and your last prompt didn't mention deleting anything, so this looks unintended. I'm pausing the session so you can check before it runs — you can resume from the panel if it was deliberate.",
-                        "reasoning_technical": "rm -rf /Users/test/important matches the destructive_action_pending rubric clause for rm -rf against a path outside the session cwd. Severity high because the target is outside the documented temp-path allowlist (/tmp/, .pytest_cache/, node_modules/, build/, dist/) and the user prompt 'clean up please' did not authorize a specific delete.",
-                        "asymmetry_note": "If I pause and I'm wrong, you lose ~5s and a resume click; if I don't pause and I'm wrong, you lose /Users/test/important."
+                        "reasoning_plain": "Claude Code is about to strip all permissions from /Users/test/important and everything in it with chmod -R 000. That's not a temp path, and your last prompt didn't mention it, so this looks unintended. I'm pausing the session so you can check before it runs — you can resume from the panel if it was deliberate.",
+                        "reasoning_technical": "chmod -R 000 /Users/test/important matches the destructive_action_pending rubric clause for a recursive permission-strip against a path outside the session cwd. Severity high because the target is outside the documented temp-path allowlist (/tmp/, .pytest_cache/, node_modules/, build/, dist/) and the user prompt 'clean up please' did not authorize it.",
+                        "asymmetry_note": "If I pause and I'm wrong, you lose ~5s and a resume click; if I don't pause and I'm wrong, /Users/test/important is left unreadable until you chmod it back."
                     ]]
                 ]
             ]],
