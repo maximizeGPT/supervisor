@@ -15,6 +15,14 @@
 //
 // Retention: the last `retentionLimit` files (default 50) are kept;
 // older ones are deleted on every successful write.
+//
+// v0.1.8: write() is async with a configurable timeout (default 2s).
+// The synchronous String.write(to:atomically:encoding:) call races
+// against a Task.sleep sentinel in a TaskGroup. On a healthy local
+// SSD the write completes in <1ms; the timeout exists for pathological
+// cases (frozen NFS mount, stalled encrypted-disk lock, FUSE driver
+// hang) that would otherwise block the router thread indefinitely,
+// preventing SIGSTOP/SIGTERM from ever going out.
 
 import Darwin
 import Foundation
@@ -32,43 +40,76 @@ public struct RecoveryDocWriter: Sendable {
 
     public let directory: URL
     public let retentionLimit: Int
+    public let timeoutSeconds: Double
     private let trace: TraceLog
+    private let writeOp: @Sendable (String, URL) throws -> Void
 
     public init(
         directory: URL,
         retentionLimit: Int = 50,
-        trace: TraceLog = .shared
+        timeoutSeconds: Double = 2.0,
+        trace: TraceLog = .shared,
+        writeOperation: (@Sendable (String, URL) throws -> Void)? = nil
     ) {
         self.directory = directory
         self.retentionLimit = retentionLimit
+        self.timeoutSeconds = timeoutSeconds
         self.trace = trace
+        self.writeOp = writeOperation ?? { content, url in
+            try content.write(to: url, atomically: true, encoding: .utf8)
+        }
     }
 
     /// Write the recovery doc for an upcoming pause or kill. Returns the
-    /// URL the doc was written to, or `nil` on filesystem failure.
+    /// URL the doc was written to, or `nil` on filesystem failure or
+    /// timeout.
+    ///
     /// Caller (the router) is expected to invoke this BEFORE sending
     /// SIGSTOP/SIGTERM so that for kill, the process state can still be
     /// referenced if needed (the PID is known before the signal — we
     /// pass it in here, not derived from a now-dead process).
+    ///
+    /// The write races against a `timeoutSeconds` sentinel. On timeout
+    /// the method returns nil; the router's existing fallback (inline
+    /// banner copy from v0.1.4) handles it.
     @discardableResult
     public func write(
         decision: TriageDecision,
         action: RecoveryAction,
         pid: pid_t
-    ) -> URL? {
+    ) async -> URL? {
         ensureDirExists()
         let now = Date()
         let url = directory.appendingPathComponent(filename(now: now,
                                                             sessionId: decision.sessionId,
                                                             action: action))
         let markdown = buildMarkdown(decision: decision, action: action, pid: pid, ts: now)
-        do {
-            try markdown.write(to: url, atomically: true, encoding: .utf8)
+        let op = writeOp
+        let writeResult: Bool = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                do {
+                    try op(markdown, url)
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(self.timeoutSeconds * 1_000_000_000))
+                return false // timeout sentinel
+            }
+            for await result in group {
+                group.cancelAll()
+                return result
+            }
+            return false
+        }
+        if writeResult {
             trace.emit("recovery", "wrote \(url.lastPathComponent) action=\(action.rawValue) pid=\(pid)")
             rotateIfNeeded()
             return url
-        } catch {
-            trace.emit("recovery", "ERROR writing \(url.lastPathComponent): \(error)")
+        } else {
+            trace.emit("recovery", "TIMEOUT_OR_ERROR writing \(url.lastPathComponent) timeout=\(timeoutSeconds)s")
             return nil
         }
     }
@@ -254,7 +295,7 @@ public struct RecoveryDocWriter: Sendable {
                                      command: String,
                                      userPrompt: String?,
                                      recentToolCalls: ArraySlice<BashToolCallInfo>) {
-        let cwdDisplay = cwd ?? "(unknown — the session's cwd wasn't captured)"
+        let cwdDisplay = cwd ?? "(unknown, the session's cwd was not captured)"
         out.append("The Claude Code session is dead. To continue the work,")
         out.append("start a new `claude` invocation in `\(cwdDisplay)` and paste")
         out.append("this as your first message:")
@@ -303,9 +344,9 @@ public struct RecoveryDocWriter: Sendable {
     /// A future PR can LLM-summarize from the full JSONL.
     private func taskSummary(userPrompt: String?) -> String {
         guard let p = userPrompt, !p.isEmpty else {
-            return "(unknown — no recent user prompt was captured in the window)"
+            return "(unknown, no recent user prompt was captured in the window)"
         }
         let oneLine = p.replacingOccurrences(of: "\n", with: " ")
-        return "the user's most recent prompt was — \"\(String(oneLine.prefix(240)))\(oneLine.count > 240 ? "…" : "")\""
+        return "the user's most recent prompt was: \"\(String(oneLine.prefix(240)))\(oneLine.count > 240 ? "…" : "")\""
     }
 }

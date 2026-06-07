@@ -66,6 +66,15 @@ public struct ConfigPaths: Sendable {
         appSupportDir.appendingPathComponent("active-provider.json", isDirectory: false)
     }
 
+    /// `~/Library/Application Support/Supervisor/self-rebuild.marker`
+    /// Written by the deploy step right before relaunching a freshly
+    /// built Supervisor over the running one. The app reads it once at
+    /// launch, announces "Supervisor updated itself" on the hover, and
+    /// deletes it. Contents are an optional version string.
+    public var selfRebuildMarkerPath: URL {
+        appSupportDir.appendingPathComponent("self-rebuild.marker", isDirectory: false)
+    }
+
     /// `~/Library/Logs/Supervisor/supervisor.log`
     public var traceLogPath: URL {
         logsDir.appendingPathComponent("supervisor.log", isDirectory: false)

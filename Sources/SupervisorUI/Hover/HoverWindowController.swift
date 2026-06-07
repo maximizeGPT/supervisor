@@ -15,37 +15,37 @@
 // with the user's frontmost app; `[.canJoinAllSpaces, .stationary,
 // .ignoresCycle]` collection behavior survives hide/show cycles
 // without losing the top-right anchor.
+//
+// v0.1.7: expanded panel. Click on hover toggles a 480x360 panel
+// below the hover with recent flags, session metrics, and cost.
+//
+// v0.8.1: draggable hover. The user can grab and drag the hover window
+// anywhere on screen. A click (< 3pt movement) toggles the expanded
+// panel; a drag (>= 3pt) moves the window. Once dragged, the hover
+// remembers its user-set position and doesn't snap back to top-right.
 
 import AppKit
+import Combine
 import SwiftUI
 import SupervisorCore
 
 @MainActor
 public final class HoverWindowController {
 
-    /// Single source of truth for the hover panel's dimensions. Used at
-    /// init (contentRect), at position-time (origin math), and at every
-    /// re-anchor. Don't compute the size from `panel.frame.size` —
-    /// during early init the panel reports (0, 0) until the SwiftUI
-    /// hosting controller realizes its content. We hit that exact bug
-    /// during the Checkpoint C visual smoke: the hover ended up at
-    /// (1908, 2)–(2148, 42), only the leftmost 12 px on-screen. Caught
-    /// when I reported "some bubble top right but not sure".
+    /// Single source of truth for the hover panel's dimensions.
     public static let panelSize = NSSize(width: 240, height: 40)
+
+    /// Expanded panel dimensions per DESIGN.md section 6.2.
+    public static let expandedSize = NSSize(width: 480, height: 360)
+
+    /// Gap between hover and expanded panel.
+    private static let expandedGap: CGFloat = 4
 
     /// Pixel inset from the right edge and top edge of visibleFrame.
     private static let edgeInset: CGFloat = 12
 
-    /// Apps that host a tailable Claude Code session — terminal emulators
-    /// where the `claude` CLI runs, plus the Claude desktop app which
-    /// spawns `claude` internally. Frontmost bundle IDs not in this set
-    /// are treated as non-hosting and trigger hover hide.
-    ///
-    /// Long-term path: see Issue #3 (user-configurable host-app list)
-    /// for users on emulators not in the default set — Electron-based
-    /// VS Code / Cursor integrated terminals, mosh, tmux-over-ssh on a
-    /// remote, etc. Until that ships, additions land here.
-    public static let claudeCodeHostApps: Set<String> = [
+    /// Default apps that host a tailable Claude Code session.
+    public static let defaultHostApps: Set<String> = [
         "com.apple.Terminal",
         "com.googlecode.iterm2",
         "com.mitchellh.ghostty",
@@ -54,21 +54,41 @@ public final class HoverWindowController {
         "com.anthropic.claudefordesktop",
     ]
 
+    /// Live set: defaults + user config. Updated by `mergeUserConfig`.
+    public private(set) var claudeCodeHostApps: Set<String>
+
     private let vm: HoverViewModel
-    private let panel: NSPanel
+    private let panel: HoverPanel
+    private let expandedPanel: HoverPanel
     private let isAnySessionActive: () -> Bool
 
     private var workspaceObserver: NSObjectProtocol?
     private var pollTimer: Timer?
     private var currentlyVisible: Bool = false
+    private var expandedCancellable: AnyCancellable?
+    private var flashCancellable: AnyCancellable?
+    private var frameObserver: NSObjectProtocol?
+
+    /// True while the VM's actionFlash is lit. The hover is force-shown for
+    /// the duration so a substantial action (pause/kill/inject/dispatch/
+    /// self-extend/self-rebuild) is ALWAYS seen, even when the frontmost app
+    /// isn't a terminal — e.g. right after a self-deploy relaunch, when the
+    /// "Supervisor updated itself" announcement fires.
+    private var forcedVisibleByFlash: Bool = false
+
+    /// Once the user drags the hover, don't auto-position it anymore.
+    private var userHasRepositioned: Bool = false
 
     public init(
         vm: HoverViewModel,
-        isAnySessionActive: @escaping () -> Bool = { true }
+        isAnySessionActive: @escaping () -> Bool = { true },
+        additionalHostApps: [String] = []
     ) {
         self.vm = vm
         self.isAnySessionActive = isAnySessionActive
+        self.claudeCodeHostApps = Self.defaultHostApps.union(additionalHostApps)
 
+        // -- Hover panel (240x40) --
         let panel = HoverPanel(
             contentRect: NSRect(origin: .zero, size: Self.panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -80,23 +100,96 @@ public final class HoverWindowController {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        // `.canJoinAllSpaces` keeps the panel pinned to the active
-        // Space so alt-tab → different Space + alt-tab back doesn't
-        // strand the panel on the old Space. `.stationary` prevents
-        // Mission Control / Expose from grouping the panel with app
-        // windows. `.ignoresCycle` keeps the panel out of Cmd-` /
-        // Cmd-Tab cycles.
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
-        panel.isMovableByWindowBackground = false
+        // v0.8.1: enable native drag via isMovableByWindowBackground.
+        // Click vs drag is distinguished in HoverPanel's mouse handling.
+        panel.isMovableByWindowBackground = true
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
+
+        // The HoverView no longer has onTapGesture — click detection is
+        // handled at the NSPanel level to properly distinguish from drag.
         panel.contentViewController = NSHostingController(rootView: HoverView(vm: vm))
         self.panel = panel
+
+        // -- Expanded panel (480x360) --
+        let expanded = HoverPanel(
+            contentRect: NSRect(origin: .zero, size: Self.expandedSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: true
+        )
+        expanded.isFloatingPanel = true
+        expanded.level = .statusBar
+        expanded.isOpaque = false
+        expanded.backgroundColor = .clear
+        expanded.hasShadow = true
+        expanded.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        expanded.isMovableByWindowBackground = false
+        expanded.isReleasedWhenClosed = false
+        expanded.hidesOnDeactivate = false
+        expanded.contentViewController = NSHostingController(
+            rootView: ExpandedPanelView(vm: vm)
+        )
+        self.expandedPanel = expanded
+
+        // Wire callbacks now that all stored properties are initialized.
+        panel.onClick = { [weak vm] in
+            vm?.toggleExpanded()
+        }
+        panel.onDragStarted = { [weak self] in
+            self?.userHasRepositioned = true
+        }
+
+        // Observe vm.isExpanded to show/hide the expanded panel.
+        self.expandedCancellable = vm.$isExpanded
+            .removeDuplicates()
+            .sink { [weak self] isExpanded in
+                guard let self else { return }
+                if isExpanded {
+                    self.showExpanded()
+                } else {
+                    self.hideExpanded()
+                }
+            }
+
+        // Observe vm.actionFlash: force the hover visible for the duration
+        // of a substantial action's flash, then revert to the normal
+        // frontmost-terminal/session visibility gate. Without this, the
+        // flash (and the self-rebuild announcement) fire into a hidden
+        // window whenever a terminal isn't frontmost, which is why the user
+        // never saw it.
+        self.flashCancellable = vm.$actionFlash
+            .removeDuplicates()
+            .sink { [weak self] flashing in
+                guard let self else { return }
+                self.forcedVisibleByFlash = flashing
+                if flashing {
+                    self.forceShowForFlash()
+                } else {
+                    self.applyVisibility()
+                }
+            }
+
+        // Observe hover panel frame changes — re-anchor expanded panel
+        // when the hover is dragged to a new position.
+        self.frameObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.expandedPanel.isVisible else { return }
+            Task { @MainActor in self.positionExpanded() }
+        }
+    }
+
+    /// Merge user config into the live host-apps set.
+    public func mergeUserConfig(additionalHostApps: [String]) {
+        claudeCodeHostApps = Self.defaultHostApps.union(additionalHostApps)
+        applyVisibility()
     }
 
     public func present() {
-        // v0.1.4 Gap 8: don't unconditionally show. Hook up the
-        // visibility-deciding observer + poller, then apply once.
         registerWorkspaceObserver()
         startPollTimer()
         applyVisibility()
@@ -109,29 +202,73 @@ public final class HoverWindowController {
             panel.orderOut(nil)
             currentlyVisible = false
         }
+        hideExpanded()
+    }
+
+    // MARK: - Expanded panel show/hide
+
+    private func showExpanded() {
+        guard panel.isVisible else { return }
+        positionExpanded()
+        expandedPanel.alphaValue = 1.0
+        expandedPanel.orderFrontRegardless()
+    }
+
+    private func hideExpanded() {
+        expandedPanel.orderOut(nil)
+        expandedPanel.alphaValue = 0.0
+    }
+
+    /// Position expanded panel directly below the hover, right-aligned.
+    private func positionExpanded() {
+        let hoverFrame = panel.frame
+        expandedPanel.setContentSize(Self.expandedSize)
+        let origin = NSPoint(
+            x: hoverFrame.maxX - Self.expandedSize.width,
+            y: hoverFrame.minY - Self.expandedGap - Self.expandedSize.height
+        )
+        expandedPanel.setFrameOrigin(origin)
     }
 
     // MARK: - Visibility logic (Gap 8)
 
-    /// Compound visibility rule: show iff a Claude-Code-hosting app is
-    /// frontmost AND Supervisor is tailing at least one session.
-    /// Re-applied on every workspace activation event + on a 3s poll.
+    /// Bring the hover forward for an action flash, overriding the normal
+    /// frontmost-terminal/session gate. Visibility reverts to that gate when
+    /// the flash ends.
+    private func forceShowForFlash() {
+        if !userHasRepositioned {
+            positionTopRight()
+        }
+        panel.orderFrontRegardless()
+        currentlyVisible = true
+    }
+
     private func applyVisibility() {
+        // While a substantial action is flashing, keep the hover up no
+        // matter what — the whole point is that the user sees Supervisor
+        // act. The poll timer and workspace observer both route here, so
+        // this guard also stops them hiding the hover mid-flash.
+        if forcedVisibleByFlash {
+            if !currentlyVisible { forceShowForFlash() }
+            return
+        }
+
         let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        let frontmostHostsClaudeCode = frontmostBundleID.map(Self.claudeCodeHostApps.contains) ?? false
+        let frontmostHostsClaudeCode = frontmostBundleID.map(claudeCodeHostApps.contains) ?? false
         let sessionActive = isAnySessionActive()
         let shouldShow = frontmostHostsClaudeCode && sessionActive
 
         if shouldShow && !currentlyVisible {
-            positionTopRight()
-            // `.nonactivatingPanel` + `orderFrontRegardless()` shows
-            // the panel without activating Supervisor — focus stays
-            // with the user's frontmost terminal.
+            // Only auto-position if the user hasn't manually dragged.
+            if !userHasRepositioned {
+                positionTopRight()
+            }
             panel.orderFrontRegardless()
             currentlyVisible = true
         } else if !shouldShow && currentlyVisible {
             panel.orderOut(nil)
             currentlyVisible = false
+            vm.isExpanded = false
         }
     }
 
@@ -143,12 +280,6 @@ public final class HoverWindowController {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            // The observer queue is `.main`, so this fires on the main
-            // thread; we hop to the @MainActor context explicitly to
-            // satisfy Swift concurrency without doubling up the dispatch.
-            // Local-bind self before Task so Swift 5.10 (CI) accepts the
-            // capture pattern — see HoverViewModel.swift for the long
-            // form of this comment.
             guard let self else { return }
             Task { @MainActor in self.applyVisibility() }
         }
@@ -161,9 +292,6 @@ public final class HoverWindowController {
         }
     }
 
-    /// 3s poll catches the "session became active while my terminal was
-    /// already frontmost" case (the NSWorkspace event only fires on app
-    /// switches). Cheap — one closure tick + a string lookup.
     private func startPollTimer() {
         guard pollTimer == nil else { return }
         pollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
@@ -180,15 +308,7 @@ public final class HoverWindowController {
     private func positionTopRight() {
         guard let screen = NSScreen.main else { return }
         let frame = screen.visibleFrame
-
-        // Belt: pin the content size now so layout has the right rect.
         panel.setContentSize(Self.panelSize)
-
-        // Suspenders: compute origin from the known constant, not from
-        // `panel.frame.size`. If the SwiftUI hosting controller hasn't
-        // realized layout yet (Checkpoint-C-visual-smoke bug), frame.size
-        // can be (0, 0) — using the constant makes the position correct
-        // regardless of init timing.
         let origin = NSPoint(
             x: frame.maxX - Self.panelSize.width - Self.edgeInset,
             y: frame.maxY - Self.panelSize.height - Self.edgeInset
@@ -197,10 +317,61 @@ public final class HoverWindowController {
     }
 }
 
-/// `canBecomeKey` override on a borderless NSPanel. Default borderless
-/// panels can't become key, which would block the v0.1.7+ expanded-panel
-/// interactions. For v0.1.0 the hover is read-only — we override anyway so
-/// the foundation is in place.
-private final class HoverPanel: NSPanel {
+// MARK: - HoverPanel (click vs drag distinction)
+
+/// Custom NSPanel that distinguishes a click (< 3pt movement) from a drag.
+/// `canBecomeKey` is overridden so the expanded panel can receive input.
+/// `isMovableByWindowBackground` is true so macOS handles the native drag;
+/// this class tracks mouse-down/up to detect whether it was a click.
+final class HoverPanel: NSPanel {
+
+    /// Movement threshold: if the mouse moves less than this many points
+    /// between mouseDown and mouseUp, it's a click, not a drag.
+    private static let clickThreshold: CGFloat = 3.0
+
+    /// Called when the user clicks (not drags) the panel.
+    var onClick: (() -> Void)?
+
+    /// Called when the user starts dragging (movement exceeds threshold).
+    var onDragStarted: (() -> Void)?
+
+    private var mouseDownLocation: NSPoint?
+    private var didNotifyDrag = false
+
     override var canBecomeKey: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownLocation = NSEvent.mouseLocation
+        didNotifyDrag = false
+        super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        super.mouseDragged(with: event)
+        // Check if we've exceeded the drag threshold.
+        if !didNotifyDrag, let start = mouseDownLocation {
+            let current = NSEvent.mouseLocation
+            let dx = current.x - start.x
+            let dy = current.y - start.y
+            let distance = sqrt(dx * dx + dy * dy)
+            if distance >= Self.clickThreshold {
+                didNotifyDrag = true
+                onDragStarted?()
+            }
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        guard let start = mouseDownLocation else { return }
+        let end = NSEvent.mouseLocation
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        let distance = sqrt(dx * dx + dy * dy)
+        if distance < Self.clickThreshold {
+            // Click — not a drag.
+            onClick?()
+        }
+        mouseDownLocation = nil
+    }
 }

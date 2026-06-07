@@ -143,6 +143,37 @@ final class StorageTests: XCTestCase {
         XCTAssertEqual(recent[0].evidenceUUIDList, ["evt-1", "evt-2"])
     }
 
+    func testCountCurrentWorkWindowScopesToRecentRun() throws {
+        // The badge must show the current work window, NOT the all-time total
+        // (the 13k bug). A work window = the most recent contiguous run of
+        // flags with no gap >= 60 min; after an idle gap, a fresh launch is 0.
+        let db = try SupervisorDatabase.inMemory()
+        try SessionStore(database: db).upsert(StoredSession(
+            id: "s", projectHash: "p", cwd: "/c",
+            startedAt: Date(), lastSeenAt: Date(), jsonlPath: "/x"))
+        let store = FlagStore(database: db)
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func mk(_ secondsAgo: TimeInterval) -> StoredFlag {
+            StoredFlag(sessionId: "s", ts: now.addingTimeInterval(-secondsAgo),
+                       category: "c", severity: .medium, action: .notify,
+                       reasoningPlain: "p", reasoningTechnical: "t")
+        }
+        // Current window: 3 flags within minutes of now and each other.
+        try store.insert(mk(60)); try store.insert(mk(120)); try store.insert(mk(180))
+        // Older burst, after a >60 min gap.
+        try store.insert(mk(7200)); try store.insert(mk(7260))
+
+        XCTAssertEqual(try store.count(), 5, "all-time count stays unscoped")
+        XCTAssertEqual(try store.countCurrentWorkWindow(now: now), 3,
+                       "work window = the recent contiguous run, not all-time")
+        // A launch long after the last flag = fresh window = 0.
+        XCTAssertEqual(try store.countCurrentWorkWindow(now: now.addingTimeInterval(2 * 3600)), 0,
+                       "after an idle gap the current window is empty")
+        // Empty table = 0.
+        let empty = FlagStore(database: try SupervisorDatabase.inMemory())
+        XCTAssertEqual(try empty.countCurrentWorkWindow(now: now), 0)
+    }
+
     func testFlagMarkUserResponse() throws {
         let db = try SupervisorDatabase.inMemory()
         try SessionStore(database: db).upsert(StoredSession(

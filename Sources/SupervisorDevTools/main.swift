@@ -110,6 +110,40 @@ case "seed-offsets-eof":
         }
     }
     print("ok: seeded \(seeded) sessions at EOF")
+case "inject-test":
+    // Drive the REAL CGEventInjector against a target pid so the targeting
+    // fix can be verified on screen: with a different app frontmost, the text
+    // must land in the host of <pid>, never the frontmost app.
+    guard args.count >= 4, let pid = Int32(args[2]) else {
+        print("usage: SupervisorDevTools inject-test <host-pid> <text>")
+        exit(2)
+    }
+    let text = args[3]
+    let sem = DispatchSemaphore(value: 0)
+    // `result` is written on @MainActor and read here after sem.signal();
+    // the semaphore is the happens-before edge. Using a reference box instead
+    // of a captured `var` keeps this concurrency-clean — strict concurrency
+    // (Swift 6, which CI's toolchain enforces) rejects mutating a captured var
+    // from concurrently-executing code. Local `swift test` never caught it
+    // because it doesn't build this dev-tools target.
+    final class ResultBox: @unchecked Sendable { var value = "ERROR: did not run" }
+    let result = ResultBox()
+    Task { @MainActor in
+        let injector = CGEventInjector()
+        do {
+            let n = try await injector.inject(text: text, claudeCodePID: pid, targetWindowTitle: nil)
+            result.value = "ok: injected \(n) bytes targeting host of pid \(pid)"
+        } catch {
+            result.value = "degraded/threw: \(error)"
+        }
+        sem.signal()
+    }
+    // Pump the main run loop so the @MainActor inject can progress without
+    // deadlocking on a blocking wait.
+    while sem.wait(timeout: .now()) == .timedOut {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    }
+    print(result.value)
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)

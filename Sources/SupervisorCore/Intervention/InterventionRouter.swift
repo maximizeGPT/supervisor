@@ -32,6 +32,14 @@ public final class InterventionRouter {
     private let signalSender: any SignalSender
     private let injector: any Injector
     private let recoveryDocWriter: RecoveryDocWriter?
+    /// How many Claude Code sessions Supervisor currently considers live.
+    /// Used to gate inject delivery: when >1 session is active AND the locator
+    /// could not pin THIS session's own process (it fell back to the shared
+    /// Claude desktop host, whose single window multiplexes sessions as tabs),
+    /// a paste-to-frontmost could land in the WRONG session. Defaults to a
+    /// single-session world `{ 1 }`, which disables the gate for tests and
+    /// single-session users (no behavior change).
+    private let activeSessionCount: () -> Int
     private let trace: TraceLog
 
     public init(
@@ -40,6 +48,7 @@ public final class InterventionRouter {
         signalSender: any SignalSender = DarwinSignalSender(),
         injector: any Injector,
         recoveryDocWriter: RecoveryDocWriter? = nil,
+        activeSessionCount: @escaping () -> Int = { 1 },
         trace: TraceLog = .shared
     ) {
         self.notifier = notifier
@@ -47,7 +56,39 @@ public final class InterventionRouter {
         self.signalSender = signalSender
         self.injector = injector
         self.recoveryDocWriter = recoveryDocWriter
+        self.activeSessionCount = activeSessionCount
         self.trace = trace
+    }
+
+    /// The 2026-06-04 misroute guard. True when delivering into the resolved
+    /// target risks the WRONG session: the locator fell back to a shared host
+    /// (`handle.cwd != targetCwd` — a precise CLI match sets cwd == targetCwd,
+    /// the Claude.app fallback sets cwd "/") AND more than one session is live.
+    /// In that case paste-to-frontmost cannot be trusted to hit the session the
+    /// dispatch is FOR — a landing-page dispatch once landed in the supervisor
+    /// repo session. The caller degrades to a notify banner instead.
+    private func targetUnconfirmedAcrossSessions(_ handle: ProcessHandle, targetCwd: String, sessionCount: Int) -> Bool {
+        sessionCount > 1 && handle.cwd != targetCwd
+    }
+
+    /// Resolve the process to deliver into. Prefer an exact **session-id**
+    /// match (a CONFIRMED target — safe to inject even with concurrent
+    /// sessions, because the id pins WHICH one); fall back to the cwd walk,
+    /// which the caller still gates with the multi-session check since cwd
+    /// can't confirm the session (the `claude` proc cwd is usually the home
+    /// dir, not the project). Returns nil when neither resolves. This is what
+    /// turns "degrade because I can't tell which of your sessions this is for"
+    /// into "inject into the right one."
+    private func resolveInjectTarget(_ decision: TriageDecision, cwd: String, op: String) -> (handle: ProcessHandle, sessionConfirmed: Bool)? {
+        if !decision.sessionId.isEmpty,
+           let byId = locator.locate(bySessionId: decision.sessionId) {
+            trace.emit("router", "intervention.\(op).target_by_session_id pid=\(byId.pid) session=\(decision.sessionId) exec=\(byId.execPath)")
+            return (byId, true)
+        }
+        if let byCwd = locator.locate(targetCwd: cwd) {
+            return (byCwd, false)
+        }
+        return nil
     }
 
     /// Dispatch a triage decision through the right executor. Always
@@ -58,6 +99,21 @@ public final class InterventionRouter {
             await postNotify(decision)
         case .inject:
             await injectOrDegrade(decision)
+        case .continue:
+            // v0.4.0 Part B: the dispatch path. The TriageEngine has
+            // already run the second-stage Dispatcher call and written
+            // its results into the candidate (nextTaskProposal +
+            // confidence + asymmetryNote). The router branches on
+            // confidence:
+            //   high   → inject the next_task_proposal into Claude Code
+            //   medium → notify with the proposal text (propose-and-wait)
+            //   low    → notify with the reasoning (supervisor can't pick)
+            await routeContinue(decision)
+        case .selfExtend:
+            // v0.5.0: SelfExtender is primarily hook-driven. In-app, degrade
+            // to notify — the hook handles the actual self-extension logic.
+            trace.emit("router", "intervention.selfExtend.degrade_to_notify reason=in_app_not_implemented")
+            await postNotify(decision)
         case .pause:
             await signalOrDegrade(decision, signal: SIGSTOP, opName: "pause")
         case .kill:
@@ -89,13 +145,25 @@ public final class InterventionRouter {
             await postInjectDegraded(decision, intendedText: text, reason: "no_cwd_on_decision")
             return
         }
-        guard let handle = locator.locate(targetCwd: cwd) else {
+        guard let target = resolveInjectTarget(decision, cwd: cwd, op: "inject") else {
             trace.emit("router", "intervention.inject.degraded reason=locator_nil cwd=\(cwd)")
             await postInjectDegraded(decision, intendedText: text, reason: "locator_nil")
             return
         }
+        let handle = target.handle
+        // A session-id match IS the confirmation of WHICH session we're hitting,
+        // so it bypasses the cwd-era multi-session gate. The cwd fallback can't
+        // confirm the session, so it stays gated to avoid a cross-session paste.
+        if !target.sessionConfirmed {
+            let sessionCount = activeSessionCount()
+            if targetUnconfirmedAcrossSessions(handle, targetCwd: cwd, sessionCount: sessionCount) {
+                trace.emit("router", "intervention.inject.degraded reason=multi_session_unconfirmed_target sessions=\(sessionCount) cwd=\(cwd) handle_cwd=\(handle.cwd)")
+                await postInjectDegraded(decision, intendedText: text, reason: "multi_session_unconfirmed_target")
+                return
+            }
+        }
         do {
-            let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid)
+            let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)
             trace.emit("router", "intervention.inject.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
             _ = await notifier.postInterventionResult(
                 decision: decision,
@@ -108,6 +176,7 @@ public final class InterventionRouter {
             case .unsupportedHost(let b):     reason = "unsupported_host_\(b)"
             case .activationFailed(let b):    reason = "activation_failed_\(b)"
             case .eventCreationFailed:        reason = "event_creation_failed"
+            case .targetUnresolvable(let r):  reason = "target_unresolvable_\(r)"
             }
             trace.emit("router", "intervention.inject.degraded reason=\(reason) pid=\(handle.pid) cwd=\(cwd)")
             await postInjectDegraded(decision, intendedText: text, reason: reason)
@@ -121,6 +190,136 @@ public final class InterventionRouter {
         _ = await notifier.postInterventionResult(
             decision: decision,
             outcome: .injectDegraded(intendedText: intendedText, reason: reason)
+        )
+    }
+
+    /// v0.4.0 Part B: dispatch a worker_idle_post_completion flag. The
+    /// engine has already populated `nextTaskProposal` (the prompt to
+    /// inject) and `confidence` (which decides whether to inject vs.
+    /// surface). asymmetryNote carries the dispatcher's justification —
+    /// it lands in the low/medium banner so the user sees WHY supervisor
+    /// went quiet or proposed this specific task.
+    private func routeContinue(_ decision: TriageDecision) async {
+        let confidence = decision.candidate.confidence ?? "low"
+        let proposal = decision.candidate.nextTaskProposal ?? ""
+        let justification = decision.candidate.asymmetryNote ?? "(no justification)"
+
+        switch confidence {
+        case "high":
+            await continueHighInjectOrDegrade(
+                decision: decision,
+                proposal: proposal,
+                justification: justification
+            )
+        case "medium":
+            // Propose-and-wait. Even if a high-confidence dispatch could
+            // theoretically happen, medium means we DON'T inject — we
+            // surface and let the user decide. Same path the spec calls
+            // out as "propose and wait" from Part A.
+            trace.emit("router", "intervention.continue.proposed_medium_confidence session=\(decision.sessionId) proposal_bytes=\(proposal.utf8.count)")
+            _ = await notifier.postInterventionResult(
+                decision: decision,
+                outcome: .continueProposedMedium(
+                    proposal: proposal,
+                    justification: justification
+                )
+            )
+        default:
+            // .low (and anything else — defensive fallback). Surface the
+            // dispatcher's reasoning so the user understands why
+            // supervisor went quiet rather than just hanging.
+            trace.emit("router", "intervention.continue.degraded_low_confidence session=\(decision.sessionId) reason=\"\(justification.prefix(120))\"")
+            _ = await notifier.postInterventionResult(
+                decision: decision,
+                outcome: .continueLowConfidence(reasoning: justification)
+            )
+        }
+    }
+
+    /// High-confidence dispatch — actually CGEventPost the next prompt
+    /// into Claude Code. On any locator/injector failure, degrade to
+    /// the medium-confidence propose-and-wait banner so the user can
+    /// paste the proposal themselves. Per the v0.4.0 Part B spec:
+    /// "If locator fails: degrade to medium-confidence behavior."
+    private func continueHighInjectOrDegrade(
+        decision: TriageDecision,
+        proposal: String,
+        justification: String
+    ) async {
+        guard !proposal.isEmpty else {
+            // No proposal text means there's nothing to inject. This
+            // shouldn't happen with confidence=high (Dispatcher
+            // guarantees a proposal on high), but defend against it
+            // anyway: degrade to a low-confidence banner with a
+            // diagnostic justification.
+            trace.emit("router", "intervention.continue.degraded reason=no_proposal_text_on_high_confidence session=\(decision.sessionId)")
+            _ = await notifier.postInterventionResult(
+                decision: decision,
+                outcome: .continueLowConfidence(
+                    reasoning: "Dispatcher returned high confidence with no proposal text. Falling back to user pick."
+                )
+            )
+            return
+        }
+
+        guard let cwd = decision.cwd, !cwd.isEmpty else {
+            trace.emit("router", "intervention.continue.degraded reason=no_cwd_on_decision session=\(decision.sessionId)")
+            await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+            return
+        }
+        guard let target = resolveInjectTarget(decision, cwd: cwd, op: "continue") else {
+            trace.emit("router", "intervention.continue.degraded reason=locator_nil cwd=\(cwd)")
+            await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+            return
+        }
+        let handle = target.handle
+        // session-id match confirms the target → bypass the cwd-era gate.
+        if !target.sessionConfirmed {
+            let sessionCount = activeSessionCount()
+            if targetUnconfirmedAcrossSessions(handle, targetCwd: cwd, sessionCount: sessionCount) {
+                trace.emit("router", "intervention.continue.degraded reason=multi_session_unconfirmed_target sessions=\(sessionCount) cwd=\(cwd) handle_cwd=\(handle.cwd)")
+                await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+                return
+            }
+        }
+        do {
+            let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)
+            trace.emit("router", "intervention.continue.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
+            let head = String(proposal.prefix(80))
+            _ = await notifier.postInterventionResult(
+                decision: decision,
+                outcome: .continueFired(pid: handle.pid, bytes: bytes, promptHead: head)
+            )
+        } catch let err as InjectError {
+            let reason: String
+            switch err {
+            case .noHostingApp:               reason = "no_hosting_app"
+            case .unsupportedHost(let b):     reason = "unsupported_host_\(b)"
+            case .activationFailed(let b):    reason = "activation_failed_\(b)"
+            case .eventCreationFailed:        reason = "event_creation_failed"
+            case .targetUnresolvable(let r):  reason = "target_unresolvable_\(r)"
+            }
+            trace.emit("router", "intervention.continue.degraded reason=\(reason) pid=\(handle.pid) cwd=\(cwd)")
+            await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+        } catch {
+            trace.emit("router", "intervention.continue.degraded reason=unexpected_throw=\(error) pid=\(handle.pid) cwd=\(cwd)")
+            await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+        }
+    }
+
+    /// Inject failed but we still have the proposal — degrade to the
+    /// medium-confidence banner so the user can paste manually.
+    private func continueDegradeToMedium(
+        _ decision: TriageDecision,
+        proposal: String,
+        justification: String
+    ) async {
+        _ = await notifier.postInterventionResult(
+            decision: decision,
+            outcome: .continueProposedMedium(
+                proposal: proposal,
+                justification: justification
+            )
         )
     }
 
@@ -144,7 +343,7 @@ public final class InterventionRouter {
         // second. The doc reads "Supervisor fired <action>" past-tense
         // because at the user's read-time, the signal has landed.
         let recoveryAction: RecoveryAction = (signal == SIGSTOP) ? .pause : .kill
-        let recoveryDocPath = recoveryDocWriter?.write(
+        let recoveryDocPath = await recoveryDocWriter?.write(
             decision: decision,
             action: recoveryAction,
             pid: handle.pid

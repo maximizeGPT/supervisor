@@ -14,11 +14,26 @@ public enum FlagSeverity: String, Codable, Sendable, CaseIterable {
 }
 
 public enum FlagAction: String, Codable, Sendable, CaseIterable {
-    case notify, inject, pause, kill
+    // Action ladder per PRINCIPLES.md §3d, lightest → heaviest:
+    //   - notify:   banner only; user decides
+    //   - inject:   types ≤200 chars (engineering-answer or rewritten taste
+    //               question) into the worker's input
+    //   - continue: types a NEW TASK PROMPT (multi-paragraph) into the
+    //               worker's input when the worker is idle post-completion.
+    //               Heavier than inject because it triggers hours of
+    //               follow-on work; lighter than pause because it doesn't
+    //               stop the session. v0.4.0+.
+    //   - pause:    SIGSTOP — freezes the worker; recoverable
+    //   - kill:     SIGTERM — terminates the worker; not recoverable
+    //   - selfExtend: v0.5.0. SelfExtender diagnoses dispatch failures
+    //                 and produces a fix prompt. Heavier than continue
+    //                 (it modifies Supervisor's own infrastructure) but
+    //                 lighter than pause (the session stays alive).
+    case notify, inject, `continue`, selfExtend, pause, kill
 }
 
 public enum FlagUserResponse: String, Codable, Sendable, CaseIterable {
-    case approved, dismissed, falsePositive = "false_positive"
+    case approved, dismissed, falsePositive = "false_positive", rejected
 }
 
 // MARK: - Session
@@ -152,6 +167,86 @@ public struct StoredFlag: Codable, FetchableRecord, PersistableRecord, Sendable,
         case haikuOutputTokens = "haiku_output_tokens"
         case sonnetInputTokens = "sonnet_input_tokens"
         case sonnetOutputTokens = "sonnet_output_tokens"
+    }
+}
+
+// MARK: - Loop dispatch (v0.4.0 Part C)
+
+/// One row of the `loop_dispatches` ledger — recorded every time the
+/// Dispatcher returns a result. The LoopController writes these and
+/// queries the recent rows to (a) decide the
+/// `prior_dispatches_considered` count for the NEXT dispatch, and
+/// (b) check the "3 consecutive low-confidence" hard-stop condition.
+///
+/// `responseShape` is the source of truth for which DispatchResult
+/// case fired: "ready" | "lowConfidence" | "error". For "ready" rows,
+/// confidence + selectedPath + (optional) selectedIssueNumber are
+/// populated. For "lowConfidence" rows, confidence is set to "low"
+/// and selectedPath to "low_confidence_no_action". For "error" rows,
+/// confidence is nil and the justification holds the error reason.
+public struct StoredLoopDispatch: Codable, FetchableRecord, PersistableRecord, Sendable, Equatable {
+
+    public static let databaseTableName = "loop_dispatches"
+
+    public var id: Int64?
+    public var sessionId: String
+    public var ts: Date
+    public var responseShape: String                   // ready | lowConfidence | error
+    public var confidence: String?                     // high | medium | low — nil for error
+    public var selectedPath: String?                   // continue_branch | transition_to_issue | low_confidence_no_action
+    public var selectedIssueNumber: Int?
+    public var taskProposalHead: String                // first ~200 chars of next_task_proposal
+    public var justification: String
+    public var priorDispatchesConsidered: Int          // value at input time
+    public var haikuInputTokens: Int?
+    public var haikuOutputTokens: Int?
+
+    public init(
+        id: Int64? = nil,
+        sessionId: String,
+        ts: Date = Date(),
+        responseShape: String,
+        confidence: String? = nil,
+        selectedPath: String? = nil,
+        selectedIssueNumber: Int? = nil,
+        taskProposalHead: String = "",
+        justification: String = "",
+        priorDispatchesConsidered: Int = 0,
+        haikuInputTokens: Int? = nil,
+        haikuOutputTokens: Int? = nil
+    ) {
+        self.id = id
+        self.sessionId = sessionId
+        self.ts = ts
+        self.responseShape = responseShape
+        self.confidence = confidence
+        self.selectedPath = selectedPath
+        self.selectedIssueNumber = selectedIssueNumber
+        self.taskProposalHead = taskProposalHead
+        self.justification = justification
+        self.priorDispatchesConsidered = priorDispatchesConsidered
+        self.haikuInputTokens = haikuInputTokens
+        self.haikuOutputTokens = haikuOutputTokens
+    }
+
+    /// GRDB hook — let SQLite assign the integer id on insert.
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sessionId = "session_id"
+        case ts
+        case responseShape = "response_shape"
+        case confidence
+        case selectedPath = "selected_path"
+        case selectedIssueNumber = "selected_issue_number"
+        case taskProposalHead = "task_proposal_head"
+        case justification
+        case priorDispatchesConsidered = "prior_dispatches_considered"
+        case haikuInputTokens = "haiku_input_tokens"
+        case haikuOutputTokens = "haiku_output_tokens"
     }
 }
 

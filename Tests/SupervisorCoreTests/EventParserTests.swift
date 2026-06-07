@@ -43,6 +43,27 @@ final class EventParserTests: XCTestCase {
         XCTAssertEqual(events2.filter { if case .sessionStart = $0 { return true }; return false }.count, 0)
     }
 
+    func testSessionStartSkipsCwdlessLeadInAndResolvesRealCwd() {
+        // Real session files lead with ai-title / mode / queue-operation that
+        // carry NO cwd; the cwd appears on the first user/assistant event.
+        // sessionStart must surface the REAL cwd, never "<unknown>".
+        let p = parser()
+        func has(_ events: [SupervisorEvent]) -> Bool {
+            events.contains { if case .sessionStart = $0 { return true }; return false }
+        }
+        let lead1 = p.parse(line: #"{"type":"ai-title","timestamp":"2026-05-21T19:36:19.8Z","sessionId":"s","aiTitle":"t"}"#)
+        let lead2 = p.parse(line: #"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-05-21T19:36:19.9Z","sessionId":"s","content":"hi"}"#)
+        XCTAssertFalse(has(lead1) || has(lead2), "cwd-less lead-in events must NOT emit sessionStart")
+
+        let user = p.parse(line: #"{"type":"user","timestamp":"2026-05-21T19:36:20.0Z","sessionId":"s","cwd":"/Users/main/supervisor","gitBranch":"autonomous-x","message":{"role":"user","content":"hello"}}"#)
+        guard let ss = user.first(where: { if case .sessionStart = $0 { return true }; return false }),
+              case .sessionStart(let info) = ss else {
+            return XCTFail("expected sessionStart from the first cwd-bearing event; got \(user)")
+        }
+        XCTAssertEqual(info.cwd, "/Users/main/supervisor", "cwd must be the real project, not <unknown>")
+        XCTAssertEqual(info.gitBranch, "autonomous-x")
+    }
+
     // MARK: - User prompt
 
     func testUserPromptAsString() {

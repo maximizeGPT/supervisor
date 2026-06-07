@@ -42,6 +42,9 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private var sessionStore: SessionStore?
     private var flagStore: FlagStore?
     private var costStore: CostStore?
+    private var loopDispatchStore: LoopDispatchStore?
+    private var loopController: LoopController?
+    private var configWatcher: ConfigWatcher?
     private var llm: LLMClient?
     private var triageEngine: TriageEngine?
     private var discovery: SessionDiscovery?
@@ -74,6 +77,11 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         trace.emit("app", "applicationDidFinishLaunching pid=\(ProcessInfo.processInfo.processIdentifier)")
+
+        // v0.8.1: single-instance guard. Kill any prior Supervisor
+        // instance so we don't get duplicate hover windows after a
+        // self-rebuild/relaunch.
+        terminatePriorInstances()
 
         // v0.2.0: "has key" now means a key exists for whatever provider
         // the user marked as active. Falls back to .anthropic for fresh
@@ -149,6 +157,10 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             self.sessionStore = SessionStore(database: db)
             self.flagStore = FlagStore(database: db)
             self.costStore = CostStore(database: db)
+            // v0.4.0 Part C/D: continuous-loop dispatch ledger lives in
+            // the same SQLite DB. Migration v3 (loop_dispatches table)
+            // ran during the SupervisorDatabase init above.
+            self.loopDispatchStore = LoopDispatchStore(database: db)
             trace.emit("app", "storage opened at \(paths.databasePath.path)")
         } catch {
             trace.emit("app", "FATAL: storage open failed: \(error)")
@@ -158,16 +170,79 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // 2. Bus + Hover
         let bus = EventBus(trace: trace)
         self.bus = bus
-        let hoverVM = HoverViewModel(bus: bus, trace: trace)
+        // Seed the badge with the CURRENT WORK WINDOW's flag count, not the
+        // all-time total. The all-time count (13k+ after months of use) is not
+        // a useful "what just happened" badge; the work-window count resets
+        // after an idle gap so a fresh launch shows a sane number (often 0).
+        // All-time data stays in the DB — this scopes the DISPLAY, not the data.
+        let historicFlagCount = (try? flagStore?.countCurrentWorkWindow(now: Date())) ?? 0
+        // v0.1.7: pass stores + model name for the expanded panel.
+        let activeProviderForHover = (try? activeProviderStore.read()) ?? .anthropic
+        let hoverVM = HoverViewModel(
+            bus: bus,
+            trace: trace,
+            initialFlagCount: historicFlagCount,
+            costStore: costStore,
+            flagStore: flagStore,
+            modelName: activeProviderForHover.defaultTriageModel
+        )
         self.hoverVM = hoverVM
         // v0.1.4 Gap 8: hover visibility depends on whether Supervisor
         // is actually tailing a session. discovery is constructed later
         // (step 6) so we read it lazily via a closure capturing self.
-        let hoverWindow = HoverWindowController(vm: hoverVM, isAnySessionActive: { [weak self] in
-            (self?.discovery?.activeSessions().isEmpty == false)
-        })
+        // Load user config (Issue #3: additional host apps from config.yaml).
+        let userConfig = UserConfig.load(from: paths.configPath)
+        let hoverWindow = HoverWindowController(
+            vm: hoverVM,
+            isAnySessionActive: { [weak self] in
+                (self?.discovery?.activeSessions().isEmpty == false)
+            },
+            additionalHostApps: userConfig.additionalHostApps
+        )
         self.hoverWindow = hoverWindow
         hoverWindow.present()
+
+        // Self-rebuild announcement: if the deploy step left a marker, the
+        // app was just rebuilt and relaunched over a running instance.
+        // Announce it on the hover so the user sees Supervisor updated
+        // itself, then delete the marker so it only shows once.
+        let marker = paths.selfRebuildMarkerPath
+        if let version = try? String(contentsOf: marker, encoding: .utf8) {
+            let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
+            hoverVM.announceSelfRebuild(version: trimmed.isEmpty ? nil : trimmed)
+            try? FileManager.default.removeItem(at: marker)
+            trace.emit("app", "self-rebuild marker found; announced and cleared")
+        }
+
+        // Debug affordance: SUPERVISOR_DEBUG_FLASH=1 fires a sample action
+        // flash every few seconds after launch, so the action-flash
+        // animation can be verified on screen without waiting for a real
+        // pause/kill. Inert unless the env var is set. This is how to
+        // confirm the flash that "kept getting shipped but was never seen."
+        if ProcessInfo.processInfo.environment["SUPERVISOR_DEBUG_FLASH"] == "1" {
+            trace.emit("app", "DEBUG_FLASH enabled; holding a continuous sample flash")
+            Task { @MainActor [weak hoverVM] in
+                // Re-trigger faster than the 2.5s auto-off so the flash stays
+                // lit continuously for ~90s, making on-screen verification
+                // timing-independent (any capture in the window shows it).
+                for i in 0..<60 {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    guard let vm = hoverVM else { return }
+                    vm.recordAction(
+                        action: .pause,
+                        description: "Paused Claude Code. Needs your attention."
+                    )
+                    if i == 0 { trace.emit("app", "DEBUG_FLASH holding continuous flash") }
+                }
+            }
+        }
+
+        // Watch config.yaml for live changes — FSEvents fires on write/rename.
+        let watcher = ConfigWatcher(configPath: paths.configPath, trace: trace) { [weak hoverWindow] config in
+            hoverWindow?.mergeUserConfig(additionalHostApps: config.additionalHostApps)
+        }
+        watcher.start()
+        self.configWatcher = watcher
 
         // 3. LLM client (key required — should be present post-onboarding).
         // v0.2.0: provider is whatever the user picked in onboarding (or
@@ -194,23 +269,64 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             directory: paths.recoveryDir,
             trace: trace
         )
+        let locator = LiveProcessLocator(trace: trace)
+        let signalSender = DarwinSignalSender()
         let router = InterventionRouter(
             notifier: notifier,
-            locator: LiveProcessLocator(trace: trace),
-            signalSender: DarwinSignalSender(),
+            locator: locator,
+            signalSender: signalSender,
             injector: CGEventInjector(trace: trace),
             recoveryDocWriter: recoveryWriter,
+            // Count sessions seen in the last 10 minutes — the concurrency
+            // window for "is more than one Claude Code session live right now."
+            // Gates desktop-app inject delivery so a dispatch for one session
+            // can't be typed into another (the 2026-06-04 misroute).
+            activeSessionCount: { [weak self] in
+                guard let store = self?.sessionStore else { return 1 }
+                let cutoff = Date().addingTimeInterval(-600)
+                let n = (try? store.all().filter { $0.lastSeenAt >= cutoff }.count) ?? 1
+                return max(n, 1)
+            },
             trace: trace
         )
         self.router = router
 
+        // v0.1.7: wire the resume handler for the expanded panel's
+        // Resume button. Uses the same locator + signal sender as the
+        // router's pause path, but sends SIGCONT instead of SIGSTOP.
+        hoverVM.resumeHandler = { [weak self] cwd in
+            guard let self else { return false }
+            guard let handle = locator.locate(targetCwd: cwd) else {
+                self.trace.emit("hover", "resume: locator returned nil for cwd=\(cwd)")
+                return false
+            }
+            do {
+                try signalSender.send(SIGCONT, to: handle.pid)
+                self.trace.emit("hover", "resume: SIGCONT sent pid=\(handle.pid) cwd=\(cwd)")
+                return true
+            } catch {
+                self.trace.emit("hover", "resume: SIGCONT failed pid=\(handle.pid) error=\(error)")
+                return false
+            }
+        }
+
         // 5. Triage engine. v0.2.0: model comes from the active provider.
         // v0.3.0: optional QuestionAnswerer for the user_question_pending
-        // secondary call. Loads PRINCIPLES.md from the repo root (the
-        // running Supervisor.app's working directory at launch);
-        // gracefully no-ops if the file isn't found (degrades to
-        // user_question_pending firing as a plain notify, no inject).
+        // secondary call. v0.4.0: optional Dispatcher + LoopController
+        // + LoopDispatchStore for the worker_idle_post_completion
+        // dispatch loop. Both PRINCIPLES.md-loading paths use the
+        // three-candidate-URL pattern; if the file isn't found the
+        // corresponding component stays nil and the engine degrades
+        // (QuestionAnswerer nil → plain notify on user_question_pending;
+        // Dispatcher nil → plain notify on worker_idle_post_completion).
         let questionAnswerer = loadQuestionAnswerer(client: client, trace: trace)
+        let dispatcher = loadDispatcher(client: client, trace: trace, dispatchHistory: loopDispatchStore)
+        // LoopController is always constructed (loop hard stops are
+        // pure logic — no external deps). LoopDispatchStore was set up
+        // in step 1 above. Both are passed into the engine; tests
+        // bypass them by passing nil.
+        let loopController = LoopController(trace: trace, loopStore: loopDispatchStore)
+        self.loopController = loopController
         let engine = TriageEngine(
             client: client,
             bus: bus,
@@ -219,6 +335,9 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             costStore: costStore,
             redactor: DefaultRedactor(),
             questionAnswerer: questionAnswerer,
+            dispatcher: dispatcher,
+            loopController: loopController,
+            loopStore: loopDispatchStore,
             trace: trace
         )
         engine.onActivityChange = { [weak self] activity in
@@ -230,7 +349,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             switch activity {
             case .triaging:           self?.hoverVM?.triageStarted()
             case .idle:                                self?.hoverVM?.triageFinishedNoFlag()
-            case .flagged(let sev, let action):        self?.hoverVM?.flagRaised(severity: sev, action: action)
+            case .flagged(let sev, let action, let plain): self?.hoverVM?.flagRaised(severity: sev, action: action, reasoningPlain: plain)
             }
         }
         engine.onDecision = { [weak self] decision in
@@ -316,7 +435,15 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             await self?.router?.dispatch(decision: decision)
         }
 
-        // 3. Hover view already updated by engine.onActivityChange.
+        // 3. v0.8.1: record the action in the hover's action log.
+        //    The plain description comes from the same labels the
+        //    flagRaised already uses. Only substantial actions are
+        //    recorded (recordAction filters out .notify internally).
+        let actionDesc = HoverViewModel.plainLabelForFlag(
+            action: candidate.action,
+            reasoningPlain: candidate.reasoningPlain
+        )
+        hoverVM?.recordAction(action: candidate.action, description: actionDesc)
     }
 
     // MARK: - Heartbeat child
@@ -359,6 +486,27 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         return nil
+    }
+
+    // MARK: - Single-instance guard
+
+    /// Kill any prior Supervisor.app instances so we don't get duplicate
+    /// hover windows after a self-rebuild/relaunch. Identifies siblings by
+    /// bundle identifier, terminates any with a different PID than ours.
+    private func terminatePriorInstances() {
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        let myBundle = Bundle.main.bundleIdentifier ?? "live.supervisor.app"
+        let siblings = NSRunningApplication.runningApplications(
+            withBundleIdentifier: myBundle
+        ).filter { $0.processIdentifier != myPID }
+
+        for app in siblings {
+            trace.emit("app", "terminating prior instance pid=\(app.processIdentifier)")
+            app.terminate()
+        }
+        if !siblings.isEmpty {
+            trace.emit("app", "terminated \(siblings.count) prior instance(s)")
+        }
     }
 
     // MARK: - Permission monitor
@@ -423,6 +571,48 @@ private func loadQuestionAnswerer(client: LLMClient, trace: TraceLog) -> Questio
         }
     }
     trace.emit("app", "no PRINCIPLES.md found; QuestionAnswerer disabled — user_question_pending flags will surface as plain notify")
+    return nil
+}
+
+/// v0.4.0 Part D: construct the Dispatcher used by the worker-idle
+/// dispatch loop. Same three-candidate-URL pattern as
+/// loadQuestionAnswerer — PRINCIPLES.md is the dispatch contract;
+/// without it the Dispatcher would be guessing per §1d.
+///
+/// Two real GH/git fetchers attached: GitHubIssueFetcher (60s
+/// per-cwd cache) + GitBranchCommitFetcher (30s per-(cwd, branch)
+/// cache). Both degrade silently to empty arrays on shell-out
+/// failure — Dispatcher MUST work without gh per the v0.4.0 Part B
+/// spec.
+@MainActor
+private func loadDispatcher(
+    client: LLMClient,
+    trace: TraceLog,
+    dispatchHistory: (any DispatchHistoryReading)? = nil
+) -> Dispatcher? {
+    let candidates: [URL] = [
+        Bundle.main.url(forResource: "PRINCIPLES", withExtension: "md"),
+        Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("PRINCIPLES.md"),
+        URL(fileURLWithPath: "/Users/main/supervisor/PRINCIPLES.md"),
+    ].compactMap { $0 }
+
+    for url in candidates {
+        if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
+            trace.emit("app", "loaded PRINCIPLES.md for Dispatcher from \(url.path) (\(text.count) chars)")
+            return Dispatcher(
+                client: client,
+                principlesText: text,
+                principlesPath: url,
+                issueFetcher: GitHubIssueFetcher(trace: trace),
+                commitFetcher: GitBranchCommitFetcher(trace: trace),
+                dispatchHistory: dispatchHistory,
+                grounder: RepoProposalGrounder(trace: trace),
+                trace: trace
+            )
+        }
+    }
+    trace.emit("app", "no PRINCIPLES.md found; Dispatcher disabled — worker_idle_post_completion flags will surface as plain notify (no auto-dispatch)")
     return nil
 }
 

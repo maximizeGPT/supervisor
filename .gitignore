@@ -37,3 +37,6 @@ secrets/
 test-output/
 coverage/
 *.xcresult
+
+# Generated at runtime by the dispatch loop hook
+OWNER-BRIEF.md

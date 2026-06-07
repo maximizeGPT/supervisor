@@ -45,8 +45,25 @@ echo "[sign-adhoc] bundle: $APP"
 echo "[sign-adhoc] CFBundleIdentifier: $BUNDLE_ID"
 echo "[sign-adhoc] entitlements:       $ENTITLEMENTS"
 
-# Re-sign.
-codesign --force --sign - --entitlements "$ENTITLEMENTS" --timestamp=none "$APP"
+# Pick the signing identity. Prefer the stable self-signed identity from
+# Scripts/setup-signing-identity.sh: it gives a cert-based designated
+# requirement that survives rebuilds, so the Accessibility grant and the
+# Keychain access ACL persist after a self-deploy. Fall back to ad-hoc
+# ("-") when the cert is absent, so the build still works on a machine
+# that has not run the setup script. The cdhash-based ad-hoc DR is what
+# breaks grants on every rebuild; the stable identity is the fix.
+STABLE_IDENTITY="Supervisor Self-Signed"
+if security find-certificate -c "$STABLE_IDENTITY" >/dev/null 2>&1; then
+    SIGN_AS="$STABLE_IDENTITY"
+    echo "[sign-adhoc] signing identity:   $STABLE_IDENTITY (stable, cert-based DR)"
+else
+    SIGN_AS="-"
+    echo "[sign-adhoc] signing identity:   ad-hoc (run setup-signing-identity.sh for grants that survive rebuilds)"
+fi
+
+# Re-sign. --deep so nested code (the embedded Heartbeat) is signed too.
+codesign --force --deep --sign "$SIGN_AS" --identifier "$BUNDLE_ID" \
+    --entitlements "$ENTITLEMENTS" --timestamp=none "$APP"
 
 # Guard: assert the CodeDirectory Identifier matches the bundle id.
 SIGN_ID=$(codesign -dv "$APP" 2>&1 | awk -F'=' '/^Identifier=/{print $2}')

@@ -72,15 +72,15 @@ final class TriageEngineTests: XCTestCase {
     private static func haikuFlagResponse(
         severity: String = "high",
         action: String = "pause",
-        reasoningPlain: String = "Claude Code is about to delete /Users/main/important and everything in it. That's not a temp path, so I'm pausing the session — you can resume from the panel if it was deliberate.",
-        reasoningTechnical: String = "rm -rf /Users/main/important matches destructive_action_pending rubric clause for 'rm -rf against a path outside the session cwd /Users/test'. Severity high because the path is outside the documented temp-path allowlist; user prompt did not authorize a specific delete.",
-        asymmetryNote: String? = "If I pause and I'm wrong, you lose ~5s; if I don't pause and I'm wrong, you lose /Users/main/important.",
+        reasoningPlain: String = "Claude Code is about to strip every permission off /Users/main/important and everything in it with chmod -R 000. That's not a temp path, so I'm pausing the session — you can resume from the panel if it was deliberate.",
+        reasoningTechnical: String = "chmod -R 000 /Users/main/important matches the destructive_action_pending rubric clause for 'a recursive permission-strip against a path outside the session cwd /Users/test'. Severity high because the path is outside the documented temp-path allowlist; user prompt did not authorize it.",
+        asymmetryNote: String? = "If I pause and I'm wrong, you lose ~5s; if I don't pause and I'm wrong, /Users/main/important is left unreadable until you chmod it back.",
         includeAllFields: Bool = true
     ) -> Data {
         var candidate: [String: Any] = [
             "category": "destructive_action_pending",
             "severity": severity,
-            "matched_command": "rm -rf /Users/main/important"
+            "matched_command": "chmod -R 000 /Users/main/important"
         ]
         if includeAllFields {
             candidate["recommended_action"] = action
@@ -135,16 +135,20 @@ final class TriageEngineTests: XCTestCase {
         let (engine, bus, captured) = makeEngine()
         defer { engine.stop() }
 
-        publishBashCall(bus, command: "rm -rf /Users/main/important")
+        // chmod -R 000 is destructive (recursively unreadable) but NOT on the
+        // deterministic catch-list, so it exercises the mocked Haiku path
+        // instead of short-circuiting on the catch. (rm -rf would fire the
+        // catch before the model ever runs — see DeterministicCatch.)
+        publishBashCall(bus, command: "chmod -R 000 /Users/main/important")
 
         try await captured.waitFor(count: 1, within: 3.0)
         XCTAssertEqual(captured.snapshot.count, 1)
         let candidate = try XCTUnwrap(captured.snapshot.first?.candidate)
         XCTAssertEqual(candidate.severity, .high)
         XCTAssertEqual(candidate.category, "destructive_action_pending")
-        XCTAssertTrue(candidate.matchedCommand.contains("rm -rf"))
+        XCTAssertTrue(candidate.matchedCommand.contains("chmod"))
         XCTAssertEqual(candidate.action, .pause)
-        XCTAssertTrue(candidate.reasoningPlain.contains("delete"),
+        XCTAssertTrue(candidate.reasoningPlain.contains("permission"),
                       "reasoningPlain should describe the action in plain English; got: \(candidate.reasoningPlain)")
         XCTAssertTrue(candidate.reasoningTechnical.contains("rubric"),
                       "reasoningTechnical should cite the rubric; got: \(candidate.reasoningTechnical)")
@@ -161,7 +165,9 @@ final class TriageEngineTests: XCTestCase {
         let (engine, bus, captured) = makeEngine()
         defer { engine.stop() }
 
-        publishBashCall(bus, command: "rm -rf /Users/main/x")
+        // chmod -R 000: destructive but not on the catch-list, so the degraded
+        // Haiku verdict (no reasoning/action) drives the fallback under test.
+        publishBashCall(bus, command: "chmod -R 000 /Users/main/x")
 
         try await captured.waitFor(count: 1, within: 3.0)
         let candidate = try XCTUnwrap(captured.snapshot.first?.candidate)
@@ -215,7 +221,9 @@ final class TriageEngineTests: XCTestCase {
         let (engine, bus, captured) = makeEngine()
         defer { engine.stop() }
 
-        publishBashCall(bus, command: "rm -rf /Users/main/x")
+        // chmod -R 000: destructive but not on the catch-list, so this reaches
+        // the (now failing) Haiku call instead of short-circuiting on the catch.
+        publishBashCall(bus, command: "chmod -R 000 /Users/main/x")
 
         try await Task.sleep(nanoseconds: 800_000_000)
         XCTAssertEqual(captured.snapshot.count, 0)
@@ -439,4 +447,49 @@ private final class TriageMockURLProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+// MARK: - detectWorkerStopped unit tests
+
+@MainActor
+final class DetectWorkerStoppedTests: XCTestCase {
+
+    private let now = Date()
+
+    func testGatePassesWhenAssistantEndsWithTextOnly() {
+        let events: [SupervisorEvent] = [
+            .userPrompt(.init(sessionId: "s1", text: "do the thing", ts: now)),
+            .assistantText(.init(sessionId: "s1", text: "All tests pass. Pushed.", turnUUID: "u1", ts: now)),
+        ]
+        XCTAssertTrue(TriageEngine.detectWorkerStopped(in: events))
+    }
+
+    func testGateBlocksWhenAssistantEndsWithToolUse() {
+        let events: [SupervisorEvent] = [
+            .userPrompt(.init(sessionId: "s1", text: "do the thing", ts: now)),
+            .assistantText(.init(sessionId: "s1", text: "Running tests now.", turnUUID: "u1", ts: now)),
+            .bashToolCall(.init(sessionId: "s1", command: "swift test", description: nil, toolUseId: "t1", turnUUID: "u1", ts: now)),
+        ]
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: events))
+    }
+
+    func testGateBlocksWhenLastBlockIsToolUseAfterText() {
+        let events: [SupervisorEvent] = [
+            .assistantText(.init(sessionId: "s1", text: "Let me check.", turnUUID: "u1", ts: now)),
+            .assistantText(.init(sessionId: "s1", text: "Looking at the file.", turnUUID: "u2", ts: now)),
+            .bashToolCall(.init(sessionId: "s1", command: "cat /tmp/x", description: nil, toolUseId: "t2", turnUUID: "u2", ts: now)),
+        ]
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: events))
+    }
+
+    func testGateHandlesEmptyWindowGracefully() {
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: []))
+    }
+
+    func testGateHandlesNoAssistantMessagesGracefully() {
+        let events: [SupervisorEvent] = [
+            .userPrompt(.init(sessionId: "s1", text: "hello", ts: now)),
+        ]
+        XCTAssertFalse(TriageEngine.detectWorkerStopped(in: events))
+    }
 }

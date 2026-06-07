@@ -99,13 +99,13 @@ have been ~500. The triage prompt is calibrated; rebuilding it
 in an OpenAI-native shape would invalidate the calibration. When
 in doubt, wrap the existing surface; don't fork it.
 
-**1d. "File an issue" beats "build the feature now"** unless the
-feature is on the immediate roadmap. Issues #1, #2, #3 are all
-real engineering work that got filed instead of forced into a
-release. The CHANGELOG explicitly says things like
-*"Out of scope this PR: making the terminals list user-configurable
-(filed as a v0.1.5+ issue with config.yaml + FSEvents reload spec)."*
-**Always file with shape, not vaguely.** Specify the call sites,
+**1d. Defer scope to trial-notes.md, not GitHub issues.** If scope
+is too big for one session, write it as a deferred task in
+trial-notes.md on the autonomous branch — never to GitHub. The
+SelfExtender (v0.5.0) picks up deferred work from trial-notes.md
+on the next dispatch cycle. GitHub issues are for work that needs
+Mohammed's review or approval, not for routine deferral.
+**Always defer with shape, not vaguely.** Specify the call sites,
 the proposed mechanism, and the trade-off the deferral makes.
 
 **1e. Each commit is one reviewable unit.** Commit granularity is

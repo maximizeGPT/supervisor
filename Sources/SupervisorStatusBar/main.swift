@@ -149,6 +149,17 @@ final class StatusBarController: NSObject {
         openRecovery.target = self
         menu.addItem(openRecovery)
 
+        // v0.7.0: open the owner brief — the plain-language summary of
+        // what the dispatch loop shipped, what's next, and what needs
+        // the owner's attention.
+        let openBrief = NSMenuItem(
+            title: "Open Owner Brief",
+            action: #selector(openOwnerBrief),
+            keyEquivalent: ""
+        )
+        openBrief.target = self
+        menu.addItem(openBrief)
+
         let openLog = NSMenuItem(
             title: "Open Trace Log",
             action: #selector(openTraceLog),
@@ -204,6 +215,25 @@ final class StatusBarController: NSObject {
 
     @objc private func openTraceLog() {
         NSWorkspace.shared.open(paths.traceLogPath)
+    }
+
+    /// v0.7.0: open OWNER-BRIEF.md — the dispatch loop's plain-language
+    /// summary of what shipped, what's next, and what needs the owner.
+    /// Looks in the Supervisor repo root first, falls back to cwd.
+    @objc private func openOwnerBrief() {
+        let candidates = [
+            URL(fileURLWithPath: "/Users/main/supervisor/OWNER-BRIEF.md"),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("OWNER-BRIEF.md"),
+        ]
+        for url in candidates {
+            if FileManager.default.fileExists(atPath: url.path) {
+                NSWorkspace.shared.open(url)
+                trace.emit("statusbar", "open owner brief → \(url.path)")
+                return
+            }
+        }
+        trace.emit("statusbar", "owner brief not found — no OWNER-BRIEF.md in known locations")
     }
 
     /// v0.1.6: reveal the recovery-doc directory in Finder. Creates the

@@ -48,6 +48,18 @@ public struct SessionStore: Sendable {
         }
     }
 
+    /// Replace the `<resolving>` placeholder with the real cwd once a
+    /// cwd-bearing event surfaces it (EventParser/SessionTail). Best-effort;
+    /// a no-op if the session row doesn't exist yet.
+    public func updateResolvedCwd(sessionId: String, cwd: String) throws {
+        try db.queue.write { conn in
+            try conn.execute(
+                sql: "UPDATE sessions SET cwd = ? WHERE id = ?",
+                arguments: [cwd, sessionId]
+            )
+        }
+    }
+
     public func delete(id: String) throws {
         _ = try db.queue.write { conn in
             try StoredSession.deleteOne(conn, key: id)

@@ -29,6 +29,10 @@ public final class SessionTail: @unchecked Sendable {
     private let trace: TraceLog
     private let offsetPersistInterval: TimeInterval
 
+    /// Set once the real cwd has been persisted to the session record, so we
+    /// only write the UPDATE once per tail (the placeholder -> real transition).
+    private var persistedResolvedCwd = false
+
     private let queue: DispatchQueue
     private var fd: Int32 = -1
     private var source: DispatchSourceFileSystemObject?
@@ -177,6 +181,15 @@ public final class SessionTail: @unchecked Sendable {
             let events = parser.parse(line: line)
             for event in events {
                 bus.publish(event)
+                // Persist the real cwd to the session record the first time a
+                // cwd-bearing event surfaces it, replacing "<resolving>".
+                if !persistedResolvedCwd,
+                   case .sessionStart(let info) = event,
+                   info.cwd != "<resolving>", info.cwd != "<unknown>", !info.cwd.isEmpty {
+                    try? sessionStore?.updateResolvedCwd(sessionId: sessionId, cwd: info.cwd)
+                    persistedResolvedCwd = true
+                    trace.emit("tail", "session=\(sessionId) resolved cwd=\(info.cwd) branch=\(info.gitBranch ?? "?")")
+                }
             }
         }
     }

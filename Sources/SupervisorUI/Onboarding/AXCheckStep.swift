@@ -17,22 +17,23 @@ struct AXCheckStep: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Required so Supervisor can send text into your terminal when an intervention fires. macOS will route you to System Settings → Privacy & Security → Accessibility — enable “Supervisor” in the list, then this step advances on its own.")
+            Text("Supervisor needs Accessibility access to type into your terminal when it acts for you. Open System Settings, then turn Supervisor on under Privacy and Security, then Accessibility.")
                 .font(BrandFont.body)
                 .foregroundStyle(BrandColor.inkDeep.color)
                 .lineSpacing(6)
                 .fixedSize(horizontal: false, vertical: true)
 
             if prompted {
-                Label("Waiting for grant…", systemImage: "hourglass")
+                Text("This step continues by itself once macOS reports the grant. If it does not continue within a few seconds, click Continue. macOS sometimes fails to report the grant for self built apps, so Continue moves you forward either way.")
                     .font(BrandFont.note)
                     .foregroundStyle(BrandColor.mute.color)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("You can skip this. Supervisor still watches and notifies without it. It asks again when it needs to type.")
+                    .font(BrandFont.note)
+                    .foregroundStyle(BrandColor.mute.color)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-
-            Text("Skip is fine — v0.1.0's intervention surface is notify-only and doesn't use Accessibility. Inject (v0.1.1+) will prompt you again when it's needed. If macOS isn't accepting your grant (a known unsigned-app pattern), use Skip and continue.")
-                .font(BrandFont.note)
-                .foregroundStyle(BrandColor.mute.color)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
