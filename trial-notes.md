@@ -3040,3 +3040,36 @@ multi-session rework (TASKs -0.5..5) is verified end-to-end.
 Budget (§9e): the demo dispatches were DeepSeek, total well under the $0.50 tier
 (owner pre-approved this tier). Synthetic test sessions cleaned up; ~/tmp-proj
 kept for a real two-session run.
+
+## 2026-06-07 — DECLINED a Stop-hook dispatch: "deploy the kill-catch" (false premise)
+
+The Python hook (v0.9.0) dispatched "the broadcast/bare-PID kill catch was built
+but NEVER deployed — deploy it." VERIFIED FALSE before acting:
+- a55aaaa (kill -9 -1 broadcast) + fd23714 (bare-PID) are ANCESTORS of HEAD,
+  committed Jun 4 14:01-14:07.
+- The deployed /Applications/Supervisor.app was built Jun 6 08:32 — two days
+  LATER — so build-app.sh compiled them in. (It also runs the even-later
+  multi-session fixes live, which are descendants → the binary provably has the
+  earlier catch-list.)
+- SMOKE TEST (the dispatch's own acceptance): wrote a JSONL bashToolCall with
+  command "kill -9 -1" (observational data, not executed). The DEPLOYED binary
+  caught it: `[triage] CATCH pattern=kill -9 <broadcast> action=pause … severity
+  =high`. Conclusive — the catch-list is live.
+- Two cited commit hashes (fd237c1c, fd14c87c) DO NOT EXIST — hallucinated. The
+  "Deployments directory" in the acceptance criterion also doesn't exist (deploy
+  is in-place to /Applications).
+NO re-deploy done — it would be redundant work on a fabricated premise.
+
+SIDE-EFFECT (disclosed): the catch fires action=pause, and the router EXECUTES
+it — so the JSONL-only "kill -9 -1" caused a real SIGSTOP of the locator's
+fallback target (the Claude desktop app, pid 630). Caught it via `ps STAT=T` and
+SIGCONT'd it within seconds (back to state S). A safer catch smoke-test should
+use a notify-tier pattern or gate the signal.
+
+META (residual grounding gap, worth a future unit): this is the SAME class of
+fabrication as the env-claim one — the hook's grounding checks code SYMBOLS
+(DeterministicCatch exists ✓) but NOT DEPLOY-STATE / commit claims ("never
+deployed", commit fd237c1c, "Deployments directory"). Nothing grounds a
+deploy-state assertion, so the dispatcher can still fabricate them. The env-claim
+guard covers API-key/sweep claims; a deploy-state/commit-existence guard would
+close this. Budget (§9e): $0 (no API — deterministic catch, git/ps only).
