@@ -1729,15 +1729,52 @@ Last updated: 2026-06-07
 
 ## Open now (actionable, unblocked) — 2026-06-07
 
-- **CI test-debt: make the branch green.** ~9 pre-existing failures where the
-  `rm -rf` deterministic catch short-circuits old Haiku-path assertions. Repoint
+- ~~**CI test-debt: make the branch green.**~~ RESOLVED 2026-06-07. Was 9
+  failures (388 tests): the `rm -rf` deterministic catch fired BEFORE the mocked
+  Haiku path, so assertions reading the model verdict saw the catch's banner
+  instead. Repointed the 4 tests (`testBashCallProducesFlagWhenHaikuFires`,
   `testMalformedVerdictFallsBackToFixedBannerString`,
-  `testBashCallProducesFlagWhenHaikuFires`, `testHaikuNetworkFailureDoesNotCrash`
-  (TriageEngineTests) and `testFullPipelineFromJSONLToFlagRow`
-  (EndToEndPipelineTests) at a destructive-but-not-caught command (e.g. a
-  model-judged `chmod -R 000` / force-push) so they exercise the Haiku path as
-  intended. Highest priority — it's what stands between this branch and a clean
-  merge to main.
+  `testHaikuNetworkFailureDoesNotCrash`, `testFullPipelineFromJSONLToFlagRow`)
+  at `chmod -R 000 <non-temp path>` — destructive but NOT on the catch-list — so
+  they exercise the Haiku path as intended. Catch was NOT weakened (it's the
+  production floor). `swift test` → 388 tests, 0 failures.
+- ~~**runProcess deadlock (found while fixing CI).**~~ RESOLVED 2026-06-07. The
+  full suite HUNG (xctest at ~100% CPU for 16 min) in `ProposalGroundingTests`,
+  masking the failure list. Root cause was NOT git (git grep returned in 10ms):
+  `runProcess` (the shared subprocess runner in DispatchFetchers.swift) parked a
+  thread on `await Task.detached { proc.waitUntilExit() }`. `Task.detached` runs
+  on the Swift-concurrency cooperative pool (capped at core count); a child whose
+  exit that blocked thread never serviced starved the pool and wedged EVERY async
+  task in the process. This is almost certainly a contributor to the recurring
+  "Supervisor went silent for N minutes" reports — the in-app Dispatcher shells
+  out via this exact runner to GROUND proposals (git grep / cat-file) on every
+  idle dispatch. Rewrote it event-driven: `terminationHandler`-signalled exit (no
+  parked thread), pipes drained to EOF off the cooperative pool on a Dispatch
+  global queue (also fixes the >64KB full-pipe-buffer deadlock), SIGTERM→SIGKILL
+  timeout escalation. ProposalGroundingTests now runs in 0.11s.
+- **Multi-session inject targeting — root cause found (2026-06-07).** The owner
+  asked Supervisor to "figure out which session to respond to and inject better"
+  instead of safe-degrading. Diagnosed the LIVE process topology and the locator's
+  core premise is broken in this runtime:
+  - `ProcessLocator.locate` matches `proc_pidinfo(PIDVNODEPATHINFO).cwd == targetCwd`.
+    But the running `claude` process cwd is the **home dir** (`/Users/main`), NOT the
+    session's project dir (`/Users/main/supervisor`). Verified via `lsof -d cwd`:
+    every `claude` PID reports cwd `/Users/main`. Claude Code tracks the *logical*
+    cwd (the JSONL `cwd` field, which drives the `-Users-main-supervisor` project dir)
+    separately from the OS process cwd, which never leaves home. So cwd-matching can
+    NEVER pin a session here → 0 CLI matches → Claude.app fallback (and Claude.app
+    isn't even running) → `locator_nil` → router degrades to notify. This is why
+    inject degraded even for the *single* supervisor session.
+  - argv carries `--resume <uuid>`, but that uuid (`9d9fc5f7…`, registered under the
+    `-Users-main` home project) is NOT the watched working-transcript id
+    (`c075d53a…` under `-Users-main-supervisor`). So argv-uuid ↔ watched-session
+    correlation is also broken under local-agent-mode indirection.
+  - Implication: "match OS-proc-cwd to session-cwd" is the wrong primitive for this
+    environment. Need a different discriminator (e.g. the session's own JSONL records
+    a pid/ppid or tty we can join on; or inject via the transcript-writer rather than
+    the OS process). Do NOT ship a cwd-tweak — it can't work. Bring the finding +
+    a grounded design to the owner before building. Until then, safe-degrade is
+    CORRECT behavior, not a bug (it prevents the landing-page→supervisor misroute).
 - **Proper-noun grounding false-reject.** `RepoProposalGrounder.extractCodeSymbols`
   treats framework proper nouns (AppleScript, Electron, CGEvent) as must-exist
   code symbols, so valid proposals naming them fail to ground. Add a curated
