@@ -463,6 +463,27 @@ struct ProcessResult {
 /// Internal-visible so the tests can drive runProcess directly without
 /// going through the actors above when they want to test the timeout /
 /// error paths.
+// IMPORTANT (2026-06-07 deadlock fix): this function MUST NOT park a
+// thread on `proc.waitUntilExit()`. The prior implementation did
+// `await Task.detached { proc.waitUntilExit() }`, which blocks a thread
+// on the Swift-concurrency *cooperative* pool — capped at the core count.
+// A child that doesn't exit promptly (or whose exit the blocked thread
+// never services) starves that pool and wedges EVERY async task in the
+// process: the in-app Dispatcher (which shells out to git for proposal
+// grounding on every idle dispatch) goes silent, and `swift test` spins
+// at ~100% CPU forever (reproduced in ProposalGroundingTests, which calls
+// this via git). git itself returned in 10ms — the hang was purely this
+// runner.
+//
+// The rewrite is fully event-driven:
+//   • exit is signalled by Foundation's `terminationHandler` (no parked
+//     thread), latched through `ProcessExitSignal` to survive the
+//     fire-before-wait race;
+//   • stdout/stderr are drained to EOF on a Dispatch *global* queue
+//     (grows threads on demand — can't be starved, and can't deadlock on
+//     a >64KB full pipe buffer the way drain-after-exit could);
+//   • the timeout enforcer escalates SIGTERM → SIGKILL so a
+//     signal-ignoring child can never hold us open.
 func runProcess(
     executable: String,
     args: [String],
@@ -479,49 +500,106 @@ func runProcess(
     proc.standardOutput = outPipe
     proc.standardError = errPipe
 
+    // Event-driven exit signal — fires from terminationHandler, so no
+    // thread is ever parked waiting on the child.
+    let exitSignal = ProcessExitSignal()
+    proc.terminationHandler = { _ in exitSignal.fire() }
+
     do {
         try proc.run()
     } catch {
+        proc.terminationHandler = nil
         throw FetcherError.toolNotInstalled("\(executable) \(args.first ?? "") (\(error))")
     }
 
-    // Race process termination against a timeout sleep. Whichever wins
-    // determines what we do — finish-and-collect, or terminate-and-throw.
-    return try await withThrowingTaskGroup(of: ProcessResult?.self) { group in
-        group.addTask {
-            // Wait branch: blocks on the subprocess. waitUntilExit is
-            // sync; wrap in a Task so we don't block the actor.
-            await Task.detached { proc.waitUntilExit() }.value
-            // Drain the pipes after the process is done. Reading
-            // synchronously here is safe because the process has exited
-            // and the pipes are closed on the write side.
-            let stdout = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
-            let stderr = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
-            return ProcessResult(
-                exitCode: proc.terminationStatus,
-                stdout: stdout,
-                stderr: stderr
-            )
-        }
-        group.addTask {
-            try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-            return nil  // sentinel meaning "timeout fired first"
-        }
+    // Drain both pipes concurrently, OFF the cooperative pool, so a child
+    // writing >64KB can't block on a full pipe buffer while we wait.
+    async let outData: Data = readToEndOffCooperativePool(outPipe.fileHandleForReading)
+    async let errData: Data = readToEndOffCooperativePool(errPipe.fileHandleForReading)
 
-        defer { group.cancelAll() }
-        for try await result in group {
-            if let result {
-                return result
+    // Timeout enforcer: if the child outlives `timeout`, terminate then
+    // hard-kill it. Cancelled (and a no-op) if the child exits first.
+    let timedOut = ProcessTimeoutFlag()
+    let enforcer = Task {
+        do {
+            try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+        } catch {
+            return  // cancelled — the child already exited
+        }
+        timedOut.set()
+        if proc.isRunning {
+            let pid = proc.processIdentifier
+            proc.terminate()                                  // SIGTERM
+            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s grace
+            if proc.isRunning { kill(pid, SIGKILL) }          // hard kill
+        }
+    }
+
+    // The child always exits (naturally, or because the enforcer kills
+    // it), so this wait always resumes — no deadlock.
+    await exitSignal.wait()
+    enforcer.cancel()
+
+    if timedOut.value {
+        throw FetcherError.timedOut(tool: executable)
+    }
+    return ProcessResult(
+        exitCode: proc.terminationStatus,
+        stdout: await outData,
+        stderr: await errData
+    )
+}
+
+/// One-shot exit latch. `fire()` (called from `terminationHandler`) wakes
+/// every pending `wait()`, and any `wait()` issued after `fire()` returns
+/// immediately. This closes the fire-before-wait race: the awaiting task
+/// can never miss a child that exits before it starts waiting.
+private final class ProcessExitSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func fire() {
+        lock.lock()
+        fired = true
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        for c in pending { c.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if fired {
+                lock.unlock()
+                cont.resume()
             } else {
-                // Timeout fired. SIGTERM the subprocess and throw.
-                if proc.isRunning {
-                    proc.terminate()
-                }
-                throw FetcherError.timedOut(tool: executable)
+                waiters.append(cont)
+                lock.unlock()
             }
         }
-        // Group completed without a result (shouldn't happen — both
-        // tasks return something) — treat as launch failure.
-        throw FetcherError.toolNotInstalled(executable)
+    }
+}
+
+/// Thread-safe one-way flag (set on the enforcer task, read on the caller).
+private final class ProcessTimeoutFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    func set() { lock.lock(); flag = true; lock.unlock() }
+    var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+}
+
+/// Read a file handle to EOF on a Dispatch global queue (NOT the
+/// cooperative pool), bridged back to async. `readToEnd()` blocks until
+/// the write end closes (child exit); running it on a global queue — which
+/// spawns threads on demand — keeps the cooperative pool free so the rest
+/// of the async runtime can't be starved.
+private func readToEndOffCooperativePool(_ handle: FileHandle) async -> Data {
+    await withCheckedContinuation { (cont: CheckedContinuation<Data, Never>) in
+        DispatchQueue.global().async {
+            let data = (try? handle.readToEnd()) ?? Data()
+            cont.resume(returning: data)
+        }
     }
 }
