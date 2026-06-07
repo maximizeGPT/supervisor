@@ -1770,11 +1770,23 @@ Last updated: 2026-06-07
     (`c075d53a…` under `-Users-main-supervisor`). So argv-uuid ↔ watched-session
     correlation is also broken under local-agent-mode indirection.
   - Implication: "match OS-proc-cwd to session-cwd" is the wrong primitive for this
-    environment. Need a different discriminator (e.g. the session's own JSONL records
-    a pid/ppid or tty we can join on; or inject via the transcript-writer rather than
-    the OS process). Do NOT ship a cwd-tweak — it can't work. Bring the finding +
-    a grounded design to the owner before building. Until then, safe-degrade is
-    CORRECT behavior, not a bug (it prevents the landing-page→supervisor misroute).
+    environment. The reliable discriminator is the session id, which the `claude`
+    process carries in argv (`--resume <uuid>`). Until then, safe-degrade is CORRECT
+    behavior, not a bug (it prevents the landing-page→supervisor misroute).
+  - UPDATE 2026-06-07 — primitive BUILT. Added `LiveProcessLocator.locate(by-
+    SessionId:)` (reuses the existing KERN_PROCARGS2 argv reader; UUID uniqueness ⇒
+    ~zero false-positive risk) + `argvContainsSessionId`, and wired
+    `InterventionRouter.resolveInjectTarget` to try session-id FIRST (a CONFIRMED
+    target that BYPASSES the multi-session degrade gate) then fall back to the cwd
+    walk (still gated). Unit-tested green: testArgvContainsSessionId +
+    testLocatorFindsProcessBySessionId (spawns a real subprocess carrying an id in
+    argv and pins it). Full suite 390/0. STILL OPEN: (a) live end-to-end check —
+    need a real second session to watch an inject LAND in the right one (owner's
+    "verify on screen"); (b) FRESH (non-resumed) sessions may not carry the id in
+    argv → fall back to cwd/degrade; (c) DESKTOP (Electron) sessions: even with the
+    right PID pinned, per-tab paste delivery isn't an OS primitive → stays
+    safe-degrade. Net: fixes terminal/resumed multi-session targeting; desktop tabs
+    remain the hard ceiling.
 - **Proper-noun grounding false-reject.** `RepoProposalGrounder.extractCodeSymbols`
   treats framework proper nouns (AppleScript, Electron, CGEvent) as must-exist
   code symbols, so valid proposals naming them fail to ground. Add a curated
