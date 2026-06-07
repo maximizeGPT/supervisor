@@ -1725,7 +1725,27 @@ Standing record of unfinished, unticketed, or blocked work. The
 Dispatcher reads this section on every call. Sessions update it as
 work completes or new gaps surface.
 
-Last updated: 2026-05-31
+Last updated: 2026-06-07
+
+## Open now (actionable, unblocked) — 2026-06-07
+
+- **CI test-debt: make the branch green.** ~9 pre-existing failures where the
+  `rm -rf` deterministic catch short-circuits old Haiku-path assertions. Repoint
+  `testMalformedVerdictFallsBackToFixedBannerString`,
+  `testBashCallProducesFlagWhenHaikuFires`, `testHaikuNetworkFailureDoesNotCrash`
+  (TriageEngineTests) and `testFullPipelineFromJSONLToFlagRow`
+  (EndToEndPipelineTests) at a destructive-but-not-caught command (e.g. a
+  model-judged `chmod -R 000` / force-push) so they exercise the Haiku path as
+  intended. Highest priority — it's what stands between this branch and a clean
+  merge to main.
+- **Proper-noun grounding false-reject.** `RepoProposalGrounder.extractCodeSymbols`
+  treats framework proper nouns (AppleScript, Electron, CGEvent) as must-exist
+  code symbols, so valid proposals naming them fail to ground. Add a curated
+  proper-noun exemption set + a test.
+- **Finish the standing-record wiring.** `readKnownGaps` wired Known Gaps into
+  the in-app dispatcher; `PRODUCT-DIRECTION.md` and source markers (TODO/FIXME)
+  are the other two standing-record sources `dispatchForIdleSession` still
+  leaves empty. Same pattern.
 
 ## Never verified end-to-end
 
