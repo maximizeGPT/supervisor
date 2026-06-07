@@ -138,6 +138,20 @@ public final class CGEventInjector: Injector {
         //    owner isn't already in Claude Code — never a partial spray into
         //    another app, never a global post.
         if bundleID == "com.anthropic.claudefordesktop" {
+            // SAFETY (2026-06-07): the Claude desktop app is a SINGLE Electron
+            // window that multiplexes sessions as TABS. foreground_paste brings
+            // that window forward and pastes into whatever tab is focused — it
+            // CANNOT target the session the dispatch is actually for. Observed
+            // live: an answer generated for the CV/PM session got pasted into
+            // the focused tab (cross-session bleed). There is no OS primitive to
+            // address an Electron tab, so we DO NOT blind-paste: throw and let
+            // the router degrade to a notify banner the owner can paste where
+            // they want. Escape hatch (SUPERVISOR_ALLOW_DESKTOP_PASTE) is for the
+            // controlled on-screen verification test ONLY — unset in production.
+            if ProcessInfo.processInfo.environment["SUPERVISOR_ALLOW_DESKTOP_PASTE"] == nil {
+                trace.emit("inject", "degraded reason=electron_no_tab_targeting host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) note=desktop is one multi-tab window; foreground_paste can't target the session — degrading to notify")
+                throw InjectError.targetUnresolvable(reason: "electron_no_tab_targeting")
+            }
             return try await injectViaForegroundPaste(text: text, hostApp: hostApp, hostPid: hostPid)
         }
 
