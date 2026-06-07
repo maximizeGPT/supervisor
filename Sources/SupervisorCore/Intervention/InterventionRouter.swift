@@ -71,6 +71,26 @@ public final class InterventionRouter {
         sessionCount > 1 && handle.cwd != targetCwd
     }
 
+    /// Resolve the process to deliver into. Prefer an exact **session-id**
+    /// match (a CONFIRMED target — safe to inject even with concurrent
+    /// sessions, because the id pins WHICH one); fall back to the cwd walk,
+    /// which the caller still gates with the multi-session check since cwd
+    /// can't confirm the session (the `claude` proc cwd is usually the home
+    /// dir, not the project). Returns nil when neither resolves. This is what
+    /// turns "degrade because I can't tell which of your sessions this is for"
+    /// into "inject into the right one."
+    private func resolveInjectTarget(_ decision: TriageDecision, cwd: String, op: String) -> (handle: ProcessHandle, sessionConfirmed: Bool)? {
+        if !decision.sessionId.isEmpty,
+           let byId = locator.locate(bySessionId: decision.sessionId) {
+            trace.emit("router", "intervention.\(op).target_by_session_id pid=\(byId.pid) session=\(decision.sessionId) exec=\(byId.execPath)")
+            return (byId, true)
+        }
+        if let byCwd = locator.locate(targetCwd: cwd) {
+            return (byCwd, false)
+        }
+        return nil
+    }
+
     /// Dispatch a triage decision through the right executor. Always
     /// async-completes — never throws, never crashes on a failed signal.
     public func dispatch(decision: TriageDecision) async {
@@ -125,16 +145,22 @@ public final class InterventionRouter {
             await postInjectDegraded(decision, intendedText: text, reason: "no_cwd_on_decision")
             return
         }
-        guard let handle = locator.locate(targetCwd: cwd) else {
+        guard let target = resolveInjectTarget(decision, cwd: cwd, op: "inject") else {
             trace.emit("router", "intervention.inject.degraded reason=locator_nil cwd=\(cwd)")
             await postInjectDegraded(decision, intendedText: text, reason: "locator_nil")
             return
         }
-        let sessionCount = activeSessionCount()
-        if targetUnconfirmedAcrossSessions(handle, targetCwd: cwd, sessionCount: sessionCount) {
-            trace.emit("router", "intervention.inject.degraded reason=multi_session_unconfirmed_target sessions=\(sessionCount) cwd=\(cwd) handle_cwd=\(handle.cwd)")
-            await postInjectDegraded(decision, intendedText: text, reason: "multi_session_unconfirmed_target")
-            return
+        let handle = target.handle
+        // A session-id match IS the confirmation of WHICH session we're hitting,
+        // so it bypasses the cwd-era multi-session gate. The cwd fallback can't
+        // confirm the session, so it stays gated to avoid a cross-session paste.
+        if !target.sessionConfirmed {
+            let sessionCount = activeSessionCount()
+            if targetUnconfirmedAcrossSessions(handle, targetCwd: cwd, sessionCount: sessionCount) {
+                trace.emit("router", "intervention.inject.degraded reason=multi_session_unconfirmed_target sessions=\(sessionCount) cwd=\(cwd) handle_cwd=\(handle.cwd)")
+                await postInjectDegraded(decision, intendedText: text, reason: "multi_session_unconfirmed_target")
+                return
+            }
         }
         do {
             let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)
@@ -241,16 +267,20 @@ public final class InterventionRouter {
             await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
             return
         }
-        guard let handle = locator.locate(targetCwd: cwd) else {
+        guard let target = resolveInjectTarget(decision, cwd: cwd, op: "continue") else {
             trace.emit("router", "intervention.continue.degraded reason=locator_nil cwd=\(cwd)")
             await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
             return
         }
-        let sessionCount = activeSessionCount()
-        if targetUnconfirmedAcrossSessions(handle, targetCwd: cwd, sessionCount: sessionCount) {
-            trace.emit("router", "intervention.continue.degraded reason=multi_session_unconfirmed_target sessions=\(sessionCount) cwd=\(cwd) handle_cwd=\(handle.cwd)")
-            await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
-            return
+        let handle = target.handle
+        // session-id match confirms the target → bypass the cwd-era gate.
+        if !target.sessionConfirmed {
+            let sessionCount = activeSessionCount()
+            if targetUnconfirmedAcrossSessions(handle, targetCwd: cwd, sessionCount: sessionCount) {
+                trace.emit("router", "intervention.continue.degraded reason=multi_session_unconfirmed_target sessions=\(sessionCount) cwd=\(cwd) handle_cwd=\(handle.cwd)")
+                await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+                return
+            }
         }
         do {
             let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)

@@ -376,4 +376,58 @@ final class ProcessLocatorTests: XCTestCase {
             "trace must reference the unrecognized candidate's execPath (FakeClaudeCLI); trace was:\n\(traceText)"
         )
     }
+
+    // MARK: - Session-id targeting (multi-session inject)
+
+    /// The session-id matcher against synthetic argv. Pure logic, fast.
+    /// Covers the `--resume <id>` / `--session-id <id>` value forms, the
+    /// embedded-in-path form (a `--jsonl /…/<id>.jsonl` arg), and the
+    /// negatives (wrong id, empty argv, empty id).
+    func testArgvContainsSessionId() {
+        let sid = "9d9fc5f7-f8b8-41c8-b9e9-5313e6c6d1ec"
+        XCTAssertTrue(LiveProcessLocator.argvContainsSessionId(
+            ["claude", "--resume", sid], sessionId: sid))
+        XCTAssertTrue(LiveProcessLocator.argvContainsSessionId(
+            ["claude", "--session-id", sid, "--model", "opus"], sessionId: sid))
+        XCTAssertTrue(LiveProcessLocator.argvContainsSessionId(
+            ["claude", "/Users/x/.claude/projects/-p/\(sid).jsonl"], sessionId: sid),
+            "an id embedded in a path arg must still match")
+        XCTAssertFalse(LiveProcessLocator.argvContainsSessionId(
+            ["claude", "--resume", "00000000-0000-0000-0000-000000000000"], sessionId: sid))
+        XCTAssertFalse(LiveProcessLocator.argvContainsSessionId([], sessionId: sid))
+        XCTAssertFalse(LiveProcessLocator.argvContainsSessionId(
+            ["claude", "--resume", sid], sessionId: ""))
+    }
+
+    /// End-to-end: a real FakeClaudeCLI subprocess carrying a session id in
+    /// its argv (via `--jsonl /…/<id>.jsonl`, the same shape a real
+    /// `--resume <id>` produces) is pinned by `locate(bySessionId:)` —
+    /// independent of cwd. A different id must NOT match (no Claude.app
+    /// fallback on this path: session-id is exact).
+    func testLocatorFindsProcessBySessionId() throws {
+        let binary = try fakeClaudeBinary()
+        let dir = try makeTempDir("by-session")
+        let sessionId = UUID().uuidString
+        let pidFile = dir + "/fake.pid"
+        let jsonl = dir + "/\(sessionId).jsonl"   // id rides in argv via --jsonl
+        let proc = try spawnFakeClaude(binary: binary, cwd: dir, jsonl: jsonl, pidFile: pidFile)
+        defer { cleanup(processes: [proc], dirs: [dir]) }
+
+        guard let fakePid = waitForPidFile(at: pidFile) else {
+            XCTFail("FakeClaudeCLI never wrote its pid file at \(pidFile)")
+            return
+        }
+
+        let locator = LiveProcessLocator(execNamePatterns: ["FakeClaudeCLI"])
+        let handle = locator.locate(bySessionId: sessionId)
+        XCTAssertNotNil(handle, "expected to find FakeClaudeCLI carrying session id \(sessionId)")
+        XCTAssertEqual(handle?.pid, fakePid, "must pin the exact process whose argv carries the id")
+
+        // A fresh, unused id matches nothing — and unlike the cwd path there
+        // is no Claude.app fallback, so this is a clean nil.
+        XCTAssertNil(locator.locate(bySessionId: UUID().uuidString),
+                     "an unused session id must not match any process")
+        // Empty id is rejected outright.
+        XCTAssertNil(locator.locate(bySessionId: ""))
+    }
 }

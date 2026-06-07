@@ -48,6 +48,22 @@ public struct ProcessHandle: Sendable, Equatable {
 /// path can be traced back to the precise cause.
 public protocol ProcessLocator: Sendable {
     func locate(targetCwd: String) -> ProcessHandle?
+
+    /// Locate the process for a specific session by its session id (the
+    /// transcript UUID), matched against the process argv (`--resume <id>`
+    /// / `--session-id <id>`). This is the RELIABLE primitive when cwd
+    /// can't pin the session: in practice the `claude` process cwd is the
+    /// user's HOME dir, not the session's project dir (verified 2026-06-07),
+    /// so cwd-matching alone always degrades. Session ids are globally
+    /// unique, so an argv match has effectively zero false-positive risk —
+    /// which is what lets the router inject into the right one of several
+    /// concurrent sessions instead of safe-degrading. Default nil so the
+    /// stub locators in tests opt out without implementing it.
+    func locate(bySessionId sessionId: String) -> ProcessHandle?
+}
+
+public extension ProcessLocator {
+    func locate(bySessionId sessionId: String) -> ProcessHandle? { nil }
 }
 
 /// Production implementation backed by libproc on macOS. No entitlements
@@ -165,6 +181,58 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
         default:
             let pidList = matches.map { String($0.pid) }.joined(separator: ",")
             trace.emit("locator", "locator.ambiguous targetCwd=\(targetCwd) pids=\(pidList)")
+            return nil
+        }
+    }
+
+    /// Multi-session targeting: pin the process for `sessionId` by scanning
+    /// each Claude-shaped candidate's argv for the id (Claude Code carries it
+    /// as `--resume <id>` / `--session-id <id>`). Returns the unique match, or
+    /// nil on 0/2+ matches (caller safe-degrades). Unlike `locate(targetCwd:)`
+    /// this is robust to the cwd≠project-dir reality, so it disambiguates
+    /// concurrent sessions the cwd walk can't.
+    public func locate(bySessionId sessionId: String) -> ProcessHandle? {
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            trace.emit("locator", "locator.session.empty_id")
+            return nil
+        }
+        let pids: [pid_t]
+        do {
+            pids = try Self.enumerateAllPIDs()
+        } catch {
+            trace.emit("locator", "locator.sysctl_failed reason=\(error) (bySessionId)")
+            return nil
+        }
+        var matches: [ProcessHandle] = []
+        for pid in pids {
+            if pid == supervisorPID { continue }
+            guard let execPath = Self.execPath(pid: pid) else { continue }
+            // Consider only Claude-shaped processes: a recognized exec name,
+            // or a JS-runtime interpreter (the `node …/cli.mjs` shape).
+            let execBase = (execPath as NSString).lastPathComponent
+            let nameMatches = matchesExecName(execPath)
+            let interpreterShaped = Self.interpreterBasenames.contains(execBase)
+            guard nameMatches || interpreterShaped else { continue }
+            guard let argv = Self.readProcessArgv(pid: pid),
+                  Self.argvContainsSessionId(argv, sessionId: trimmed) else { continue }
+            // An interpreter process must ALSO carry a Claude Code marker so an
+            // unrelated `node foo.js --resume <uuid>` can't be mistaken for it.
+            if !nameMatches, !Self.argvContainsClaudeCodeMarker(argv) { continue }
+            let cwd = Self.cwd(pid: pid) ?? "/"
+            matches.append(ProcessHandle(pid: pid, execPath: execPath, cwd: cwd))
+        }
+        switch matches.count {
+        case 0:
+            trace.emit("locator", "locator.session.not_found sessionId=\(trimmed)")
+            return nil
+        case 1:
+            let m = matches[0]
+            trace.emit("locator", "locator.session.found pid=\(m.pid) sessionId=\(trimmed) exec=\(m.execPath) cwd=\(m.cwd)")
+            return m
+        default:
+            let pidList = matches.map { String($0.pid) }.joined(separator: ",")
+            trace.emit("locator", "locator.session.ambiguous sessionId=\(trimmed) pids=\(pidList)")
             return nil
         }
     }
@@ -297,6 +365,16 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
                 return true
             }
         }
+        return false
+    }
+
+    /// True if `sessionId` (a globally-unique transcript UUID) appears as a
+    /// token in argv — the value after `--resume` / `--session-id` / `-r`, or
+    /// anywhere argv carries it. UUID uniqueness makes a plain containment
+    /// check safe from false positives.
+    static func argvContainsSessionId(_ argv: [String], sessionId: String) -> Bool {
+        guard !sessionId.isEmpty else { return false }
+        for a in argv where a == sessionId || a.contains(sessionId) { return true }
         return false
     }
 
