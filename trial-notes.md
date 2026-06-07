@@ -3011,3 +3011,32 @@ tested + live) is the backstop. Will confirm on its next idle.
 
 Budget (§9e): a handful of DeepSeek idle-eval + dispatch calls during the live
 verify, well under $0.50 (DeepSeek is cheap; no Anthropic key). Journaled per §9e.
+
+## 2026-06-07 — VERDICT: clean high-confidence dispatch landed (full pipeline live)
+
+Owner asked to watch a clean high-confidence dispatch land. Confirmed live on the
+SUPERVISOR repo (cwd /Users/main/supervisor, autonomous branch), full chain:
+1. The supervisor session's OWN autonomous dispatches (03:04–03:07, real, idle)
+   proposed only SUPERVISOR work — "validate the multi-session loop", "triage
+   edge cases", "pick up the next open issue" — at low confidence (work shipped),
+   then hit the 3-low hard stop and went SILENT. ZERO landing-page / cross-
+   project content. That is the contamination fix proven on the formerly-
+   contaminated session, and the silence = the anti-thrash fix (no spam).
+2. Seeded a concrete next task → got `[loop] recorded ready confidence=HIGH`
+   (the dispatcher selected the open Issue #12 — strongest "clear next task"
+   signal). Proposal GROUNDED: 0 CROSS_PROJECT_REJECT (supervisor proposal vs
+   supervisor repo).
+3. Delivery: `intervention.continue.degraded reason=multi_session_unconfirmed_
+   target sessions=3 cwd=/Users/main/supervisor handle_cwd=/` → safe-degraded to
+   a `continueProposedMedium` banner. CORRECT: with 3 live sessions and only a
+   desktop-app fallback target, it refused to risk a wrong-session keystroke and
+   surfaced the proposal as a banner. A literal inject fires only at sessions=1.
+
+Net verdict: the loop is RUNNING across sessions, produces clean grounded high-
+confidence dispatches, never leaks cross-project, and delivers safely (inject
+when the target is confirmable, banner when not). Marker stays OFF. The full
+multi-session rework (TASKs -0.5..5) is verified end-to-end.
+
+Budget (§9e): the demo dispatches were DeepSeek, total well under the $0.50 tier
+(owner pre-approved this tier). Synthetic test sessions cleaned up; ~/tmp-proj
+kept for a real two-session run.
