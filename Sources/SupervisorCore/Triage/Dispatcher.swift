@@ -513,6 +513,18 @@ public final class Dispatcher: Dispatching, Sendable {
                     trace.emit("dispatch", "CROSS_PROJECT_REJECT cwd=\(cwd) missing_symbols=\(head) — proposal names code absent from this session's repo; discarding")
                     return .lowConfidence(reasoning: "Cross-project proposal rejected: it references \(head), which does not exist in this session's repo (\(cwd)). Idling instead of dispatching another project's work into this session.")
                 }
+                // DEPLOY-STATE grounding: a proposal that justifies itself by
+                // citing commits ("commit abc123 shipped X / was never
+                // deployed") must reference REAL commits. A fabricated hash is a
+                // fabricated premise (the 2026-06-07 "deploy the already-deployed
+                // kill-catch" dispatch cited two hashes that don't exist). Check
+                // proposal + justification — the deploy-state claim lives there.
+                let badCommits = await grounder.missingCommits(inText: prompt + " " + justification, cwd: cwd)
+                if !badCommits.isEmpty {
+                    let head = badCommits.prefix(5).joined(separator: ",")
+                    trace.emit("dispatch", "DEPLOY_STATE_REJECT cwd=\(cwd) missing_commits=\(head) — proposal cites commits absent from the repo; discarding")
+                    return .lowConfidence(reasoning: "Deploy-state claim rejected: the proposal cites commit(s) \(head) that don't exist in this repo — a fabricated 'shipped/deployed/never-deployed' premise. Idling instead of acting on an unverifiable claim.")
+                }
             }
             trace.emit("dispatch", "ready confidence=\(confidence.rawValue) path=\(path.rawValue) issue=\(issueN.map(String.init) ?? "-") prior_echoed=\(priorEchoed.map(String.init) ?? "-") requires_human=\(requiresHuman) prompt_bytes=\(prompt.utf8.count) just=\"\(justification.prefix(120))\"")
             return .ready(

@@ -59,4 +59,39 @@ final class ProposalGroundingTests: XCTestCase {
             inProposal: "Improve the documentation", cwd: dir.path)
         XCTAssertEqual(prose, [])
     }
+
+    func testExtractCommitHashesIgnoresPlainNumbers() {
+        let h = Set(RepoProposalGrounder.extractCommitHashes(
+            "Commit a55aaaa shipped it; see fd237c1c. The port is 1234567 and count 42."))
+        XCTAssertTrue(h.contains("a55aaaa"))
+        XCTAssertTrue(h.contains("fd237c1c"))
+        XCTAssertFalse(h.contains("1234567"), "a pure decimal is not a commit hash")
+    }
+
+    func testMissingCommitsFlagsFabricatedHashes() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("commits-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func git(_ args: [String]) async throws -> String {
+            let r = try await runProcess(executable: "/usr/bin/env",
+                args: ["git", "-c", "user.email=t@t", "-c", "user.name=t"] + args,
+                cwd: dir.path, timeout: 10)
+            return String(data: r.stdout, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+        try "x\n".write(to: dir.appendingPathComponent("f.txt"), atomically: true, encoding: .utf8)
+        _ = try await git(["init", "-q"]); _ = try await git(["add", "."]); _ = try await git(["commit", "-qm", "init"])
+        let realHash = try await git(["rev-parse", "--short", "HEAD"])
+        let grounder = RepoProposalGrounder()
+
+        // A real cited commit grounds.
+        let ok = await grounder.missingCommits(inText: "deployed in commit \(realHash) already", cwd: dir.path)
+        XCTAssertEqual(ok, [], "a real commit must ground; got \(ok)")
+        // A fabricated commit (the failure mode) is flagged.
+        let bad = await grounder.missingCommits(inText: "shipped in commit fd237c1c, never deployed", cwd: dir.path)
+        XCTAssertTrue(bad.contains("fd237c1c"), "a fabricated commit must be flagged; got \(bad)")
+        // No commit-context -> no check (avoid flagging incidental hex).
+        let noContext = await grounder.missingCommits(inText: "the color is deadbeef in the css", cwd: dir.path)
+        XCTAssertEqual(noContext, [], "without commit context, hex isn't checked")
+    }
 }

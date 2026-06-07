@@ -21,6 +21,16 @@ public protocol ProposalGrounding: Sendable {
     /// at `cwd`. Empty = grounded. A non-empty result means the proposal
     /// references code from a different project (cross-project leak) -> discard.
     func missingSymbols(inProposal proposal: String, cwd: String) async -> [String]
+
+    /// Commit hashes the proposal cites that do NOT exist in the repo at `cwd`.
+    /// Catches fabricated deploy-state claims ("commit abc123 shipped X / was
+    /// never deployed") where the cited commit is invented. Default [] so stubs
+    /// don't need to implement it.
+    func missingCommits(inText text: String, cwd: String) async -> [String]
+}
+
+public extension ProposalGrounding {
+    func missingCommits(inText text: String, cwd: String) async -> [String] { [] }
 }
 
 public struct RepoProposalGrounder: ProposalGrounding {
@@ -145,5 +155,53 @@ public struct RepoProposalGrounder: ProposalGrounding {
         ) else { return false }
         // git grep exits 0 with output when found, 1 when not found.
         return result.exitCode == 0 && !(String(data: result.stdout, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    // MARK: - Commit-existence (deploy-state grounding)
+
+    /// Deploy/commit context words — only check cited hashes when the text makes
+    /// a commit/deploy claim, so incidental hex (colors, ids) in unrelated
+    /// proposals isn't flagged.
+    private static let commitContextWords = [
+        "commit", "deployed", "deploy", "shipped", "pushed", "cherry-pick",
+        "cherry pick", "revision", " sha ", "merge", "rebase",
+    ]
+
+    public func missingCommits(inText text: String, cwd: String) async -> [String] {
+        let lower = text.lowercased()
+        guard Self.commitContextWords.contains(where: { lower.contains($0) }) else { return [] }
+        let hashes = Self.extractCommitHashes(text)
+        guard !hashes.isEmpty else { return [] }
+        var missing: [String] = []
+        for h in hashes {
+            if !(await commitExists(h, cwd: cwd)) {
+                missing.append(h)
+                if missing.count >= 5 { break }
+            }
+        }
+        return missing
+    }
+
+    /// Word-bounded lowercase hex, 7-40 chars (git short..full), requiring at
+    /// least one a-f letter so a plain decimal number isn't treated as a hash.
+    static func extractCommitHashes(_ text: String) -> [String] {
+        guard let re = try? NSRegularExpression(pattern: #"\b[0-9a-f]{7,40}\b"#) else { return [] }
+        let ns = text as NSString
+        var seen = Set<String>(); var out: [String] = []
+        for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            let h = ns.substring(with: m.range)
+            if h.range(of: #"[a-f]"#, options: .regularExpression) == nil { continue }  // pure number
+            if !seen.contains(h) { seen.insert(h); out.append(h) }
+        }
+        return out
+    }
+
+    private func commitExists(_ hash: String, cwd: String) async -> Bool {
+        // `git cat-file -e <hash>^{commit}` exits 0 iff hash resolves to a commit.
+        let r = try? await runProcess(
+            executable: gitPath, args: ["git", "cat-file", "-e", "\(hash)^{commit}"],
+            cwd: cwd, timeout: timeout
+        )
+        return r?.exitCode == 0
     }
 }
