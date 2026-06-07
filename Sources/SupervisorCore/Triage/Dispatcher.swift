@@ -384,6 +384,11 @@ public final class Dispatcher: Dispatching, Sendable {
         let recentProposals = dispatchHistory?.recentProposalHeads(
             sessionId: sessionUUID, limit: 6
         ) ?? []
+        // Read the session's standing work record so the loop proposes the REAL
+        // backlog instead of fabricating a task when issues/commits give no
+        // clear move. Without this the in-app dispatcher's knownGaps was always
+        // empty (only the Python hook read it).
+        let knownGaps = cwd.flatMap { $0.isEmpty ? nil : readKnownGaps(cwd: $0) } ?? ""
 
         let context = SessionContext(
             sessionUUID: sessionUUID,
@@ -393,6 +398,7 @@ public final class Dispatcher: Dispatching, Sendable {
             openIssues: issues,
             currentBranchCommits: commits,
             priorDispatchesConsidered: priorDispatchesConsidered,
+            knownGaps: knownGaps,
             recentDispatchProposals: recentProposals
         )
         return await dispatch(context: context)

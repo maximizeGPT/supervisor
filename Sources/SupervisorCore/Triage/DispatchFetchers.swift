@@ -421,6 +421,33 @@ func gatherRepoContextForAnswer(
     return result
 }
 
+// MARK: - Known Gaps (the standing work record)
+
+/// Read the "# Known Gaps" section of `trial-notes.md` at `cwd` — the standing
+/// record of unfinished / unticketed / blocked work the dispatcher should
+/// propose from. Without this the in-app loop never sees the backlog: a task
+/// flagged in trial-notes.md was invisible to it, so when issues/commits gave
+/// no clear move it FABRICATED one. Mirror of the Python hook's
+/// `fetch_known_gaps`: from "# Known Gaps" to the next top-level "# " heading
+/// (or a "---" rule). Returns "" if the file or section is absent. Bounded so a
+/// long record can't dominate the dispatch prompt.
+func readKnownGaps(cwd: String, maxChars: Int = 6000) -> String {
+    let path = (cwd as NSString).appendingPathComponent("trial-notes.md")
+    guard let content = try? String(contentsOfFile: path, encoding: .utf8),
+          let markerRange = content.range(of: "# Known Gaps") else { return "" }
+    let section = content[markerRange.lowerBound...]
+    var result: [Substring] = []
+    for (i, line) in section.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+        if i > 0 {
+            if line.hasPrefix("# ") && !line.hasPrefix("# Known Gaps") { break }
+            if line.trimmingCharacters(in: .whitespaces) == "---" { break }
+        }
+        result.append(line)
+    }
+    let joined = result.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    return String(joined.prefix(maxChars))
+}
+
 // MARK: - Process runner (the shared internals)
 
 struct ProcessResult {

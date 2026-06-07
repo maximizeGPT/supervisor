@@ -598,3 +598,58 @@ final class DispatcherEnvironmentClaimTests: XCTestCase {
                        "a TRUE availability claim must pass when the key is present")
     }
 }
+
+/// The in-app dispatcher must READ the standing work record (Known Gaps) so it
+/// proposes real backlog instead of fabricating a task. Tests the extractor.
+final class DispatcherKnownGapsTests: XCTestCase {
+
+    private func writeTrialNotes(_ body: String) -> String {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kg-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? body.write(to: dir.appendingPathComponent("trial-notes.md"), atomically: true, encoding: .utf8)
+        return dir.path
+    }
+
+    func testReadsKnownGapsSectionAndStopsAtNextHeading() {
+        let cwd = writeTrialNotes("""
+        # Trial notes
+
+        Some preamble that must NOT be included.
+
+        # Known Gaps
+
+        - Wire Known Gaps into the in-app dispatcher.
+        ## A subsection that IS part of Known Gaps
+        - Add a deploy-state grounding guard.
+
+        # Some Later Section
+
+        - This must NOT be included.
+        """)
+        let gaps = readKnownGaps(cwd: cwd)
+        XCTAssertTrue(gaps.hasPrefix("# Known Gaps"))
+        XCTAssertTrue(gaps.contains("Wire Known Gaps into the in-app dispatcher"))
+        XCTAssertTrue(gaps.contains("## A subsection that IS part of Known Gaps"),
+                      "## subsections stay inside Known Gaps")
+        XCTAssertTrue(gaps.contains("deploy-state grounding guard"))
+        XCTAssertFalse(gaps.contains("preamble"), "content before the marker is excluded")
+        XCTAssertFalse(gaps.contains("This must NOT be included"), "stops at the next top-level heading")
+    }
+
+    func testNoFileOrNoSectionReturnsEmpty() {
+        XCTAssertEqual(readKnownGaps(cwd: "/no/such/dir"), "")
+        let cwd = writeTrialNotes("# Trial notes\n\nNo gaps section here.\n")
+        XCTAssertEqual(readKnownGaps(cwd: cwd), "")
+    }
+
+    func testKnownGapsReachesTheDispatchPrompt() {
+        let ctx = SessionContext(
+            sessionUUID: "s", cwd: "/c", gitBranch: "b",
+            lastNTurns: [], openIssues: [], currentBranchCommits: [],
+            knownGaps: "# Known Gaps\n\n- Build the deploy-state guard.")
+        let msg = Dispatcher.userMessage(context: ctx, principles: "(stub)")
+        XCTAssertTrue(msg.contains("Build the deploy-state guard"),
+                      "Known Gaps must be rendered into the dispatch prompt")
+    }
+}
