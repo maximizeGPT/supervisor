@@ -1729,6 +1729,31 @@ Last updated: 2026-06-07
 
 ## Open now (actionable, unblocked) — 2026-06-07
 
+- **Hardcoded `/Users/main/...` absolute paths in app targets (FOLLOW-UP — note,
+  do NOT fix now; owner-directed 2026-06-07).** Same bug class as the CI failure
+  that the `#filePath` Dispatcher fix resolved — these will break on any other
+  machine / CI runner if those targets ever get tested or run elsewhere:
+  - `Sources/SupervisorApp/main.swift:564` — `/Users/main/supervisor/PRINCIPLES.md`
+  - `Sources/SupervisorApp/main.swift:597` — `/Users/main/supervisor/PRINCIPLES.md`
+  - `Sources/SupervisorStatusBar/main.swift:225` — `/Users/main/supervisor/OWNER-BRIEF.md`
+  Fix pattern when picked up: resolve via `#filePath`-derived repo root (same as
+  `Dispatcher.systemPrompt`), keeping the absolute path as a fallback. They work
+  today only because the repo lives at `/Users/main/supervisor` on the owner's box.
+- ~~**activeSessionCount spikes to ~31 post-restart (over-trips inject gate).**~~
+  RESOLVED 2026-06-07. Root cause: `SessionDiscovery.startTail` seeded
+  `lastSeenAt: Date()` (now) for EVERY historical JSONL on the startup scan, so all
+  ~37 looked "active" for 10 min after each relaunch. Behaviorally it only
+  mis-degraded a *single*-session inject in that window (≥2 real sessions trip the
+  gate anyway), and it self-corrected after 10 min. Fixed by seeding `lastSeenAt`
+  from the JSONL's file mtime (real last-activity proxy); SessionTail still bumps
+  live sessions to now on streamed events. Quick + contained, no triage-path change.
+  390 tests / 0 failures. (Not yet redeployed — lands on the next build.)
+- ~~**PR #13 → main.**~~ MERGED 2026-06-07 (owner gave explicit go). The
+  autonomous branch (196 commits) is now on main. CI green required two fixes:
+  a Swift-6 concurrency error in SupervisorDevTools (`swift test` doesn't build
+  that target, so it was invisible locally) and the `#filePath` Dispatcher prompt
+  path. Sandbox stays ON (owner-directed) — desktop sessions remain notify-only
+  by design, which is correct, not a gap.
 - ~~**CI test-debt: make the branch green.**~~ RESOLVED 2026-06-07. Was 9
   failures (388 tests): the `rm -rf` deterministic catch fired BEFORE the mocked
   Haiku path, so assertions reading the model verdict saw the catch's banner
