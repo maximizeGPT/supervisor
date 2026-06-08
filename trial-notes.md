@@ -3191,3 +3191,26 @@ B. Deploy-state guard (a5d58d2). Backstop for the deploy-state fabrication class
 
 Tests: DispatcherKnownGapsTests +3, ProposalGroundingTests +2; full dispatcher
 suites green. Deploying so the loop uses both. Budget (§9e): $0 (no API).
+## Deploy of desktop-targeting build (2026-06-08 ~17:02Z)
+- Built `build/Supervisor.app` via build-app.sh release; signed "Supervisor Self-Signed",
+  Identifier=live.supervisor.app, codesign --verify --deep --strict = VALID. Cert matches the
+  deployed app, so the in-place rsync swap preserves the AX TCC grant.
+- deploy.sh swapped in place + relaunched (pid 88188). Smoke test flagged Keychain + AX.
+- ROOT CAUSE of smoke flag: new instance HUNG on a Keychain ACL prompt (SecurityAgent up,
+  app state S / 0% CPU, no API calls post-launch). Onboarding blocks on the key read until the
+  owner clicks "Always Allow". This contradicts the cert-stable-DR assumption in deploy.sh
+  comments — FOLLOW-UP: confirm whether "Always Allow" makes it survive the NEXT deploy, or if
+  the DR genuinely regresses each rebuild (would need setup-signing-identity.sh / DR pinning).
+- Screen Recording: added CGRequestScreenCaptureAccess() at app startup (main.swift, right
+  before "running state ready") so the deployed app prompts + appears in System Settings.
+  Owner grants once (user-only TCC); may need a relaunch to take effect.
+
+### "get thru it all" status at deploy
+- Item 1 router wiring: DONE (56f3c80)
+- Item 4 off-main threading: DONE (07ab5bd), desktop inject re-verified off-main
+- Item 3 Screen Recording request: DONE (startup request added; owner grant pending)
+- Item 5 deploy: IN PROGRESS (binary live, blocked on owner Keychain+ScreenRec clicks, then live verify)
+- Item 2 LLM matcher: NOT done. Local fuzzy match works (conf 1.00/0.00). LLM layer (deepseek on
+  OCR text / vision on screenshot) is the next robustness layer; plumbing challenge = injector is
+  @MainActor with no LLMClient, matcher closure is sync (would need a blocking LLM call on the
+  desktop-targeting queue via semaphore).
