@@ -86,7 +86,17 @@ public final class InterventionRouter {
             return (byId, true)
         }
         if let byCwd = locator.locate(targetCwd: cwd) {
-            return (byCwd, false)
+            // The Claude.app desktop host can't be cwd-confirmed (one Electron
+            // window multiplexing conversations), but the injector now targets
+            // the right CONVERSATION by screenshot+OCR with confident-match-or-
+            // notify. So a desktop host BYPASSES the cwd-era multi-session gate
+            // and defers targeting to the injector, instead of pre-degrading
+            // here (which is what blocked desktop answers entirely).
+            let isDesktopHost = byCwd.execPath.contains("Claude.app/Contents/MacOS/Claude")
+            if isDesktopHost {
+                trace.emit("router", "intervention.\(op).desktop_host_deferred_to_injector pid=\(byCwd.pid)")
+            }
+            return (byCwd, isDesktopHost)
         }
         return nil
     }
@@ -163,7 +173,7 @@ public final class InterventionRouter {
             }
         }
         do {
-            let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)
+            let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
             trace.emit("router", "intervention.inject.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
             _ = await notifier.postInterventionResult(
                 decision: decision,
@@ -283,7 +293,7 @@ public final class InterventionRouter {
             }
         }
         do {
-            let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)
+            let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
             trace.emit("router", "intervention.continue.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
             let head = String(proposal.prefix(80))
             _ = await notifier.postInterventionResult(

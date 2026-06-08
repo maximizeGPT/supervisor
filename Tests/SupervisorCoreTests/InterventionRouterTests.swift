@@ -256,17 +256,30 @@ final class InterventionRouterTests: XCTestCase {
         }
     }
 
-    // MARK: - Multi-session misroute guard (2026-06-04)
+    // MARK: - Multi-session misroute guard (2026-06-04, revised 2026-06-08)
 
-    /// The exact bug: >1 session live AND the locator fell back to the shared
-    /// Claude desktop host (handle.cwd "/" != the decision cwd) — pasting into
-    /// the frontmost tab could hit the WRONG session. Must degrade to notify,
-    /// never inject.
-    func testMultiSessionUnconfirmedTargetDegradesWithoutInjecting() async {
+    /// The multi-session misroute protection MOVED from the router to the
+    /// injector. When the locator falls back to the shared Claude desktop host,
+    /// the router no longer degrades — it DEFERS to the injector, which targets
+    /// the right CONVERSATION by screenshot+OCR (confident-match-or-notify). So
+    /// a desktop host must reach the injector, not be pre-degraded by the old
+    /// cwd-era gate (which blocked desktop answers entirely).
+    func testDesktopHostDefersToInjectorForConversationTargeting() async {
         let fallback = ProcessHandle(pid: 94716, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+        let (router, _, _, recorder) = makeRouter(handle: fallback, activeSessionCount: { 2 })
+        await router.dispatch(decision: makeDecision(action: .inject, suggestedInjectText: "Answer for session A"))
+        XCTAssertEqual(recorder.calls.count, 1,
+            "a desktop host must reach the injector (it does conversation targeting), not be pre-degraded by the router")
+    }
+
+    /// The gate still degrades a NON-desktop unconfirmed target — a fallback that
+    /// isn't the desktop host has no conversation-targeting path, so we can't
+    /// confirm the session and must not blind-inject.
+    func testNonDesktopUnconfirmedTargetStillDegrades() async {
+        let fallback = ProcessHandle(pid: 555, execPath: "/usr/bin/unknown-host", cwd: "/")
         let (router, notifier, _, recorder) = makeRouter(handle: fallback, activeSessionCount: { 2 })
         await router.dispatch(decision: makeDecision(action: .inject, suggestedInjectText: "Answer for session A"))
-        XCTAssertTrue(recorder.calls.isEmpty, "must NOT inject when the target session can't be confirmed across multiple sessions")
+        XCTAssertTrue(recorder.calls.isEmpty, "non-desktop unconfirmed target must still degrade, not inject")
         if case let .injectDegraded(intended, reason) = notifier.calls.first?.outcome {
             XCTAssertEqual(reason, "multi_session_unconfirmed_target")
             XCTAssertEqual(intended, "Answer for session A", "the intended text must still surface as a banner")

@@ -288,4 +288,38 @@ public struct DesktopConversationTargeter {
         let longer = na.count <= nb.count ? nb : na
         return longer.hasPrefix(shorter) && shorter.count >= 6
     }
+
+    // MARK: - ai-title (the conversation's identity)
+
+    /// Read a session's `ai-title` — the conversation title Claude shows in the
+    /// desktop sidebar — from its JSONL transcript. This is the identity we
+    /// match a desktop conversation on. Searches the standard projects dir for
+    /// `<sessionId>.jsonl`; returns the LAST ai-title (titles can be revised).
+    /// nil if the file or an ai-title event isn't found.
+    public static func readAiTitle(
+        sessionId: String,
+        projectsDir: URL? = nil
+    ) -> String? {
+        let base = projectsDir ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects", isDirectory: true)
+        guard let projects = try? FileManager.default.contentsOfDirectory(
+            at: base, includingPropertiesForKeys: nil
+        ) else { return nil }
+        for proj in projects {
+            let jsonl = proj.appendingPathComponent("\(sessionId).jsonl")
+            guard FileManager.default.fileExists(atPath: jsonl.path),
+                  let text = try? String(contentsOf: jsonl, encoding: .utf8) else { continue }
+            var title: String?
+            text.enumerateLines { line, _ in
+                guard line.contains("\"ai-title\"") || line.contains("\"aiTitle\"") else { return }
+                if let d = line.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                   let t = obj["aiTitle"] as? String, !t.isEmpty {
+                    title = t
+                }
+            }
+            if let title { return title }
+        }
+        return nil
+    }
 }
