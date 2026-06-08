@@ -3230,3 +3230,21 @@ suites green. Deploying so the loop uses both. Budget (§9e): $0 (no API).
   notification with an "Open Screen Recording settings" button. Avoids the manual "+" dance.
   Deferred to avoid a rebuild+redeploy now (redeploy re-triggers the Keychain ACL prompt until
   the signing DR stability is confirmed).
+
+## CONFIRMED BUG: Keychain ACL re-prompts on EVERY deploy (2026-06-08 ~23:05Z)
+- This morning's hope ("Always Allow updates the ACL so it shouldn't recur") is WRONG.
+  Deploy of the LLM-matcher build (commit ba6b1f0) hung the new instance (pid 2410) on the
+  Keychain prompt AGAIN — SecurityAgent up, blocked before running-state-ready — despite the
+  owner having clicked Always Allow this morning. So the ACL grant is bound per-build
+  (cdhash/signature), NOT per-cert designated requirement, even though both builds are signed
+  "Supervisor Self-Signed". Every self-deploy therefore hangs until the owner clicks.
+- IMPACT: defeats the "stable identity survives rebuilds" goal for the Keychain item (AX/screen
+  recording DID survive via the cert DR; the Keychain item ACL did not).
+- FIX OPTIONS (follow-up, needs a build):
+  1. Don't re-sign the bundle on every deploy — deploy.sh rsyncs new contents into the existing
+     bundle; if the binary changed, the signature changes, so the ACL breaks. Could sign ONCE
+     with a pinned designated requirement that the Keychain ACL trusts by cert, not cdhash.
+  2. setup-signing-identity.sh may need to set the Keychain item's ACL to a cert-based partition
+     list / "always allow this app by DR" rather than the specific signature.
+  3. Investigate `security set-key-partition-list` / SecAccess with a cert-based requirement.
+- INTERIM: owner clicks Always Allow once per deploy (recoverable, but friction).
