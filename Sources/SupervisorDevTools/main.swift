@@ -180,6 +180,37 @@ case "desktop-target":
     print("screen-recording granted: \(DesktopConversationTargeter.hasScreenRecordingPermission())")
     let outcome = targeter.focusConversation(targetTitle: title)
     print("outcome: \(outcome)")
+case "match-test":
+    // Verify the Path B LLM conversation matcher against real titles, using
+    // the user's CONFIGURED provider + key (same path the app uses), so the
+    // live failing case can be checked without rebuilding the app:
+    //   SupervisorDevTools match-test "<target>" "<candidate0>" "<candidate1>" ...
+    guard args.count >= 4 else {
+        print("usage: SupervisorDevTools match-test <target-title> <candidate> [candidate...]")
+        exit(2)
+    }
+    let target = args[2]
+    let candidates = args[3...].map { DesktopConversationCandidate(text: $0, point: .zero) }
+    let paths = ConfigPaths()
+    let provider = (try? FileActiveProviderStore(path: paths.activeProviderPath).read()) ?? .anthropic
+    guard let key = ((try? KeychainProviderKeyStore().read(provider)) ?? nil), !key.isEmpty else {
+        print("ERROR: no API key for active provider \(provider.rawValue)")
+        exit(1)
+    }
+    let client = LLMClient(provider: provider, apiKey: key, redactor: DefaultRedactor(), traceLog: .shared)
+    print("provider=\(provider.rawValue) model=\(provider.defaultTriageModel)")
+    print("target: \"\(target)\"")
+    for (i, c) in candidates.enumerated() { print("  [\(i)] \"\(c.text)\"") }
+    // match() blocks on a semaphore while a detached Task runs the LLM call on
+    // the cooperative pool (off this thread), so calling it directly is fine.
+    let matcher = LLMConversationMatcher(client: client)
+    if let (cand, conf) = matcher.match(target: target, candidates: candidates) {
+        let idx = candidates.firstIndex(of: cand) ?? -1
+        let verdict = conf >= 0.6 ? "WOULD SWITCH (>= 0.6 gate)" : "below 0.6: would NOT switch (degrade to notify)"
+        print("MATCH idx=\(idx) conf=\(String(format: "%.2f", conf)) title=\"\(cand.text)\" -> \(verdict)")
+    } else {
+        print("nil (LLM failure; the injector would fall back to the local matcher)")
+    }
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)

@@ -37,6 +37,11 @@ import AppKit
 public struct DesktopConversationCandidate: Sendable, Equatable {
     public let text: String
     public let point: CGPoint
+
+    public init(text: String, point: CGPoint) {
+        self.text = text
+        self.point = point
+    }
 }
 
 /// Result of trying to focus a target conversation.

@@ -275,7 +275,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             notifier: notifier,
             locator: locator,
             signalSender: signalSender,
-            injector: CGEventInjector(trace: trace),
+            injector: CGEventInjector(trace: trace, llm: client),
             recoveryDocWriter: recoveryWriter,
             // Count sessions seen in the last 10 minutes — the concurrency
             // window for "is more than one Claude Code session live right now."
@@ -392,6 +392,19 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
                 let after = await self.permissions.notificationStatus()
                 self.trace.emit("app", "notification status after request: \(after)")
             }
+        }
+
+        // Screen Recording: the desktop conversation targeter screenshots the
+        // Claude desktop window to read its sidebar and pick the right
+        // conversation before injecting. Without the grant, desktop targeting
+        // falls back to notify. Request once on entry so Supervisor appears in
+        // System Settings > Privacy > Screen Recording for the user to enable;
+        // macOS only surfaces the prompt the first time per app identity and
+        // never blocks on the user's choice.
+        if !permissions.isScreenRecordingGranted() {
+            trace.emit("app", "screen recording not granted — requesting once (needed for desktop conversation targeting)")
+            let granted = CGRequestScreenCaptureAccess()
+            trace.emit("app", "screen recording request returned: \(granted)")
         }
 
         trace.emit("app", "running state ready — watching \(paths.claudeProjectsDir.path)")

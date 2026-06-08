@@ -105,14 +105,21 @@ public final class CGEventInjector: Injector {
 
     private let trace: TraceLog
 
+    /// Optional LLM client for Path B semantic conversation matching on the
+    /// desktop targeting path. nil keeps the local token-overlap matcher, so
+    /// existing callers and tests are unaffected.
+    private let llm: LLMClient?
+
     public init(
         interCharDelayMicros: useconds_t = 15_000,
         focusSettleNanos: UInt64 = 250_000_000,
-        trace: TraceLog = .shared
+        trace: TraceLog = .shared,
+        llm: LLMClient? = nil
     ) {
         self.interCharDelayMicros = interCharDelayMicros
         self.focusSettleNanos = focusSettleNanos
         self.trace = trace
+        self.llm = llm
     }
 
     public func inject(text: String, claudeCodePID: pid_t, targetWindowTitle: String? = nil) async throws -> Int {
@@ -162,9 +169,40 @@ public final class CGEventInjector: Injector {
             // freezes the UI or blocks the @MainActor triage/catch engine. A
             // dedicated serial queue (NOT the cooperative pool) avoids the
             // pool-starvation failure mode; activateClaudeApp hops to main.
+            let llm = self.llm
+            let trace = self.trace
             let outcome: DesktopTargetingOutcome = await withCheckedContinuation { cont in
                 Self.desktopTargetingQueue.async {
-                    cont.resume(returning: targeter.focusConversation(targetTitle: target))
+                    // Path B semantic matcher (active text provider) when a
+                    // client is wired; the desktop sidebar truncates/rewords
+                    // titles, which the local token matcher scores under the
+                    // gate. Falls back to the local matcher on any LLM failure
+                    // so targeting never regresses below today's behavior. The
+                    // matcher is built and used entirely on this queue, so no
+                    // non-Sendable closure crosses a concurrency boundary.
+                    let matcher: (([DesktopConversationCandidate], String) -> (DesktopConversationCandidate, Double)?)?
+                    if let llm = llm {
+                        let semantic = LLMConversationMatcher(client: llm, trace: trace)
+                        matcher = { candidates, target in
+                            // Fuzzy stays the default: it's fast and free, so
+                            // trust it when it's clearly confident (>= 0.80, an
+                            // exact/near-exact window title). Escalate to the
+                            // semantic LLM matcher ONLY for the ambiguous,
+                            // truncated, or reworded cases the token math can't
+                            // resolve (the 18:07 conf=0.50 miss), falling back to
+                            // the fuzzy result if the LLM call fails. Screen
+                            // recording is already a precondition here: a denied
+                            // grant short-circuits to .screenRecordingDenied
+                            // upstream, so no candidates (and no matcher call)
+                            // ever happen without OCR text available.
+                            let local = targeter.bestMatch(target: target, candidates: candidates)
+                            if let local = local, local.1 >= 0.80 { return local }
+                            return semantic.match(target: target, candidates: candidates) ?? local
+                        }
+                    } else {
+                        matcher = nil
+                    }
+                    cont.resume(returning: targeter.focusConversation(targetTitle: target, matcher: matcher))
                 }
             }
             switch outcome {
