@@ -51,7 +51,7 @@ public enum DesktopTargetingOutcome: Sendable, Equatable {
     case screenRecordingDenied
 }
 
-public struct DesktopConversationTargeter {
+public struct DesktopConversationTargeter: @unchecked Sendable {
 
     private let trace: TraceLog
     public init(trace: TraceLog = .shared) { self.trace = trace }
@@ -248,11 +248,18 @@ public struct DesktopConversationTargeter {
     }
 
     private func activateClaudeApp() {
-        for app in NSWorkspace.shared.runningApplications
-        where app.bundleIdentifier == "com.anthropic.claudefordesktop" {
-            app.activate(options: [])
-            return
+        // focusConversation runs OFF the main actor (it blocks ~4s and must not
+        // freeze the UI / the @MainActor triage engine), but NSWorkspace
+        // activation is an AppKit call that belongs on the main thread. Hop
+        // there non-blocking; the caller's settle-sleep covers the async gap.
+        let work = {
+            for app in NSWorkspace.shared.runningApplications
+            where app.bundleIdentifier == "com.anthropic.claudefordesktop" {
+                app.activate(options: [])
+                return
+            }
         }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
 
     // MARK: - String matching

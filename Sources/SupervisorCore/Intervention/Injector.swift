@@ -87,6 +87,12 @@ public final class CGEventInjector: Injector {
         "com.anthropic.claudefordesktop",
     ]
 
+    /// Off-main serial queue for the blocking desktop conversation targeting
+    /// (screenshot + OCR + click + verify). Keeps the ~4s of work off the
+    /// @MainActor so it can't freeze the UI or the triage/catch engine.
+    private static let desktopTargetingQueue = DispatchQueue(
+        label: "live.supervisor.desktop-targeting", qos: .userInitiated)
+
     /// Inter-character delay during keystroke synthesis. Terminal apps
     /// need a few ms between events or coalescing/buffering can drop
     /// characters. 15ms was the value the v0.3.0 A1 scratch test
@@ -152,7 +158,16 @@ public final class CGEventInjector: Injector {
                 throw InjectError.targetUnresolvable(reason: "desktop_no_target_title")
             }
             let targeter = DesktopConversationTargeter(trace: trace)
-            switch targeter.focusConversation(targetTitle: target) {
+            // Run the ~4s screenshot+OCR+poll OFF the @MainActor so it never
+            // freezes the UI or blocks the @MainActor triage/catch engine. A
+            // dedicated serial queue (NOT the cooperative pool) avoids the
+            // pool-starvation failure mode; activateClaudeApp hops to main.
+            let outcome: DesktopTargetingOutcome = await withCheckedContinuation { cont in
+                Self.desktopTargetingQueue.async {
+                    cont.resume(returning: targeter.focusConversation(targetTitle: target))
+                }
+            }
+            switch outcome {
             case .focused(let matched):
                 // Claude.app is now frontmost with the target conversation
                 // active. Paste into it, then restore the owner's prior app.
