@@ -3248,3 +3248,37 @@ suites green. Deploying so the loop uses both. Budget (§9e): $0 (no API).
      list / "always allow this app by DR" rather than the specific signature.
   3. Investigate `security set-key-partition-list` / SecAccess with a cert-based requirement.
 - INTERIM: owner clicks Always Allow once per deploy (recoverable, but friction).
+
+## ROOT CAUSE (data-backed): desktop targeting fails on a MULTI-WINDOW layout (2026-06-08 ~23:15Z)
+Added `SupervisorDevTools ocr-dump` (read-only: activate Claude, capture, run the real
+recognizeRows + sidebarCandidates + activeConversationTitle, print every row w/ position).
+Ran it against the owner's live screen. Findings:
+
+- The screen is TWO Claude windows side by side (c075d53a "Pause and kill interventions" on the
+  right, 9d9fc5f7 "Supervisor macOS app signing and notarization" center) PLUS the Supervisor
+  flags panel. CGDisplayCreateImage captures ALL of it as one image.
+- BUG 1 (sidebarCandidates): leftEdge = screen.width*0.30 = 576px on 1920 is too wide. It
+  swallows the CENTER window's body text. Real result: 42 "candidates", ~18 real sidebar titles
+  (x~110-150) + ~24 garbage from the neighbor window (x~360-540: "Freeze + Sign + Verify...",
+  "Signed inside-out...", "Notarization - all 3 submitted..."). FIX: isolate the true sidebar
+  column (fixed ~300px width, or cluster rows by the dominant left-x after "Recents"), not 0.30*W.
+- BUG 2 (activeConversationTitle): picks the LONGEST "project / title" row in the top 5.5%. With
+  two windows open it returns the WRONG one ("Supervisor macOS app signing and notarization", the
+  notarization window, because it's longer than "supervisor / Pause and kill interventions"). This
+  also breaks post-click VERIFICATION (polls for the clicked title; if active-detection picks the
+  wrong window, verify fails even when the click worked). FIX: collect ALL visible "/" title bars;
+  verify by matching the CLICKED target specifically, not "the longest".
+- BUG 3 (LLM matcher): at 23:09 live it returned no_parse on the 23-candidate noise soup -> local
+  fallback matched an unrelated convo ("Filing 1040...") at 0.15 -> degrade. Likely the noise +
+  candidate count. FIX: harden parse + cut candidate noise upstream (Bug 1) so the matcher gets a
+  clean ~18-title list.
+- The target IS readable ("Pause and kill interventions" is the #1 clean sidebar candidate). So
+  the fix is the upstream OCR EXTRACTION, not the matching math (which I over-verified on clean
+  fixtures and wrongly called done).
+- The targeter was built assuming ONE clean Claude window. The owner's real workflow is
+  multi-window, which breaks sidebar isolation + active-detection + verification together.
+
+NEXT (gated on owner's choice): (A) multi-window rework — sidebar isolation -> multi-pane active
+detection -> verification -> matcher hardening, each verified via ocr-dump, no blind deploy. OR
+(B) honesty-first — stop the UI claiming "answering yes so you don't have to type it" when the
+inject degraded to nothing (the false-success is worse than the failure).

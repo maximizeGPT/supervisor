@@ -16,6 +16,7 @@
 //                               from replaying 40 MB of historical events
 //                               through Haiku on first start.
 
+import AppKit
 import Foundation
 import SupervisorCore
 
@@ -211,6 +212,32 @@ case "match-test":
     } else {
         print("nil (LLM failure; the injector would fall back to the local matcher)")
     }
+case "ocr-dump":
+    // Read-only: activate Claude (as the real targeter does before capturing),
+    // screenshot, run the REAL OCR + extraction heuristics, and print every row
+    // with its position so the sidebar / active-title heuristics can be fixed
+    // against the actual on-screen layout. No click, no inject.
+    if let claude = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first {
+        claude.activate(options: [.activateIgnoringOtherApps])
+        Thread.sleep(forTimeInterval: 0.7)
+    } else {
+        print("WARN: Claude desktop not running — capturing whatever is frontmost")
+    }
+    let targeter = DesktopConversationTargeter()
+    print("screen-recording granted: \(DesktopConversationTargeter.hasScreenRecordingPermission())")
+    guard let img = targeter.captureMainDisplay() else { print("CAPTURE FAILED"); exit(1) }
+    let bounds = CGDisplayBounds(CGMainDisplayID())
+    let rows = targeter.recognizeRows(in: img)
+    print("screen \(Int(bounds.width))x\(Int(bounds.height)), \(rows.count) OCR rows (top->bottom; L=left30% T=top5.5%):")
+    for r in rows.sorted(by: { $0.point.y < $1.point.y }) {
+        let l = r.point.x < bounds.width * 0.30 ? "L" : "-"
+        let t = r.point.y < bounds.height * 0.055 ? "T" : "-"
+        let txt = r.text.count > 78 ? String(r.text.prefix(78)) + "…" : r.text
+        print(String(format: "  [%4d,%4d] %@%@ | %@", Int(r.point.x), Int(r.point.y), l, t, txt))
+    }
+    print("--- sidebarCandidates() -> \(targeter.sidebarCandidates(from: rows).count): ---")
+    for c in targeter.sidebarCandidates(from: rows) { print("    @[\(Int(c.point.x)),\(Int(c.point.y))] \"\(c.text)\"") }
+    print("--- activeConversationTitle() -> \(targeter.activeConversationTitle(from: rows).map { "\"\($0)\"" } ?? "nil")")
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)
