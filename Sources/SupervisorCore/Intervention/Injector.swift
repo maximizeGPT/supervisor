@@ -155,10 +155,26 @@ public final class CGEventInjector: Injector {
             return try await injectViaForegroundPaste(text: text, hostApp: hostApp, hostPid: hostPid)
         }
 
-        // 4. Terminals accept TARGETED background posts (CGEventPostToPid),
-        //    which ARE focus-independent — the owner keeps using their
-        //    frontmost app while the keystrokes flow to the session's host.
-        //    THE INVARIANT: never post(tap:) (global); targeted-or-throw.
+        // 4. Terminal hosts. CGEventPostToPid to a BACKGROUNDED terminal
+        //    silently DROPS the keystrokes — confirmed on screen 2026-06-07:
+        //    posting to a non-frontmost Terminal.app never reached the claude
+        //    tab (and didn't leak to the frontmost app either — it just
+        //    vanished). The old "focus-independent" claim was wrong. So we use
+        //    the same bring-forward-then-restore shape as the Electron path:
+        //    save the owner's frontmost app, activate the terminal (its
+        //    selected tab is the target — see selectTerminalTab below), post
+        //    the keystrokes into that now-frontmost tab, then restore the prior
+        //    frontmost. Targeted (never a global post); lands in the session,
+        //    not whatever app the owner is looking at.
+        // Terminal hosts. CGEventPostToPid delivers focus-independently to the
+        // host terminal's SELECTED tab even while it's backgrounded — confirmed
+        // on screen 2026-06-08: a keystroke probe landed in the claude tab's
+        // input box with TextEdit still frontmost. (Paste/Cmd-V did NOT land for
+        // Terminal; per-char synthesis does.) We select the session's tab first
+        // — so the post hits the RIGHT session, not whatever tab the owner last
+        // used — WITHOUT stealing focus, then post. Never a global tap, never
+        // the frontmost app.
+        Self.selectTerminalTab(forClaudePID: claudeCodePID, hostBundleID: bundleID, trace: trace)
         let bytes = try postKeystrokes(text: text, hostPid: hostPid, bundleID: bundleID)
         trace.emit("inject", "fired method=postToPid host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) bytes=\(bytes)")
         return bytes
@@ -184,11 +200,17 @@ public final class CGEventInjector: Injector {
             usleep(interCharDelayMicros / 3)
             bytes += String(ch).utf8.count
         }
-        if let downRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
-           let upRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) {
-            downRet.postToPid(hostPid)
-            usleep(interCharDelayMicros)
-            upRet.postToPid(hostPid)
+        // SUPERVISOR_INJECT_NO_SUBMIT: type the text but DON'T press Return —
+        // lets an on-screen verification confirm the keystrokes land in the
+        // right terminal session without sending a real prompt. Symmetric with
+        // the Electron paste path. Unset in production: the Return submits.
+        if ProcessInfo.processInfo.environment["SUPERVISOR_INJECT_NO_SUBMIT"] == nil {
+            if let downRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+               let upRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) {
+                downRet.postToPid(hostPid)
+                usleep(interCharDelayMicros)
+                upRet.postToPid(hostPid)
+            }
         }
         return bytes
     }
@@ -207,10 +229,11 @@ public final class CGEventInjector: Injector {
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
+        let hostBundle = hostApp.bundleIdentifier ?? "?"
         guard hostApp.activate(options: []) else {
             restoreClipboard(savedClipboard, pasteboard)
-            trace.emit("inject", "degraded reason=electron_activate_failed host=com.anthropic.claudefordesktop")
-            throw InjectError.targetUnresolvable(reason: "electron_activate_failed")
+            trace.emit("inject", "degraded reason=host_activate_failed host=\(hostBundle)")
+            throw InjectError.targetUnresolvable(reason: "host_activate_failed")
         }
         try? await Task.sleep(nanoseconds: focusSettleNanos)
 
@@ -228,7 +251,7 @@ public final class CGEventInjector: Injector {
         restoreClipboard(savedClipboard, pasteboard)
         prior?.activate(options: [])
 
-        trace.emit("inject", "fired method=foreground_paste host=com.anthropic.claudefordesktop host_pid=\(hostPid) bytes=\(text.utf8.count) restored=\(prior?.bundleIdentifier ?? "?")")
+        trace.emit("inject", "fired method=foreground_paste host=\(hostBundle) host_pid=\(hostPid) bytes=\(text.utf8.count) restored=\(prior?.bundleIdentifier ?? "?")")
         return text.utf8.count
     }
 
@@ -306,11 +329,86 @@ public final class CGEventInjector: Injector {
     /// Look up parent PID via `proc_pidinfo(PROC_PIDTBSDINFO)`. Returns
     /// nil if the call fails (process gone, EPERM, etc.).
     private static func parentPID(of pid: pid_t) -> pid_t? {
-        var info = proc_bsdinfo()
-        let size = MemoryLayout<proc_bsdinfo>.size
-        let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(size))
-        if n != Int32(size) { return nil }
-        return pid_t(info.pbi_ppid)
+        // Use sysctl(KERN_PROC_PID), NOT proc_pidinfo(PROC_PIDTBSDINFO):
+        // proc_pidinfo FAILS on root-owned processes in the chain — notably
+        // `login`, which sits between a terminal's shell and Terminal.app — so
+        // the old walk gave up at `login` and returned noHostingApp for EVERY
+        // terminal-hosted claude session. sysctl reads kinfo_proc for any
+        // process regardless of owner. (Confirmed 2026-06-07: claude→zsh→login
+        // →Terminal.app; proc_pidinfo broke at login, sysctl walked through.)
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(pid)]
+        var kp = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        guard sysctl(&mib, 4, &kp, &size, nil, 0) == 0, size > 0 else { return nil }
+        let ppid = pid_t(kp.kp_eproc.e_ppid)
+        return ppid > 0 ? ppid : nil
+    }
+
+    /// Best-effort: select the terminal TAB hosting the claude session (matched
+    /// by its controlling tty) so the activate+post lands in the RIGHT session,
+    /// not whatever tab the owner last touched. No-op on unsupported terminals
+    /// or AppleScript/Automation failure — the caller still posts into the
+    /// currently-selected tab, so this only ADDS targeting, never breaks it.
+    static func selectTerminalTab(forClaudePID pid: pid_t, hostBundleID: String, trace: TraceLog) {
+        guard let tty = ttyPath(of: pid) else {
+            trace.emit("inject", "terminal_tab_select skip reason=no_tty pid=\(pid)")
+            return
+        }
+        let script: String
+        switch hostBundleID {
+        case "com.apple.Terminal":
+            script = #"""
+            tell application "Terminal"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  try
+                    if (tty of t) is "\#(tty)" then
+                      set selected of t to true
+                      return "ok"
+                    end if
+                  end try
+                end repeat
+              end repeat
+            end tell
+            return "no_match"
+            """#
+        case "com.googlecode.iterm2":
+            script = #"""
+            tell application "iTerm2"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  repeat with s in sessions of t
+                    try
+                      if (tty of s) is "\#(tty)" then
+                        select t
+                        return "ok"
+                      end if
+                    end try
+                  end repeat
+                end repeat
+              end repeat
+            end tell
+            return "no_match"
+            """#
+        default:
+            trace.emit("inject", "terminal_tab_select skip reason=unsupported_host=\(hostBundleID) tty=\(tty)")
+            return
+        }
+        var errInfo: NSDictionary?
+        let out = NSAppleScript(source: script)?.executeAndReturnError(&errInfo)
+        trace.emit("inject", "terminal_tab_select tty=\(tty) host=\(hostBundleID) result=\(out?.stringValue ?? "nil")\(errInfo == nil ? "" : " err=\(errInfo!)")")
+    }
+
+    /// Controlling-terminal device path for `pid`, e.g. "/dev/ttys000", via
+    /// kinfo_proc.kp_eproc.e_tdev. nil if the process has no controlling tty.
+    static func ttyPath(of pid: pid_t) -> String? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(pid)]
+        var kp = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        guard sysctl(&mib, 4, &kp, &size, nil, 0) == 0, size > 0 else { return nil }
+        let dev = kp.kp_eproc.e_tdev
+        guard dev != -1, let name = devname(dev, S_IFCHR) else { return nil }
+        return "/dev/" + String(cString: name)
     }
 }
 

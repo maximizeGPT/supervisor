@@ -144,6 +144,29 @@ case "inject-test":
         RunLoop.main.run(until: Date().addingTimeInterval(0.02))
     }
     print(result.value)
+case "locate-session":
+    // Diagnostic: run the app's REAL locator against a live session id (and
+    // optionally a cwd) so we can characterize the session→process mapping
+    // without a sandbox in the way. Prints the resolved pid/cwd/exec.
+    guard args.count >= 3 else {
+        print("usage: SupervisorDevTools locate-session <session-id> [target-cwd]")
+        exit(2)
+    }
+    let sid = args[2]
+    let locator = LiveProcessLocator(execNamePatterns: ["claude", "claude-code"])
+    if let h = locator.locate(bySessionId: sid) {
+        print("bySessionId(\(sid)) -> FOUND pid=\(h.pid) cwd=\(h.cwd) exec=\(h.execPath)")
+    } else {
+        print("bySessionId(\(sid)) -> nil (not_found/ambiguous — see trace)")
+    }
+    if args.count >= 4 {
+        let cwd = args[3]
+        if let h = locator.locate(targetCwd: cwd) {
+            print("byCwd(\(cwd)) -> FOUND pid=\(h.pid) cwd=\(h.cwd) exec=\(h.execPath)")
+        } else {
+            print("byCwd(\(cwd)) -> nil")
+        }
+    }
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)
