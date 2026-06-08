@@ -95,12 +95,20 @@ public final class Notifier: Notifying, @unchecked Sendable {
     private let center: UNUserNotificationCenter
     private let trace: TraceLog
 
+    /// v0.9.0 (integrity): result hook fired with the SAME (decision, outcome)
+    /// that drives the banner body, so every OTHER surface (the hover action
+    /// log + live label) reports what the executor ACTUALLY did, never intent.
+    /// Set by the app at construction; nil in tests/mocks.
+    private let onResult: (@Sendable (TriageDecision, InterventionOutcome) -> Void)?
+
     public init(
         center: UNUserNotificationCenter = .current(),
-        trace: TraceLog = .shared
+        trace: TraceLog = .shared,
+        onResult: (@Sendable (TriageDecision, InterventionOutcome) -> Void)? = nil
     ) {
         self.center = center
         self.trace = trace
+        self.onResult = onResult
     }
 
     /// Post a notification for a triage decision. Returns the outcome
@@ -219,6 +227,11 @@ public final class Notifier: Notifying, @unchecked Sendable {
         decision: TriageDecision,
         outcome: InterventionOutcome
     ) async -> Outcome {
+        // v0.9.0 (integrity): drive the hover action log + live label from the
+        // SAME outcome the banner uses, BEFORE composing the banner, so no
+        // surface claims an inject it didn't make — even if the banner is
+        // suppressed (notifications denied).
+        onResult?(decision, outcome)
         let content = UNMutableNotificationContent()
         content.title = Self.plainTitle(for: outcome)
         content.body = body(for: decision, outcome: outcome)

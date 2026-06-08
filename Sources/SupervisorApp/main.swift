@@ -263,7 +263,14 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
         // 4. Notifier + Intervention router (v0.1.4 Part A3) + v0.1.6
         // RecoveryDocWriter (writes handoff markdown before SIGSTOP/SIGTERM).
-        let notifier = Notifier(trace: trace)
+        // v0.9.0 (integrity): the hover action log + live label must report the
+        // REAL inject result, not intent. Wire the Notifier's result hook to the
+        // hover so every recorded action is driven by what actually happened
+        // (answered vs "couldn't place it, here it is to paste"). Hops to the
+        // main actor for the @MainActor hover.
+        let notifier = Notifier(trace: trace, onResult: { [weak hoverVM] decision, outcome in
+            Task { @MainActor in hoverVM?.recordInterventionOutcome(decision, outcome) }
+        })
         self.notifier = notifier
         let recoveryWriter = RecoveryDocWriter(
             directory: paths.recoveryDir,
@@ -448,15 +455,14 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             await self?.router?.dispatch(decision: decision)
         }
 
-        // 3. v0.8.1: record the action in the hover's action log.
-        //    The plain description comes from the same labels the
-        //    flagRaised already uses. Only substantial actions are
-        //    recorded (recordAction filters out .notify internally).
-        let actionDesc = HoverViewModel.plainLabelForFlag(
-            action: candidate.action,
-            reasoningPlain: candidate.reasoningPlain
-        )
-        hoverVM?.recordAction(action: candidate.action, description: actionDesc)
+        // 3. v0.9.0 (integrity): do NOT record the action here. The old eager
+        //    record fired at DECISION time with the INTENT label ("Answered a
+        //    question") — before the inject ran, and it stayed even when the
+        //    inject degraded to nothing. That was the "claims an action it
+        //    didn't take" bug. The action log + live label are now recorded
+        //    from the REAL outcome via the Notifier's onResult hook
+        //    (recordInterventionOutcome), so Supervisor only ever claims an
+        //    inject/pause/kill/continue it actually performed.
     }
 
     // MARK: - Heartbeat child
