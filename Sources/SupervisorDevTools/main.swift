@@ -131,7 +131,7 @@ case "inject-test":
     Task { @MainActor in
         let injector = CGEventInjector()
         do {
-            let n = try await injector.inject(text: text, claudeCodePID: pid, targetWindowTitle: nil)
+            let n = try await injector.inject(text: text, claudeCodePID: pid, targetWindowTitle: (args.count >= 5 ? args[4] : nil))
             result.value = "ok: injected \(n) bytes targeting host of pid \(pid)"
         } catch {
             result.value = "degraded/threw: \(error)"
@@ -167,6 +167,19 @@ case "locate-session":
             print("byCwd(\(cwd)) -> nil")
         }
     }
+case "desktop-target":
+    // Drive the real DesktopConversationTargeter: screenshot -> OCR -> match ->
+    // click -> verify, for a conversation title. Prints the outcome so the
+    // screenshot+OCR+click pipeline can be verified on screen.
+    guard args.count >= 3 else {
+        print("usage: SupervisorDevTools desktop-target <conversation-title>")
+        exit(2)
+    }
+    let title = args[2]
+    let targeter = DesktopConversationTargeter()
+    print("screen-recording granted: \(DesktopConversationTargeter.hasScreenRecordingPermission())")
+    let outcome = targeter.focusConversation(targetTitle: title)
+    print("outcome: \(outcome)")
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)

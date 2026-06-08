@@ -138,21 +138,41 @@ public final class CGEventInjector: Injector {
         //    owner isn't already in Claude Code — never a partial spray into
         //    another app, never a global post.
         if bundleID == "com.anthropic.claudefordesktop" {
-            // SAFETY (2026-06-07): the Claude desktop app is a SINGLE Electron
-            // window that multiplexes sessions as TABS. foreground_paste brings
-            // that window forward and pastes into whatever tab is focused — it
-            // CANNOT target the session the dispatch is actually for. Observed
-            // live: an answer generated for the CV/PM session got pasted into
-            // the focused tab (cross-session bleed). There is no OS primitive to
-            // address an Electron tab, so we DO NOT blind-paste: throw and let
-            // the router degrade to a notify banner the owner can paste where
-            // they want. Escape hatch (SUPERVISOR_ALLOW_DESKTOP_PASTE) is for the
-            // controlled on-screen verification test ONLY — unset in production.
-            if ProcessInfo.processInfo.environment["SUPERVISOR_ALLOW_DESKTOP_PASTE"] == nil {
-                trace.emit("inject", "degraded reason=electron_no_tab_targeting host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) note=desktop is one multi-tab window; foreground_paste can't target the session — degrading to notify")
-                throw InjectError.targetUnresolvable(reason: "electron_no_tab_targeting")
+            // The Claude desktop app is one Electron window that multiplexes
+            // conversations, with an opaque AX tree — we can't address a
+            // conversation through AX. So we target it the way a human does:
+            // screenshot the window, OCR the sidebar, find the conversation whose
+            // title matches the one we're answering, click it to make it active,
+            // VERIFY the switch, then paste. The target's identity is its
+            // ai-title, passed in as `targetWindowTitle`.
+            let originalPrior = NSWorkspace.shared.frontmostApplication
+            let target = (targetWindowTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !target.isEmpty else {
+                trace.emit("inject", "degraded reason=desktop_no_target_title host=\(bundleID) cc_pid=\(claudeCodePID)")
+                throw InjectError.targetUnresolvable(reason: "desktop_no_target_title")
             }
-            return try await injectViaForegroundPaste(text: text, hostApp: hostApp, hostPid: hostPid)
+            let targeter = DesktopConversationTargeter(trace: trace)
+            switch targeter.focusConversation(targetTitle: target) {
+            case .focused(let matched):
+                // Claude.app is now frontmost with the target conversation
+                // active. Paste into it, then restore the owner's prior app.
+                let bytes = pasteIntoFrontmost(text: text, hostPid: hostPid)
+                originalPrior?.activate(options: [])
+                trace.emit("inject", "fired method=desktop_targeted_paste host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) bytes=\(bytes) target=\"\(matched.prefix(40))\" restored=\(originalPrior?.bundleIdentifier ?? "?")")
+                return bytes
+            case .targetingFailed(let reason):
+                // confident-match-or-notify: could not confirm the right
+                // conversation, so we DO NOT paste. Loud targeting-FAILURE trace
+                // (not routine) and degrade to a notify the owner can act on.
+                originalPrior?.activate(options: [])
+                trace.emit("inject", "degraded reason=desktop_targeting_failed host=\(bundleID) cc_pid=\(claudeCodePID) detail=\(reason)")
+                throw InjectError.targetUnresolvable(reason: "desktop_targeting_failed")
+            case .screenRecordingDenied:
+                // Can't screenshot without Screen Recording. Surface it; never a
+                // silent degrade — the permission layer prompts for the grant.
+                trace.emit("inject", "degraded reason=desktop_screen_recording_denied host=\(bundleID) cc_pid=\(claudeCodePID)")
+                throw InjectError.targetUnresolvable(reason: "screen_recording_denied")
+            }
         }
 
         // 4. Terminal hosts. CGEventPostToPid to a BACKGROUNDED terminal
@@ -258,6 +278,27 @@ public final class CGEventInjector: Injector {
     private func restoreClipboard(_ saved: String?, _ pasteboard: NSPasteboard) {
         pasteboard.clearContents()
         if let saved { pasteboard.setString(saved, forType: .string) }
+    }
+
+    /// Paste `text` into the already-frontmost app via Cmd-V (+ Return unless
+    /// SUPERVISOR_INJECT_NO_SUBMIT). Used after the desktop targeter has brought
+    /// the target Claude conversation to the front, so we DON'T re-activate or
+    /// restore here — the caller manages focus restore to the owner's prior app.
+    /// Saves and restores the clipboard.
+    private func pasteIntoFrontmost(text: String, hostPid: pid_t) -> Int {
+        let pasteboard = NSPasteboard.general
+        let saved = pasteboard.string(forType: .string)
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        let source = CGEventSource(stateID: .hidSystemState)
+        postChord(source: source, virtualKey: 9, flags: .maskCommand, hostPid: hostPid)  // Cmd-V
+        usleep(interCharDelayMicros * 2)
+        if ProcessInfo.processInfo.environment["SUPERVISOR_INJECT_NO_SUBMIT"] == nil {
+            postChord(source: source, virtualKey: 36, flags: [], hostPid: hostPid)        // Return
+        }
+        usleep(interCharDelayMicros)
+        restoreClipboard(saved, pasteboard)
+        return text.utf8.count
     }
 
     /// Post a single key chord (key + modifier flags) targeted to a pid.
