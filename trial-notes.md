@@ -3214,3 +3214,19 @@ suites green. Deploying so the loop uses both. Budget (§9e): $0 (no API).
   OCR text / vision on screenshot) is the next robustness layer; plumbing challenge = injector is
   @MainActor with no LLMClient, matcher closure is sync (would need a blocking LLM call on the
   desktop-targeting queue via semaphore).
+
+## Screen Recording grant: background-app registration gap (2026-06-08 ~17:57Z)
+- Post-deploy TCC state: AX INTACT for live.supervisor.app/.heartbeat/.statusbar (auth_value=2),
+  so inject survived the swap. But live.supervisor.app is in NO kTCCServiceScreenCapture list.
+- Root cause: Supervisor is LSUIElement (background). startup CGRequestScreenCaptureAccess()
+  returned false and did NOT register the app in the Screen Recording list / surface a visible
+  prompt. macOS typically only lists a background app for screen capture once it ATTEMPTS a
+  real capture (CGDisplayCreateImage) — but the targeter's preflight guard returns
+  .screenRecordingDenied BEFORE attempting, so it never registers. Chicken-and-egg.
+- INTERIM: owner adds Supervisor manually via System Settings > Screen Recording > "+" >
+  /Applications/Supervisor.app, then relaunch. Verified-after via TCC auth_value=2.
+- FOLLOW-UP (item 3 polish): on first desktop inject, attempt CGDisplayCreateImage even when
+  preflight says denied (to register + trigger the system prompt), and/or surface an in-app
+  notification with an "Open Screen Recording settings" button. Avoids the manual "+" dance.
+  Deferred to avoid a rebuild+redeploy now (redeploy re-triggers the Keychain ACL prompt until
+  the signing DR stability is confirmed).
