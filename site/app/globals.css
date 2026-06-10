@@ -1,0 +1,39 @@
+@import "tailwindcss";
+
+/* ── Supervisor brand tokens ───────────────────────────────────────────
+   Source of truth: supervisor/branding/README.md (palette + type system).
+   Signal green is the ONLY accent: CTA + focus rings + the marker symbol.   */
+:root {
+  --ink: #0e0f11;        /* primary text, wordmark fill            */
+  --ink-deep: #1a1b1e;   /* deepest surface / dark hero            */
+  --paper: #f7f6f2;      /* primary background                     */
+  --paper-warm: #ededeb; /* secondary surface, dividers, banding   */
+  --mute: #a6a6a2;       /* secondary text, labels                 */
+  --signal: #2d7a4e;     /* the single accent                      */
+  --signal-strong: #25653f; /* CTA hover/active                    */
+}
+
+@theme inline {
+  --color-ink: var(--ink);
+  --color-ink-deep: var(--ink-deep);
+  --color-paper: var(--paper);
+  --color-paper-warm: var(--paper-warm);
+  --color-mute: var(--mute);
+  --color-signal: var(--signal);
+  --color-signal-strong: var(--signal-strong);
+
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-jetbrains-mono);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
