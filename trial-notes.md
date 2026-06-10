@@ -3282,3 +3282,29 @@ NEXT (gated on owner's choice): (A) multi-window rework — sidebar isolation ->
 detection -> verification -> matcher hardening, each verified via ocr-dump, no blind deploy. OR
 (B) honesty-first — stop the UI claiming "answering yes so you don't have to type it" when the
 inject degraded to nothing (the false-success is worse than the failure).
+
+## Multi-window OCR fix DONE, deploy-pending (2026-06-10 ~06:15)
+- Commit 1013e5d: sidebar clustering (dominant left-x), visibleConversationTitles
+  (keys on " / ", never the clock), conservative already-active (single-window
+  only). Verified 3 ways: ocr-dump (42->21 candidates, 0 neighbor prose, 3 real
+  titles), match-test (0.95 correct match vs Supervisor-* distractors), 3 fixture
+  tests. Full suite 399/0.
+- NOT deployed. Held for owner PRESENCE (not approval-shy): deploy.sh hangs on the
+  Keychain ACL re-prompt (Gap 1), so deploying while the owner is away would leave
+  Supervisor hung at onboarding -> violates never-stop-Supervisor. One word + the
+  owner at the keyboard and it ships in ~30s.
+
+## Known Gaps (as of 1013e5d)
+1. KEYCHAIN ACL RE-PROMPT on every in-place deploy. Despite the cert-stable
+   "Supervisor Self-Signed" DR, each rsync swap re-presents "Supervisor wants to
+   use [key] in your keychain" and the new instance HANGS until the owner clicks
+   "Always Allow". "Always Allow" has NOT survived to the next deploy (re-prompted
+   on 475a637; expected again on 1013e5d). FOLLOW-UP: pin the Keychain item ACL to
+   the cert DR, or find why the DR doesn't match across rebuilds. Until fixed every
+   deploy needs the owner at the keyboard. This is the single worst friction.
+2. SCREEN RECORDING manual-add for the LSUIElement app. Startup
+   CGRequestScreenCaptureAccess does not surface a visible prompt nor list the
+   background app, so the owner had to add Supervisor via System Settings > Screen
+   Recording > "+". Survives in-place deploys once granted (cert-stable TCC).
+   FOLLOW-UP (item 3 polish): attempt a real CGDisplayCreateImage on first desktop
+   inject to auto-register + surface an in-app "Open Settings" prompt.
