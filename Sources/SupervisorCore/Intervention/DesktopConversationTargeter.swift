@@ -269,19 +269,26 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
 
         let screen = CGDisplayBounds(CGMainDisplayID())
         // Poll for the switch: the title bar (top strip) should come to show the
-        // clicked conversation. The bar re-renders a beat after the click, so a
-        // single-shot read can catch it stale — poll up to ~3.2s. We check that
-        // the CLICKED title now appears up top (substring/high-score), which is
-        // robust to the "branch / title" framing.
-        let needle = Self.normalize(cand.text)
+        // clicked conversation. Match by SHARED-TOKEN OVERLAP, not substring: the
+        // title bar's text form routinely differs from BOTH the clicked sidebar
+        // text and the ai-title -- reworded, reordered ("Loop engineering
+        // accessibility" vs "Accessibility of loop engineering"), truncated, or
+        // OCR-merged with a neighbor window's bar. The old substring/Jaccard
+        // check on the clicked text alone false-negatived on exactly that: a
+        // verified-0.95 match degraded at switch_not_verified. So confirm each
+        // top row against BOTH the clicked candidate AND the target, order-
+        // independent, requiring several shared tokens (bleed guard).
+        let targetTokens = Self.titleTokens(targetTitle)
+        let clickedTokens = Self.titleTokens(cand.text)
         let topY = screen.height * 0.055, leftX = screen.width * 0.18
         for attempt in 0..<8 {
             usleep(400_000)
             guard let v = captureMainDisplay() else { continue }
             let top = recognizeRows(in: v).filter { $0.point.y < topY && $0.point.x > leftX }
             let hit = top.contains { row in
-                let n = Self.normalize(row.text)
-                return n.contains(needle) || Self.score(n, needle) > 0.6
+                let rowTokens = Self.titleTokens(row.text)
+                return Self.tokensConfirmSwitch(rowTokens, targetTokens)
+                    || Self.tokensConfirmSwitch(rowTokens, clickedTokens)
             }
             if hit {
                 trace.emit("desktop", "targeting switch_verified attempt=\(attempt) title=\"\(cand.text.prefix(40))\"")
@@ -352,6 +359,31 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         let shorter = na.count <= nb.count ? na : nb
         let longer = na.count <= nb.count ? nb : na
         return longer.hasPrefix(shorter) && shorter.count >= 6
+    }
+
+    /// Lowercased word tokens (>= 3 chars) for order-independent title matching.
+    /// Splits on any non-alphanumeric so "/", bullets, and close-button glyphs
+    /// the OCR picks up don't fuse into tokens.
+    static func titleTokens(_ s: String) -> Set<String> {
+        Set(
+            s.lowercased()
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+                .filter { $0.count >= 3 }
+        )
+    }
+
+    /// True when an OCR'd top-strip row shares enough tokens with a title to
+    /// confirm a post-click switch — robust to reordering, truncation, and a row
+    /// that OCR-merged several windows' title bars. Requires >= 2 shared tokens
+    /// AND a solid majority of the smaller token set, so a short unrelated title
+    /// (or an incidental token overlap) can't false-confirm and cause a paste
+    /// into the wrong conversation.
+    static func tokensConfirmSwitch(_ row: Set<String>, _ title: Set<String>) -> Bool {
+        let shared = row.intersection(title).count
+        let minCount = min(row.count, title.count)
+        guard minCount >= 2, shared >= 2 else { return false }
+        return Double(shared) / Double(minCount) >= 0.6
     }
 
     // MARK: - ai-title (the conversation's identity)

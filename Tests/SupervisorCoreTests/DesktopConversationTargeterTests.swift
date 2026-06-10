@@ -140,4 +140,38 @@ final class DesktopConversationTargeterTests: XCTestCase {
             XCTAssertFalse(t.contains("locks most people"), "body prose leaked: \(t)")
         }
     }
+
+    /// Regression for the third real failure: a verified-0.95 match clicked the
+    /// right conversation but the post-click verify (substring on the clicked
+    /// text) false-negatived because the title bar showed a reworded/reordered
+    /// form -> switch_not_verified -> degraded. Token overlap must confirm the
+    /// switch across the differing forms, while still rejecting a wrong title.
+    func testTokenOverlapConfirmsSwitchAcrossRewordedTitleForms() {
+        typealias T = DesktopConversationTargeter
+        let target = "Accessibility of loop engineering for non-technica" // ai-title
+        let clicked = "Loop engineering accessibility for no!"            // sidebar text (reordered, truncated)
+
+        // Title bar in the ai-title word order -> confirms against the target.
+        XCTAssertTrue(T.tokensConfirmSwitch(
+            T.titleTokens("supervisor / Accessibility of loop engineering for non-technical people"),
+            T.titleTokens(target)))
+
+        // Title bar in the sidebar word order -> confirms against the clicked text.
+        XCTAssertTrue(T.tokensConfirmSwitch(
+            T.titleTokens("supervisor / Loop engineering accessibility for non-technical"),
+            T.titleTokens(clicked)))
+
+        // OCR-merged top row carrying the target's full bar among others -> still confirms.
+        XCTAssertTrue(T.tokensConfirmSwitch(
+            T.titleTokens("Pause and kill interventions ~ x supervisor / Accessibility of loop engineering for non-technical people"),
+            T.titleTokens(target)))
+
+        // A different conversation's bar must NOT false-confirm (bleed guard).
+        XCTAssertFalse(T.tokensConfirmSwitch(
+            T.titleTokens("supervisor / Pause and kill interventions"),
+            T.titleTokens(target)))
+        XCTAssertFalse(T.tokensConfirmSwitch(
+            T.titleTokens("main / Supervisor landing page"),
+            T.titleTokens(target)))
+    }
 }
