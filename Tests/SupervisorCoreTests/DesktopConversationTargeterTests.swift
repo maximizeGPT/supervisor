@@ -1,0 +1,99 @@
+import XCTest
+import CoreGraphics
+@testable import SupervisorCore
+
+/// Regression tests for the multi-window OCR extraction. The fixture is real
+/// OCR output captured (via SupervisorDevTools ocr-dump) from the owner's
+/// actual two/three-window Claude layout on a 1920x1080 display: a left sidebar
+/// conversation list, neighbor-window body prose bleeding in at x~360-540, the
+/// "project / title" bars of each open window up top, and the menu-bar clock.
+///
+/// Before the fix, sidebarCandidates used `x < 0.30*W` and swallowed the
+/// neighbor window's prose as fake candidates (42 candidates, ~24 garbage), and
+/// activeConversationTitle picked the longest top row — the clock. These assert
+/// the extraction now isolates the real sidebar column and the real title bars.
+final class DesktopConversationTargeterTests: XCTestCase {
+
+    private let screen = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+
+    /// Real rows from a multi-window ocr-dump (text as OCR'd, point in screen px).
+    private let rows: [(text: String, point: CGPoint)] = [
+        // --- top strip: title bars (one per open window) + menu-bar clock ---
+        ("• supervisor / Pause and kill interventions ~", CGPoint(x: 999, y: 25)),
+        ("• main / Supervisor landing page •", CGPoint(x: 1515, y: 26)),
+        ("Wed Jun 10 6:13 AM", CGPoint(x: 1772, y: 12)),
+        ("0- x", CGPoint(x: 784, y: 26)),
+        // --- left nav rail (above Recents) ---
+        ("+ New session", CGPoint(x: 73, y: 110)),
+        ("& Routines", CGPoint(x: 62, y: 135)),
+        // --- Recents header ---
+        ("Recents", CGPoint(x: 46, y: 233)),
+        // --- real sidebar conversation list (left column, x~108-150) ---
+        ("Pause and kill interventions", CGPoint(x: 128, y: 287)),
+        ("• Insurance form completion", CGPoint(x: 117, y: 315)),
+        ("• Resume feedback and review", CGPoint(x: 125, y: 341)),
+        ("• Supervisor landing page", CGPoint(x: 108, y: 368)),
+        ("• Supervisor design proposal", CGPoint(x: 118, y: 396)),
+        ("• claude-eval-harness build", CGPoint(x: 114, y: 447)),
+        ("• netsuite-saved-search-mcp build", CGPoint(x: 136, y: 530)),
+        // --- neighbor window's BODY PROSE (x~360-540) — must NOT be candidates ---
+        ("Relaunching:", CGPoint(x: 382, y: 237)),
+        ("Ran Corrected isolated pipeline with literal app lists", CGPoint(x: 516, y: 266)),
+        ("Freeze + Sign + Verify (all on the isolated snapshot):", CGPoint(x: 510, y: 406)),
+        ("Signed inside-out - and all three verify PASS:", CGPoint(x: 500, y: 488)),
+        ("Notarization - all 3 submitted, now In Progress:", CGPoint(x: 506, y: 647)),
+        ("TeamIdentifier=Q7HKTCTZXQ", CGPoint(x: 470, y: 591)),
+        // --- account footer (left column, but below the list) ---
+        ("Relaunch to update", CGPoint(x: 136, y: 993)),
+        ("MW Mohammed • Max", CGPoint(x: 83, y: 1053)),
+    ]
+
+    func testSidebarCandidatesIsolateRealColumnNotNeighborWindow() {
+        let targeter = DesktopConversationTargeter()
+        let titles = targeter.sidebarCandidates(from: rows, screen: screen).map(\.text)
+
+        // The real sidebar titles are present.
+        XCTAssertTrue(titles.contains("Pause and kill interventions"))
+        XCTAssertTrue(titles.contains("Insurance form completion"))
+        XCTAssertTrue(titles.contains("Supervisor landing page"))
+        XCTAssertTrue(titles.contains("claude-eval-harness build"))
+
+        // The neighbor window's body prose is NOT picked up as a candidate.
+        for t in titles {
+            XCTAssertFalse(t.contains("Freeze"), "neighbor prose leaked in: \(t)")
+            XCTAssertFalse(t.contains("Notarization"), "neighbor prose leaked in: \(t)")
+            XCTAssertFalse(t.contains("Signed inside-out"), "neighbor prose leaked in: \(t)")
+            XCTAssertFalse(t.contains("TeamIdentifier"), "neighbor prose leaked in: \(t)")
+            XCTAssertFalse(t.contains("Relaunching"), "neighbor prose leaked in: \(t)")
+        }
+
+        // And the candidate set is tight (the real list + at most footer noise),
+        // not the old ~42-with-24-garbage blowout.
+        XCTAssertLessThanOrEqual(titles.count, 12)
+    }
+
+    func testVisibleConversationTitlesReadsTitleBarsNotClock() {
+        let targeter = DesktopConversationTargeter()
+        let visible = targeter.visibleConversationTitles(from: rows, screen: screen)
+
+        // Both open windows' titles are read.
+        XCTAssertTrue(visible.contains("Pause and kill interventions"))
+        XCTAssertTrue(visible.contains("Supervisor landing page"))
+
+        // The menu-bar clock (no " / ") is never mistaken for a title.
+        XCTAssertFalse(visible.contains(where: { $0.contains("6:13") || $0.contains("Jun 10") }))
+
+        // Exactly the two title bars, nothing else from the top strip.
+        XCTAssertEqual(visible.count, 2)
+    }
+
+    func testActiveTitleReturnsARealTitleNotTheClock() {
+        let targeter = DesktopConversationTargeter()
+        let active = targeter.visibleConversationTitles(from: rows, screen: screen).first
+        XCTAssertNotNil(active)
+        // Longest-first ordering puts the longer real title at the head; either
+        // real title is acceptable, but it must never be the clock.
+        XCTAssertNotEqual(active, "Wed Jun 10 6:13 AM")
+        XCTAssertTrue(active == "Pause and kill interventions" || active == "Supervisor landing page")
+    }
+}

@@ -237,6 +237,7 @@ case "ocr-dump":
     }
     print("--- sidebarCandidates() -> \(targeter.sidebarCandidates(from: rows).count): ---")
     for c in targeter.sidebarCandidates(from: rows) { print("    @[\(Int(c.point.x)),\(Int(c.point.y))] \"\(c.text)\"") }
+    print("--- visibleConversationTitles() -> \(targeter.visibleConversationTitles(from: rows))")
     print("--- activeConversationTitle() -> \(targeter.activeConversationTitle(from: rows).map { "\"\($0)\"" } ?? "nil")")
 default:
     print("unknown subcommand: \(args[1])")

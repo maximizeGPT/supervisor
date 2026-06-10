@@ -109,22 +109,48 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
     /// Filter recognised rows to the sidebar conversation list. The sidebar is
     /// the left column; conversation rows sit below the "Recents" header and to
     /// the left of the main pane. Best-effort heuristic, refined by the matcher.
-    public func sidebarCandidates(from rows: [(text: String, point: CGPoint)]) -> [DesktopConversationCandidate] {
-        let screen = CGDisplayBounds(CGMainDisplayID())
-        let leftEdge = screen.width * 0.30   // sidebar is the left ~30%
-        var started = false
-        var out: [DesktopConversationCandidate] = []
-        for row in rows where row.point.x < leftEdge {
-            // Conversation list begins after the "Recents" header.
-            if !started {
-                if row.text.localizedCaseInsensitiveContains("Recent") { started = true }
-                continue
-            }
-            let cleaned = Self.cleanTitle(row.text)
-            guard cleaned.count >= 3 else { continue }
-            out.append(.init(text: cleaned, point: row.point))
+    public func sidebarCandidates(
+        from rows: [(text: String, point: CGPoint)],
+        screen: CGRect = CGDisplayBounds(CGMainDisplayID())
+    ) -> [DesktopConversationCandidate] {
+        // The sidebar is a narrow LEFT COLUMN. The old "left 30%" bound
+        // (x < 0.30*W) was fine for one window but in a multi-window layout it
+        // swallowed the NEIGHBOR window's body text (x~360-540 on a 1920 screen)
+        // as fake conversation candidates — ocr-dump showed 42 candidates, ~24
+        // of them neighbor-window prose. So don't bound by a width fraction;
+        // isolate the real sidebar by its x-COLUMN: conversation titles are
+        // left-aligned at one consistent x and form the densest left-side
+        // column, while a neighbor window's text sits in a different, sparser
+        // x-spread. Cluster rows by left-x, keep only the densest column. This
+        // is independent of how the windows are arranged.
+
+        // Conversation list sits at/below the "Recents" header; anything above
+        // it (nav rail, search) and the account footer is not a conversation.
+        let recentsY = rows.first {
+            $0.text.localizedCaseInsensitiveContains("Recent") && $0.point.x < screen.width * 0.40
+        }?.point.y ?? 0
+
+        let region = rows.filter {
+            $0.point.x < screen.width * 0.40
+                && $0.point.y >= recentsY
+                && !$0.text.localizedCaseInsensitiveContains("Recent")
+                && Self.cleanTitle($0.text).count >= 3
         }
-        return out
+        guard !region.isEmpty else { return [] }
+
+        // Bucket by left-x (~50px); the densest bucket is the sidebar title
+        // column. Neighbor-window prose spreads across far-right buckets and
+        // loses; the nav rail sits at a smaller x in a sparser bucket.
+        let bucketW = 50.0
+        var counts: [Int: Int] = [:]
+        for r in region { counts[Int(r.point.x / bucketW), default: 0] += 1 }
+        guard let dominant = counts.max(by: { $0.value < $1.value })?.key else { return [] }
+        let center = (Double(dominant) + 0.5) * bucketW
+        let tolerance = 55.0
+
+        return region
+            .filter { abs($0.point.x - center) <= tolerance }
+            .map { .init(text: Self.cleanTitle($0.text), point: $0.point) }
     }
 
     /// The conversation currently open, read from the window title bar (top
@@ -133,16 +159,33 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
     /// labels and sidebar rows that can be longer; keying on "/" reliably picks
     /// the title bar. nil if not found.
     public func activeConversationTitle(from rows: [(text: String, point: CGPoint)]) -> String? {
-        let screen = CGDisplayBounds(CGMainDisplayID())
-        let topRows = rows.filter { $0.point.y < screen.height * 0.055 }
-        // Prefer the "branch / title" row; fall back to the longest centered row.
-        let bar = topRows.filter { $0.text.contains("/") }.max(by: { $0.text.count < $1.text.count })
-            ?? topRows.filter { $0.point.x > screen.width * 0.20 }.max(by: { $0.text.count < $1.text.count })
-        guard let bar else { return nil }
-        let parts = bar.text.components(separatedBy: "/")
-        let tail = (parts.count > 1 ? parts.dropFirst().joined(separator: "/") : bar.text)
-            .trimmingCharacters(in: CharacterSet(charactersIn: " ~›•-"))
-        return Self.cleanTitle(tail)
+        visibleConversationTitles(from: rows).first
+    }
+
+    /// Every conversation title bar visible in the top strip, as title tails
+    /// ("project / Title" -> "Title"), longest-first — one per open Claude
+    /// window in a multi-window layout. Keys on " / " (slash with surrounding
+    /// spaces), so it never mistakes a filesystem path ("/Users/main/…") or the
+    /// menu-bar clock ("Wed Jun 10 6:13 AM") for a title. Returns [] when no
+    /// title bar is readable; callers must NOT fall back to a random top row —
+    /// the old "longest centered row" fallback is what grabbed the clock.
+    public func visibleConversationTitles(
+        from rows: [(text: String, point: CGPoint)],
+        screen: CGRect = CGDisplayBounds(CGMainDisplayID())
+    ) -> [String] {
+        let decorations = CharacterSet(charactersIn: " ~›•-")
+        return rows
+            .filter { $0.point.y < screen.height * 0.055 && $0.text.contains(" / ") }
+            .compactMap { row -> String? in
+                let tail = row.text
+                    .components(separatedBy: " / ")
+                    .dropFirst()
+                    .joined(separator: " / ")
+                    .trimmingCharacters(in: decorations)
+                let cleaned = Self.cleanTitle(tail)
+                return cleaned.count >= 3 ? cleaned : nil
+            }
+            .sorted { $0.count > $1.count }
     }
 
     /// Strip leading bullets / icon glyphs and trailing ellipses OCR picks up.
@@ -197,12 +240,16 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         }
         let rows = recognizeRows(in: img)
         let candidates = sidebarCandidates(from: rows)
-        let active = activeConversationTitle(from: rows)
-        trace.emit("desktop", "targeting ocr active=\"\(active ?? "?")\" candidates=\(candidates.count) target=\"\(targetTitle.prefix(50))\"")
+        let titles = visibleConversationTitles(from: rows)
+        trace.emit("desktop", "targeting ocr windows=\(titles.count) candidates=\(candidates.count) target=\"\(targetTitle.prefix(50))\"")
 
-        if let active, Self.titlesMatch(active, targetTitle) {
-            trace.emit("desktop", "targeting already_active title=\"\(active)\"")
-            return .focused(matchedTitle: active)
+        // Already-active shortcut, but ONLY with exactly one visible window.
+        // With 2+ windows a matching title bar may not be the FRONTMOST one a
+        // paste would land in, so fall through to click+verify, which
+        // disambiguates by actually focusing the target and confirming it.
+        if titles.count == 1, Self.titlesMatch(titles[0], targetTitle) {
+            trace.emit("desktop", "targeting already_active title=\"\(titles[0])\"")
+            return .focused(matchedTitle: titles[0])
         }
         let match = (matcher ?? { c, t in self.bestMatch(target: t, candidates: c) })(candidates, targetTitle)
         guard let (cand, confidence) = match else {
