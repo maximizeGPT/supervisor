@@ -96,4 +96,48 @@ final class DesktopConversationTargeterTests: XCTestCase {
         XCTAssertNotEqual(active, "Wed Jun 10 6:13 AM")
         XCTAssertTrue(active == "Pause and kill interventions" || active == "Supervisor landing page")
     }
+
+    /// Regression for the second real failure: a conversation BODY pane whose
+    /// prose lands in the left-40% region with MORE rows than the sidebar. The
+    /// old "densest column" rule picked the prose (29 rows) over the sidebar (18);
+    /// "leftmost dense column" must lock onto the sidebar, which is always to the
+    /// left of any body pane. Fixture mirrors the real ocr-dump: 6 sidebar titles
+    /// at x~120 plus 11 draft-tweet body rows at x~470.
+    func testLeftmostColumnWinsWhenBodyPaneIsDenserThanSidebar() {
+        var fixture: [(text: String, point: CGPoint)] = [
+            ("Recents", CGPoint(x: 46, y: 233)),
+            // sidebar: 6 real titles at x~120
+            ("Pause and kill interventions", CGPoint(x: 119, y: 286)),
+            ("• Supervisor landing page", CGPoint(x: 108, y: 259)),
+            ("• Insurance form completion", CGPoint(x: 118, y: 366)),
+            ("• Resume feedback and review", CGPoint(x: 125, y: 394)),
+            ("• claude-eval-harness build", CGPoint(x: 114, y: 475)),
+            ("• netsuite-saved-search-mcp build", CGPoint(x: 136, y: 530)),
+        ]
+        // body pane: 11 prose rows at x~470 — denser than the 6-row sidebar
+        let prose = [
+            "I'm a CPA. Not a CS grad.", "So don't make them. Build the loop",
+            "That's what Supervisor does", "Workflows, routines, orchestration",
+            "and why it locks most people out", "The win isn't everyone learning",
+            "So I'm building it. Supervisor", "Mechanics: quote-tweet the post",
+            "the Supervisor demo card resurfaces", "My pick is reach (screenshottable)",
+            "the non-engineer-who-built-it angle",
+        ]
+        for (i, line) in prose.enumerated() {
+            fixture.append((line, CGPoint(x: 470, y: 260 + Double(i) * 26)))
+        }
+
+        let targeter = DesktopConversationTargeter()
+        let titles = targeter.sidebarCandidates(from: fixture, screen: screen).map(\.text)
+
+        // Sidebar wins despite the denser body pane.
+        XCTAssertTrue(titles.contains("Pause and kill interventions"))
+        XCTAssertTrue(titles.contains("Supervisor landing page"))
+        // None of the body prose is mistaken for a conversation.
+        for t in titles {
+            XCTAssertFalse(t.contains("CPA"), "body prose leaked: \(t)")
+            XCTAssertFalse(t.contains("quote-tweet"), "body prose leaked: \(t)")
+            XCTAssertFalse(t.contains("locks most people"), "body prose leaked: \(t)")
+        }
+    }
 }

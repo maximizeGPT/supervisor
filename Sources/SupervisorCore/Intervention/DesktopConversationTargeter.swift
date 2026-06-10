@@ -138,14 +138,20 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         }
         guard !region.isEmpty else { return [] }
 
-        // Bucket by left-x (~50px); the densest bucket is the sidebar title
-        // column. Neighbor-window prose spreads across far-right buckets and
-        // loses; the nav rail sits at a smaller x in a sparser bucket.
+        // Bucket by left-x (~50px) and take the LEFTMOST column that has at
+        // least a few rows. The sidebar is structurally the leftmost column;
+        // conversation BODY panes are always to its right, even when a pane's
+        // prose is denser than the sidebar (a draft-tweet pane with 29 rows beat
+        // the 18-row sidebar under the old "densest column" rule). Requiring a
+        // minimum row count skips the sparse account footer; taking the leftmost
+        // qualifying column — not the densest — locks onto the sidebar. When the
+        // sidebar isn't on screen this yields [] -> safe notify, never body prose.
         let bucketW = 50.0
+        let minColumnRows = 4
         var counts: [Int: Int] = [:]
         for r in region { counts[Int(r.point.x / bucketW), default: 0] += 1 }
-        guard let dominant = counts.max(by: { $0.value < $1.value })?.key else { return [] }
-        let center = (Double(dominant) + 0.5) * bucketW
+        guard let sidebarBucket = counts.filter({ $0.value >= minColumnRows }).keys.min() else { return [] }
+        let center = (Double(sidebarBucket) + 0.5) * bucketW
         let tolerance = 55.0
 
         return region
