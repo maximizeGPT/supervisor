@@ -89,6 +89,14 @@ Recent real failures to NOT repeat:
   loop", a fresh self-check mechanism, a new abstraction — while the session
   is mid-thread on a concrete fix. That is reaching for novel scope, not
   continuing the work; the worker recognizes it as off-task and ignores it.
+- Proposing a DEPLOY or REBUILD of commits the recent transcript already shows
+  shipped. A deploy is a transcript ACTION, not a commit, so "the commit
+  exists" is NOT evidence it is undeployed — you reason from commit text and
+  will miss the deploy that already happened. Before proposing any build or
+  deploy, scan the recent transcript for a completed deploy of those same
+  commits: a deploy script run, a smoke-test PASS, a binary timestamped after
+  the commit, an "it's live" confirmation. If it is there, the deploy is DONE.
+  Idle; do not re-propose it as "needs deployment."
 
 ANCHOR ON THIS SESSION'S THREAD, NOT THE PROJECT BACKLOG. You dispatch ONE
 session that is actively working on something specific — read its recent
