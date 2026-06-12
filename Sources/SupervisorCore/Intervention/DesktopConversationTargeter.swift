@@ -476,4 +476,51 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         }
         return nil
     }
+
+    /// Read the LIVE conversation title Claude Desktop currently shows for a
+    /// Claude Code session — the title in the sidebar and window title bar, which
+    /// is the identity the OCR actually sees. Claude Desktop RENAMES a
+    /// conversation as its content evolves (e.g. "Ship pause and kill
+    /// interventions" became "The token-overlap verify fix ..."), but the
+    /// `aiTitle` baked into the JSONL transcript stays frozen at the original.
+    /// Targeting the frozen title aims at a name no longer on screen — it
+    /// degrades to a banner (can't find it) or, worse, fuzzy-matches the wrong
+    /// conversation. This reads the ground truth instead.
+    ///
+    /// Claude Desktop's `claude-code-sessions` store holds one JSON per session
+    /// mapping `cliSessionId` (== our sessionId) to the live `title`. Returns nil
+    /// if the store or a matching entry isn't found (caller falls back to the
+    /// frozen aiTitle, then the branch).
+    public static func readDesktopTitle(
+        sessionId: String,
+        storeDir: URL? = nil
+    ) -> String? {
+        let base = storeDir ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Claude/claude-code-sessions", isDirectory: true)
+        guard let walker = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) else { return nil }
+        for case let url as URL in walker {
+            guard url.pathExtension == "json" else { continue }
+            // Cheap prefilter: only parse files that even mention the sessionId,
+            // so we don't JSON-decode every session's store on each inject.
+            guard let text = try? String(contentsOf: url, encoding: .utf8),
+                  text.contains(sessionId),
+                  let data = text.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            // Confirm this file IS our session (not just a stray mention).
+            guard obj["cliSessionId"] as? String == sessionId else { continue }
+            if let title = obj["title"] as? String, !title.isEmpty {
+                // Titles are normally short. Cap an anomalously long one (a stray
+                // paragraph titled from content) to its distinctive head — which
+                // is all the sidebar shows anyway — so it can't over-match
+                // unrelated conversations on incidental shared tokens.
+                var head = String(title.prefix(80))
+                if title.count > 80, let lastSpace = head.lastIndex(of: " ") {
+                    head = String(head[..<lastSpace])
+                }
+                return head
+            }
+        }
+        return nil
+    }
 }

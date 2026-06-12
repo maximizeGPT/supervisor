@@ -261,6 +261,21 @@ case "scroll-test":
     targeter.scrollSidebar(toTop: true); Thread.sleep(forTimeInterval: 0.4)
     let afterTop = cands()
     print("after to-top:  \(afterTop.count) candidates; top: \(afterTop.prefix(4))")
+case "desktop-title":
+    // The targeting identity: compare the FROZEN transcript aiTitle against the
+    // LIVE title Claude Desktop currently displays for a sessionId. Divergence
+    // is the root cause of both the wrong-chat bleed and the silent degrade.
+    guard args.count >= 3 else {
+        print("usage: SupervisorDevTools desktop-title <sessionId>")
+        exit(2)
+    }
+    let sid = args[2]
+    let frozen = DesktopConversationTargeter.readAiTitle(sessionId: sid)
+    let live = DesktopConversationTargeter.readDesktopTitle(sessionId: sid)
+    print("session:                 \(sid)")
+    print("aiTitle (JSONL, frozen): \(frozen.map { "\"\($0)\"" } ?? "nil")")
+    print("desktop title (live):    \(live.map { "\"\($0)\"" } ?? "nil")")
+    print(frozen == live ? "  -> MATCH (no drift)" : "  -> DIVERGED: targeting must use the live title (this fix)")
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)

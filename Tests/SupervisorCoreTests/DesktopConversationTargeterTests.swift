@@ -195,4 +195,44 @@ final class DesktopConversationTargeterTests: XCTestCase {
             T.titleTokens("supervisor / Pause and kill interventions"),
             T.titleTokens(intended)))
     }
+
+    /// The root cause of both the wrong-chat bleed and the silent degrade: the
+    /// `aiTitle` frozen in the JSONL transcript drifts from the title Claude
+    /// Desktop actually displays once it renames a conversation. readDesktopTitle
+    /// must read the LIVE title from the claude-code-sessions store, keyed by
+    /// cliSessionId == our sessionId, so targeting aims at what's on screen.
+    func testReadDesktopTitleResolvesLiveTitleByCliSessionId() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccs-\(UUID().uuidString)", isDirectory: true)
+        // Nested two deep, like the real <uuid>/<uuid>/local_<uuid>.json layout.
+        let nested = tmp.appendingPathComponent("a/b", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try #"{"sessionId":"local_x","cliSessionId":"sess-123","title":"The token-overlap verify fix","titleSource":"user"}"#
+            .write(to: nested.appendingPathComponent("local_x.json"), atomically: true, encoding: .utf8)
+
+        // Resolves the live title for the matching cliSessionId.
+        XCTAssertEqual(
+            DesktopConversationTargeter.readDesktopTitle(sessionId: "sess-123", storeDir: tmp),
+            "The token-overlap verify fix")
+        // A session not in the store -> nil (caller falls back to the frozen aiTitle).
+        XCTAssertNil(DesktopConversationTargeter.readDesktopTitle(sessionId: "absent", storeDir: tmp))
+    }
+
+    /// An anomalously long title (a paragraph titled from content, as seen live)
+    /// is capped to its distinctive head so it can't over-match unrelated chats.
+    func testReadDesktopTitleCapsRunawayTitle() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ccs-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let long = "The token-overlap verify fix is committed deployed and live and then a very long runaway paragraph that keeps going far past any real title length"
+        try "{\"cliSessionId\":\"s\",\"title\":\"\(long)\"}"
+            .write(to: tmp.appendingPathComponent("local_s.json"), atomically: true, encoding: .utf8)
+
+        let title = try XCTUnwrap(DesktopConversationTargeter.readDesktopTitle(sessionId: "s", storeDir: tmp))
+        XCTAssertLessThanOrEqual(title.count, 80)
+        XCTAssertTrue(title.hasPrefix("The token-overlap verify fix"))
+        XCTAssertFalse(title.hasSuffix(" "), "should trim back to a word boundary")
+    }
 }
