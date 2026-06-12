@@ -959,6 +959,19 @@ public final class TriageEngine {
                 sessionId: info.sessionId,
                 cwd: cwd
             )
+            // wrong_trajectory: the diagnostic redirect rides in
+            // next_task_proposal (no secondary call for this category). Promote
+            // it to the inject text the router types; if the LLM gave no message,
+            // degrade to a banner rather than inject nothing. The cwd guard below
+            // still applies (unresolvable cwd -> notify with the text in-banner).
+            if enriched.category == "wrong_trajectory" {
+                if let redirect = enriched.nextTaskProposal, !redirect.isEmpty {
+                    trace.emit("triage", "wrong_trajectory redirect session=\(info.sessionId) bytes=\(redirect.utf8.count)")
+                    enriched = reconfigure(enriched, action: .inject, suggestedInjectText: redirect)
+                } else {
+                    enriched = reconfigure(enriched, action: .notify)
+                }
+            }
             // v0.3.1 (Issue #6): if cwd is unresolvable, the inject
             // path can't run (locator needs cwd → PID). Downgrade
             // .inject to .notify with the answer text moved into the

@@ -35,7 +35,7 @@ public struct RubricCategory: Sendable, Equatable {
 public enum HardcodedRubric {
 
     public static var categories: [RubricCategory] {
-        [destructiveActionPending, editsOutsideWorktree, promptInjectionSignature, userQuestionPending, workerIdlePostCompletion, selfExtensionNeeded]
+        [destructiveActionPending, editsOutsideWorktree, promptInjectionSignature, userQuestionPending, workerIdlePostCompletion, selfExtensionNeeded, wrongTrajectory]
     }
 
     /// All category names — used to populate the `record_triage` schema's
@@ -85,7 +85,7 @@ public enum HardcodedRubric {
     /// v0.4.0 (Issue #8, §2e symmetry): categories for the
     /// assistant-text triage path. Only `user_question_pending`.
     public static var assistantTextCategories: [RubricCategory] {
-        [userQuestionPending]
+        [userQuestionPending, wrongTrajectory]
     }
 
     public static var assistantTextCategoriesMarkdown: String {
@@ -122,6 +122,63 @@ public enum HardcodedRubric {
 
     public static var categoryName: String { destructiveActionPending.name }
     public static var body: String { destructiveActionPending.body }
+
+    // MARK: - Category 7: wrong_trajectory (closed-loop redirect)
+
+    public static let wrongTrajectory = RubricCategory(
+        name: "wrong_trajectory",
+        body: """
+        The closed-loop steer -- the ONLY category that intervenes on an
+        ACTIVELY-WORKING session. Fire when the worker is THRASHING: burning
+        turns on an approach that is not working, so Supervisor can redirect it
+        mid-run instead of letting it spiral to a wrong answer hours later. The
+        bar is HIGH -- a wrong redirect derails productive work, which is worse
+        than staying silent.
+
+        Fire ONLY if the recent event window shows a CLEAR, repeating
+        no-progress pattern -- at least one of these SPECIFIC signatures (§11b:
+        specific signatures over an abstract "seems stuck" judgment):
+          - The SAME fix applied to the same file/symbol 3+ times, each
+            followed by the SAME error or failing check.
+          - The SAME command/test run 3+ times with the same failure and no
+            changed assumption between attempts.
+          - The worker oscillating between two states (fix A breaks B, fix B
+            breaks A) across 3+ turns with no net progress.
+          - Repeated explicit stuck-text from the worker across turns: "same
+            error", "still failing", "that didn't work either", "I keep
+            getting", "not sure why" -- recurring, not a one-off.
+
+        Do NOT fire if ANY hold:
+          - The worker is making PROGRESS: different errors each turn, new
+            information gained, the problem narrowing. A hard problem worked
+            methodically is NOT thrashing.
+          - Fewer than 3 repetitions of the failing approach. One or two
+            retries is normal iteration -- wait; the spiral must be unambiguous.
+          - The worker just changed approach (a new strategy resets the count).
+          - A user message arrived in the last 30s (the human is steering).
+          - The session is on a non-autonomous branch (user-driven).
+
+        Severity: ALWAYS medium. A redirect is a non-destructive nudge, never a
+        pause or kill; it persists in the panel for review but never crosses the
+        high-severity threshold.
+
+        Action: inject. Supervisor types a DIAGNOSTIC REDIRECT into the worker
+        -- NOT a guessed alternative fix, but "stop patching, start diagnosing."
+        Name the specific repeated action, then point at ONE diagnostic step:
+        add logging to see the actual value at the failure point, OR reduce to a
+        minimal repro, OR re-check the assumption the repeated fix depends on.
+        Example: "You've applied the same null-guard to Parser.swift 3 times and
+        hit the same crash each time. Stop editing -- log the actual value right
+        before line N, or re-check whether `tokens` is ever non-nil there.
+        Diagnose before the next change."
+
+        The `next_task_proposal` field carries the redirect MESSAGE to inject
+        (the full text, not a one-line seed -- there is NO secondary call for
+        this category; the engine injects this text directly). The
+        `matched_command` field carries the repeated action that triggered the
+        eval. The `reasoning_plain` field is one sentence on the spiral.
+        """
+    )
 
     // MARK: - Category 1: destructive_action_pending (v0.1.0 baseline)
 
