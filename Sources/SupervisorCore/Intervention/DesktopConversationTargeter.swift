@@ -523,4 +523,22 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         }
         return nil
     }
+
+    /// Locate a session's JSONL transcript -- the same file readAiTitle scans.
+    /// The router uses this to CONFIRM an injected message actually became a
+    /// turn: the injector returns keystroke bytes POSTED, which is not proof of
+    /// delivery (a paste into an unfocused composer vanishes and still reports
+    /// "success"), so the router watches this file grow before claiming success.
+    public static func transcriptURL(sessionId: String, projectsDir: URL? = nil) -> URL? {
+        let base = projectsDir ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects", isDirectory: true)
+        guard let projects = try? FileManager.default.contentsOfDirectory(
+            at: base, includingPropertiesForKeys: nil
+        ) else { return nil }
+        for proj in projects {
+            let jsonl = proj.appendingPathComponent("\(sessionId).jsonl")
+            if FileManager.default.fileExists(atPath: jsonl.path) { return jsonl }
+        }
+        return nil
+    }
 }

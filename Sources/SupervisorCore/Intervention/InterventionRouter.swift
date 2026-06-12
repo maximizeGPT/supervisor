@@ -173,12 +173,22 @@ public final class InterventionRouter {
             }
         }
         do {
+            let preSize = transcriptSize(sessionId: decision.sessionId)
             let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readDesktopTitle(sessionId: decision.sessionId) ?? DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
-            trace.emit("router", "intervention.inject.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
-            _ = await notifier.postInterventionResult(
-                decision: decision,
-                outcome: .injectSucceeded(pid: handle.pid, bytes: bytes)
-            )
+            // The injector returns keystroke bytes POSTED, not proof of delivery:
+            // a paste into an unfocused composer vanishes and still returns a
+            // count. Confirm a real turn actually appended to the transcript
+            // before claiming success; otherwise degrade to an honest banner.
+            if await injectLanded(sessionId: decision.sessionId, sincePreSize: preSize) {
+                trace.emit("router", "intervention.inject.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd) delivery=confirmed")
+                _ = await notifier.postInterventionResult(
+                    decision: decision,
+                    outcome: .injectSucceeded(pid: handle.pid, bytes: bytes)
+                )
+            } else {
+                trace.emit("router", "intervention.inject.degraded reason=paste_no_turn_landed pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
+                await postInjectDegraded(decision, intendedText: text, reason: "paste_no_turn_landed")
+            }
         } catch let err as InjectError {
             let reason: String
             switch err {
@@ -201,6 +211,32 @@ public final class InterventionRouter {
             decision: decision,
             outcome: .injectDegraded(intendedText: intendedText, reason: reason)
         )
+    }
+
+    /// Byte size of the session transcript now, or 0 if not found. The baseline
+    /// for confirming an inject actually produced a turn.
+    private func transcriptSize(sessionId: String) -> UInt64 {
+        guard let url = DesktopConversationTargeter.transcriptURL(sessionId: sessionId),
+              let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return 0 }
+        return UInt64(size)
+    }
+
+    /// Confirm an injected message became a REAL turn: a submit appends to the
+    /// JSONL transcript, growing it past `preSize`. Polls ~3.6s. Returns false
+    /// if nothing appended -- the keystrokes posted but no message landed (the
+    /// all-day false-success bug: a paste into an unfocused composer). A missing
+    /// transcript (preSize 0, size stays 0) also returns false -> honest degrade.
+    private func injectLanded(sessionId: String, sincePreSize preSize: UInt64) async -> Bool {
+        // No transcript to watch (a real Claude Code session always has its JSONL,
+        // so this is a test session or an unexpected layout): we can't DISconfirm,
+        // so don't punish a delivery we can't observe. The degrade path only fires
+        // when a transcript exists and stays flat -- the real false-success case.
+        guard DesktopConversationTargeter.transcriptURL(sessionId: sessionId) != nil else { return true }
+        for _ in 0..<8 {
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            if transcriptSize(sessionId: sessionId) > preSize { return true }
+        }
+        return false
     }
 
     /// v0.4.0 Part B: dispatch a worker_idle_post_completion flag. The
@@ -293,13 +329,20 @@ public final class InterventionRouter {
             }
         }
         do {
+            let preSize = transcriptSize(sessionId: decision.sessionId)
             let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readDesktopTitle(sessionId: decision.sessionId) ?? DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
-            trace.emit("router", "intervention.continue.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
-            let head = String(proposal.prefix(80))
-            _ = await notifier.postInterventionResult(
-                decision: decision,
-                outcome: .continueFired(pid: handle.pid, bytes: bytes, promptHead: head)
-            )
+            // Confirm the proposal actually landed as a turn (see inject path).
+            if await injectLanded(sessionId: decision.sessionId, sincePreSize: preSize) {
+                trace.emit("router", "intervention.continue.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd) delivery=confirmed")
+                let head = String(proposal.prefix(80))
+                _ = await notifier.postInterventionResult(
+                    decision: decision,
+                    outcome: .continueFired(pid: handle.pid, bytes: bytes, promptHead: head)
+                )
+            } else {
+                trace.emit("router", "intervention.continue.degraded reason=paste_no_turn_landed pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
+                await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+            }
         } catch let err as InjectError {
             let reason: String
             switch err {
