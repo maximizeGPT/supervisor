@@ -239,6 +239,28 @@ case "ocr-dump":
     for c in targeter.sidebarCandidates(from: rows) { print("    @[\(Int(c.point.x)),\(Int(c.point.y))] \"\(c.text)\"") }
     print("--- visibleConversationTitles() -> \(targeter.visibleConversationTitles(from: rows))")
     print("--- activeConversationTitle() -> \(targeter.activeConversationTitle(from: rows).map { "\"\($0)\"" } ?? "nil")")
+case "scroll-test":
+    // Verify scrollSidebar actually moves the sidebar and in the right
+    // direction: capture, scroll DOWN, capture again, and report which
+    // conversations are NEW (proving scroll-to-find can reach off-screen ones).
+    if let claude = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first {
+        claude.activate(options: [.activateIgnoringOtherApps]); Thread.sleep(forTimeInterval: 0.7)
+    }
+    let targeter = DesktopConversationTargeter()
+    func cands() -> [String] {
+        guard let img = targeter.captureMainDisplay() else { return [] }
+        return targeter.sidebarCandidates(from: targeter.recognizeRows(in: img)).map(\.text)
+    }
+    let before = cands()
+    print("before:        \(before.count) candidates; top: \(before.prefix(4))")
+    targeter.scrollSidebar(toTop: false); Thread.sleep(forTimeInterval: 0.4)
+    let afterDown = cands()
+    let newOnes = afterDown.filter { !before.contains($0) }
+    print("after down:    \(afterDown.count) candidates; \(newOnes.count) NEW: \(newOnes.prefix(5))")
+    print(newOnes.isEmpty ? "  -> scroll-down revealed NOTHING new (wrong direction, no scroll, or at bottom)" : "  -> scroll-down works (revealed off-screen conversations)")
+    targeter.scrollSidebar(toTop: true); Thread.sleep(forTimeInterval: 0.4)
+    let afterTop = cands()
+    print("after to-top:  \(afterTop.count) candidates; top: \(afterTop.prefix(4))")
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)

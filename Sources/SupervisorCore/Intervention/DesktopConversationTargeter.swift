@@ -219,6 +219,28 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
     }
 
+    /// Scroll the conversation sidebar (left column) to reveal off-screen
+    /// conversations during scroll-to-find. `toTop: true` jumps to the top of
+    /// the list with a strong upward scroll; otherwise it nudges one view down.
+    /// The cursor is parked over the sidebar first so the wheel events target
+    /// it, not the conversation pane. Scroll convention: positive wheel1 scrolls
+    /// up (toward the top of the list), negative scrolls down.
+    public func scrollSidebar(toTop: Bool) {
+        let screen = CGDisplayBounds(CGMainDisplayID())
+        let src = CGEventSource(stateID: .hidSystemState)
+        let hover = CGPoint(x: screen.width * 0.10, y: screen.height * 0.45)
+        CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: hover, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(40_000)
+        // +up = toward top (large, to reach the top); -down = a partial page so
+        // successive views overlap (the target can't fall between two scrolls).
+        let bursts = toTop ? 14 : 3
+        let lines: Int32 = toTop ? 6 : -5
+        for _ in 0..<bursts {
+            CGEvent(scrollWheelEvent2Source: src, units: .line, wheelCount: 1, wheel1: lines, wheel2: 0, wheel3: 0)?.post(tap: .cghidEventTap)
+            usleep(25_000)
+        }
+    }
+
     // MARK: - Orchestration
 
     /// Bring the target conversation to the front: screenshot, read the sidebar,
@@ -241,6 +263,9 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         }
         activateClaudeApp()
         usleep(500_000)
+        let matcherFn = matcher ?? { c, t in self.bestMatch(target: t, candidates: c) }
+
+        // Pass 1: the sidebar as currently shown (+ already-active shortcut).
         guard let img = captureMainDisplay() else {
             return .targetingFailed(reason: "capture_failed")
         }
@@ -248,21 +273,47 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         let candidates = sidebarCandidates(from: rows)
         let titles = visibleConversationTitles(from: rows)
         trace.emit("desktop", "targeting ocr windows=\(titles.count) candidates=\(candidates.count) target=\"\(targetTitle.prefix(50))\"")
-
         // Already-active shortcut, but ONLY with exactly one visible window.
-        // With 2+ windows a matching title bar may not be the FRONTMOST one a
-        // paste would land in, so fall through to click+verify, which
-        // disambiguates by actually focusing the target and confirming it.
         if titles.count == 1, Self.titlesMatch(titles[0], targetTitle) {
             trace.emit("desktop", "targeting already_active title=\"\(titles[0])\"")
             return .focused(matchedTitle: titles[0])
         }
-        let match = (matcher ?? { c, t in self.bestMatch(target: t, candidates: c) })(candidates, targetTitle)
-        guard let (cand, confidence) = match else {
-            return .targetingFailed(reason: "no_candidate_match candidates=\(candidates.count) target=\"\(targetTitle.prefix(40))\"")
+
+        var matched: (cand: DesktopConversationCandidate, conf: Double)?
+        if let (c, conf) = matcherFn(candidates, targetTitle), conf >= confidenceThreshold {
+            matched = (c, conf)
         }
-        guard confidence >= confidenceThreshold else {
-            return .targetingFailed(reason: "low_confidence=\(String(format: "%.2f", confidence)) best=\"\(cand.text.prefix(40))\" target=\"\(targetTitle.prefix(40))\"")
+
+        // Pass 2 (scroll-to-find): the target wasn't confidently in the visible
+        // sidebar -- it's scrolled off-screen. Jump to the top of the list and
+        // scroll DOWN through it, re-matching each view, so an off-screen
+        // conversation is FOUND instead of degrading straight to notify.
+        // Bounded; stops when found or a scroll yields no new conversations
+        // (end of list). The matched candidate's coordinates are from the view
+        // it was found in, so the click below lands on its current position.
+        if matched == nil {
+            scrollSidebar(toTop: true)
+            var seen = Set(candidates.map(\.text))
+            for attempt in 0..<6 {
+                usleep(350_000)
+                guard let v = captureMainDisplay() else { break }
+                let scrolled = sidebarCandidates(from: recognizeRows(in: v))
+                if let (c, conf) = matcherFn(scrolled, targetTitle), conf >= confidenceThreshold {
+                    trace.emit("desktop", "targeting found_after_scroll attempt=\(attempt) match=\"\(c.text.prefix(30))\" conf=\(String(format: "%.2f", conf))")
+                    matched = (c, conf); break
+                }
+                let fresh = scrolled.map(\.text).filter { !seen.contains($0) }
+                if fresh.isEmpty {
+                    trace.emit("desktop", "targeting scroll_end attempt=\(attempt) candidates=\(scrolled.count) (no new conversations)")
+                    break
+                }
+                scrolled.forEach { seen.insert($0.text) }
+                scrollSidebar(toTop: false)
+            }
+        }
+
+        guard let (cand, confidence) = matched else {
+            return .targetingFailed(reason: "not_found_after_scroll candidates=\(candidates.count) target=\"\(targetTitle.prefix(40))\"")
         }
         trace.emit("desktop", "targeting click match=\"\(cand.text)\" conf=\(String(format: "%.2f", confidence)) at=(\(Int(cand.point.x)),\(Int(cand.point.y)))")
         click(at: cand.point)
