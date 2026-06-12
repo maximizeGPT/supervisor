@@ -6,6 +6,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Desktop conversation targeting: deliver answers to the correct conversation
+across multiple open windows, and reach conversations scrolled off-screen.
+
+### Added
+
+**Scroll-to-find** (`Sources/SupervisorCore/Intervention/DesktopConversationTargeter.swift`)
+- Targeting only ever matched the sidebar as currently shown, so an answer for
+  a conversation scrolled out of the recents list degraded straight to notify.
+  `focusConversation` now runs two passes: the visible sidebar first (unchanged
+  fast path plus already-active shortcut), then, when the target is not
+  confidently there, it jumps the sidebar to the top and scrolls down through
+  it re-matching each view until the target is found or the list stops yielding
+  new conversations (bounded at 6 views). The matched candidate's coordinates
+  come from the view it was found in, so the click lands. Verified live via a
+  new `scroll-test` devtools command (scroll-down reveals off-screen
+  conversations, scroll-to-top restores).
+
+### Fixed
+
+**Sidebar isolation across multiple windows** (`DesktopConversationTargeter.swift`)
+- With several Claude windows open, OCR swallowed a neighbor window's body
+  prose as fake conversation candidates, and the active-title pick could land
+  on the menu-bar clock. Candidate extraction now locks onto the leftmost dense
+  column (the sidebar is always left of any body pane, even when a body pane
+  has more rows), and title-bar reads filter to rows containing " / ", never
+  the clock or a path.
+
+**Wrong-conversation bleed** (`DesktopConversationTargeter.swift`)
+- A high-confidence match could paste into the wrong conversation: the
+  post-click verify confirmed the title it LANDED on, not the one it was AIMING
+  for, so a 0.95 mis-pick passed. Verify now confirms token overlap against the
+  intended target ai-title only; a mismatch degrades to a notify banner instead
+  of typing. Worst case across all of the above is scroll, find nothing, banner,
+  never a wrong-chat paste.
+
 ## [0.9.3] — 2026-06-03
 
 Self-deploy stops silently dropping the Accessibility grant.
