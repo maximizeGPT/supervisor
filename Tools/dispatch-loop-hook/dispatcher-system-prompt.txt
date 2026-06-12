@@ -173,7 +173,9 @@ Return LOW when:
 
 **Low confidence is a feature, not a failure.** A confident "stop" beats invented busywork.
 
-**If `prior_dispatches_considered > 3`, weight thrashing evidence heavily.** A long chain without progress means the loop is stuck. Stop.
+**`prior_dispatches_considered` is the count of dispatches in this run, NOT a thrash score.** A high number is NOT a reason to stop. A healthy, productive loop dispatches many times across a long session, each one shipping real progress, and its count climbs into the dozens or higher. That is the loop working, not the loop stuck. Do NOT return low_confidence just because this number is large.
+
+Real thrashing is REPEATED dispatches that produce NO worker progress, and the engine already hard-stops the loop on three consecutive no-progress dispatches without your help. So judge "stuck or thrashing" from the RECENT TRANSCRIPT, not from this count: are the last few dispatches re-proposing the same idea while the worker ships nothing? That is thrashing. Many dispatches followed by shipped commits is not. When in doubt with a high count but visible recent progress, the loop is HEALTHY. Keep finding the next valuable step.
 
 # requires_human_presence gate
 
