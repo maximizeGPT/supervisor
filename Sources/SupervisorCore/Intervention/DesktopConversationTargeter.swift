@@ -278,20 +278,26 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         // verified-0.95 match degraded at switch_not_verified. So confirm each
         // top row against BOTH the clicked candidate AND the target, order-
         // independent, requiring several shared tokens (bleed guard).
+        // IDENTITY GUARD: the post-click title must match the INTENDED target
+        // ai-title -- NOT merely the clicked candidate. Confirming against the
+        // clicked text is exactly what let a wrong match BLEED: the matcher
+        // clicked "Supervisor macOS app signing" for target "Ship pause and kill
+        // interventions" at 0.95, the title bar showed that wrong title, and a
+        // clicked-text check happily "verified" it and typed there. Token
+        // overlap (order-independent) still passes a reworded/truncated form of
+        // the RIGHT title; a genuinely different conversation fails the guard
+        // -> .targetingFailed -> notify, never a paste into the wrong chat.
         let targetTokens = Self.titleTokens(targetTitle)
-        let clickedTokens = Self.titleTokens(cand.text)
         let topY = screen.height * 0.055, leftX = screen.width * 0.18
         for attempt in 0..<8 {
             usleep(400_000)
             guard let v = captureMainDisplay() else { continue }
             let top = recognizeRows(in: v).filter { $0.point.y < topY && $0.point.x > leftX }
             let hit = top.contains { row in
-                let rowTokens = Self.titleTokens(row.text)
-                return Self.tokensConfirmSwitch(rowTokens, targetTokens)
-                    || Self.tokensConfirmSwitch(rowTokens, clickedTokens)
+                Self.tokensConfirmSwitch(Self.titleTokens(row.text), targetTokens)
             }
             if hit {
-                trace.emit("desktop", "targeting switch_verified attempt=\(attempt) title=\"\(cand.text.prefix(40))\"")
+                trace.emit("desktop", "targeting switch_verified attempt=\(attempt) target=\"\(targetTitle.prefix(40))\"")
                 return .focused(matchedTitle: cand.text)
             }
         }

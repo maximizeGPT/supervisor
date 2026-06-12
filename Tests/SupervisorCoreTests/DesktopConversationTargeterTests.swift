@@ -174,4 +174,25 @@ final class DesktopConversationTargeterTests: XCTestCase {
             T.titleTokens("main / Supervisor landing page"),
             T.titleTokens(target)))
     }
+
+    /// Replays the live 2026-06-12T16:32 bleed: an engineering answer for the
+    /// "pause and kill" session was matched at 0.95 onto a DIFFERENT
+    /// conversation ("Supervisor macOS app signing and notarization") and the
+    /// verify confirmed the title it LANDED on instead of the one it was AIMING
+    /// for. The guard must confirm only against the intended target ai-title, so
+    /// the wrong conversation fails (-> notify) and the right one still passes.
+    func testVerifyRejectsWrongConversationLandedOn() {
+        typealias T = DesktopConversationTargeter
+        let intended = "Ship pause and kill interventions for Supervisor v0.1.2"
+
+        // The wrong conversation the matcher clicked -> MUST fail the identity guard.
+        XCTAssertFalse(T.tokensConfirmSwitch(
+            T.titleTokens("supervisor / Supervisor macOS app signing and notarization"),
+            T.titleTokens(intended)))
+
+        // The intended conversation's title bar (reworded/truncated) -> still passes.
+        XCTAssertTrue(T.tokensConfirmSwitch(
+            T.titleTokens("supervisor / Pause and kill interventions"),
+            T.titleTokens(intended)))
+    }
 }
