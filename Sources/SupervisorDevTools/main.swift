@@ -239,6 +239,79 @@ case "ocr-dump":
     for c in targeter.sidebarCandidates(from: rows) { print("    @[\(Int(c.point.x)),\(Int(c.point.y))] \"\(c.text)\"") }
     print("--- visibleConversationTitles() -> \(targeter.visibleConversationTitles(from: rows))")
     print("--- activeConversationTitle() -> \(targeter.activeConversationTitle(from: rows).map { "\"\($0)\"" } ?? "nil")")
+case "composer-probe":
+    // Read-only: activate Claude, screenshot, and report WHERE composerPoint
+    // would click to focus the composer — WITHOUT clicking or typing. Verifies
+    // the Piece-1 locator against the live screen before any paste touches it.
+    if let claude = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first {
+        claude.activate(options: [.activateIgnoringOtherApps])
+        Thread.sleep(forTimeInterval: 0.7)
+    } else {
+        print("WARN: Claude desktop not running — capturing whatever is frontmost")
+    }
+    let targeter = DesktopConversationTargeter()
+    print("screen-recording granted: \(DesktopConversationTargeter.hasScreenRecordingPermission())")
+    guard let img = targeter.captureMainDisplay() else { print("CAPTURE FAILED"); exit(1) }
+    let bounds = CGDisplayBounds(CGMainDisplayID())
+    let rows = targeter.recognizeRows(in: img)
+    let bandTop = bounds.height * 0.82
+    print("screen \(Int(bounds.width))x\(Int(bounds.height)); bottom band (y>=\(Int(bandTop))):")
+    for r in rows.filter({ $0.point.y >= bandTop }).sorted(by: { $0.point.y < $1.point.y }) {
+        print(String(format: "  [%4d,%4d] | %@", Int(r.point.x), Int(r.point.y), r.text))
+    }
+    if let pt = targeter.composerPoint(from: rows, screen: bounds) {
+        print("--- composerPoint -> (\(Int(pt.x)),\(Int(pt.y)))  [NO click performed]")
+    } else {
+        print("--- composerPoint -> nil (no bottom-band anchor found)")
+    }
+case "composer-focus-test":
+    // Piece-1 mechanism verification: focus the composer (the new code), paste a
+    // marked test string WITHOUT submitting (no Return -> no real turn), then OCR
+    // to confirm the string landed in the composer. Clears it afterward IFF it
+    // landed (never sends destructive keys into an unknown focus). Isolates
+    // focusComposer from the already-proven targeting arc.
+    guard args.count >= 3 else { print("usage: composer-focus-test <text>"); exit(2) }
+    let probe = args[2]
+    guard let claude = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first else {
+        print("Claude desktop not running"); exit(1)
+    }
+    claude.activate(options: [.activateIgnoringOtherApps]); Thread.sleep(forTimeInterval: 0.6)
+    let pid = claude.processIdentifier
+    let targeter = DesktopConversationTargeter()
+    let src = CGEventSource(stateID: .hidSystemState)
+    func postKey(_ vk: CGKeyCode, _ flags: CGEventFlags = []) {
+        guard let d = CGEvent(keyboardEventSource: src, virtualKey: vk, keyDown: true),
+              let u = CGEvent(keyboardEventSource: src, virtualKey: vk, keyDown: false) else { return }
+        d.flags = flags; u.flags = flags
+        d.postToPid(pid); usleep(30_000); u.postToPid(pid)
+    }
+    targeter.focusComposer()  // <-- the new code under test (locate + click composer)
+    let pb = NSPasteboard.general
+    let saved = pb.string(forType: .string)
+    pb.clearContents(); pb.setString(probe, forType: .string)
+    postKey(9, .maskCommand)  // Cmd-V (paste, NO Return)
+    Thread.sleep(forTimeInterval: 0.5)
+    var landed = false
+    if let img2 = targeter.captureMainDisplay() {
+        let bandTop = CGDisplayBounds(CGMainDisplayID()).height * 0.78
+        let band = targeter.recognizeRows(in: img2).filter { $0.point.y >= bandTop }
+        let needle = probe.lowercased()
+        landed = band.contains { needle.contains($0.text.lowercased()) || $0.text.lowercased().contains("focus test") }
+        print(landed ? "LANDED ✓ — probe text is in the composer (the focus click worked)"
+                     : "NOT FOUND ✗ — probe text not in the bottom band (focus likely missed)")
+        print("bottom-band text after paste:")
+        for r in band.sorted(by: { $0.point.y < $1.point.y }) { print("    [\(Int(r.point.x)),\(Int(r.point.y))] \(r.text)") }
+    }
+    if landed {
+        postKey(0, .maskCommand)  // Cmd-A (select all in the focused composer)
+        usleep(60_000)
+        postKey(51)               // Delete (clear)
+        print("(composer cleared)")
+    } else {
+        print("(left as-is — not clearing into an unknown focus)")
+    }
+    pb.clearContents(); if let saved { pb.setString(saved, forType: .string) }
+    print("(clipboard restored)")
 case "scroll-test":
     // Verify scrollSidebar actually moves the sidebar and in the right
     // direction: capture, scroll DOWN, capture again, and report which

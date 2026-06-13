@@ -241,6 +241,72 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         }
     }
 
+    // MARK: - Composer focus (Piece 1, owner-directed 2026-06-13)
+
+    /// Locate the click point of the conversation's composer (the text input
+    /// strip across the bottom of the main pane) from OCR rows.
+    ///
+    /// Why this exists: the targeting arc reliably lands on the right
+    /// CONVERSATION, but landing on the conversation is not the same as the
+    /// composer having keyboard focus. An already-active conversation never gets
+    /// a sidebar click, and even a freshly switched one can leave focus off the
+    /// input — so the subsequent Cmd-V vanishes and the turn-confirmation poll
+    /// degrades to a banner (the live `paste_no_turn_landed` miss). Clicking the
+    /// composer first gives it focus so the paste lands on the first attempt.
+    ///
+    /// Primary anchor: the composer placeholder ("Type / for commands", "Reply
+    /// to Claude", …) in the bottom band — the exact on-screen element, robust
+    /// to screen size. Fallback when the composer already holds text (no
+    /// placeholder): a point just above the bottommost band row (the account/
+    /// model footer), at the pane's horizontal center, so the click lands in the
+    /// input rather than on a footer control. nil only when there's nothing in
+    /// the bottom band to anchor on (caller then skips the focus click and the
+    /// paste falls back to whatever has focus — today's behavior, never worse).
+    public func composerPoint(
+        from rows: [(text: String, point: CGPoint)],
+        screen: CGRect = CGDisplayBounds(CGMainDisplayID())
+    ) -> CGPoint? {
+        let bandTop = screen.height * 0.82
+        let bottom = rows.filter { $0.point.y >= bandTop }
+        guard !bottom.isEmpty else { return nil }
+
+        let hints = ["type /", "for commands", "reply to claude",
+                     "message claude", "ask claude", "how can i help"]
+        if let placeholder = bottom
+            .filter({ r in hints.contains { r.text.lowercased().contains($0) } })
+            .min(by: { $0.point.y < $1.point.y }) {
+            return placeholder.point
+        }
+
+        // No placeholder: composer likely holds text. Click a touch above the
+        // lowest row (the footer), at the pane center, to land in the input.
+        let footY = bottom.map(\.point.y).max() ?? (screen.height * 0.95)
+        let paneRows = bottom.filter { $0.point.x > screen.width * 0.20 }
+        let xs = (paneRows.isEmpty ? bottom : paneRows).map(\.point.x).sorted()
+        let cx = xs.isEmpty ? screen.width * 0.45 : xs[xs.count / 2]
+        return CGPoint(x: cx, y: max(footY - screen.height * 0.04, bandTop))
+    }
+
+    /// Screenshot the now-frontmost Claude window, locate the composer, and
+    /// click it to give it keyboard focus before the caller pastes. Best-effort:
+    /// a no-op (with a discriminating trace) if capture fails or the composer
+    /// can't be located, so it never makes delivery worse than it is today.
+    /// Runs on the targeting queue (the caller is already off-main).
+    public func focusComposer() {
+        guard let img = captureMainDisplay() else {
+            trace.emit("desktop", "composer_focus skip reason=capture_failed")
+            return
+        }
+        let rows = recognizeRows(in: img)
+        guard let pt = composerPoint(from: rows) else {
+            trace.emit("desktop", "composer_focus skip reason=not_located rows=\(rows.count)")
+            return
+        }
+        trace.emit("desktop", "composer_focus click at=(\(Int(pt.x)),\(Int(pt.y)))")
+        click(at: pt)
+        usleep(150_000)  // let focus settle before the caller's paste
+    }
+
     // MARK: - Orchestration
 
     /// Bring the target conversation to the front: screenshot, read the sidebar,
@@ -276,6 +342,9 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         // Already-active shortcut, but ONLY with exactly one visible window.
         if titles.count == 1, Self.titlesMatch(titles[0], targetTitle) {
             trace.emit("desktop", "targeting already_active title=\"\(titles[0])\"")
+            // Already active = no sidebar click happened, so focus may be off
+            // the input. Focus the composer before the caller pastes (Piece 1).
+            focusComposer()
             return .focused(matchedTitle: titles[0])
         }
 
@@ -349,6 +418,9 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
             }
             if hit {
                 trace.emit("desktop", "targeting switch_verified attempt=\(attempt) target=\"\(targetTitle.prefix(40))\"")
+                // The sidebar click switched the conversation but may have left
+                // focus on the sidebar; focus the composer before pasting.
+                focusComposer()
                 return .focused(matchedTitle: cand.text)
             }
         }

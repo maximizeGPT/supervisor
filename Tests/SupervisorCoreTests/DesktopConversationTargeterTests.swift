@@ -235,4 +235,53 @@ final class DesktopConversationTargeterTests: XCTestCase {
         XCTAssertTrue(title.hasPrefix("The token-overlap verify fix"))
         XCTAssertFalse(title.hasSuffix(" "), "should trim back to a word boundary")
     }
+
+    // MARK: - composerPoint (Piece 1: focus the composer before pasting)
+
+    func testComposerPointAnchorsOnPlaceholder() {
+        // The empty Claude Code composer shows "Type / for commands" in the
+        // bottom band — the precise on-screen anchor. composerPoint returns it.
+        let targeter = DesktopConversationTargeter()
+        let rows: [(text: String, point: CGPoint)] = [
+            ("some conversation body text", CGPoint(x: 900, y: 500)),
+            ("Read 2 files", CGPoint(x: 700, y: 800)),
+            ("Type / for commands", CGPoint(x: 703, y: 1015)),  // composer placeholder
+            ("Mohammed Max", CGPoint(x: 87, y: 1050)),          // account footer
+            ("Bypass permissions", CGPoint(x: 689, y: 1057)),
+        ]
+        let pt = targeter.composerPoint(from: rows, screen: screen)
+        XCTAssertEqual(pt, CGPoint(x: 703, y: 1015),
+                       "must anchor on the composer placeholder row")
+    }
+
+    func testComposerPointFallsBackAboveFooterWhenNoPlaceholder() {
+        // Composer already holds text (no placeholder). Fallback clicks just
+        // above the footer, right of the sidebar — in the input, not on a
+        // footer control.
+        let targeter = DesktopConversationTargeter()
+        let rows: [(text: String, point: CGPoint)] = [
+            ("a draft the worker is mid-typing", CGPoint(x: 710, y: 1012)),
+            ("Mohammed Max", CGPoint(x: 87, y: 1050)),
+            ("Opus 4.8 Max", CGPoint(x: 1520, y: 1054)),
+            ("Bypass permissions", CGPoint(x: 689, y: 1057)),
+        ]
+        let pt = try? XCTUnwrap(targeter.composerPoint(from: rows, screen: screen))
+        let p = try! XCTUnwrap(pt)
+        let footerY: CGFloat = 1057
+        XCTAssertLessThan(p.y, footerY, "fallback must click ABOVE the lowest footer row")
+        XCTAssertGreaterThanOrEqual(p.y, screen.height * 0.82, "still within the bottom band")
+        XCTAssertGreaterThan(p.x, screen.width * 0.20, "right of the sidebar, in the main pane")
+    }
+
+    func testComposerPointNilWhenNothingInBottomBand() {
+        // No rows in the bottom band → can't anchor → nil (caller skips the
+        // focus click; paste falls back to current focus, never worse).
+        let targeter = DesktopConversationTargeter()
+        let rows: [(text: String, point: CGPoint)] = [
+            ("title bar", CGPoint(x: 900, y: 25)),
+            ("conversation body", CGPoint(x: 800, y: 400)),
+            ("more body", CGPoint(x: 820, y: 700)),  // still above 0.82*1080=885.6
+        ]
+        XCTAssertNil(targeter.composerPoint(from: rows, screen: screen))
+    }
 }
