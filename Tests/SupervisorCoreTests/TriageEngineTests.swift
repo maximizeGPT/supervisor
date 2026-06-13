@@ -493,3 +493,40 @@ final class DetectWorkerStoppedTests: XCTestCase {
         XCTAssertFalse(TriageEngine.detectWorkerStopped(in: events))
     }
 }
+
+/// cwd-exclusivity gate (2026-06-13): repo grounding (git branch/commits) may be
+/// attributed to a session ONLY when it is the sole live worker in that cwd —
+/// otherwise a co-located session's git state bleeds into this session's
+/// answer/dispatch (the tweet-engine bleed). These lock the pure decision.
+final class CwdExclusivityGateTests: XCTestCase {
+    func testSoleLiveSessionKeepsCwdForGrounding() {
+        XCTAssertEqual(
+            TriageEngine.groundingCwd("/Users/main/supervisor", liveSessionsInCwd: 1),
+            "/Users/main/supervisor",
+            "a solo session is the rightful owner of its cwd's git state"
+        )
+    }
+
+    func testSharedCwdOmitsGrounding() {
+        XCTAssertNil(
+            TriageEngine.groundingCwd("/Users/main/supervisor", liveSessionsInCwd: 2),
+            "with >1 live session in the cwd, repo grounding MUST be omitted (no cross-session bleed)"
+        )
+        XCTAssertNil(TriageEngine.groundingCwd("/Users/main/supervisor", liveSessionsInCwd: 5))
+    }
+
+    func testNilOrEmptyCwdPassesThroughUnchanged() {
+        // Nothing to gate — a missing cwd already means no repo grounding.
+        XCTAssertNil(TriageEngine.groundingCwd(nil, liveSessionsInCwd: 1))
+        XCTAssertEqual(TriageEngine.groundingCwd("", liveSessionsInCwd: 3), "")
+    }
+
+    func testZeroCountTreatedAsSole_noFalseOmit() {
+        // Defensive: a 0 reading (store empty/race) must not over-gate a real
+        // solo session into losing its grounding. <=1 keeps the cwd.
+        XCTAssertEqual(
+            TriageEngine.groundingCwd("/Users/main/supervisor", liveSessionsInCwd: 0),
+            "/Users/main/supervisor"
+        )
+    }
+}

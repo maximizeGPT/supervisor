@@ -345,6 +345,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             dispatcher: dispatcher,
             loopController: loopController,
             loopStore: loopDispatchStore,
+            // cwd-exclusivity gate: count live sessions (last 10 min) sharing a
+            // cwd, so repo grounding is omitted when this isn't the sole worker
+            // in that dir — prevents one session's git state bleeding into a
+            // co-located session's answer/dispatch (2026-06-13 tweet-engine bleed).
+            liveSessionsSharingCwd: { [weak self] cwd in
+                guard let store = self?.sessionStore else { return 1 }
+                let cutoff = Date().addingTimeInterval(-600)
+                let n = (try? store.all().filter { $0.cwd == cwd && $0.lastSeenAt >= cutoff }.count) ?? 1
+                return max(n, 1)
+            },
             trace: trace
         )
         engine.onActivityChange = { [weak self] activity in
