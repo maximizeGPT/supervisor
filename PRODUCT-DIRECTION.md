@@ -52,6 +52,65 @@ needs a human — in plain language. The self-watch catches stale
 builds, stuck workers, and ineffective changes before the owner
 has to notice them.
 
+## The next phase: drive a session to its objective
+
+Today the dispatch loop reasons LOCALLY. On each idle it asks "is there an
+obvious mechanical follow-on from this branch's commits, the open issues, or the
+last few turns?" When the immediate thread looks done it idles — because its
+governing rule is "an ignorable proposal is worse than idle," and it has no
+model of the USER'S objective or whether that objective is met. That
+conservatism was the right fix for an earlier failure (re-proposing rejected and
+false-premise tasks), but it's the wrong DEFAULT for what Supervisor is
+becoming: a harness you give one prompt to, screen-record, and watch carry the
+session to completion — prompting the worker the whole way, going quiet only
+when the thing is built.
+
+Three pieces are missing:
+
+- **A session objective.** Capture the user's initial prompt as the
+  through-line and anchor every idle-time decision on "what's the next concrete
+  step toward THIS objective?" — which yields a step even when repo state is
+  quiet. An objective-anchored step is grounded work, not invented scope (it
+  does not violate the "don't invent scope" rule below — the objective IS the
+  grounding).
+- **A completion model.** Judge whether the objective is MET. This is the
+  keystone — it's what lets the loop be relentless WITHOUT running past the
+  finish or manufacturing busywork. "Done" becomes objective-complete, not
+  "three idle rounds in a row."
+- **A confidence bias that favors driving.** With a clear, unmet objective, the
+  next step toward it is rarely ignorable, so "keep driving" should beat "idle
+  when unsure." The conservative default still applies when there is NO captured
+  objective.
+
+The safety rails are orthogonal and stay enforced: `wrong_trajectory` still
+redirects a thrashing worker, pause/kill still stop genuine danger. In the ideal
+run none of them fire — the loop just drives the worker from the opening prompt
+to the finished artifact.
+
+### First slice — anchor in, completion out
+
+Smallest end-to-end version, verifiable on a real canary (§6d), which doubles as
+the screen-record demo:
+
+1. **Capture the objective** — persist each session's first substantive user
+   prompt so it survives the rolling event window (the transcript's first user
+   turn is the source; store it per-session).
+2. **Feed it to the dispatcher** — add the objective to the dispatch prompt
+   beside this file, and ask for the next concrete step toward it (not merely a
+   mechanical follow-on).
+3. **Report completion** — extend `DispatchResult` with an `objective_complete`
+   judgment (met / not-met + what remains); the loop stops on objective-complete
+   rather than waiting for the 3-consecutive-low hard stop to trip.
+
+Acceptance: a session given one build prompt, then left idle, receives
+successive high-confidence steps toward that objective (not "waiting for
+direction"), and the loop reports objective-complete — and stops — when the
+artifact is built, with no safety regression.
+
+Deferred to later slices: the confidence-bias retune (piece 3) as its own
+calibrated change; objective revision / multi-objective sessions; objective
+inference when the opening prompt is vague.
+
 ## What "done" looks like for the next phase
 
 - ~~The dispatch loop runs a multi-session autonomous trial (>= 3
@@ -72,6 +131,10 @@ has to notice them.
   draggable hover.
 - The system runs reliably on both Anthropic and DeepSeek providers
   without provider-specific workarounds beyond the translation layer.
+- A session given a single objective prompt is driven to completion
+  autonomously — successive grounded steps toward that objective, a
+  stop on objective-complete, no safety regression. This is the bar for
+  the give-it-one-prompt screen-record demo (first slice above).
 
 ## What forward does NOT mean
 
@@ -81,5 +144,7 @@ has to notice them.
   state changes are bugs, not features.
 - Loosening safety gates for convenience. The rubric is the contract;
   if it's wrong, change it with evidence, don't bypass it.
-- Inventing scope that isn't grounded in filed work, known gaps, or
-  the direction above.
+- Inventing scope that isn't grounded in filed work, known gaps, the
+  session's captured objective, or the direction above. (A concrete step
+  toward the session's objective IS grounded — that's the whole point of
+  the objective anchor; it is not "invented scope.")
