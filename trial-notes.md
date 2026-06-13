@@ -3308,3 +3308,40 @@ inject degraded to nothing (the false-success is worse than the failure).
    Recording > "+". Survives in-place deploys once granted (cert-stable TCC).
    FOLLOW-UP (item 3 polish): attempt a real CGDisplayCreateImage on first desktop
    inject to auto-register + surface an in-app "Open Settings" prompt.
+
+---
+
+## Delivery-reliability arc: live verification — 2026-06-13
+
+Arc commits live: human-typing guard (8a619fc), composer focus (bca79fa),
+queued-as-delivered (6a44fc0), CHANGELOG (316d00b). Branch
+delivery-reliability-20260613T144714Z pushed for CI; full suite 412 green.
+
+### Deploy (deploy.sh, in-place rsync swap to /Applications)
+- Auto-smoke FAILED both checks — hit Known Gap #1 (Keychain ACL re-prompt on
+  in-place deploy). The relaunched instance (pid 45915) hung at the key read:
+  applicationDidFinishLaunching logged, then no onboarding decision, heartbeat
+  stale ~90s. NOT the new code (startup never touches the Piece 1-3 paths).
+- Owner cleared the "Always Allow" prompt. 15:44:59Z: "onboarding skipped;
+  entering running state", self-rebuild announced "Supervisor updated itself to
+  delivery-reliability", heartbeat resumed. Arc is live and watching.
+- Per the directive's stop-clause + §12: did NOT iterate on deploy reliability.
+
+### Piece 1 (composer focus) — VERIFIED LIVE
+- 15:49:19Z [desktop] composer_focus click at=(701,1014)
+- 15:49:20Z [router] intervention.continue.fired pid=41620 bytes=1436
+  delivery=confirmed
+- The high-confidence dispatch that delivered THIS session's "arc is fully
+  shipped" directive landed first-try: focusComposer clicked the composer →
+  paste → turn-confirmation poll (4e00980) passed → delivery=confirmed, no
+  degrade banner. Precisely the Piece 1 §6d acceptance; the §2a artifact is the
+  delivered turn itself. The arc delivered its own verification request.
+
+### Piece 2 (human guard) / Piece 3 (queued-as-delivered) — pending live trigger
+- queued / deferred-human_active events since deploy: 0. These fire only when a
+  high-confidence dispatch coincides with a human keystroke <2s old. Unit-proven
+  (3 tests) + deployed, not yet observed live. Controlled trigger proposed:
+  owner types through a dispatch window while this session idles (the loop
+  dispatches into it reliably — it just did at 15:49:20) → expect deferred
+  reason=human_active + outcome=queued (hover flashes "Queued — will send when
+  Claude Code is ready") → owner pauses → next tick delivers. Two hover entries.
