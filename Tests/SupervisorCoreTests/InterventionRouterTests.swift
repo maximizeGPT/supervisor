@@ -114,7 +114,12 @@ final class InterventionRouterTests: XCTestCase {
         handle: ProcessHandle? = ProcessHandle(pid: 4242, execPath: "/path/claude", cwd: "/tmp/test-cwd"),
         sender: CapturingSignalSender = CapturingSignalSender(),
         injector: MockInjector = MockInjector(),
-        activeSessionCount: @escaping () -> Int = { 1 }
+        activeSessionCount: @escaping () -> Int = { 1 },
+        // Default the human "idle" (999s since last keystroke) so the typing
+        // gate never fires for tests that aren't exercising it — otherwise the
+        // live CGHumanActivityProbe would read the dev's real keyboard and make
+        // every inject/continue test flaky. The human-active tests override this.
+        humanActivity: any HumanActivityProbe = StubHumanActivityProbe(idleSeconds: 999)
     ) -> (router: InterventionRouter, notifier: MockNotifier, sender: CapturingSignalSender, injector: MockInjector) {
         let notifier = MockNotifier()
         let router = InterventionRouter(
@@ -123,6 +128,7 @@ final class InterventionRouterTests: XCTestCase {
             signalSender: sender,
             injector: injector,
             activeSessionCount: activeSessionCount,
+            humanActivity: humanActivity,
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("router-test-\(UUID().uuidString).log"))
         )
@@ -410,6 +416,56 @@ final class InterventionRouterTests: XCTestCase {
             XCTAssertEqual(reason, "no_cwd_on_decision")
         } else {
             XCTFail("expected injectDegraded(no_cwd_on_decision)")
+        }
+    }
+
+    // MARK: - Human-active typing gate (owner policy 2026-06-13)
+
+    func testInjectDefersWhenHumanIsTyping_SurfacesBannerNeverTypes() async {
+        // A real keystroke landed 0.5s ago — the human is at the keyboard. The
+        // inject path must NOT synthesize keystrokes (would steal focus / clobber
+        // their draft) but must still surface the answer as a banner so it isn't
+        // lost.
+        let injector = MockInjector()
+        let (router, notifier, _, _) = makeRouter(
+            injector: injector,
+            humanActivity: StubHumanActivityProbe(idleSeconds: 0.5)
+        )
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            sessionId: "human-active-\(UUID().uuidString)",
+            suggestedInjectText: "the answer",
+            category: "user_question_pending"
+        ))
+        XCTAssertTrue(injector.calls.isEmpty,
+                      "must not type while the human is actively typing")
+        XCTAssertEqual(notifier.calls.count, 1, "deferred inject still surfaces a banner")
+        if case let .injectDegraded(_, reason) = notifier.calls.first?.outcome {
+            XCTAssertEqual(reason, "human_active",
+                           "deferral reason must discriminate human_active in the banner/trace")
+        } else {
+            XCTFail("expected injectDegraded(human_active), got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    func testInjectProceedsWhenHumanIdle() async {
+        // No recent keystroke (default 999s idle) — safe to type. The inject
+        // path resolves the target and posts to the injector.
+        let injector = MockInjector()
+        let (router, notifier, _, _) = makeRouter(injector: injector)
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            sessionId: "human-idle-\(UUID().uuidString)",
+            suggestedInjectText: "the answer",
+            category: "user_question_pending"
+        ))
+        XCTAssertEqual(injector.calls.count, 1, "idle human → inject proceeds to the injector")
+        XCTAssertEqual(injector.calls.first?.text, "the answer")
+        if case .injectSucceeded = notifier.calls.first?.outcome {
+            // OK — no transcript for a synthetic session id, so injectLanded
+            // can't disconfirm and the path reports success.
+        } else {
+            XCTFail("expected injectSucceeded, got \(String(describing: notifier.calls.first?.outcome))")
         }
     }
 }

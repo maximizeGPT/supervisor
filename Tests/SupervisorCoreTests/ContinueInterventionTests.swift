@@ -127,6 +127,8 @@ final class ContinueInterventionTests: XCTestCase {
             locator: locator,
             signalSender: DarwinSignalSender(),
             injector: injector,
+            // Human idle so the typing gate never fires in these continue tests.
+            humanActivity: StubHumanActivityProbe(idleSeconds: 999),
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("continue-router-\(UUID().uuidString).log"))
         )

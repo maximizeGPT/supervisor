@@ -40,6 +40,12 @@ public final class InterventionRouter {
     /// single-session world `{ 1 }`, which disables the gate for tests and
     /// single-session users (no behavior change).
     private let activeSessionCount: () -> Int
+    /// Owner policy (2026-06-13): never type into — or queue behind — a composer
+    /// the human is actively using. The probe answers "how long since the human
+    /// pressed a key"; if that's under `humanActiveThresholdSeconds`, the typing
+    /// paths defer (the engine re-fires on the next idle tick, so nothing is lost).
+    private let humanActivity: any HumanActivityProbe
+    private let humanActiveThresholdSeconds: TimeInterval
     private let trace: TraceLog
 
     public init(
@@ -49,6 +55,8 @@ public final class InterventionRouter {
         injector: any Injector,
         recoveryDocWriter: RecoveryDocWriter? = nil,
         activeSessionCount: @escaping () -> Int = { 1 },
+        humanActivity: any HumanActivityProbe = CGHumanActivityProbe(),
+        humanActiveThresholdSeconds: TimeInterval = 2.0,
         trace: TraceLog = .shared
     ) {
         self.notifier = notifier
@@ -57,7 +65,21 @@ public final class InterventionRouter {
         self.injector = injector
         self.recoveryDocWriter = recoveryDocWriter
         self.activeSessionCount = activeSessionCount
+        self.humanActivity = humanActivity
+        self.humanActiveThresholdSeconds = humanActiveThresholdSeconds
         self.trace = trace
+    }
+
+    /// True when a real keystroke landed within the guard window — the human is
+    /// at the keyboard right now. Both typing paths (inject + high-confidence
+    /// continue) consult this and defer rather than steal focus or clobber a
+    /// draft. The same instinct as wrong_trajectory's "back off within 30s of a
+    /// user message": active human input IS the human steering.
+    private func humanIsActivelyTyping(op: String, session: String) -> Bool {
+        let idle = humanActivity.secondsSinceLastKeystroke()
+        guard idle < humanActiveThresholdSeconds else { return false }
+        trace.emit("router", "intervention.\(op).deferred reason=human_active idle=\(String(format: "%.1f", idle))s threshold=\(String(format: "%.1f", humanActiveThresholdSeconds))s session=\(session)")
+        return true
     }
 
     /// The 2026-06-04 misroute guard. True when delivering into the resolved
@@ -171,6 +193,15 @@ public final class InterventionRouter {
                 await postInjectDegraded(decision, intendedText: text, reason: "multi_session_unconfirmed_target")
                 return
             }
+        }
+        // Human-active gate: about to synthesize keystrokes. If the human is
+        // typing right now, don't steal focus or clobber their draft. Degrade to
+        // a banner so the answer is still surfaced (never silently dropped) —
+        // the human can use it or ignore it; future dispatches type normally
+        // once they pause.
+        if humanIsActivelyTyping(op: "inject", session: decision.sessionId) {
+            await postInjectDegraded(decision, intendedText: text, reason: "human_active")
+            return
         }
         do {
             let preSize = transcriptSize(sessionId: decision.sessionId)
@@ -327,6 +358,14 @@ public final class InterventionRouter {
                 await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
                 return
             }
+        }
+        // Human-active gate (see injectOrDegrade): defer typing while the human
+        // is at the keyboard. Degrade to the propose-and-wait banner so the
+        // proposal is still visible — the human can act on it or ignore it —
+        // rather than dropping it silently mid-session.
+        if humanIsActivelyTyping(op: "continue", session: decision.sessionId) {
+            await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+            return
         }
         do {
             let preSize = transcriptSize(sessionId: decision.sessionId)

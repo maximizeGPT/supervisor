@@ -79,6 +79,8 @@ final class v0_3_0_CanaryTest: XCTestCase {
             signalSender: CanaryNoopSignalSender(),
             injector: mockInjector,
             recoveryDocWriter: nil,
+            // Human idle so the typing gate never fires in the canary.
+            humanActivity: StubHumanActivityProbe(idleSeconds: 999),
             trace: trace
         )
 
