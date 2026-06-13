@@ -268,8 +268,15 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // hover so every recorded action is driven by what actually happened
         // (answered vs "couldn't place it, here it is to paste"). Hops to the
         // main actor for the @MainActor hover.
-        let notifier = Notifier(trace: trace, onResult: { [weak hoverVM] decision, outcome in
-            Task { @MainActor in hoverVM?.recordInterventionOutcome(decision, outcome) }
+        let notifier = Notifier(trace: trace, onResult: { decision, outcome in
+            // [weak hoverVM] on the Task, NOT the outer @Sendable closure:
+            // capturing the weak var in the nested concurrently-executing Task
+            // is the Swift-5.10 "capture of var in concurrently-executing code"
+            // error CI flags (6.2.x doesn't, so it builds clean locally). This
+            // mirrors the working DEBUG_FLASH Task pattern above. hoverVM is a
+            // @MainActor view model (Sendable), so the @Sendable closure may
+            // hold it; the Task takes it weakly so async work doesn't extend its life.
+            Task { @MainActor [weak hoverVM] in hoverVM?.recordInterventionOutcome(decision, outcome) }
         })
         self.notifier = notifier
         let recoveryWriter = RecoveryDocWriter(
