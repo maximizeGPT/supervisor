@@ -195,12 +195,12 @@ public final class InterventionRouter {
             }
         }
         // Human-active gate: about to synthesize keystrokes. If the human is
-        // typing right now, don't steal focus or clobber their draft. Degrade to
-        // a banner so the answer is still surfaced (never silently dropped) —
-        // the human can use it or ignore it; future dispatches type normally
-        // once they pause.
+        // typing right now, don't steal focus or clobber their draft. Record the
+        // dispatch as QUEUED (Piece 3) — a distinct "will send when Claude Code
+        // is ready" state, not a failure and not silence. The loop re-fires on
+        // the next idle tick and delivers once they pause.
         if humanIsActivelyTyping(op: "inject", session: decision.sessionId) {
-            await postInjectDegraded(decision, intendedText: text, reason: "human_active")
+            await postQueued(decision, head: text)
             return
         }
         do {
@@ -241,6 +241,19 @@ public final class InterventionRouter {
         _ = await notifier.postInterventionResult(
             decision: decision,
             outcome: .injectDegraded(intendedText: intendedText, reason: reason)
+        )
+    }
+
+    /// Piece 3 (queued-as-delivered): the human is typing, so the router held
+    /// the dispatch rather than delivering. Post the queued outcome — the hover
+    /// shows a distinct "Queued — will send when Claude Code is ready" indicator
+    /// instead of a misleading failure banner or silence. The loop re-fires on
+    /// the next idle tick and records a separate fired/answered entry when it
+    /// actually lands.
+    private func postQueued(_ decision: TriageDecision, head: String) async {
+        _ = await notifier.postInterventionResult(
+            decision: decision,
+            outcome: .queued(promptHead: String(head.prefix(80)))
         )
     }
 
@@ -360,11 +373,11 @@ public final class InterventionRouter {
             }
         }
         // Human-active gate (see injectOrDegrade): defer typing while the human
-        // is at the keyboard. Degrade to the propose-and-wait banner so the
-        // proposal is still visible — the human can act on it or ignore it —
-        // rather than dropping it silently mid-session.
+        // is at the keyboard. Record the dispatch as QUEUED (Piece 3) so the
+        // hover shows "will send when Claude Code is ready" rather than silently
+        // holding it; the loop re-fires and delivers once they pause.
         if humanIsActivelyTyping(op: "continue", session: decision.sessionId) {
-            await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+            await postQueued(decision, head: proposal)
             return
         }
         do {

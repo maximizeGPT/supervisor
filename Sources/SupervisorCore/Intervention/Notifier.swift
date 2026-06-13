@@ -82,6 +82,13 @@ public enum InterventionOutcome: Sendable, Equatable {
     /// is the dispatcher's justification (lands in the banner so the
     /// user knows WHY supervisor went quiet).
     case continueLowConfidence(reasoning: String)
+    /// Piece 3 (queued-as-delivered, 2026-06-13): the router was ready to
+    /// deliver, but the human is actively at the keyboard (Piece 1's
+    /// HumanActivityProbe), so it deferred rather than typing over them. This
+    /// is NOT a failure and NOT a fire — the dispatch is held; the loop
+    /// re-attempts on the next idle tick and delivers once the human pauses.
+    /// `promptHead` is the first ~80 chars of what's queued, for the banner.
+    case queued(promptHead: String)
 }
 
 public final class Notifier: Notifying, @unchecked Sendable {
@@ -173,6 +180,8 @@ public final class Notifier: Notifying, @unchecked Sendable {
             return "Supervisor has a suggestion"
         case .continueLowConfidence:
             return "Supervisor is waiting for direction"
+        case .queued:
+            return "Supervisor queued a task"
         }
     }
 
@@ -214,6 +223,9 @@ public final class Notifier: Notifying, @unchecked Sendable {
             return "Supervisor thinks Claude Code should work on this next, but wants your approval:\n\n\(proposal)\n\nPaste this into Claude Code if you agree, or write your own direction."
         case .continueLowConfidence(let reasoning):
             return "Claude Code finished its work and Supervisor couldn't decide what to do next. \(reasoning)\n\nTell Claude Code what to work on, or add items to the issue queue."
+        case .queued(let promptHead):
+            let head = promptHead.count >= 80 ? promptHead + "..." : promptHead
+            return "Claude Code is busy, so Supervisor queued this and will send it when the worker is ready:\n\n\(head)"
         }
     }
 

@@ -421,11 +421,11 @@ final class InterventionRouterTests: XCTestCase {
 
     // MARK: - Human-active typing gate (owner policy 2026-06-13)
 
-    func testInjectDefersWhenHumanIsTyping_SurfacesBannerNeverTypes() async {
+    func testInjectQueuesWhenHumanIsTyping_NeverTypes() async {
         // A real keystroke landed 0.5s ago — the human is at the keyboard. The
         // inject path must NOT synthesize keystrokes (would steal focus / clobber
-        // their draft) but must still surface the answer as a banner so it isn't
-        // lost.
+        // their draft); it records the dispatch as QUEUED (Piece 3) so the hover
+        // shows "will send when Claude Code is ready" rather than typing over them.
         let injector = MockInjector()
         let (router, notifier, _, _) = makeRouter(
             injector: injector,
@@ -439,12 +439,11 @@ final class InterventionRouterTests: XCTestCase {
         ))
         XCTAssertTrue(injector.calls.isEmpty,
                       "must not type while the human is actively typing")
-        XCTAssertEqual(notifier.calls.count, 1, "deferred inject still surfaces a banner")
-        if case let .injectDegraded(_, reason) = notifier.calls.first?.outcome {
-            XCTAssertEqual(reason, "human_active",
-                           "deferral reason must discriminate human_active in the banner/trace")
+        XCTAssertEqual(notifier.calls.count, 1, "deferred inject surfaces a queued indicator")
+        if case let .queued(head) = notifier.calls.first?.outcome {
+            XCTAssertEqual(head, "the answer", "queued indicator carries what's pending")
         } else {
-            XCTFail("expected injectDegraded(human_active), got \(String(describing: notifier.calls.first?.outcome))")
+            XCTFail("expected .queued, got \(String(describing: notifier.calls.first?.outcome))")
         }
     }
 
@@ -531,6 +530,8 @@ final class NotifierOutcomeBodyTests: XCTestCase {
                 return base + " Supervisor proposes: \(proposal) Paste this into Claude Code to continue, or write your own."
             case .continueLowConfidence(let reasoning):
                 return base + " Supervisor saw idle but couldn't confidently dispatch — pick the next task yourself. Reason: \(reasoning)"
+            case .queued(let promptHead):
+                return base + " Queued — will send when Claude Code is ready: \(promptHead)"
             }
         }
     }

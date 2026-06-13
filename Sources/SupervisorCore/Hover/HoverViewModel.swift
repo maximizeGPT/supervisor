@@ -427,6 +427,11 @@ public final class HoverViewModel: ObservableObject {
             return (.continue, "Sent Claude Code its next task")
         case .continueProposedMedium:
             return (.continue, "Suggested a next task. It's in the banner for you.")
+        case .queued:
+            // Piece 3: deferred because the human is typing. Honest — it has
+            // NOT sent/answered; it's holding the dispatch until the worker is
+            // ready, when the loop re-fires and delivers it.
+            return (.continue, "Queued — will send when Claude Code is ready")
         case .pauseSucceeded:
             return (.pause, "Paused Claude Code. Needs your attention.")
         case .killSucceeded:

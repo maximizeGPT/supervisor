@@ -53,6 +53,20 @@ final class InjectClaimHonestyTests: XCTestCase {
         )
     }
 
+    func testQueuedRecordsHonestlyNeverClaimsSent() {
+        // Piece 3: a queued dispatch was NOT sent — it's held until the worker
+        // is ready. The label must say "queued"/"will send" and never claim it
+        // already sent or answered.
+        let r = HoverViewModel.actionForOutcome(.queued(promptHead: "do the thing"))
+        let label = r?.label ?? ""
+        XCTAssertTrue(label.localizedCaseInsensitiveContains("queued"),
+                      "must announce it's queued: \"\(label)\"")
+        XCTAssertFalse(label.localizedCaseInsensitiveContains("sent"),
+                       "a queued dispatch must NOT claim it sent: \"\(label)\"")
+        XCTAssertFalse(label.localizedCaseInsensitiveContains("answered"),
+                       "a queued dispatch must NOT claim it answered: \"\(label)\"")
+    }
+
     func testNotifyAndDegradedSignalsRecordNoFalseAction() {
         // notify isn't an "action taken"; a degraded pause/kill arrives as
         // .notifyOnly, so nothing ever claims it paused/stopped something.
