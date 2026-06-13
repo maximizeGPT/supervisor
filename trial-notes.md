@@ -3345,3 +3345,33 @@ delivery-reliability-20260613T144714Z pushed for CI; full suite 412 green.
   dispatches into it reliably — it just did at 15:49:20) → expect deferred
   reason=human_active + outcome=queued (hover flashes "Queued — will send when
   Claude Code is ready") → owner pauses → next tick delivers. Two hover entries.
+
+---
+
+## Cross-session context-bleed fix + CI green — 2026-06-13
+
+Live bug owner flagged: the "Supervisor tweet engine" session (0b1effa7, a
+socials routine) got an inject grounded in THIS dev session's context (the
+delivery-reliability arc, CI, commit d54..., §-citations). Targeting was correct;
+grounding was poisoned because both sessions share cwd=/Users/main/supervisor and
+repo_context is gathered from the cwd's live git state (branch=delivery-reliability
++ this session's commits). git HEAD is directory-global, not session-specific.
+
+- **Fix (25b3e69):** default-deny cwd-exclusivity gate. groundingCwd(_:liveSessionsInCwd:)
+  omits cwd-derived repo grounding unless the session is the SOLE live worker in
+  the cwd; applied at both the answer (gatherRepoContextForAnswer) and dispatch
+  (dispatchForIdleSession) seams. cwd still flows to targeting. Wired to
+  SessionStore (10-min window) like the router's activeSessionCount. 4 tests, 416 green.
+- **CI fix (6d65125):** CI runs Swift 5.10 (local is 6.2.4, which doesn't flag it).
+  5.10 errored on main.swift:272 — the v0.9.0 onResult hook captured [weak hoverVM]
+  on the outer @Sendable closure; the nested Task captured the weak var. Moved
+  [weak hoverVM] onto the Task (the in-file DEBUG_FLASH pattern). Pre-existing
+  autonomous-branch code, never CI'd on 5.10 — surfaced because PR #15 diffs the
+  whole unmerged branch vs main.
+- **PR #15: CI GREEN** (build + tests, Swift 5.10). NOT merged (owner: skip merge).
+
+DEFERRED-DEPLOY GAP (owner-held, §4c honesty): the bleed gate is committed +
+CI-green on the branch but NOT deployed. The running app is still on 6a44fc0
+(arc only), so the cross-session bleed can recur live until redeployed. Auto-
+closes on the next deploy.sh from this branch (it builds branch HEAD). Owner
+deferred the redeploy to avoid the Known Gap #1 Keychain re-prompt right now.
