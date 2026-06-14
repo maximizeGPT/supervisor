@@ -262,9 +262,17 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
     /// input rather than on a footer control. nil only when there's nothing in
     /// the bottom band to anchor on (caller then skips the focus click and the
     /// paste falls back to whatever has focus — today's behavior, never worse).
+    /// `nearX`: the x-column of the TARGET conversation's window (its matched
+    /// title bar). When several Claude windows are tiled, the bottom band holds
+    /// several composers; without this the picker grabbed the leftmost/topmost
+    /// one and pasted into the WRONG window (the 2026-06-14 multi-window mispick:
+    /// clicked x=408 for a conversation whose composer was at ~1018). With it,
+    /// the picker chooses the composer in the target window's column. nil =
+    /// single-window / unknown → the original topmost-placeholder behavior.
     public func composerPoint(
         from rows: [(text: String, point: CGPoint)],
-        screen: CGRect = CGDisplayBounds(CGMainDisplayID())
+        screen: CGRect = CGDisplayBounds(CGMainDisplayID()),
+        nearX: CGFloat? = nil
     ) -> CGPoint? {
         let bandTop = screen.height * 0.82
         let bottom = rows.filter { $0.point.y >= bandTop }
@@ -272,19 +280,26 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
 
         let hints = ["type /", "for commands", "reply to claude",
                      "message claude", "ask claude", "how can i help"]
-        if let placeholder = bottom
-            .filter({ r in hints.contains { r.text.lowercased().contains($0) } })
-            .min(by: { $0.point.y < $1.point.y }) {
-            return placeholder.point
+        let placeholders = bottom.filter { r in hints.contains { r.text.lowercased().contains($0) } }
+        if !placeholders.isEmpty {
+            // Multi-window: pick the composer in the TARGET window's column
+            // (closest x to the matched title bar). Single-window: topmost.
+            if let nearX {
+                return placeholders.min { abs($0.point.x - nearX) < abs($1.point.x - nearX) }!.point
+            }
+            return placeholders.min { $0.point.y < $1.point.y }!.point
         }
 
         // No placeholder: composer likely holds text. Click a touch above the
-        // lowest row (the footer), at the pane center, to land in the input.
+        // lowest row (the footer). Prefer the target column when known, else the
+        // pane center.
         let footY = bottom.map(\.point.y).max() ?? (screen.height * 0.95)
+        let y = max(footY - screen.height * 0.04, bandTop)
+        if let nearX { return CGPoint(x: nearX, y: y) }
         let paneRows = bottom.filter { $0.point.x > screen.width * 0.20 }
         let xs = (paneRows.isEmpty ? bottom : paneRows).map(\.point.x).sorted()
         let cx = xs.isEmpty ? screen.width * 0.45 : xs[xs.count / 2]
-        return CGPoint(x: cx, y: max(footY - screen.height * 0.04, bandTop))
+        return CGPoint(x: cx, y: y)
     }
 
     /// Screenshot the now-frontmost Claude window, locate the composer, and
@@ -292,17 +307,20 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
     /// a no-op (with a discriminating trace) if capture fails or the composer
     /// can't be located, so it never makes delivery worse than it is today.
     /// Runs on the targeting queue (the caller is already off-main).
-    public func focusComposer() {
+    /// `nearX`: the target window's column (its title-bar x), so in a tiled
+    /// multi-window layout the click lands on the TARGET conversation's composer,
+    /// not a neighbor window's.
+    public func focusComposer(nearX: CGFloat? = nil) {
         guard let img = captureMainDisplay() else {
             trace.emit("desktop", "composer_focus skip reason=capture_failed")
             return
         }
         let rows = recognizeRows(in: img)
-        guard let pt = composerPoint(from: rows) else {
+        guard let pt = composerPoint(from: rows, nearX: nearX) else {
             trace.emit("desktop", "composer_focus skip reason=not_located rows=\(rows.count)")
             return
         }
-        trace.emit("desktop", "composer_focus click at=(\(Int(pt.x)),\(Int(pt.y)))")
+        trace.emit("desktop", "composer_focus click at=(\(Int(pt.x)),\(Int(pt.y)))\(nearX.map { " nearX=\(Int($0))" } ?? "")")
         click(at: pt)
         usleep(150_000)  // let focus settle before the caller's paste
     }
@@ -343,8 +361,13 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         if titles.count == 1, Self.titlesMatch(titles[0], targetTitle) {
             trace.emit("desktop", "targeting already_active title=\"\(titles[0])\"")
             // Already active = no sidebar click happened, so focus may be off
-            // the input. Focus the composer before the caller pastes (Piece 1).
-            focusComposer()
+            // the input. Focus the composer in THIS window's column (the matched
+            // title bar's x) before the caller pastes — so a partially-visible
+            // neighbor window's composer in the band can't be grabbed instead.
+            let titleX = rows.first {
+                $0.point.y < CGDisplayBounds(CGMainDisplayID()).height * 0.055 && $0.text.contains(" / ")
+            }?.point.x
+            focusComposer(nearX: titleX)
             return .focused(matchedTitle: titles[0])
         }
 
@@ -413,14 +436,16 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
             usleep(400_000)
             guard let v = captureMainDisplay() else { continue }
             let top = recognizeRows(in: v).filter { $0.point.y < topY && $0.point.x > leftX }
-            let hit = top.contains { row in
+            let hitRow = top.first { row in
                 Self.tokensConfirmSwitch(Self.titleTokens(row.text), targetTokens)
             }
-            if hit {
-                trace.emit("desktop", "targeting switch_verified attempt=\(attempt) target=\"\(targetTitle.prefix(40))\"")
+            if let hitRow {
+                trace.emit("desktop", "targeting switch_verified attempt=\(attempt) target=\"\(targetTitle.prefix(40))\" titleX=\(Int(hitRow.point.x))")
                 // The sidebar click switched the conversation but may have left
-                // focus on the sidebar; focus the composer before pasting.
-                focusComposer()
+                // focus on the sidebar; focus the composer in the MATCHED window's
+                // column (its title-bar x) so a tiled neighbor window's composer
+                // isn't grabbed instead.
+                focusComposer(nearX: hitRow.point.x)
                 return .focused(matchedTitle: cand.text)
             }
         }

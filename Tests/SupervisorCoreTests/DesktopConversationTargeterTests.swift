@@ -284,4 +284,25 @@ final class DesktopConversationTargeterTests: XCTestCase {
         ]
         XCTAssertNil(targeter.composerPoint(from: rows, screen: screen))
     }
+
+    func testComposerPointPicksTargetWindowColumnInMultiWindow() {
+        // Three tiled Claude windows → three composers in the bottom band. With
+        // nearX = the target window's title-bar column, pick THAT window's
+        // composer, not the leftmost (the 2026-06-14 mispick: clicked 408 for a
+        // conversation whose composer was at ~1018).
+        let targeter = DesktopConversationTargeter()
+        let rows: [(text: String, point: CGPoint)] = [
+            ("Type / for commands", CGPoint(x: 408, y: 1015)),    // left window
+            ("Type / for commands", CGPoint(x: 1018, y: 1015)),   // MIDDLE — the target
+            ("Type / for commands", CGPoint(x: 1495, y: 1015)),   // right window
+            ("Mw Mohammed Max", CGPoint(x: 86, y: 1050)),
+        ]
+        // Target ("app state review") title bar sits at x~1001 — the middle window.
+        XCTAssertEqual(targeter.composerPoint(from: rows, screen: screen, nearX: 1001),
+                       CGPoint(x: 1018, y: 1015),
+                       "must pick the composer in the target window's column, not the leftmost")
+        // No nearX → original topmost behavior (leftmost at min y).
+        XCTAssertEqual(targeter.composerPoint(from: rows, screen: screen)?.x, 408,
+                       "without nearX, falls back to the original pick")
+    }
 }
