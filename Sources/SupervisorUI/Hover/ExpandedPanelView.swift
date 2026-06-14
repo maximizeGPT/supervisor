@@ -30,10 +30,47 @@ public struct ExpandedPanelView: View {
             Divider()
             activitySection
             Divider()
+            controlsSection
+            Divider()
             footer
         }
         .frame(width: 480, height: 360)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    // MARK: - Controls section (owner runtime toggles)
+
+    private var controlsSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("CONTROLS")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+            HStack(spacing: 8) {
+                // Global pause / resume — Supervisor goes dormant (no triage,
+                // dispatch, or inject) until resumed.
+                Button(action: { vm.toggleSupervisorPaused() }) {
+                    Label(vm.supervisorPaused ? "Resume Supervisor" : "Pause Supervisor",
+                          systemImage: vm.supervisorPaused ? "play.fill" : "pause.fill")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.bordered)
+                .tint(vm.supervisorPaused ? BrandColor.signal.color : .orange)
+
+                // 4-hour loop cap on / off.
+                Button(action: { vm.toggleLoopCapDisabled() }) {
+                    Label(vm.loopCapDisabled ? "4h cap: off" : "4h cap: on",
+                          systemImage: vm.loopCapDisabled ? "infinity" : "timer")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.bordered)
+                .tint(vm.loopCapDisabled ? .orange : BrandColor.mute.color)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 6)
+        }
     }
 
     // MARK: - Header

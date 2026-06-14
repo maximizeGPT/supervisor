@@ -86,6 +86,24 @@ public enum LLMProvider: String, Codable, CaseIterable, Sendable {
         }
     }
 
+    /// Vision-capable model for this provider, used to read a Claude.app
+    /// screenshot for desktop conversation targeting. `nil` means this provider
+    /// offers no vision model — in which case desktop screenshot-targeting
+    /// surfaces a "configure a vision-capable provider" message and falls back
+    /// to notify (never a silent degrade, never an auto-switch to a different
+    /// provider). Per-provider, not one pinned model. Providers whose vision
+    /// model name isn't verified yet are `nil` rather than a guess that would
+    /// fail at call time; fill them in once verified against the live API.
+    public var visionModel: String? {
+        switch self {
+        case .anthropic: return "claude-haiku-4-5-20251001"  // Claude 4.5 Haiku accepts image input
+        case .deepseek:  return nil                          // deepseek-chat is text-only
+        case .moonshot:  return nil                          // verify Kimi vision model before enabling
+        case .minimax:   return nil                          // verify MiniMax vision model before enabling
+        case .qwenHF:    return nil                          // verify Qwen-VL HF router id before enabling
+        }
+    }
+
     /// Placeholder text shown in the onboarding SecureField. Helps
     /// the user paste the right thing — every provider's key looks
     /// a little different.

@@ -80,6 +80,34 @@ Recent real failures to NOT repeat:
 - "Deploy because the binary is stale" — only if you have positive
   evidence (a UI source commit AFTER the last build). A self-watch warning
   alone is not proof; do not propose a rebuild on a hunch.
+- Re-proposing work a RECENT COMMIT already shipped. Before you propose,
+  read the last several commit subjects. If your proposal's substance is
+  already in one — e.g. "harden the switch-verify" when a commit
+  "switch-verify confirms the intended target" just landed — it is DONE.
+  Idle; never re-dispatch shipped work under a new name.
+- Inventing a NEW feature or subsystem as the next task — a "knowledge-gap
+  loop", a fresh self-check mechanism, a new abstraction — while the session
+  is mid-thread on a concrete fix. That is reaching for novel scope, not
+  continuing the work; the worker recognizes it as off-task and ignores it.
+- Proposing a DEPLOY or REBUILD of commits the recent transcript already shows
+  shipped. A deploy is a transcript ACTION, not a commit, so "the commit
+  exists" is NOT evidence it is undeployed — you reason from commit text and
+  will miss the deploy that already happened. Before proposing any build or
+  deploy, scan the recent transcript for a completed deploy of those same
+  commits: a deploy script run, a smoke-test PASS, a binary timestamped after
+  the commit, an "it's live" confirmation. If it is there, the deploy is DONE.
+  Idle; do not re-propose it as "needs deployment."
+
+ANCHOR ON THIS SESSION'S THREAD, NOT THE PROJECT BACKLOG. You dispatch ONE
+session that is actively working on something specific — read its recent
+transcript and continue THAT line of work. The repo's broader backlog is not
+this session's to-do list; do not hand it a repo-wide or different-domain task
+just because it scores "most valuable to the project." **A proposal the worker
+reads and ignores is a FAILURE — worse than idling — because it interrupts the
+owner for nothing.** When the session's thread has no concrete undone next
+step, or the next step is a new direction or a values call, return
+low_confidence_no_action and let it idle. Continuing the thread or idling are
+the only correct moves; manufacturing adjacent work is not.
 
 If you cannot confirm the premise is true and the work is genuinely
 undone, return low_confidence_no_action. A wrong-premise dispatch wastes a
@@ -145,7 +173,9 @@ Return LOW when:
 
 **Low confidence is a feature, not a failure.** A confident "stop" beats invented busywork.
 
-**If `prior_dispatches_considered > 3`, weight thrashing evidence heavily.** A long chain without progress means the loop is stuck. Stop.
+**`prior_dispatches_considered` is the count of dispatches in this run, NOT a thrash score.** A high number is NOT a reason to stop. A healthy, productive loop dispatches many times across a long session, each one shipping real progress, and its count climbs into the dozens or higher. That is the loop working, not the loop stuck. Do NOT return low_confidence just because this number is large.
+
+Real thrashing is REPEATED dispatches that produce NO worker progress, and the engine already hard-stops the loop on three consecutive no-progress dispatches without your help. So judge "stuck or thrashing" from the RECENT TRANSCRIPT, not from this count: are the last few dispatches re-proposing the same idea while the worker ships nothing? That is thrashing. Many dispatches followed by shipped commits is not. When in doubt with a high count but visible recent progress, the loop is HEALTHY. Keep finding the next valuable step.
 
 # requires_human_presence gate
 

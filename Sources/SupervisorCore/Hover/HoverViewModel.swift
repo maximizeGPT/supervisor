@@ -47,6 +47,18 @@ public final class HoverViewModel: ObservableObject {
     /// Whether the expanded panel is visible.
     @Published public var isExpanded: Bool = false
 
+    // MARK: - Owner runtime toggles (panel controls)
+
+    /// Global pause — when true, Supervisor is dormant (no triage/dispatch/
+    /// inject). Mirrors the RuntimeToggles marker; the panel's Pause button
+    /// flips it and the engine reads the marker live, so it takes effect at once.
+    @Published public private(set) var supervisorPaused: Bool = RuntimeToggles.supervisorPaused
+
+    /// 4-hour loop-cap disabled — when true, the loop runs without the 4-hour
+    /// wall-clock hard stop (for long sessions / the screen-record demo). The
+    /// other hard stops still apply.
+    @Published public private(set) var loopCapDisabled: Bool = RuntimeToggles.loopCapDisabled
+
     // MARK: - Session metrics (v0.1.7 expanded panel)
 
     /// Number of assistant turns (user prompt → assistant response cycles).
@@ -154,6 +166,23 @@ public final class HoverViewModel: ObservableObject {
     public func toggleExpanded() {
         isExpanded.toggle()
         trace.emit("hover", "expanded panel \(isExpanded ? "opened" : "closed")")
+    }
+
+    /// Owner control: pause / resume Supervisor globally. The engine reads the
+    /// marker live, so the effect is immediate — no rebuild, no restart.
+    public func toggleSupervisorPaused() {
+        let next = !supervisorPaused
+        RuntimeToggles.setSupervisorPaused(next)
+        supervisorPaused = next
+        trace.emit("hover", "owner toggled supervisor_paused=\(next)")
+    }
+
+    /// Owner control: turn the 4-hour loop cap off / on for this machine.
+    public func toggleLoopCapDisabled() {
+        let next = !loopCapDisabled
+        RuntimeToggles.setLoopCapDisabled(next)
+        loopCapDisabled = next
+        trace.emit("hover", "owner toggled loop_cap_disabled=\(next)")
     }
 
     /// Record user response (dismiss / false positive) for a flag.
@@ -387,11 +416,57 @@ public final class HoverViewModel: ObservableObject {
         // Generic fallback per action type.
         switch action {
         case .notify:     return "Noticed something. Check the notification."
-        case .inject:     return "Answered a question for Claude Code"
-        case .continue:   return "Sent Claude Code its next task"
+        // Flag-time label, set BEFORE the inject runs — present tense, never a
+        // success claim. The honest result lands later via
+        // recordInterventionOutcome once the executor actually finishes.
+        case .inject:     return "Answering a question for Claude Code"
+        case .continue:   return "Sending Claude Code its next task"
         case .selfExtend: return "Helping the dispatch loop recover"
         case .pause:      return "Paused Claude Code. Needs your attention."
         case .kill:       return "Stopped Claude Code. Something looked dangerous."
+        }
+    }
+
+    /// v0.9.0 (integrity): record the action-log entry + live label from the
+    /// ACTUAL intervention outcome, never from intent. The app wires this to the
+    /// Notifier's result hook, so it fires with the same (decision, outcome) the
+    /// banner uses, AFTER the router's executor finishes. A degraded inject or
+    /// continue reports honestly that it couldn't place the text and points to
+    /// the banner; it NEVER claims it answered. This replaces the old eager
+    /// record that fired at decision time with the intent label.
+    public func recordInterventionOutcome(_ decision: TriageDecision, _ outcome: InterventionOutcome) {
+        guard let result = Self.actionForOutcome(outcome) else { return }
+        recordAction(action: result.action, description: result.label)
+        plainLabel = result.label
+        trace.emit("hover", "action recorded from REAL outcome: \(result.label)")
+    }
+
+    /// Map a real intervention outcome to an honest (action, label), or nil when
+    /// there's nothing Supervisor actually did to record (a plain notify, or a
+    /// low-confidence "waiting for direction" — neither is an action taken, and
+    /// a degraded pause/kill arrives as `.notifyOnly`, so it never claims it
+    /// paused/stopped something it didn't).
+    nonisolated static func actionForOutcome(_ outcome: InterventionOutcome) -> (action: FlagAction, label: String)? {
+        switch outcome {
+        case .injectSucceeded:
+            return (.inject, "Answered a question for Claude Code")
+        case .injectDegraded:
+            return (.inject, "Couldn't place the answer in the conversation. It's in the banner to paste.")
+        case .continueFired:
+            return (.continue, "Sent Claude Code its next task")
+        case .continueProposedMedium:
+            return (.continue, "Suggested a next task. It's in the banner for you.")
+        case .queued:
+            // Piece 3: deferred because the human is typing. Honest — it has
+            // NOT sent/answered; it's holding the dispatch until the worker is
+            // ready, when the loop re-fires and delivers it.
+            return (.continue, "Queued — will send when Claude Code is ready")
+        case .pauseSucceeded:
+            return (.pause, "Paused Claude Code. Needs your attention.")
+        case .killSucceeded:
+            return (.kill, "Stopped Claude Code. Something looked dangerous.")
+        case .notifyOnly, .continueLowConfidence:
+            return nil
         }
     }
 

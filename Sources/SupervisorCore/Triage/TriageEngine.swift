@@ -200,6 +200,18 @@ public final class TriageEngine {
     /// Nil disables persistence (tests without a SupervisorDatabase).
     private let loopStore: LoopDispatchStore?
 
+    /// cwd-exclusivity gate (2026-06-13): how many LIVE sessions currently share
+    /// a given cwd. git HEAD/branch/commits are directory-global, so they may
+    /// only be attributed to a session that is the SOLE live worker in that dir.
+    /// When >1 session shares it, the repo state belongs to whichever session is
+    /// actively committing — feeding it as "this session's context" leaks one
+    /// session's work into another's answer/dispatch (the 2026-06-13 tweet-engine
+    /// bleed). Defaults to `{ _ in 1 }` (solo) so tests and single-session users
+    /// are unaffected; the app wires it to the SessionStore. Non-Sendable and
+    /// invoked only from this @MainActor engine (mirrors the router's
+    /// `activeSessionCount`), so it can read MainActor-isolated stores directly.
+    private let liveSessionsSharingCwd: (String) -> Int
+
     public init(
         client: LLMClient,
         bus: EventBus,
@@ -214,6 +226,7 @@ public final class TriageEngine {
         idleThresholdSeconds: TimeInterval = 15,
         idleReTriageIntervalSeconds: TimeInterval = 60,
         idleCheckIntervalSeconds: TimeInterval = 1,
+        liveSessionsSharingCwd: @escaping (String) -> Int = { _ in 1 },
         now: @escaping @MainActor () -> Date = { Date() },
         trace: TraceLog = .shared
     ) {
@@ -230,8 +243,30 @@ public final class TriageEngine {
         self.idleThresholdSeconds = idleThresholdSeconds
         self.idleReTriageIntervalSeconds = idleReTriageIntervalSeconds
         self.idleCheckIntervalSeconds = idleCheckIntervalSeconds
+        self.liveSessionsSharingCwd = liveSessionsSharingCwd
         self.now = now
         self.trace = trace
+    }
+
+    /// Pure cwd-exclusivity decision (testable in isolation): the cwd to ground
+    /// repo context in, or nil to omit grounding. Default-deny — repo state is
+    /// attributable to a session ONLY when it is the sole live occupant of the
+    /// cwd. A nil/empty cwd passes through unchanged (there's nothing to gate).
+    nonisolated static func groundingCwd(_ cwd: String?, liveSessionsInCwd: Int) -> String? {
+        guard let cwd, !cwd.isEmpty else { return cwd }
+        return liveSessionsInCwd <= 1 ? cwd : nil
+    }
+
+    /// Instance wrapper: resolve the live-session count for `cwd` and apply the
+    /// gate, tracing when grounding is omitted so the bleed-prevention is visible.
+    private func repoGroundingCwd(_ cwd: String?) -> String? {
+        guard let cwd, !cwd.isEmpty else { return cwd }
+        let n = liveSessionsSharingCwd(cwd)
+        let grounded = Self.groundingCwd(cwd, liveSessionsInCwd: n)
+        if grounded == nil {
+            trace.emit("triage", "repo_grounding omitted reason=cwd_shared sessions=\(n) cwd=\(cwd)")
+        }
+        return grounded
     }
 
     public func start() {
@@ -443,6 +478,10 @@ public final class TriageEngine {
     /// `evaluateAssistantText(info:)` — the same record_triage tool path,
     /// just scoped to the worker_idle_post_completion category.
     private func evaluateIdle(sessionId: String) async {
+        // Global pause (owner toggle): stay dormant — no triage, dispatch, or
+        // inject, and no API spend. consume() keeps tracking window/idle state,
+        // so resume is seamless. Same guard on evaluate + evaluateAssistantText.
+        if RuntimeToggles.supervisorPaused { return }
         onActivityChange?(.triaging)
 
         let window = perSessionWindow[sessionId] ?? []
@@ -649,10 +688,15 @@ public final class TriageEngine {
         priorDispatchesConsidered: Int
     ) async -> TriageCandidate {
         trace.emit("dispatch", "start session=\(sessionId) branch=\(branch ?? "?") prior=\(priorDispatchesConsidered)")
+        // cwd-exclusivity gate (see repoGroundingCwd): when the cwd is shared by
+        // multiple live sessions, drop cwd+branch so the dispatcher grounds in
+        // THIS session's transcript only — never a co-located session's git state
+        // (the same bleed the answer path guards). Targeting is unaffected.
+        let groundedCwd = repoGroundingCwd(cwd)
         let result = await dispatcher.dispatchForIdleSession(
             sessionUUID: sessionId,
-            cwd: cwd,
-            gitBranch: branch,
+            cwd: groundedCwd,
+            gitBranch: groundedCwd == nil ? nil : branch,
             lastNTurns: window,
             priorDispatchesConsidered: priorDispatchesConsidered
         )
@@ -752,12 +796,29 @@ public final class TriageEngine {
                 nextTaskProposal: nil,
                 confidence: "low"
             )
+        case let .objectiveComplete(summary):
+            // The objective is built. Stop the loop cleanly (success — stop
+            // reason objective_complete, not the 3-low backstop) and surface a
+            // notify banner. No inject: there's nothing left to dispatch. The
+            // loop won't fire again for this session until it's given a new
+            // objective / reset.
+            trace.emit("dispatch", "objective_complete → stopping loop session=\(sessionId) summary=\"\(summary.prefix(120))\"")
+            await loopController?.stop(sessionId: sessionId, reason: .objectiveComplete)
+            return reconfigure(
+                candidate,
+                action: .notify,
+                asymmetryNote: redactor.redact("Objective complete: \(summary)"),
+                suggestedInjectText: nil,
+                nextTaskProposal: nil,
+                confidence: "low"
+            )
         }
     }
 
     // MARK: - Triage call
 
     private func evaluate(call: BashToolCallInfo, prePost: TriageDecision.PrePost) async {
+        if RuntimeToggles.supervisorPaused { return }  // global pause (see evaluateIdle)
         onActivityChange?(.triaging)
 
         let window = perSessionWindow[call.sessionId] ?? []
@@ -878,6 +939,7 @@ public final class TriageEngine {
     /// QuestionAnswerer call (engineering → inject text; taste →
     /// rewritten reasoning_plain; safety → pass through unchanged).
     private func evaluateAssistantText(info: AssistantTextInfo) async {
+        if RuntimeToggles.supervisorPaused { return }  // global pause (see evaluateIdle)
         onActivityChange?(.triaging)
 
         let window = perSessionWindow[info.sessionId] ?? []
@@ -959,6 +1021,19 @@ public final class TriageEngine {
                 sessionId: info.sessionId,
                 cwd: cwd
             )
+            // wrong_trajectory: the diagnostic redirect rides in
+            // next_task_proposal (no secondary call for this category). Promote
+            // it to the inject text the router types; if the LLM gave no message,
+            // degrade to a banner rather than inject nothing. The cwd guard below
+            // still applies (unresolvable cwd -> notify with the text in-banner).
+            if enriched.category == "wrong_trajectory" {
+                if let redirect = enriched.nextTaskProposal, !redirect.isEmpty {
+                    trace.emit("triage", "wrong_trajectory redirect session=\(info.sessionId) bytes=\(redirect.utf8.count)")
+                    enriched = reconfigure(enriched, action: .inject, suggestedInjectText: redirect)
+                } else {
+                    enriched = reconfigure(enriched, action: .notify)
+                }
+            }
             // v0.3.1 (Issue #6): if cwd is unresolvable, the inject
             // path can't run (locator needs cwd → PID). Downgrade
             // .inject to .notify with the answer text moved into the
@@ -1035,10 +1110,16 @@ public final class TriageEngine {
                 // question gets a concrete, context-based answer rather than
                 // a generic one. cwd is required to reach git; without it
                 // the answerer falls back to PRINCIPLES.md only.
-                let repoContext = cwd.map { c in c.isEmpty ? "" : c } ?? ""
-                let context = repoContext.isEmpty
+                // cwd-exclusivity gate: omit repo grounding when the cwd is
+                // shared by multiple live sessions — the git state belongs to
+                // whichever session is actively committing, not necessarily this
+                // one. Without this, a co-located session's branch/commits bleed
+                // into this answer (the 2026-06-13 tweet-engine bleed). cwd is
+                // still used for targeting elsewhere; only grounding is gated.
+                let gatedCwd = repoGroundingCwd(cwd) ?? ""
+                let context = gatedCwd.isEmpty
                     ? ""
-                    : await gatherRepoContextForAnswer(cwd: repoContext, branch: nil, trace: trace)
+                    : await gatherRepoContextForAnswer(cwd: gatedCwd, branch: nil, trace: trace)
                 let answer = try await answerer.answerEngineering(
                     question: question,
                     repoContext: context
@@ -1133,6 +1214,18 @@ public final class TriageEngine {
                 selectedIssueNumber: nil,
                 taskProposalHead: "",
                 justification: reasoning,
+                priorDispatchesConsidered: priorDispatchesConsidered
+            )
+        case let .objectiveComplete(summary):
+            return StoredLoopDispatch(
+                sessionId: sessionId,
+                ts: ts,
+                responseShape: "objectiveComplete",
+                confidence: nil,
+                selectedPath: SelectedPath.objectiveComplete.rawValue,
+                selectedIssueNumber: nil,
+                taskProposalHead: String(summary.prefix(200)),
+                justification: summary,
                 priorDispatchesConsidered: priorDispatchesConsidered
             )
         }

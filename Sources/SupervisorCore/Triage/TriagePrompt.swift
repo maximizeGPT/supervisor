@@ -75,7 +75,7 @@ public enum TriagePrompt {
                                     "enum": .array([
                                         .string("notify"), .string("inject"), .string("continue"), .string("selfExtend"), .string("pause"), .string("kill")
                                     ]),
-                                    "description": .string("What Supervisor should do. Pick the lightest action that fits. notify = banner only; inject = type an answer into the terminal (v0.3.0+, only for user_question_pending where question_type=engineering); continue = type a NEW TASK PROMPT into the worker's input (v0.4.0+, only for worker_idle_post_completion with confidence=high); pause = SIGSTOP (recoverable); kill = SIGTERM (not recoverable).")
+                                    "description": .string("What Supervisor should do. Pick the lightest action that fits. notify = banner only; inject = type text into the worker (v0.3.0+: an ANSWER for user_question_pending where question_type=engineering, OR a DIAGNOSTIC REDIRECT for wrong_trajectory); continue = type a NEW TASK PROMPT into the worker's input (v0.4.0+, only for worker_idle_post_completion with confidence=high); pause = SIGSTOP (recoverable); kill = SIGTERM (not recoverable).")
                                 ]),
                                 "question_type": .object([
                                     "type": .string("string"),
@@ -93,7 +93,7 @@ public enum TriagePrompt {
                                 ]),
                                 "next_task_proposal": .object([
                                     "type": .string("string"),
-                                    "description": .string("v0.4.0: REQUIRED when category=worker_idle_post_completion; omit otherwise. One-sentence description of the next task this idle worker should pick up. The actual prompt body is constructed later by Part B's dispatcher (a secondary Haiku call). In Part A this is the seed: 'pick up Issue #7', 'continue refactor of TriageEngine', etc. Stays nil in v0.4.0 Part A's primary call when the dispatcher is not yet wired up — populated by Part B.")
+                                    "description": .string("REQUIRED when category=worker_idle_post_completion OR category=wrong_trajectory; omit otherwise. For worker_idle_post_completion: a one-sentence SEED of the next task ('pick up Issue #7', 'continue refactor of TriageEngine'); the prompt body is built later by Part B's dispatcher. For wrong_trajectory: the FULL diagnostic redirect MESSAGE to type into the worker (there is NO secondary call -- this exact text is injected), e.g. 'You have run the same failing test 3 times unchanged. Stop -- add logging at the failure point to see the actual value, or reduce to a minimal repro, before another edit.'")
                                 ]),
                                 "reasoning_plain": .object([
                                     "type": .string("string"),
@@ -286,7 +286,7 @@ public enum TriagePrompt {
             }
         }
         lines.append("")
-        lines.append("Evaluate ONLY against the `user_question_pending` category. The bash-shaped categories (destructive_action_pending, edits_outside_worktree, prompt_injection_signature) do not apply here. Use the same record_triage tool: call it with one candidate if the assistant is asking the user a question, or with candidates=[] if not.")
+        lines.append("Evaluate against TWO categories from this path: `user_question_pending` (the assistant is asking the USER a question) and `wrong_trajectory` (the WORKER is thrashing -- repeating a failing approach 3+ times with no progress -- and should be redirected to diagnose). The bash-shaped categories (destructive_action_pending, edits_outside_worktree, prompt_injection_signature) and worker_idle_post_completion do not apply here. Use the record_triage tool: return one candidate per category that fires (a session can fire neither, one, or both), or candidates=[] if neither does. Hold wrong_trajectory to its HIGH bar -- when in doubt, do NOT fire it; a wrong redirect derails good work, which is worse than silence.")
 
         let userText = lines.joined(separator: "\n")
 

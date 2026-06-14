@@ -87,6 +87,12 @@ public final class CGEventInjector: Injector {
         "com.anthropic.claudefordesktop",
     ]
 
+    /// Off-main serial queue for the blocking desktop conversation targeting
+    /// (screenshot + OCR + click + verify). Keeps the ~4s of work off the
+    /// @MainActor so it can't freeze the UI or the triage/catch engine.
+    private static let desktopTargetingQueue = DispatchQueue(
+        label: "live.supervisor.desktop-targeting", qos: .userInitiated)
+
     /// Inter-character delay during keystroke synthesis. Terminal apps
     /// need a few ms between events or coalescing/buffering can drop
     /// characters. 15ms was the value the v0.3.0 A1 scratch test
@@ -99,14 +105,21 @@ public final class CGEventInjector: Injector {
 
     private let trace: TraceLog
 
+    /// Optional LLM client for Path B semantic conversation matching on the
+    /// desktop targeting path. nil keeps the local token-overlap matcher, so
+    /// existing callers and tests are unaffected.
+    private let llm: LLMClient?
+
     public init(
         interCharDelayMicros: useconds_t = 15_000,
         focusSettleNanos: UInt64 = 250_000_000,
-        trace: TraceLog = .shared
+        trace: TraceLog = .shared,
+        llm: LLMClient? = nil
     ) {
         self.interCharDelayMicros = interCharDelayMicros
         self.focusSettleNanos = focusSettleNanos
         self.trace = trace
+        self.llm = llm
     }
 
     public func inject(text: String, claudeCodePID: pid_t, targetWindowTitle: String? = nil) async throws -> Int {
@@ -138,27 +151,103 @@ public final class CGEventInjector: Injector {
         //    owner isn't already in Claude Code — never a partial spray into
         //    another app, never a global post.
         if bundleID == "com.anthropic.claudefordesktop" {
-            // SAFETY (2026-06-07): the Claude desktop app is a SINGLE Electron
-            // window that multiplexes sessions as TABS. foreground_paste brings
-            // that window forward and pastes into whatever tab is focused — it
-            // CANNOT target the session the dispatch is actually for. Observed
-            // live: an answer generated for the CV/PM session got pasted into
-            // the focused tab (cross-session bleed). There is no OS primitive to
-            // address an Electron tab, so we DO NOT blind-paste: throw and let
-            // the router degrade to a notify banner the owner can paste where
-            // they want. Escape hatch (SUPERVISOR_ALLOW_DESKTOP_PASTE) is for the
-            // controlled on-screen verification test ONLY — unset in production.
-            if ProcessInfo.processInfo.environment["SUPERVISOR_ALLOW_DESKTOP_PASTE"] == nil {
-                trace.emit("inject", "degraded reason=electron_no_tab_targeting host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) note=desktop is one multi-tab window; foreground_paste can't target the session — degrading to notify")
-                throw InjectError.targetUnresolvable(reason: "electron_no_tab_targeting")
+            // The Claude desktop app is one Electron window that multiplexes
+            // conversations, with an opaque AX tree — we can't address a
+            // conversation through AX. So we target it the way a human does:
+            // screenshot the window, OCR the sidebar, find the conversation whose
+            // title matches the one we're answering, click it to make it active,
+            // VERIFY the switch, then paste. The target's identity is its
+            // ai-title, passed in as `targetWindowTitle`.
+            let originalPrior = NSWorkspace.shared.frontmostApplication
+            let target = (targetWindowTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !target.isEmpty else {
+                trace.emit("inject", "degraded reason=desktop_no_target_title host=\(bundleID) cc_pid=\(claudeCodePID)")
+                throw InjectError.targetUnresolvable(reason: "desktop_no_target_title")
             }
-            return try await injectViaForegroundPaste(text: text, hostApp: hostApp, hostPid: hostPid)
+            let targeter = DesktopConversationTargeter(trace: trace)
+            // Run the ~4s screenshot+OCR+poll OFF the @MainActor so it never
+            // freezes the UI or blocks the @MainActor triage/catch engine. A
+            // dedicated serial queue (NOT the cooperative pool) avoids the
+            // pool-starvation failure mode; activateClaudeApp hops to main.
+            let llm = self.llm
+            let trace = self.trace
+            let outcome: DesktopTargetingOutcome = await withCheckedContinuation { cont in
+                Self.desktopTargetingQueue.async {
+                    // Path B semantic matcher (active text provider) when a
+                    // client is wired; the desktop sidebar truncates/rewords
+                    // titles, which the local token matcher scores under the
+                    // gate. Falls back to the local matcher on any LLM failure
+                    // so targeting never regresses below today's behavior. The
+                    // matcher is built and used entirely on this queue, so no
+                    // non-Sendable closure crosses a concurrency boundary.
+                    let matcher: (([DesktopConversationCandidate], String) -> (DesktopConversationCandidate, Double)?)?
+                    if let llm = llm {
+                        let semantic = LLMConversationMatcher(client: llm, trace: trace)
+                        matcher = { candidates, target in
+                            // Fuzzy stays the default: it's fast and free, so
+                            // trust it when it's clearly confident (>= 0.80, an
+                            // exact/near-exact window title). Escalate to the
+                            // semantic LLM matcher ONLY for the ambiguous,
+                            // truncated, or reworded cases the token math can't
+                            // resolve (the 18:07 conf=0.50 miss), falling back to
+                            // the fuzzy result if the LLM call fails. Screen
+                            // recording is already a precondition here: a denied
+                            // grant short-circuits to .screenRecordingDenied
+                            // upstream, so no candidates (and no matcher call)
+                            // ever happen without OCR text available.
+                            let local = targeter.bestMatch(target: target, candidates: candidates)
+                            if let local = local, local.1 >= 0.80 { return local }
+                            return semantic.match(target: target, candidates: candidates) ?? local
+                        }
+                    } else {
+                        matcher = nil
+                    }
+                    cont.resume(returning: targeter.focusConversation(targetTitle: target, matcher: matcher))
+                }
+            }
+            switch outcome {
+            case .focused(let matched):
+                // Claude.app is now frontmost with the target conversation
+                // active. Paste into it, then restore the owner's prior app.
+                let bytes = pasteIntoFrontmost(text: text, hostPid: hostPid)
+                originalPrior?.activate(options: [])
+                trace.emit("inject", "fired method=desktop_targeted_paste host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) bytes=\(bytes) target=\"\(matched.prefix(40))\" restored=\(originalPrior?.bundleIdentifier ?? "?")")
+                return bytes
+            case .targetingFailed(let reason):
+                // confident-match-or-notify: could not confirm the right
+                // conversation, so we DO NOT paste. Loud targeting-FAILURE trace
+                // (not routine) and degrade to a notify the owner can act on.
+                originalPrior?.activate(options: [])
+                trace.emit("inject", "degraded reason=desktop_targeting_failed host=\(bundleID) cc_pid=\(claudeCodePID) detail=\(reason)")
+                throw InjectError.targetUnresolvable(reason: "desktop_targeting_failed")
+            case .screenRecordingDenied:
+                // Can't screenshot without Screen Recording. Surface it; never a
+                // silent degrade — the permission layer prompts for the grant.
+                trace.emit("inject", "degraded reason=desktop_screen_recording_denied host=\(bundleID) cc_pid=\(claudeCodePID)")
+                throw InjectError.targetUnresolvable(reason: "screen_recording_denied")
+            }
         }
 
-        // 4. Terminals accept TARGETED background posts (CGEventPostToPid),
-        //    which ARE focus-independent — the owner keeps using their
-        //    frontmost app while the keystrokes flow to the session's host.
-        //    THE INVARIANT: never post(tap:) (global); targeted-or-throw.
+        // 4. Terminal hosts. CGEventPostToPid to a BACKGROUNDED terminal
+        //    silently DROPS the keystrokes — confirmed on screen 2026-06-07:
+        //    posting to a non-frontmost Terminal.app never reached the claude
+        //    tab (and didn't leak to the frontmost app either — it just
+        //    vanished). The old "focus-independent" claim was wrong. So we use
+        //    the same bring-forward-then-restore shape as the Electron path:
+        //    save the owner's frontmost app, activate the terminal (its
+        //    selected tab is the target — see selectTerminalTab below), post
+        //    the keystrokes into that now-frontmost tab, then restore the prior
+        //    frontmost. Targeted (never a global post); lands in the session,
+        //    not whatever app the owner is looking at.
+        // Terminal hosts. CGEventPostToPid delivers focus-independently to the
+        // host terminal's SELECTED tab even while it's backgrounded — confirmed
+        // on screen 2026-06-08: a keystroke probe landed in the claude tab's
+        // input box with TextEdit still frontmost. (Paste/Cmd-V did NOT land for
+        // Terminal; per-char synthesis does.) We select the session's tab first
+        // — so the post hits the RIGHT session, not whatever tab the owner last
+        // used — WITHOUT stealing focus, then post. Never a global tap, never
+        // the frontmost app.
+        Self.selectTerminalTab(forClaudePID: claudeCodePID, hostBundleID: bundleID, trace: trace)
         let bytes = try postKeystrokes(text: text, hostPid: hostPid, bundleID: bundleID)
         trace.emit("inject", "fired method=postToPid host=\(bundleID) host_pid=\(hostPid) cc_pid=\(claudeCodePID) bytes=\(bytes)")
         return bytes
@@ -184,11 +273,17 @@ public final class CGEventInjector: Injector {
             usleep(interCharDelayMicros / 3)
             bytes += String(ch).utf8.count
         }
-        if let downRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
-           let upRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) {
-            downRet.postToPid(hostPid)
-            usleep(interCharDelayMicros)
-            upRet.postToPid(hostPid)
+        // SUPERVISOR_INJECT_NO_SUBMIT: type the text but DON'T press Return —
+        // lets an on-screen verification confirm the keystrokes land in the
+        // right terminal session without sending a real prompt. Symmetric with
+        // the Electron paste path. Unset in production: the Return submits.
+        if ProcessInfo.processInfo.environment["SUPERVISOR_INJECT_NO_SUBMIT"] == nil {
+            if let downRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+               let upRet = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) {
+                downRet.postToPid(hostPid)
+                usleep(interCharDelayMicros)
+                upRet.postToPid(hostPid)
+            }
         }
         return bytes
     }
@@ -207,10 +302,11 @@ public final class CGEventInjector: Injector {
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
+        let hostBundle = hostApp.bundleIdentifier ?? "?"
         guard hostApp.activate(options: []) else {
             restoreClipboard(savedClipboard, pasteboard)
-            trace.emit("inject", "degraded reason=electron_activate_failed host=com.anthropic.claudefordesktop")
-            throw InjectError.targetUnresolvable(reason: "electron_activate_failed")
+            trace.emit("inject", "degraded reason=host_activate_failed host=\(hostBundle)")
+            throw InjectError.targetUnresolvable(reason: "host_activate_failed")
         }
         try? await Task.sleep(nanoseconds: focusSettleNanos)
 
@@ -228,13 +324,34 @@ public final class CGEventInjector: Injector {
         restoreClipboard(savedClipboard, pasteboard)
         prior?.activate(options: [])
 
-        trace.emit("inject", "fired method=foreground_paste host=com.anthropic.claudefordesktop host_pid=\(hostPid) bytes=\(text.utf8.count) restored=\(prior?.bundleIdentifier ?? "?")")
+        trace.emit("inject", "fired method=foreground_paste host=\(hostBundle) host_pid=\(hostPid) bytes=\(text.utf8.count) restored=\(prior?.bundleIdentifier ?? "?")")
         return text.utf8.count
     }
 
     private func restoreClipboard(_ saved: String?, _ pasteboard: NSPasteboard) {
         pasteboard.clearContents()
         if let saved { pasteboard.setString(saved, forType: .string) }
+    }
+
+    /// Paste `text` into the already-frontmost app via Cmd-V (+ Return unless
+    /// SUPERVISOR_INJECT_NO_SUBMIT). Used after the desktop targeter has brought
+    /// the target Claude conversation to the front, so we DON'T re-activate or
+    /// restore here — the caller manages focus restore to the owner's prior app.
+    /// Saves and restores the clipboard.
+    private func pasteIntoFrontmost(text: String, hostPid: pid_t) -> Int {
+        let pasteboard = NSPasteboard.general
+        let saved = pasteboard.string(forType: .string)
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        let source = CGEventSource(stateID: .hidSystemState)
+        postChord(source: source, virtualKey: 9, flags: .maskCommand, hostPid: hostPid)  // Cmd-V
+        usleep(interCharDelayMicros * 2)
+        if ProcessInfo.processInfo.environment["SUPERVISOR_INJECT_NO_SUBMIT"] == nil {
+            postChord(source: source, virtualKey: 36, flags: [], hostPid: hostPid)        // Return
+        }
+        usleep(interCharDelayMicros)
+        restoreClipboard(saved, pasteboard)
+        return text.utf8.count
     }
 
     /// Post a single key chord (key + modifier flags) targeted to a pid.
@@ -306,11 +423,86 @@ public final class CGEventInjector: Injector {
     /// Look up parent PID via `proc_pidinfo(PROC_PIDTBSDINFO)`. Returns
     /// nil if the call fails (process gone, EPERM, etc.).
     private static func parentPID(of pid: pid_t) -> pid_t? {
-        var info = proc_bsdinfo()
-        let size = MemoryLayout<proc_bsdinfo>.size
-        let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(size))
-        if n != Int32(size) { return nil }
-        return pid_t(info.pbi_ppid)
+        // Use sysctl(KERN_PROC_PID), NOT proc_pidinfo(PROC_PIDTBSDINFO):
+        // proc_pidinfo FAILS on root-owned processes in the chain — notably
+        // `login`, which sits between a terminal's shell and Terminal.app — so
+        // the old walk gave up at `login` and returned noHostingApp for EVERY
+        // terminal-hosted claude session. sysctl reads kinfo_proc for any
+        // process regardless of owner. (Confirmed 2026-06-07: claude→zsh→login
+        // →Terminal.app; proc_pidinfo broke at login, sysctl walked through.)
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(pid)]
+        var kp = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        guard sysctl(&mib, 4, &kp, &size, nil, 0) == 0, size > 0 else { return nil }
+        let ppid = pid_t(kp.kp_eproc.e_ppid)
+        return ppid > 0 ? ppid : nil
+    }
+
+    /// Best-effort: select the terminal TAB hosting the claude session (matched
+    /// by its controlling tty) so the activate+post lands in the RIGHT session,
+    /// not whatever tab the owner last touched. No-op on unsupported terminals
+    /// or AppleScript/Automation failure — the caller still posts into the
+    /// currently-selected tab, so this only ADDS targeting, never breaks it.
+    static func selectTerminalTab(forClaudePID pid: pid_t, hostBundleID: String, trace: TraceLog) {
+        guard let tty = ttyPath(of: pid) else {
+            trace.emit("inject", "terminal_tab_select skip reason=no_tty pid=\(pid)")
+            return
+        }
+        let script: String
+        switch hostBundleID {
+        case "com.apple.Terminal":
+            script = #"""
+            tell application "Terminal"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  try
+                    if (tty of t) is "\#(tty)" then
+                      set selected of t to true
+                      return "ok"
+                    end if
+                  end try
+                end repeat
+              end repeat
+            end tell
+            return "no_match"
+            """#
+        case "com.googlecode.iterm2":
+            script = #"""
+            tell application "iTerm2"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  repeat with s in sessions of t
+                    try
+                      if (tty of s) is "\#(tty)" then
+                        select t
+                        return "ok"
+                      end if
+                    end try
+                  end repeat
+                end repeat
+              end repeat
+            end tell
+            return "no_match"
+            """#
+        default:
+            trace.emit("inject", "terminal_tab_select skip reason=unsupported_host=\(hostBundleID) tty=\(tty)")
+            return
+        }
+        var errInfo: NSDictionary?
+        let out = NSAppleScript(source: script)?.executeAndReturnError(&errInfo)
+        trace.emit("inject", "terminal_tab_select tty=\(tty) host=\(hostBundleID) result=\(out?.stringValue ?? "nil")\(errInfo == nil ? "" : " err=\(errInfo!)")")
+    }
+
+    /// Controlling-terminal device path for `pid`, e.g. "/dev/ttys000", via
+    /// kinfo_proc.kp_eproc.e_tdev. nil if the process has no controlling tty.
+    static func ttyPath(of pid: pid_t) -> String? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(pid)]
+        var kp = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        guard sysctl(&mib, 4, &kp, &size, nil, 0) == 0, size > 0 else { return nil }
+        let dev = kp.kp_eproc.e_tdev
+        guard dev != -1, let name = devname(dev, S_IFCHR) else { return nil }
+        return "/dev/" + String(cString: name)
     }
 }
 

@@ -114,7 +114,12 @@ final class InterventionRouterTests: XCTestCase {
         handle: ProcessHandle? = ProcessHandle(pid: 4242, execPath: "/path/claude", cwd: "/tmp/test-cwd"),
         sender: CapturingSignalSender = CapturingSignalSender(),
         injector: MockInjector = MockInjector(),
-        activeSessionCount: @escaping () -> Int = { 1 }
+        activeSessionCount: @escaping () -> Int = { 1 },
+        // Default the human "idle" (999s since last keystroke) so the typing
+        // gate never fires for tests that aren't exercising it — otherwise the
+        // live CGHumanActivityProbe would read the dev's real keyboard and make
+        // every inject/continue test flaky. The human-active tests override this.
+        humanActivity: any HumanActivityProbe = StubHumanActivityProbe(idleSeconds: 999)
     ) -> (router: InterventionRouter, notifier: MockNotifier, sender: CapturingSignalSender, injector: MockInjector) {
         let notifier = MockNotifier()
         let router = InterventionRouter(
@@ -123,6 +128,7 @@ final class InterventionRouterTests: XCTestCase {
             signalSender: sender,
             injector: injector,
             activeSessionCount: activeSessionCount,
+            humanActivity: humanActivity,
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("router-test-\(UUID().uuidString).log"))
         )
@@ -256,17 +262,30 @@ final class InterventionRouterTests: XCTestCase {
         }
     }
 
-    // MARK: - Multi-session misroute guard (2026-06-04)
+    // MARK: - Multi-session misroute guard (2026-06-04, revised 2026-06-08)
 
-    /// The exact bug: >1 session live AND the locator fell back to the shared
-    /// Claude desktop host (handle.cwd "/" != the decision cwd) — pasting into
-    /// the frontmost tab could hit the WRONG session. Must degrade to notify,
-    /// never inject.
-    func testMultiSessionUnconfirmedTargetDegradesWithoutInjecting() async {
+    /// The multi-session misroute protection MOVED from the router to the
+    /// injector. When the locator falls back to the shared Claude desktop host,
+    /// the router no longer degrades — it DEFERS to the injector, which targets
+    /// the right CONVERSATION by screenshot+OCR (confident-match-or-notify). So
+    /// a desktop host must reach the injector, not be pre-degraded by the old
+    /// cwd-era gate (which blocked desktop answers entirely).
+    func testDesktopHostDefersToInjectorForConversationTargeting() async {
         let fallback = ProcessHandle(pid: 94716, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+        let (router, _, _, recorder) = makeRouter(handle: fallback, activeSessionCount: { 2 })
+        await router.dispatch(decision: makeDecision(action: .inject, suggestedInjectText: "Answer for session A"))
+        XCTAssertEqual(recorder.calls.count, 1,
+            "a desktop host must reach the injector (it does conversation targeting), not be pre-degraded by the router")
+    }
+
+    /// The gate still degrades a NON-desktop unconfirmed target — a fallback that
+    /// isn't the desktop host has no conversation-targeting path, so we can't
+    /// confirm the session and must not blind-inject.
+    func testNonDesktopUnconfirmedTargetStillDegrades() async {
+        let fallback = ProcessHandle(pid: 555, execPath: "/usr/bin/unknown-host", cwd: "/")
         let (router, notifier, _, recorder) = makeRouter(handle: fallback, activeSessionCount: { 2 })
         await router.dispatch(decision: makeDecision(action: .inject, suggestedInjectText: "Answer for session A"))
-        XCTAssertTrue(recorder.calls.isEmpty, "must NOT inject when the target session can't be confirmed across multiple sessions")
+        XCTAssertTrue(recorder.calls.isEmpty, "non-desktop unconfirmed target must still degrade, not inject")
         if case let .injectDegraded(intended, reason) = notifier.calls.first?.outcome {
             XCTAssertEqual(reason, "multi_session_unconfirmed_target")
             XCTAssertEqual(intended, "Answer for session A", "the intended text must still surface as a banner")
@@ -399,6 +418,55 @@ final class InterventionRouterTests: XCTestCase {
             XCTFail("expected injectDegraded(no_cwd_on_decision)")
         }
     }
+
+    // MARK: - Human-active typing gate (owner policy 2026-06-13)
+
+    func testInjectQueuesWhenHumanIsTyping_NeverTypes() async {
+        // A real keystroke landed 0.5s ago — the human is at the keyboard. The
+        // inject path must NOT synthesize keystrokes (would steal focus / clobber
+        // their draft); it records the dispatch as QUEUED (Piece 3) so the hover
+        // shows "will send when Claude Code is ready" rather than typing over them.
+        let injector = MockInjector()
+        let (router, notifier, _, _) = makeRouter(
+            injector: injector,
+            humanActivity: StubHumanActivityProbe(idleSeconds: 0.5)
+        )
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            sessionId: "human-active-\(UUID().uuidString)",
+            suggestedInjectText: "the answer",
+            category: "user_question_pending"
+        ))
+        XCTAssertTrue(injector.calls.isEmpty,
+                      "must not type while the human is actively typing")
+        XCTAssertEqual(notifier.calls.count, 1, "deferred inject surfaces a queued indicator")
+        if case let .queued(head) = notifier.calls.first?.outcome {
+            XCTAssertEqual(head, "the answer", "queued indicator carries what's pending")
+        } else {
+            XCTFail("expected .queued, got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    func testInjectProceedsWhenHumanIdle() async {
+        // No recent keystroke (default 999s idle) — safe to type. The inject
+        // path resolves the target and posts to the injector.
+        let injector = MockInjector()
+        let (router, notifier, _, _) = makeRouter(injector: injector)
+        await router.dispatch(decision: makeDecision(
+            action: .inject,
+            sessionId: "human-idle-\(UUID().uuidString)",
+            suggestedInjectText: "the answer",
+            category: "user_question_pending"
+        ))
+        XCTAssertEqual(injector.calls.count, 1, "idle human → inject proceeds to the injector")
+        XCTAssertEqual(injector.calls.first?.text, "the answer")
+        if case .injectSucceeded = notifier.calls.first?.outcome {
+            // OK — no transcript for a synthetic session id, so injectLanded
+            // can't disconfirm and the path reports success.
+        } else {
+            XCTFail("expected injectSucceeded, got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
 }
 
 // MARK: - Banner copy tests (Gap 1+2+3)
@@ -462,6 +530,8 @@ final class NotifierOutcomeBodyTests: XCTestCase {
                 return base + " Supervisor proposes: \(proposal) Paste this into Claude Code to continue, or write your own."
             case .continueLowConfidence(let reasoning):
                 return base + " Supervisor saw idle but couldn't confidently dispatch — pick the next task yourself. Reason: \(reasoning)"
+            case .queued(let promptHead):
+                return base + " Queued — will send when Claude Code is ready: \(promptHead)"
             }
         }
     }

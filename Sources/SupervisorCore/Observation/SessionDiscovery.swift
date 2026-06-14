@@ -156,12 +156,20 @@ public final class SessionDiscovery: @unchecked Sendable {
         do {
             try tail.start()
             tails[sessionId] = tail
+            // Seed lastSeenAt from the JSONL's modification time, NOT Date().
+            // startTail runs for EVERY historical session on the startup scan;
+            // seeding `now` made all of them look "active," spiking
+            // activeSessionCount to ~37 for the first 10 min after a relaunch
+            // and over-tripping the multi-session inject gate. The file mtime is
+            // the real last-activity proxy; SessionTail bumps it to now as live
+            // events stream, so genuinely-active sessions stay current.
+            let lastActivity = ((try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date) ?? Date()
             try sessionStore?.upsert(StoredSession(
                 id: sessionId,
                 projectHash: projectHash,
                 cwd: "<resolving>",       // EventParser will surface the real cwd from sessionStart
                 startedAt: Date(),
-                lastSeenAt: Date(),
+                lastSeenAt: lastActivity,
                 jsonlPath: path.path,
                 jsonlOffset: savedOffset
             ))

@@ -40,6 +40,12 @@ public final class InterventionRouter {
     /// single-session world `{ 1 }`, which disables the gate for tests and
     /// single-session users (no behavior change).
     private let activeSessionCount: () -> Int
+    /// Owner policy (2026-06-13): never type into — or queue behind — a composer
+    /// the human is actively using. The probe answers "how long since the human
+    /// pressed a key"; if that's under `humanActiveThresholdSeconds`, the typing
+    /// paths defer (the engine re-fires on the next idle tick, so nothing is lost).
+    private let humanActivity: any HumanActivityProbe
+    private let humanActiveThresholdSeconds: TimeInterval
     private let trace: TraceLog
 
     public init(
@@ -49,6 +55,8 @@ public final class InterventionRouter {
         injector: any Injector,
         recoveryDocWriter: RecoveryDocWriter? = nil,
         activeSessionCount: @escaping () -> Int = { 1 },
+        humanActivity: any HumanActivityProbe = CGHumanActivityProbe(),
+        humanActiveThresholdSeconds: TimeInterval = 2.0,
         trace: TraceLog = .shared
     ) {
         self.notifier = notifier
@@ -57,7 +65,21 @@ public final class InterventionRouter {
         self.injector = injector
         self.recoveryDocWriter = recoveryDocWriter
         self.activeSessionCount = activeSessionCount
+        self.humanActivity = humanActivity
+        self.humanActiveThresholdSeconds = humanActiveThresholdSeconds
         self.trace = trace
+    }
+
+    /// True when a real keystroke landed within the guard window — the human is
+    /// at the keyboard right now. Both typing paths (inject + high-confidence
+    /// continue) consult this and defer rather than steal focus or clobber a
+    /// draft. The same instinct as wrong_trajectory's "back off within 30s of a
+    /// user message": active human input IS the human steering.
+    private func humanIsActivelyTyping(op: String, session: String) -> Bool {
+        let idle = humanActivity.secondsSinceLastKeystroke()
+        guard idle < humanActiveThresholdSeconds else { return false }
+        trace.emit("router", "intervention.\(op).deferred reason=human_active idle=\(String(format: "%.1f", idle))s threshold=\(String(format: "%.1f", humanActiveThresholdSeconds))s session=\(session)")
+        return true
     }
 
     /// The 2026-06-04 misroute guard. True when delivering into the resolved
@@ -86,7 +108,17 @@ public final class InterventionRouter {
             return (byId, true)
         }
         if let byCwd = locator.locate(targetCwd: cwd) {
-            return (byCwd, false)
+            // The Claude.app desktop host can't be cwd-confirmed (one Electron
+            // window multiplexing conversations), but the injector now targets
+            // the right CONVERSATION by screenshot+OCR with confident-match-or-
+            // notify. So a desktop host BYPASSES the cwd-era multi-session gate
+            // and defers targeting to the injector, instead of pre-degrading
+            // here (which is what blocked desktop answers entirely).
+            let isDesktopHost = byCwd.execPath.contains("Claude.app/Contents/MacOS/Claude")
+            if isDesktopHost {
+                trace.emit("router", "intervention.\(op).desktop_host_deferred_to_injector pid=\(byCwd.pid)")
+            }
+            return (byCwd, isDesktopHost)
         }
         return nil
     }
@@ -162,13 +194,32 @@ public final class InterventionRouter {
                 return
             }
         }
+        // Human-active gate: about to synthesize keystrokes. If the human is
+        // typing right now, don't steal focus or clobber their draft. Record the
+        // dispatch as QUEUED (Piece 3) — a distinct "will send when Claude Code
+        // is ready" state, not a failure and not silence. The loop re-fires on
+        // the next idle tick and delivers once they pause.
+        if humanIsActivelyTyping(op: "inject", session: decision.sessionId) {
+            await postQueued(decision, head: text)
+            return
+        }
         do {
-            let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)
-            trace.emit("router", "intervention.inject.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
-            _ = await notifier.postInterventionResult(
-                decision: decision,
-                outcome: .injectSucceeded(pid: handle.pid, bytes: bytes)
-            )
+            let preSize = transcriptSize(sessionId: decision.sessionId)
+            let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readDesktopTitle(sessionId: decision.sessionId) ?? DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
+            // The injector returns keystroke bytes POSTED, not proof of delivery:
+            // a paste into an unfocused composer vanishes and still returns a
+            // count. Confirm a real turn actually appended to the transcript
+            // before claiming success; otherwise degrade to an honest banner.
+            if await injectLanded(sessionId: decision.sessionId, sincePreSize: preSize) {
+                trace.emit("router", "intervention.inject.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd) delivery=confirmed")
+                _ = await notifier.postInterventionResult(
+                    decision: decision,
+                    outcome: .injectSucceeded(pid: handle.pid, bytes: bytes)
+                )
+            } else {
+                trace.emit("router", "intervention.inject.degraded reason=paste_no_turn_landed pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
+                await postInjectDegraded(decision, intendedText: text, reason: "paste_no_turn_landed")
+            }
         } catch let err as InjectError {
             let reason: String
             switch err {
@@ -191,6 +242,45 @@ public final class InterventionRouter {
             decision: decision,
             outcome: .injectDegraded(intendedText: intendedText, reason: reason)
         )
+    }
+
+    /// Piece 3 (queued-as-delivered): the human is typing, so the router held
+    /// the dispatch rather than delivering. Post the queued outcome — the hover
+    /// shows a distinct "Queued — will send when Claude Code is ready" indicator
+    /// instead of a misleading failure banner or silence. The loop re-fires on
+    /// the next idle tick and records a separate fired/answered entry when it
+    /// actually lands.
+    private func postQueued(_ decision: TriageDecision, head: String) async {
+        _ = await notifier.postInterventionResult(
+            decision: decision,
+            outcome: .queued(promptHead: String(head.prefix(80)))
+        )
+    }
+
+    /// Byte size of the session transcript now, or 0 if not found. The baseline
+    /// for confirming an inject actually produced a turn.
+    private func transcriptSize(sessionId: String) -> UInt64 {
+        guard let url = DesktopConversationTargeter.transcriptURL(sessionId: sessionId),
+              let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return 0 }
+        return UInt64(size)
+    }
+
+    /// Confirm an injected message became a REAL turn: a submit appends to the
+    /// JSONL transcript, growing it past `preSize`. Polls ~3.6s. Returns false
+    /// if nothing appended -- the keystrokes posted but no message landed (the
+    /// all-day false-success bug: a paste into an unfocused composer). A missing
+    /// transcript (preSize 0, size stays 0) also returns false -> honest degrade.
+    private func injectLanded(sessionId: String, sincePreSize preSize: UInt64) async -> Bool {
+        // No transcript to watch (a real Claude Code session always has its JSONL,
+        // so this is a test session or an unexpected layout): we can't DISconfirm,
+        // so don't punish a delivery we can't observe. The degrade path only fires
+        // when a transcript exists and stays flat -- the real false-success case.
+        guard DesktopConversationTargeter.transcriptURL(sessionId: sessionId) != nil else { return true }
+        for _ in 0..<8 {
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            if transcriptSize(sessionId: sessionId) > preSize { return true }
+        }
+        return false
     }
 
     /// v0.4.0 Part B: dispatch a worker_idle_post_completion flag. The
@@ -282,14 +372,29 @@ public final class InterventionRouter {
                 return
             }
         }
+        // Human-active gate (see injectOrDegrade): defer typing while the human
+        // is at the keyboard. Record the dispatch as QUEUED (Piece 3) so the
+        // hover shows "will send when Claude Code is ready" rather than silently
+        // holding it; the loop re-fires and delivers once they pause.
+        if humanIsActivelyTyping(op: "continue", session: decision.sessionId) {
+            await postQueued(decision, head: proposal)
+            return
+        }
         do {
-            let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid, targetWindowTitle: decision.branch)
-            trace.emit("router", "intervention.continue.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
-            let head = String(proposal.prefix(80))
-            _ = await notifier.postInterventionResult(
-                decision: decision,
-                outcome: .continueFired(pid: handle.pid, bytes: bytes, promptHead: head)
-            )
+            let preSize = transcriptSize(sessionId: decision.sessionId)
+            let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readDesktopTitle(sessionId: decision.sessionId) ?? DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
+            // Confirm the proposal actually landed as a turn (see inject path).
+            if await injectLanded(sessionId: decision.sessionId, sincePreSize: preSize) {
+                trace.emit("router", "intervention.continue.fired pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd) delivery=confirmed")
+                let head = String(proposal.prefix(80))
+                _ = await notifier.postInterventionResult(
+                    decision: decision,
+                    outcome: .continueFired(pid: handle.pid, bytes: bytes, promptHead: head)
+                )
+            } else {
+                trace.emit("router", "intervention.continue.degraded reason=paste_no_turn_landed pid=\(handle.pid) bytes=\(bytes) cwd=\(cwd)")
+                await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
+            }
         } catch let err as InjectError {
             let reason: String
             switch err {

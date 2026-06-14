@@ -213,6 +213,8 @@ final class LoopSmokeTests: XCTestCase {
             locator: StubLocator(handle: ProcessHandle(pid: 4242, execPath: "/usr/local/bin/claude", cwd: "/Users/test/supervisor")),
             signalSender: DarwinSignalSender(),
             injector: injector,
+            // Human idle so the typing gate never fires in this smoke loop.
+            humanActivity: StubHumanActivityProbe(idleSeconds: 999),
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("smoke-router-\(UUID().uuidString).log"))
         )

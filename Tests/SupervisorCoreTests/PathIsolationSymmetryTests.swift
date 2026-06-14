@@ -18,10 +18,12 @@ final class PathIsolationSymmetryTests: XCTestCase {
 
     // MARK: - HardcodedRubric snapshots (assistant-text path)
 
-    func testAssistantTextCategoriesContainsOnlyUserQuestionPending() {
+    func testAssistantTextCategoriesAreQuestionAndWrongTrajectory() {
         let names = HardcodedRubric.assistantTextCategoryNames
-        XCTAssertEqual(names, ["user_question_pending"],
-                       "assistant-text path must evaluate ONLY user_question_pending")
+        // Both are worker-message-derived: a question to the user, or the worker
+        // thrashing. Path isolation still holds -- no bash/idle categories leak.
+        XCTAssertEqual(names, ["user_question_pending", "wrong_trajectory"],
+                       "assistant-text path evaluates the two worker-message categories")
         XCTAssertFalse(names.contains("destructive_action_pending"))
         XCTAssertFalse(names.contains("edits_outside_worktree"))
         XCTAssertFalse(names.contains("prompt_injection_signature"))
@@ -32,11 +34,29 @@ final class PathIsolationSymmetryTests: XCTestCase {
         let md = HardcodedRubric.assistantTextCategoriesMarkdown
         XCTAssertTrue(md.contains("## user_question_pending"),
                       "assistant-text markdown must contain user_question_pending body")
+        XCTAssertTrue(md.contains("## wrong_trajectory"),
+                      "assistant-text markdown must contain wrong_trajectory body")
         XCTAssertFalse(md.contains("## destructive_action_pending"),
                        "assistant-text markdown must NOT contain bash categories")
         XCTAssertFalse(md.contains("## edits_outside_worktree"))
         XCTAssertFalse(md.contains("## prompt_injection_signature"))
         XCTAssertFalse(md.contains("## worker_idle_post_completion"))
+    }
+
+    func testWrongTrajectoryCategoryIsRegisteredAndGuarded() {
+        // The closed-loop redirect must be in the master list (so the
+        // record_triage schema's category enum allows the LLM to return it) and
+        // must carry the anti-over-fire guardrails that keep it from derailing
+        // productive sessions.
+        XCTAssertTrue(HardcodedRubric.allNames.contains("wrong_trajectory"),
+                      "wrong_trajectory must be in allNames so the tool schema permits it")
+        let body = HardcodedRubric.wrongTrajectory.body
+        XCTAssertTrue(body.contains("3+"),
+                      "must require 3+ repetitions before firing (no firing on normal iteration)")
+        XCTAssertTrue(body.lowercased().contains("diagnos"),
+                      "the redirect must push diagnosis, not a guessed alternative fix")
+        XCTAssertTrue(body.contains("Do NOT fire") && body.lowercased().contains("progress"),
+                      "must NOT fire on a session that is making progress")
     }
 
     // MARK: - HardcodedRubric snapshots (idle path)

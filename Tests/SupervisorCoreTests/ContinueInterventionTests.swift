@@ -120,13 +120,17 @@ final class ContinueInterventionTests: XCTestCase {
     private func makeRouter(
         notifier: any Notifying = MockNotifier(),
         locator: any ProcessLocator = StubLocator(handle: ProcessHandle(pid: 42, execPath: "/usr/local/bin/claude", cwd: "/tmp/test-cwd")),
-        injector: any Injector = CountingMockInjector()
+        injector: any Injector = CountingMockInjector(),
+        // Human idle by default so the typing gate never fires; the queued test
+        // overrides this with an active probe.
+        humanActivity: any HumanActivityProbe = StubHumanActivityProbe(idleSeconds: 999)
     ) -> InterventionRouter {
         InterventionRouter(
             notifier: notifier,
             locator: locator,
             signalSender: DarwinSignalSender(),
             injector: injector,
+            humanActivity: humanActivity,
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("continue-router-\(UUID().uuidString).log"))
         )
@@ -163,6 +167,32 @@ final class ContinueInterventionTests: XCTestCase {
                           "banner head must carry the first chars of the proposal so the user sees what got sent")
         } else {
             XCTFail("expected .continueFired outcome, got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    /// Piece 3 (queued-as-delivered): a high-confidence dispatch that WOULD
+    /// inject must instead QUEUE when the human is at the keyboard — no
+    /// keystrokes, a distinct .queued outcome (not .continueFired, not a
+    /// failure), so the hover can show "will send when Claude Code is ready."
+    func testContinueQueuesWhenHumanIsTyping() async throws {
+        let notifier = MockNotifier()
+        let injector = CountingMockInjector()
+        let router = makeRouter(
+            notifier: notifier,
+            injector: injector,
+            humanActivity: StubHumanActivityProbe(idleSeconds: 0.5)  // typing now
+        )
+        let proposal = "Pick up Issue #7 and close the per-path-isolation gap. Stop at 75min per §12."
+        await router.dispatch(decision: makeContinueDecision(confidence: "high", proposal: proposal))
+
+        XCTAssertEqual(injector.calls.count, 0,
+                       "must NOT type while the human is at the keyboard")
+        XCTAssertEqual(notifier.calls.count, 1)
+        if case let .queued(head)? = notifier.calls.first?.outcome {
+            XCTAssertTrue(proposal.hasPrefix(head),
+                          "queued indicator carries the head of what's pending")
+        } else {
+            XCTFail("expected .queued outcome, got \(String(describing: notifier.calls.first?.outcome))")
         }
     }
 

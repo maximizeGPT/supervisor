@@ -1729,6 +1729,31 @@ Last updated: 2026-06-07
 
 ## Open now (actionable, unblocked) — 2026-06-07
 
+- **Hardcoded `/Users/main/...` absolute paths in app targets (FOLLOW-UP — note,
+  do NOT fix now; owner-directed 2026-06-07).** Same bug class as the CI failure
+  that the `#filePath` Dispatcher fix resolved — these will break on any other
+  machine / CI runner if those targets ever get tested or run elsewhere:
+  - `Sources/SupervisorApp/main.swift:564` — `/Users/main/supervisor/PRINCIPLES.md`
+  - `Sources/SupervisorApp/main.swift:597` — `/Users/main/supervisor/PRINCIPLES.md`
+  - `Sources/SupervisorStatusBar/main.swift:225` — `/Users/main/supervisor/OWNER-BRIEF.md`
+  Fix pattern when picked up: resolve via `#filePath`-derived repo root (same as
+  `Dispatcher.systemPrompt`), keeping the absolute path as a fallback. They work
+  today only because the repo lives at `/Users/main/supervisor` on the owner's box.
+- ~~**activeSessionCount spikes to ~31 post-restart (over-trips inject gate).**~~
+  RESOLVED 2026-06-07. Root cause: `SessionDiscovery.startTail` seeded
+  `lastSeenAt: Date()` (now) for EVERY historical JSONL on the startup scan, so all
+  ~37 looked "active" for 10 min after each relaunch. Behaviorally it only
+  mis-degraded a *single*-session inject in that window (≥2 real sessions trip the
+  gate anyway), and it self-corrected after 10 min. Fixed by seeding `lastSeenAt`
+  from the JSONL's file mtime (real last-activity proxy); SessionTail still bumps
+  live sessions to now on streamed events. Quick + contained, no triage-path change.
+  390 tests / 0 failures. (Not yet redeployed — lands on the next build.)
+- ~~**PR #13 → main.**~~ MERGED 2026-06-07 (owner gave explicit go). The
+  autonomous branch (196 commits) is now on main. CI green required two fixes:
+  a Swift-6 concurrency error in SupervisorDevTools (`swift test` doesn't build
+  that target, so it was invisible locally) and the `#filePath` Dispatcher prompt
+  path. Sandbox stays ON (owner-directed) — desktop sessions remain notify-only
+  by design, which is correct, not a gap.
 - ~~**CI test-debt: make the branch green.**~~ RESOLVED 2026-06-07. Was 9
   failures (388 tests): the `rm -rf` deterministic catch fired BEFORE the mocked
   Haiku path, so assertions reading the model verdict saw the catch's banner
@@ -3166,3 +3191,250 @@ B. Deploy-state guard (a5d58d2). Backstop for the deploy-state fabrication class
 
 Tests: DispatcherKnownGapsTests +3, ProposalGroundingTests +2; full dispatcher
 suites green. Deploying so the loop uses both. Budget (§9e): $0 (no API).
+## Deploy of desktop-targeting build (2026-06-08 ~17:02Z)
+- Built `build/Supervisor.app` via build-app.sh release; signed "Supervisor Self-Signed",
+  Identifier=live.supervisor.app, codesign --verify --deep --strict = VALID. Cert matches the
+  deployed app, so the in-place rsync swap preserves the AX TCC grant.
+- deploy.sh swapped in place + relaunched (pid 88188). Smoke test flagged Keychain + AX.
+- ROOT CAUSE of smoke flag: new instance HUNG on a Keychain ACL prompt (SecurityAgent up,
+  app state S / 0% CPU, no API calls post-launch). Onboarding blocks on the key read until the
+  owner clicks "Always Allow". This contradicts the cert-stable-DR assumption in deploy.sh
+  comments — FOLLOW-UP: confirm whether "Always Allow" makes it survive the NEXT deploy, or if
+  the DR genuinely regresses each rebuild (would need setup-signing-identity.sh / DR pinning).
+- Screen Recording: added CGRequestScreenCaptureAccess() at app startup (main.swift, right
+  before "running state ready") so the deployed app prompts + appears in System Settings.
+  Owner grants once (user-only TCC); may need a relaunch to take effect.
+
+### "get thru it all" status at deploy
+- Item 1 router wiring: DONE (56f3c80)
+- Item 4 off-main threading: DONE (07ab5bd), desktop inject re-verified off-main
+- Item 3 Screen Recording request: DONE (startup request added; owner grant pending)
+- Item 5 deploy: IN PROGRESS (binary live, blocked on owner Keychain+ScreenRec clicks, then live verify)
+- Item 2 LLM matcher: NOT done. Local fuzzy match works (conf 1.00/0.00). LLM layer (deepseek on
+  OCR text / vision on screenshot) is the next robustness layer; plumbing challenge = injector is
+  @MainActor with no LLMClient, matcher closure is sync (would need a blocking LLM call on the
+  desktop-targeting queue via semaphore).
+
+## Screen Recording grant: background-app registration gap (2026-06-08 ~17:57Z)
+- Post-deploy TCC state: AX INTACT for live.supervisor.app/.heartbeat/.statusbar (auth_value=2),
+  so inject survived the swap. But live.supervisor.app is in NO kTCCServiceScreenCapture list.
+- Root cause: Supervisor is LSUIElement (background). startup CGRequestScreenCaptureAccess()
+  returned false and did NOT register the app in the Screen Recording list / surface a visible
+  prompt. macOS typically only lists a background app for screen capture once it ATTEMPTS a
+  real capture (CGDisplayCreateImage) — but the targeter's preflight guard returns
+  .screenRecordingDenied BEFORE attempting, so it never registers. Chicken-and-egg.
+- INTERIM: owner adds Supervisor manually via System Settings > Screen Recording > "+" >
+  /Applications/Supervisor.app, then relaunch. Verified-after via TCC auth_value=2.
+- FOLLOW-UP (item 3 polish): on first desktop inject, attempt CGDisplayCreateImage even when
+  preflight says denied (to register + trigger the system prompt), and/or surface an in-app
+  notification with an "Open Screen Recording settings" button. Avoids the manual "+" dance.
+  Deferred to avoid a rebuild+redeploy now (redeploy re-triggers the Keychain ACL prompt until
+  the signing DR stability is confirmed).
+
+## CONFIRMED BUG: Keychain ACL re-prompts on EVERY deploy (2026-06-08 ~23:05Z)
+- This morning's hope ("Always Allow updates the ACL so it shouldn't recur") is WRONG.
+  Deploy of the LLM-matcher build (commit ba6b1f0) hung the new instance (pid 2410) on the
+  Keychain prompt AGAIN — SecurityAgent up, blocked before running-state-ready — despite the
+  owner having clicked Always Allow this morning. So the ACL grant is bound per-build
+  (cdhash/signature), NOT per-cert designated requirement, even though both builds are signed
+  "Supervisor Self-Signed". Every self-deploy therefore hangs until the owner clicks.
+- IMPACT: defeats the "stable identity survives rebuilds" goal for the Keychain item (AX/screen
+  recording DID survive via the cert DR; the Keychain item ACL did not).
+- FIX OPTIONS (follow-up, needs a build):
+  1. Don't re-sign the bundle on every deploy — deploy.sh rsyncs new contents into the existing
+     bundle; if the binary changed, the signature changes, so the ACL breaks. Could sign ONCE
+     with a pinned designated requirement that the Keychain ACL trusts by cert, not cdhash.
+  2. setup-signing-identity.sh may need to set the Keychain item's ACL to a cert-based partition
+     list / "always allow this app by DR" rather than the specific signature.
+  3. Investigate `security set-key-partition-list` / SecAccess with a cert-based requirement.
+- INTERIM: owner clicks Always Allow once per deploy (recoverable, but friction).
+
+## ROOT CAUSE (data-backed): desktop targeting fails on a MULTI-WINDOW layout (2026-06-08 ~23:15Z)
+Added `SupervisorDevTools ocr-dump` (read-only: activate Claude, capture, run the real
+recognizeRows + sidebarCandidates + activeConversationTitle, print every row w/ position).
+Ran it against the owner's live screen. Findings:
+
+- The screen is TWO Claude windows side by side (c075d53a "Pause and kill interventions" on the
+  right, 9d9fc5f7 "Supervisor macOS app signing and notarization" center) PLUS the Supervisor
+  flags panel. CGDisplayCreateImage captures ALL of it as one image.
+- BUG 1 (sidebarCandidates): leftEdge = screen.width*0.30 = 576px on 1920 is too wide. It
+  swallows the CENTER window's body text. Real result: 42 "candidates", ~18 real sidebar titles
+  (x~110-150) + ~24 garbage from the neighbor window (x~360-540: "Freeze + Sign + Verify...",
+  "Signed inside-out...", "Notarization - all 3 submitted..."). FIX: isolate the true sidebar
+  column (fixed ~300px width, or cluster rows by the dominant left-x after "Recents"), not 0.30*W.
+- BUG 2 (activeConversationTitle): picks the LONGEST "project / title" row in the top 5.5%. With
+  two windows open it returns the WRONG one ("Supervisor macOS app signing and notarization", the
+  notarization window, because it's longer than "supervisor / Pause and kill interventions"). This
+  also breaks post-click VERIFICATION (polls for the clicked title; if active-detection picks the
+  wrong window, verify fails even when the click worked). FIX: collect ALL visible "/" title bars;
+  verify by matching the CLICKED target specifically, not "the longest".
+- BUG 3 (LLM matcher): at 23:09 live it returned no_parse on the 23-candidate noise soup -> local
+  fallback matched an unrelated convo ("Filing 1040...") at 0.15 -> degrade. Likely the noise +
+  candidate count. FIX: harden parse + cut candidate noise upstream (Bug 1) so the matcher gets a
+  clean ~18-title list.
+- The target IS readable ("Pause and kill interventions" is the #1 clean sidebar candidate). So
+  the fix is the upstream OCR EXTRACTION, not the matching math (which I over-verified on clean
+  fixtures and wrongly called done).
+- The targeter was built assuming ONE clean Claude window. The owner's real workflow is
+  multi-window, which breaks sidebar isolation + active-detection + verification together.
+
+NEXT (gated on owner's choice): (A) multi-window rework — sidebar isolation -> multi-pane active
+detection -> verification -> matcher hardening, each verified via ocr-dump, no blind deploy. OR
+(B) honesty-first — stop the UI claiming "answering yes so you don't have to type it" when the
+inject degraded to nothing (the false-success is worse than the failure).
+
+## Multi-window OCR fix DONE, deploy-pending (2026-06-10 ~06:15)
+- Commit 1013e5d: sidebar clustering (dominant left-x), visibleConversationTitles
+  (keys on " / ", never the clock), conservative already-active (single-window
+  only). Verified 3 ways: ocr-dump (42->21 candidates, 0 neighbor prose, 3 real
+  titles), match-test (0.95 correct match vs Supervisor-* distractors), 3 fixture
+  tests. Full suite 399/0.
+- NOT deployed. Held for owner PRESENCE (not approval-shy): deploy.sh hangs on the
+  Keychain ACL re-prompt (Gap 1), so deploying while the owner is away would leave
+  Supervisor hung at onboarding -> violates never-stop-Supervisor. One word + the
+  owner at the keyboard and it ships in ~30s.
+
+## Known Gaps (as of 1013e5d)
+1. KEYCHAIN ACL RE-PROMPT on every in-place deploy. Despite the cert-stable
+   "Supervisor Self-Signed" DR, each rsync swap re-presents "Supervisor wants to
+   use [key] in your keychain" and the new instance HANGS until the owner clicks
+   "Always Allow". "Always Allow" has NOT survived to the next deploy (re-prompted
+   on 475a637; expected again on 1013e5d). FOLLOW-UP: pin the Keychain item ACL to
+   the cert DR, or find why the DR doesn't match across rebuilds. Until fixed every
+   deploy needs the owner at the keyboard. This is the single worst friction.
+2. SCREEN RECORDING manual-add for the LSUIElement app. Startup
+   CGRequestScreenCaptureAccess does not surface a visible prompt nor list the
+   background app, so the owner had to add Supervisor via System Settings > Screen
+   Recording > "+". Survives in-place deploys once granted (cert-stable TCC).
+   FOLLOW-UP (item 3 polish): attempt a real CGDisplayCreateImage on first desktop
+   inject to auto-register + surface an in-app "Open Settings" prompt.
+
+---
+
+## Delivery-reliability arc: live verification — 2026-06-13
+
+Arc commits live: human-typing guard (8a619fc), composer focus (bca79fa),
+queued-as-delivered (6a44fc0), CHANGELOG (316d00b). Branch
+delivery-reliability-20260613T144714Z pushed for CI; full suite 412 green.
+
+### Deploy (deploy.sh, in-place rsync swap to /Applications)
+- Auto-smoke FAILED both checks — hit Known Gap #1 (Keychain ACL re-prompt on
+  in-place deploy). The relaunched instance (pid 45915) hung at the key read:
+  applicationDidFinishLaunching logged, then no onboarding decision, heartbeat
+  stale ~90s. NOT the new code (startup never touches the Piece 1-3 paths).
+- Owner cleared the "Always Allow" prompt. 15:44:59Z: "onboarding skipped;
+  entering running state", self-rebuild announced "Supervisor updated itself to
+  delivery-reliability", heartbeat resumed. Arc is live and watching.
+- Per the directive's stop-clause + §12: did NOT iterate on deploy reliability.
+
+### Piece 1 (composer focus) — VERIFIED LIVE
+- 15:49:19Z [desktop] composer_focus click at=(701,1014)
+- 15:49:20Z [router] intervention.continue.fired pid=41620 bytes=1436
+  delivery=confirmed
+- The high-confidence dispatch that delivered THIS session's "arc is fully
+  shipped" directive landed first-try: focusComposer clicked the composer →
+  paste → turn-confirmation poll (4e00980) passed → delivery=confirmed, no
+  degrade banner. Precisely the Piece 1 §6d acceptance; the §2a artifact is the
+  delivered turn itself. The arc delivered its own verification request.
+
+### Piece 2 (human guard) / Piece 3 (queued-as-delivered) — pending live trigger
+- queued / deferred-human_active events since deploy: 0. These fire only when a
+  high-confidence dispatch coincides with a human keystroke <2s old. Unit-proven
+  (3 tests) + deployed, not yet observed live. Controlled trigger proposed:
+  owner types through a dispatch window while this session idles (the loop
+  dispatches into it reliably — it just did at 15:49:20) → expect deferred
+  reason=human_active + outcome=queued (hover flashes "Queued — will send when
+  Claude Code is ready") → owner pauses → next tick delivers. Two hover entries.
+
+---
+
+## Cross-session context-bleed fix + CI green — 2026-06-13
+
+Live bug owner flagged: the "Supervisor tweet engine" session (0b1effa7, a
+socials routine) got an inject grounded in THIS dev session's context (the
+delivery-reliability arc, CI, commit d54..., §-citations). Targeting was correct;
+grounding was poisoned because both sessions share cwd=/Users/main/supervisor and
+repo_context is gathered from the cwd's live git state (branch=delivery-reliability
++ this session's commits). git HEAD is directory-global, not session-specific.
+
+- **Fix (25b3e69):** default-deny cwd-exclusivity gate. groundingCwd(_:liveSessionsInCwd:)
+  omits cwd-derived repo grounding unless the session is the SOLE live worker in
+  the cwd; applied at both the answer (gatherRepoContextForAnswer) and dispatch
+  (dispatchForIdleSession) seams. cwd still flows to targeting. Wired to
+  SessionStore (10-min window) like the router's activeSessionCount. 4 tests, 416 green.
+- **CI fix (6d65125):** CI runs Swift 5.10 (local is 6.2.4, which doesn't flag it).
+  5.10 errored on main.swift:272 — the v0.9.0 onResult hook captured [weak hoverVM]
+  on the outer @Sendable closure; the nested Task captured the weak var. Moved
+  [weak hoverVM] onto the Task (the in-file DEBUG_FLASH pattern). Pre-existing
+  autonomous-branch code, never CI'd on 5.10 — surfaced because PR #15 diffs the
+  whole unmerged branch vs main.
+- **PR #15: CI GREEN** (build + tests, Swift 5.10). NOT merged (owner: skip merge).
+
+DEFERRED-DEPLOY GAP (owner-held, §4c honesty): the bleed gate is committed +
+CI-green on the branch but NOT deployed. The running app is still on 6a44fc0
+(arc only), so the cross-session bleed can recur live until redeployed. Auto-
+closes on the next deploy.sh from this branch (it builds branch HEAD). Owner
+deferred the redeploy to avoid the Known Gap #1 Keychain re-prompt right now.
+
+---
+
+## Drive-to-objective: first slice — objective anchor (steps 1-2) — 2026-06-13
+
+Branch drive-to-completion-<ts> (off delivery-reliability, isolated from PR #15).
+Spec lives in PRODUCT-DIRECTION.md ("The next phase: drive a session to its
+objective"). Building the first slice in order (§1a): capture → feed → completion.
+
+DONE this turn (steps 1-2 — objective anchor, end-to-end, working):
+- SessionObjective.read(sessionId:) — first plain user prompt from the JSONL
+  (type=="user" + String content; tool_result array content skipped). Bounded
+  128KB head-read (opening prompt is at the top). JSONL is the persistence, so
+  it survives restarts + sessions that predate Supervisor watching. 4 tests.
+- SessionContext.objective + the in-app Dispatcher assembles it (reads at
+  dispatch time) and the prompt leads with a "# SESSION OBJECTIVE ... drive
+  toward THIS" block. Full suite 420 green.
+
+NEXT (step 3 — completion → loop stop, the closing half of the slice):
+- Add objective_complete to SelectedPath + a DispatchResult.objectiveComplete
+  case + the parse; instruct the dispatcher system prompt (dispatcher-system-
+  prompt.txt) to judge completion first; LoopController stop reason
+  objectiveComplete; engine stops on it. Then §6d live canary (also the demo).
+
+FINDINGS (flagged, not fixed here):
+- The in-app Swift Dispatcher never populates SessionContext.productDirection
+  (the 393 assemble omits it) — so it does NOT read PRODUCT-DIRECTION.md; only
+  the Python hook (dispatch_loop_hook.py) does. Latent divergence between the
+  two dispatchers. The objective anchor built here is Swift-side; the Python
+  hook would need parity for full production coverage.
+
+BUDGET (§9e): this build was $0 API — all local (swift build/test, no model
+calls). The §6d live canary (deferred to after step 3 + deploy) will incur a
+few DeepSeek dispatch calls, est. <$0.50. Spend-to-date well under the
+journal-justified tier; recorded per §9e as requested.
+
+## Drive-to-objective: step 3 — completion → loop stop + productDirection fold-in — 2026-06-13
+
+DONE — the full first slice now lands (objective in → drive → stop when met):
+- SelectedPath.objectiveComplete + DispatchResult.objectiveComplete(summary:) +
+  Equatable + all switches (selectedPathDescription, recordDispatch,
+  storedLoopDispatchRow). The result switch maps objective_complete FIRST (a
+  terminal judgment, wins over the low-confidence normalization).
+- Swift tool schema enum gains objective_complete; the Swift USER MESSAGE (not
+  the shared system-prompt .txt) instructs "judge completion FIRST → return
+  objective_complete if met." Kept Swift-only ON PURPOSE: the Python hook reads
+  the SAME dispatcher-system-prompt.txt and has its OWN schema without
+  objective_complete, so editing the shared prompt / assuming a shared schema
+  would break the production hook. User-message + Swift-schema = zero hook risk.
+- LoopController.objectiveComplete stop reason (success, distinct from the 3-low
+  backstop); engine remap stops the loop on .objectiveComplete + surfaces a
+  notify "Objective complete: <summary>" banner (no inject — nothing left).
+- productDirection FOLD-IN (§1c): the assemble now reads PRODUCT-DIRECTION.md
+  from cwd and populates SessionContext.productDirection — fixing the latent gap
+  where the in-app Swift dispatcher never read it (only the Python hook did).
+- Tests: dispatcher objective_complete → .objectiveComplete. Full suite 421 green.
+
+STILL NEXT: §6d live canary (give a session one objective, watch successive
+high-confidence steps then objective_complete + a clean stop) — the screen-rec
+demo. And Python-hook parity (objective anchor + objective_complete) if the hook
+path is also to drive-to-objective; deferred as its own coordinated change.
+
+BUDGET (§9e): step 3 also $0 API (local build/test only). Unchanged.

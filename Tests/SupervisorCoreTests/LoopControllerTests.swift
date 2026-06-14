@@ -27,11 +27,23 @@ final class LoopControllerTests: XCTestCase {
         }
     }
 
+    /// Mutable Sendable bool so a test can flip the 4-hour cap toggle mid-run.
+    final class BoolHolder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _v: Bool
+        init(_ v: Bool) { _v = v }
+        var value: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return _v }
+            set { lock.lock(); _v = newValue; lock.unlock() }
+        }
+    }
+
     private func makeController(
         clock: ClockHolder,
         consecutiveLowThreshold: Int = LoopController.defaultConsecutiveLowThreshold,
         maxLoopDuration: TimeInterval = LoopController.defaultMaxLoopDuration,
         sessionResetIdle: TimeInterval = LoopController.defaultSessionResetIdle,
+        loopCapDisabled: @escaping @Sendable () -> Bool = { false },
         loopStore: LoopDispatchStore? = nil
     ) -> LoopController {
         LoopController(
@@ -39,6 +51,7 @@ final class LoopControllerTests: XCTestCase {
             sessionResetIdle: sessionResetIdle,
             consecutiveLowThreshold: consecutiveLowThreshold,
             now: { clock.now },
+            loopCapDisabled: loopCapDisabled,
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("loop-tests-\(UUID().uuidString).log")),
             loopStore: loopStore
@@ -196,6 +209,36 @@ final class LoopControllerTests: XCTestCase {
         XCTAssertTrue(reason.contains("4-hour wall-clock budget") ||
                       reason.contains("hour"),
                       "reason should explain the budget trigger: \(reason)")
+    }
+
+    func testLoopCapDisabledSkipsFourHourStop() async {
+        // Owner turned the 4-hour cap off → the loop keeps proceeding well past
+        // the budget instead of stopping.
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock, maxLoopDuration: 3600, loopCapDisabled: { true })
+        _ = await lc.canDispatch(sessionId: "s-cap-off")
+        clock.advance(by: 3601 * 3)   // way past the budget
+        let decision = await lc.canDispatch(sessionId: "s-cap-off")
+        guard case .proceed = decision else {
+            return XCTFail("cap disabled → should proceed past the 4-hour budget, got \(decision)")
+        }
+    }
+
+    func testTogglingLoopCapOffUnsticksAnExistingFourHourStop() async {
+        // The UX that matters: a session the cap already stopped resumes the
+        // moment the owner flips the toggle off — no relaunch required.
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let capOff = BoolHolder(false)
+        let lc = makeController(clock: clock, maxLoopDuration: 3600, loopCapDisabled: { capOff.value })
+        _ = await lc.canDispatch(sessionId: "s-x")
+        clock.advance(by: 3601)
+        guard case .stopped = await lc.canDispatch(sessionId: "s-x") else {
+            return XCTFail("cap on past budget → expected the 4-hour stop")
+        }
+        capOff.value = true   // owner flips the toggle off
+        guard case .proceed = await lc.canDispatch(sessionId: "s-x") else {
+            return XCTFail("toggling the cap off should un-stick the 4-hour stop and proceed")
+        }
     }
 
     func testLongIdleGapResetsSessionAndClearsFourHourStop() async {

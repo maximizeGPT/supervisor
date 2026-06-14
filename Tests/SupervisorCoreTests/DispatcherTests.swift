@@ -154,6 +154,29 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(path, .continueBranch)
     }
 
+    /// Step 3 of the drive-to-objective slice: when the model judges the session
+    /// objective MET (selected_path=objective_complete), the dispatcher returns
+    /// .objectiveComplete (terminal success) — NOT .ready — so the loop stops
+    /// cleanly instead of dispatching another task. Wins over the confidence
+    /// normalization (completion is a judgment, not a confidence level).
+    func testDispatcherReturnsObjectiveCompleteWhenObjectiveMet() async throws {
+        Self.canned["/v1/messages"] = (200, Self.haikuDispatchResponse(
+            proposal: "Tweet engine built: posts to X via the API on a schedule, verified end to end.",
+            justification: "The objective — a working tweet engine — is built and verified per the transcript.",
+            confidence: "high",
+            selectedPath: "objective_complete"
+        ), [:])
+        let dispatcher = makeDispatcher()
+
+        let result = await dispatcher.dispatch(context: sampleContext())
+
+        guard case let .objectiveComplete(summary) = result else {
+            return XCTFail("expected .objectiveComplete, got \(result)")
+        }
+        XCTAssertTrue(summary.contains("Tweet engine built"),
+                      "objective-complete summary must carry what was built: \"\(summary)\"")
+    }
+
     /// Spec test #2 prerequisite: low-confidence Haiku output normalizes
     /// to DispatchResult.lowConfidence (the prompt is unused; the
     /// justification surfaces as the banner reason).
@@ -195,10 +218,10 @@ final class DispatcherTests: XCTestCase {
         // Haiku call still ran with empty arrays, and the result is
         // whatever Haiku returned.
         switch result {
-        case .ready, .lowConfidence:
-            break  // either is acceptable — the contract is "no crash"
+        case .ready, .lowConfidence, .objectiveComplete:
+            break  // any of these is acceptable — the contract is "no crash"
         case let .error(reasoning):
-            XCTFail("expected .ready or .lowConfidence (Haiku still ran), got .error: \(reasoning)")
+            XCTFail("expected a non-error result (Haiku still ran), got .error: \(reasoning)")
         }
     }
 

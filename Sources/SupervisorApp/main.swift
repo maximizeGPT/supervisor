@@ -263,7 +263,21 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
         // 4. Notifier + Intervention router (v0.1.4 Part A3) + v0.1.6
         // RecoveryDocWriter (writes handoff markdown before SIGSTOP/SIGTERM).
-        let notifier = Notifier(trace: trace)
+        // v0.9.0 (integrity): the hover action log + live label must report the
+        // REAL inject result, not intent. Wire the Notifier's result hook to the
+        // hover so every recorded action is driven by what actually happened
+        // (answered vs "couldn't place it, here it is to paste"). Hops to the
+        // main actor for the @MainActor hover.
+        let notifier = Notifier(trace: trace, onResult: { decision, outcome in
+            // [weak hoverVM] on the Task, NOT the outer @Sendable closure:
+            // capturing the weak var in the nested concurrently-executing Task
+            // is the Swift-5.10 "capture of var in concurrently-executing code"
+            // error CI flags (6.2.x doesn't, so it builds clean locally). This
+            // mirrors the working DEBUG_FLASH Task pattern above. hoverVM is a
+            // @MainActor view model (Sendable), so the @Sendable closure may
+            // hold it; the Task takes it weakly so async work doesn't extend its life.
+            Task { @MainActor [weak hoverVM] in hoverVM?.recordInterventionOutcome(decision, outcome) }
+        })
         self.notifier = notifier
         let recoveryWriter = RecoveryDocWriter(
             directory: paths.recoveryDir,
@@ -275,7 +289,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             notifier: notifier,
             locator: locator,
             signalSender: signalSender,
-            injector: CGEventInjector(trace: trace),
+            injector: CGEventInjector(trace: trace, llm: client),
             recoveryDocWriter: recoveryWriter,
             // Count sessions seen in the last 10 minutes — the concurrency
             // window for "is more than one Claude Code session live right now."
@@ -338,6 +352,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             dispatcher: dispatcher,
             loopController: loopController,
             loopStore: loopDispatchStore,
+            // cwd-exclusivity gate: count live sessions (last 10 min) sharing a
+            // cwd, so repo grounding is omitted when this isn't the sole worker
+            // in that dir — prevents one session's git state bleeding into a
+            // co-located session's answer/dispatch (2026-06-13 tweet-engine bleed).
+            liveSessionsSharingCwd: { [weak self] cwd in
+                guard let store = self?.sessionStore else { return 1 }
+                let cutoff = Date().addingTimeInterval(-600)
+                let n = (try? store.all().filter { $0.cwd == cwd && $0.lastSeenAt >= cutoff }.count) ?? 1
+                return max(n, 1)
+            },
             trace: trace
         )
         engine.onActivityChange = { [weak self] activity in
@@ -394,6 +418,19 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Screen Recording: the desktop conversation targeter screenshots the
+        // Claude desktop window to read its sidebar and pick the right
+        // conversation before injecting. Without the grant, desktop targeting
+        // falls back to notify. Request once on entry so Supervisor appears in
+        // System Settings > Privacy > Screen Recording for the user to enable;
+        // macOS only surfaces the prompt the first time per app identity and
+        // never blocks on the user's choice.
+        if !permissions.isScreenRecordingGranted() {
+            trace.emit("app", "screen recording not granted — requesting once (needed for desktop conversation targeting)")
+            let granted = CGRequestScreenCaptureAccess()
+            trace.emit("app", "screen recording request returned: \(granted)")
+        }
+
         trace.emit("app", "running state ready — watching \(paths.claudeProjectsDir.path)")
     }
 
@@ -435,15 +472,14 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             await self?.router?.dispatch(decision: decision)
         }
 
-        // 3. v0.8.1: record the action in the hover's action log.
-        //    The plain description comes from the same labels the
-        //    flagRaised already uses. Only substantial actions are
-        //    recorded (recordAction filters out .notify internally).
-        let actionDesc = HoverViewModel.plainLabelForFlag(
-            action: candidate.action,
-            reasoningPlain: candidate.reasoningPlain
-        )
-        hoverVM?.recordAction(action: candidate.action, description: actionDesc)
+        // 3. v0.9.0 (integrity): do NOT record the action here. The old eager
+        //    record fired at DECISION time with the INTENT label ("Answered a
+        //    question") — before the inject ran, and it stayed even when the
+        //    inject degraded to nothing. That was the "claims an action it
+        //    didn't take" bug. The action log + live label are now recorded
+        //    from the REAL outcome via the Notifier's onResult hook
+        //    (recordInterventionOutcome), so Supervisor only ever claims an
+        //    inject/pause/kill/continue it actually performed.
     }
 
     // MARK: - Heartbeat child

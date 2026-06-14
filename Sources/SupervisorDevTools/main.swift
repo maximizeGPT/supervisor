@@ -16,6 +16,7 @@
 //                               from replaying 40 MB of historical events
 //                               through Haiku on first start.
 
+import AppKit
 import Foundation
 import SupervisorCore
 
@@ -131,7 +132,7 @@ case "inject-test":
     Task { @MainActor in
         let injector = CGEventInjector()
         do {
-            let n = try await injector.inject(text: text, claudeCodePID: pid, targetWindowTitle: nil)
+            let n = try await injector.inject(text: text, claudeCodePID: pid, targetWindowTitle: (args.count >= 5 ? args[4] : nil))
             result.value = "ok: injected \(n) bytes targeting host of pid \(pid)"
         } catch {
             result.value = "degraded/threw: \(error)"
@@ -144,6 +145,210 @@ case "inject-test":
         RunLoop.main.run(until: Date().addingTimeInterval(0.02))
     }
     print(result.value)
+case "locate-session":
+    // Diagnostic: run the app's REAL locator against a live session id (and
+    // optionally a cwd) so we can characterize the session→process mapping
+    // without a sandbox in the way. Prints the resolved pid/cwd/exec.
+    guard args.count >= 3 else {
+        print("usage: SupervisorDevTools locate-session <session-id> [target-cwd]")
+        exit(2)
+    }
+    let sid = args[2]
+    let locator = LiveProcessLocator(execNamePatterns: ["claude", "claude-code"])
+    if let h = locator.locate(bySessionId: sid) {
+        print("bySessionId(\(sid)) -> FOUND pid=\(h.pid) cwd=\(h.cwd) exec=\(h.execPath)")
+    } else {
+        print("bySessionId(\(sid)) -> nil (not_found/ambiguous — see trace)")
+    }
+    if args.count >= 4 {
+        let cwd = args[3]
+        if let h = locator.locate(targetCwd: cwd) {
+            print("byCwd(\(cwd)) -> FOUND pid=\(h.pid) cwd=\(h.cwd) exec=\(h.execPath)")
+        } else {
+            print("byCwd(\(cwd)) -> nil")
+        }
+    }
+case "desktop-target":
+    // Drive the real DesktopConversationTargeter: screenshot -> OCR -> match ->
+    // click -> verify, for a conversation title. Prints the outcome so the
+    // screenshot+OCR+click pipeline can be verified on screen.
+    guard args.count >= 3 else {
+        print("usage: SupervisorDevTools desktop-target <conversation-title>")
+        exit(2)
+    }
+    let title = args[2]
+    let targeter = DesktopConversationTargeter()
+    print("screen-recording granted: \(DesktopConversationTargeter.hasScreenRecordingPermission())")
+    let outcome = targeter.focusConversation(targetTitle: title)
+    print("outcome: \(outcome)")
+case "match-test":
+    // Verify the Path B LLM conversation matcher against real titles, using
+    // the user's CONFIGURED provider + key (same path the app uses), so the
+    // live failing case can be checked without rebuilding the app:
+    //   SupervisorDevTools match-test "<target>" "<candidate0>" "<candidate1>" ...
+    guard args.count >= 4 else {
+        print("usage: SupervisorDevTools match-test <target-title> <candidate> [candidate...]")
+        exit(2)
+    }
+    let target = args[2]
+    let candidates = args[3...].map { DesktopConversationCandidate(text: $0, point: .zero) }
+    let paths = ConfigPaths()
+    let provider = (try? FileActiveProviderStore(path: paths.activeProviderPath).read()) ?? .anthropic
+    guard let key = ((try? KeychainProviderKeyStore().read(provider)) ?? nil), !key.isEmpty else {
+        print("ERROR: no API key for active provider \(provider.rawValue)")
+        exit(1)
+    }
+    let client = LLMClient(provider: provider, apiKey: key, redactor: DefaultRedactor(), traceLog: .shared)
+    print("provider=\(provider.rawValue) model=\(provider.defaultTriageModel)")
+    print("target: \"\(target)\"")
+    for (i, c) in candidates.enumerated() { print("  [\(i)] \"\(c.text)\"") }
+    // match() blocks on a semaphore while a detached Task runs the LLM call on
+    // the cooperative pool (off this thread), so calling it directly is fine.
+    let matcher = LLMConversationMatcher(client: client)
+    if let (cand, conf) = matcher.match(target: target, candidates: candidates) {
+        let idx = candidates.firstIndex(of: cand) ?? -1
+        let verdict = conf >= 0.6 ? "WOULD SWITCH (>= 0.6 gate)" : "below 0.6: would NOT switch (degrade to notify)"
+        print("MATCH idx=\(idx) conf=\(String(format: "%.2f", conf)) title=\"\(cand.text)\" -> \(verdict)")
+    } else {
+        print("nil (LLM failure; the injector would fall back to the local matcher)")
+    }
+case "ocr-dump":
+    // Read-only: activate Claude (as the real targeter does before capturing),
+    // screenshot, run the REAL OCR + extraction heuristics, and print every row
+    // with its position so the sidebar / active-title heuristics can be fixed
+    // against the actual on-screen layout. No click, no inject.
+    if let claude = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first {
+        claude.activate(options: [.activateIgnoringOtherApps])
+        Thread.sleep(forTimeInterval: 0.7)
+    } else {
+        print("WARN: Claude desktop not running — capturing whatever is frontmost")
+    }
+    let targeter = DesktopConversationTargeter()
+    print("screen-recording granted: \(DesktopConversationTargeter.hasScreenRecordingPermission())")
+    guard let img = targeter.captureMainDisplay() else { print("CAPTURE FAILED"); exit(1) }
+    let bounds = CGDisplayBounds(CGMainDisplayID())
+    let rows = targeter.recognizeRows(in: img)
+    print("screen \(Int(bounds.width))x\(Int(bounds.height)), \(rows.count) OCR rows (top->bottom; L=left30% T=top5.5%):")
+    for r in rows.sorted(by: { $0.point.y < $1.point.y }) {
+        let l = r.point.x < bounds.width * 0.30 ? "L" : "-"
+        let t = r.point.y < bounds.height * 0.055 ? "T" : "-"
+        let txt = r.text.count > 78 ? String(r.text.prefix(78)) + "…" : r.text
+        print(String(format: "  [%4d,%4d] %@%@ | %@", Int(r.point.x), Int(r.point.y), l, t, txt))
+    }
+    print("--- sidebarCandidates() -> \(targeter.sidebarCandidates(from: rows).count): ---")
+    for c in targeter.sidebarCandidates(from: rows) { print("    @[\(Int(c.point.x)),\(Int(c.point.y))] \"\(c.text)\"") }
+    print("--- visibleConversationTitles() -> \(targeter.visibleConversationTitles(from: rows))")
+    print("--- activeConversationTitle() -> \(targeter.activeConversationTitle(from: rows).map { "\"\($0)\"" } ?? "nil")")
+case "composer-probe":
+    // Read-only: activate Claude, screenshot, and report WHERE composerPoint
+    // would click to focus the composer — WITHOUT clicking or typing. Verifies
+    // the Piece-1 locator against the live screen before any paste touches it.
+    if let claude = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first {
+        claude.activate(options: [.activateIgnoringOtherApps])
+        Thread.sleep(forTimeInterval: 0.7)
+    } else {
+        print("WARN: Claude desktop not running — capturing whatever is frontmost")
+    }
+    let targeter = DesktopConversationTargeter()
+    print("screen-recording granted: \(DesktopConversationTargeter.hasScreenRecordingPermission())")
+    guard let img = targeter.captureMainDisplay() else { print("CAPTURE FAILED"); exit(1) }
+    let bounds = CGDisplayBounds(CGMainDisplayID())
+    let rows = targeter.recognizeRows(in: img)
+    let bandTop = bounds.height * 0.82
+    print("screen \(Int(bounds.width))x\(Int(bounds.height)); bottom band (y>=\(Int(bandTop))):")
+    for r in rows.filter({ $0.point.y >= bandTop }).sorted(by: { $0.point.y < $1.point.y }) {
+        print(String(format: "  [%4d,%4d] | %@", Int(r.point.x), Int(r.point.y), r.text))
+    }
+    if let pt = targeter.composerPoint(from: rows, screen: bounds) {
+        print("--- composerPoint -> (\(Int(pt.x)),\(Int(pt.y)))  [NO click performed]")
+    } else {
+        print("--- composerPoint -> nil (no bottom-band anchor found)")
+    }
+case "composer-focus-test":
+    // Piece-1 mechanism verification: focus the composer (the new code), paste a
+    // marked test string WITHOUT submitting (no Return -> no real turn), then OCR
+    // to confirm the string landed in the composer. Clears it afterward IFF it
+    // landed (never sends destructive keys into an unknown focus). Isolates
+    // focusComposer from the already-proven targeting arc.
+    guard args.count >= 3 else { print("usage: composer-focus-test <text>"); exit(2) }
+    let probe = args[2]
+    guard let claude = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first else {
+        print("Claude desktop not running"); exit(1)
+    }
+    claude.activate(options: [.activateIgnoringOtherApps]); Thread.sleep(forTimeInterval: 0.6)
+    let pid = claude.processIdentifier
+    let targeter = DesktopConversationTargeter()
+    let src = CGEventSource(stateID: .hidSystemState)
+    func postKey(_ vk: CGKeyCode, _ flags: CGEventFlags = []) {
+        guard let d = CGEvent(keyboardEventSource: src, virtualKey: vk, keyDown: true),
+              let u = CGEvent(keyboardEventSource: src, virtualKey: vk, keyDown: false) else { return }
+        d.flags = flags; u.flags = flags
+        d.postToPid(pid); usleep(30_000); u.postToPid(pid)
+    }
+    targeter.focusComposer()  // <-- the new code under test (locate + click composer)
+    let pb = NSPasteboard.general
+    let saved = pb.string(forType: .string)
+    pb.clearContents(); pb.setString(probe, forType: .string)
+    postKey(9, .maskCommand)  // Cmd-V (paste, NO Return)
+    Thread.sleep(forTimeInterval: 0.5)
+    var landed = false
+    if let img2 = targeter.captureMainDisplay() {
+        let bandTop = CGDisplayBounds(CGMainDisplayID()).height * 0.78
+        let band = targeter.recognizeRows(in: img2).filter { $0.point.y >= bandTop }
+        let needle = probe.lowercased()
+        landed = band.contains { needle.contains($0.text.lowercased()) || $0.text.lowercased().contains("focus test") }
+        print(landed ? "LANDED ✓ — probe text is in the composer (the focus click worked)"
+                     : "NOT FOUND ✗ — probe text not in the bottom band (focus likely missed)")
+        print("bottom-band text after paste:")
+        for r in band.sorted(by: { $0.point.y < $1.point.y }) { print("    [\(Int(r.point.x)),\(Int(r.point.y))] \(r.text)") }
+    }
+    if landed {
+        postKey(0, .maskCommand)  // Cmd-A (select all in the focused composer)
+        usleep(60_000)
+        postKey(51)               // Delete (clear)
+        print("(composer cleared)")
+    } else {
+        print("(left as-is — not clearing into an unknown focus)")
+    }
+    pb.clearContents(); if let saved { pb.setString(saved, forType: .string) }
+    print("(clipboard restored)")
+case "scroll-test":
+    // Verify scrollSidebar actually moves the sidebar and in the right
+    // direction: capture, scroll DOWN, capture again, and report which
+    // conversations are NEW (proving scroll-to-find can reach off-screen ones).
+    if let claude = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first {
+        claude.activate(options: [.activateIgnoringOtherApps]); Thread.sleep(forTimeInterval: 0.7)
+    }
+    let targeter = DesktopConversationTargeter()
+    func cands() -> [String] {
+        guard let img = targeter.captureMainDisplay() else { return [] }
+        return targeter.sidebarCandidates(from: targeter.recognizeRows(in: img)).map(\.text)
+    }
+    let before = cands()
+    print("before:        \(before.count) candidates; top: \(before.prefix(4))")
+    targeter.scrollSidebar(toTop: false); Thread.sleep(forTimeInterval: 0.4)
+    let afterDown = cands()
+    let newOnes = afterDown.filter { !before.contains($0) }
+    print("after down:    \(afterDown.count) candidates; \(newOnes.count) NEW: \(newOnes.prefix(5))")
+    print(newOnes.isEmpty ? "  -> scroll-down revealed NOTHING new (wrong direction, no scroll, or at bottom)" : "  -> scroll-down works (revealed off-screen conversations)")
+    targeter.scrollSidebar(toTop: true); Thread.sleep(forTimeInterval: 0.4)
+    let afterTop = cands()
+    print("after to-top:  \(afterTop.count) candidates; top: \(afterTop.prefix(4))")
+case "desktop-title":
+    // The targeting identity: compare the FROZEN transcript aiTitle against the
+    // LIVE title Claude Desktop currently displays for a sessionId. Divergence
+    // is the root cause of both the wrong-chat bleed and the silent degrade.
+    guard args.count >= 3 else {
+        print("usage: SupervisorDevTools desktop-title <sessionId>")
+        exit(2)
+    }
+    let sid = args[2]
+    let frozen = DesktopConversationTargeter.readAiTitle(sessionId: sid)
+    let live = DesktopConversationTargeter.readDesktopTitle(sessionId: sid)
+    print("session:                 \(sid)")
+    print("aiTitle (JSONL, frozen): \(frozen.map { "\"\($0)\"" } ?? "nil")")
+    print("desktop title (live):    \(live.map { "\"\($0)\"" } ?? "nil")")
+    print(frozen == live ? "  -> MATCH (no drift)" : "  -> DIVERGED: targeting must use the live title (this fix)")
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)

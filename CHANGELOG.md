@@ -6,6 +6,79 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Delivery reliability (the inject path): land on the first try by focusing the
+composer before typing, never type over the human, and surface a queued
+dispatch honestly in the hover instead of going silent.
+
+Desktop conversation targeting: deliver answers to the correct conversation
+across multiple open windows, and reach conversations scrolled off-screen.
+
+### Added
+
+**Human-typing guard** (`Sources/SupervisorCore/Intervention/HumanActivityProbe.swift`, `InterventionRouter.swift`)
+- Owner policy: Supervisor must never type into — or queue behind — a composer
+  the human is actively using. Both keystroke-synthesizing paths (answer inject
+  + high-confidence continue dispatch) now consult a `HumanActivityProbe`
+  (CoreGraphics HID idle on `.keyDown`) before typing; if a real keystroke
+  landed within 2s, they defer rather than steal focus. The probe is read
+  BEFORE typing, so it reads the human's activity, not Supervisor's own
+  synthesized keys, and is injectable so the router stays deterministically
+  testable.
+
+**Queued-as-delivered hover state** (`InterventionRouter.swift`, `Notifier.swift`, `HoverViewModel.swift`)
+- When the human is at the keyboard, the router records a distinct `.queued`
+  outcome instead of a failure-shaped degrade. Through the existing hover
+  machinery this flashes "Queued — will send when Claude Code is ready" in the
+  moment (forcing the hover visible) and logs it honestly — `actionForOutcome`
+  maps `.queued` to a label that never claims "sent"/"answered". When the human
+  pauses, the loop re-fires and delivers, logging a separate fired/answered
+  entry: a truthful queued→delivered trail rather than silence or a false
+  failure banner.
+
+**Scroll-to-find** (`Sources/SupervisorCore/Intervention/DesktopConversationTargeter.swift`)
+- Targeting only ever matched the sidebar as currently shown, so an answer for
+  a conversation scrolled out of the recents list degraded straight to notify.
+  `focusConversation` now runs two passes: the visible sidebar first (unchanged
+  fast path plus already-active shortcut), then, when the target is not
+  confidently there, it jumps the sidebar to the top and scrolls down through
+  it re-matching each view until the target is found or the list stops yielding
+  new conversations (bounded at 6 views). The matched candidate's coordinates
+  come from the view it was found in, so the click lands. Verified live via a
+  new `scroll-test` devtools command (scroll-down reveals off-screen
+  conversations, scroll-to-top restores).
+
+### Fixed
+
+**Composer focus before paste** (`DesktopConversationTargeter.swift`, `Injector.swift`)
+- Targeting reliably landed on the right CONVERSATION, but that is not the same
+  as the composer having keyboard focus: an already-active conversation never
+  got a sidebar click, so focus sat off the input and the Cmd-V vanished — the
+  live `paste_no_turn_landed` miss (owner was in another app). `focusConversation`
+  now clicks the composer before returning `.focused`, on both the already-active
+  and post-switch paths. The click point comes from `composerPoint`, which
+  anchors on the composer placeholder ("Type / for commands", "Reply to Claude",
+  …) in the bottom band and falls back to just-above-the-footer at the pane
+  center. Verified live (devtools `composer-probe` + `composer-focus-test`):
+  the locator resolved the composer at (703,1015) on a real 1920×1080 screen and
+  a focus-click + paste landed the probe text in the composer. The turn-
+  confirmation poll (4e00980) remains the router-level proof on each real dispatch.
+
+**Sidebar isolation across multiple windows** (`DesktopConversationTargeter.swift`)
+- With several Claude windows open, OCR swallowed a neighbor window's body
+  prose as fake conversation candidates, and the active-title pick could land
+  on the menu-bar clock. Candidate extraction now locks onto the leftmost dense
+  column (the sidebar is always left of any body pane, even when a body pane
+  has more rows), and title-bar reads filter to rows containing " / ", never
+  the clock or a path.
+
+**Wrong-conversation bleed** (`DesktopConversationTargeter.swift`)
+- A high-confidence match could paste into the wrong conversation: the
+  post-click verify confirmed the title it LANDED on, not the one it was AIMING
+  for, so a 0.95 mis-pick passed. Verify now confirms token overlap against the
+  intended target ai-title only; a mismatch degrades to a notify banner instead
+  of typing. Worst case across all of the above is scroll, find nothing, banner,
+  never a wrong-chat paste.
+
 ## [0.9.3] — 2026-06-03
 
 Self-deploy stops silently dropping the Accessibility grant.
