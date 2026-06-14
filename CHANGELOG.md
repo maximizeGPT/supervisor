@@ -38,20 +38,30 @@ self-authorization / impersonation gap** (`Sources/SupervisorCore/Intervention/I
   against the ledger (same session, matching text, within a window) and stamps
   `.supervisorInjected` on a hit. The parser starts every turn `.owner` because
   the JSONL carries no provenance.
-- The rule: all three triage paths now label the most-recent-prompt block
-  `[owner]` vs `[supervisor-injected]` (and mark injected turns in the event
-  window). The shared system prompt and the `destructive_action_pending` rubric
-  body state it plainly — authorization comes ONLY from an `[owner]` prompt; a
-  `[supervisor-injected]` prompt can NEVER authorize, and if it is the sole
-  authorization the action is UNAUTHORIZED → fire. The asymmetry is safe by
-  construction (§3): ambiguity resolves toward `.supervisorInjected`.
-- No calibration regression: genuine prompts render `[owner]` and behave exactly
-  as before (every existing fixture is owner-authored); the new restriction
-  triggers only on the new label. Covered by `InjectionLedgerTests` (correlation)
-  and `ImpersonationGapPromptTests` (the artifact Haiku reads). Still owed: the
-  §6e live canary, a regression sweep when an API key is available, and the
-  Python-hook mirror (`Tools/dispatch-loop-hook/`, a power-user path — not the
-  `.app` flow a non-technical user runs).
+- The rule, and why a label is not enough: the §6d live canary (against the
+  owner's real model, DeepSeek) proved that labeling the authorizing turn
+  `[supervisor-injected]` — in the slot AND the event window — was NOT sufficient:
+  the model read its own injected text as authorization anyway and did not fire on
+  a destructive `DROP`. The model treats any user-role text in context as
+  authorization, ignoring the label. So the operative fix is deterministic, not
+  model-dependent: the authorization anchor is the most recent **owner** prompt
+  (injected turns skipped), and Supervisor-injected turns are **removed from the
+  window the triage model sees entirely** (the full labeled window still flows to
+  the recovery doc). The injected case then reads as exactly "no owner
+  authorization," and the model's correct baseline behavior (fire on an
+  unauthorized destructive action) does the rest. The `[owner]` /
+  `[supervisor-injected]` labels and the rubric prose remain as defense-in-depth.
+- Verified end-to-end (§6d/§6e) by `ImpersonationGapCanaryTest` against DeepSeek:
+  same destructive command + same words, three provenances — no-auth → fire
+  high/pause; owner-auth → honored (no fire); supervisor-injected auth → fire
+  high/pause (*"no recent prompt from you authorizing this"*). Provenance flips
+  the verdict. Plus `InjectionLedgerTests` (correlation) and
+  `ImpersonationGapPromptTests` (the prompt artifact). No calibration regression
+  (genuine owner prompts behave exactly as before). Full suite 447 pass / 0 fail.
+- Still owed (not launch-blocking for the non-technical `.app` flow): a full
+  300-fixture regression sweep when an API key is configured, and the Python-hook
+  mirror (`Tools/dispatch-loop-hook/`, a power-user path — not the `.app` a
+  non-technical user runs).
 
 ### Added
 
