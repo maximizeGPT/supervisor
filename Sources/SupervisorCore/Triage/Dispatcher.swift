@@ -76,6 +76,11 @@ public enum DispatchResult: Sendable, Equatable {
     /// The router degrades to a plain notify; the error string lands
     /// in the trace.
     case error(reasoning: String)
+    /// The session objective is complete. The loop stops cleanly (success) —
+    /// the engine ends the loop on this rather than waiting for the
+    /// 3-consecutive-low backstop. `summary` is the model's one-line account of
+    /// what was built, for the trace + the "done" banner.
+    case objectiveComplete(summary: String)
 
     public static func == (lhs: DispatchResult, rhs: DispatchResult) -> Bool {
         switch (lhs, rhs) {
@@ -85,6 +90,8 @@ public enum DispatchResult: Sendable, Equatable {
             return r1 == r2
         case let (.error(r1), .error(r2)):
             return r1 == r2
+        case let (.objectiveComplete(s1), .objectiveComplete(s2)):
+            return s1 == s2
         default:
             return false
         }
@@ -106,6 +113,12 @@ public enum SelectedPath: String, Sendable, Equatable {
     case continueBranch = "continue_branch"
     case transitionToIssue = "transition_to_issue"
     case lowConfidenceNoAction = "low_confidence_no_action"
+    /// The session objective is already met by the work so far — the loop should
+    /// stop (success), not pick another task. Distinct from
+    /// low_confidence_no_action ("couldn't pick") — this is "nothing left to
+    /// pick, the thing is built." (Swift dispatcher only; the Python hook's
+    /// schema doesn't include it, so it never emits it.)
+    case objectiveComplete = "objective_complete"
 }
 
 // MARK: - Session context
@@ -404,6 +417,15 @@ public final class Dispatcher: Dispatching, Sendable {
         if let objective {
             trace.emit("dispatch", "objective session=\(sessionUUID) bytes=\(objective.utf8.count)")
         }
+        // Fold-in fix (§1c): the in-app dispatcher never populated
+        // productDirection, so it never read PRODUCT-DIRECTION.md (only the
+        // Python hook did). Read it from the cwd repo root, like knownGaps, so
+        // the in-app dispatcher reasons against the project's north star too.
+        let productDirection = cwd.flatMap { c -> String? in
+            guard !c.isEmpty else { return nil }
+            return try? String(contentsOf: URL(fileURLWithPath: c)
+                .appendingPathComponent("PRODUCT-DIRECTION.md"), encoding: .utf8)
+        } ?? ""
         let context = SessionContext(
             sessionUUID: sessionUUID,
             cwd: cwd,
@@ -412,6 +434,7 @@ public final class Dispatcher: Dispatching, Sendable {
             openIssues: issues,
             currentBranchCommits: commits,
             priorDispatchesConsidered: priorDispatchesConsidered,
+            productDirection: productDirection,
             objective: objective,
             knownGaps: knownGaps,
             recentDispatchProposals: recentProposals
@@ -469,6 +492,15 @@ public final class Dispatcher: Dispatching, Sendable {
         // regardless of what next_task_proposal says — the router
         // shouldn't inject a half-confidence proposal.
         switch parsed {
+        case let .ready(prompt, justification, _, .objectiveComplete, _, _, _):
+            // The model judged the session objective MET. Terminal success,
+            // regardless of confidence — completion is a judgment, not a task to
+            // dispatch, so it wins over the low-confidence normalization below.
+            // summary prefers the proposal field (where the prompt asks for the
+            // one-line account), falling back to the justification.
+            let summary = prompt.isEmpty ? justification : prompt
+            trace.emit("dispatch", "objective_complete summary=\"\(summary.prefix(160))\"")
+            return .objectiveComplete(summary: summary)
         case let .ready(_, justification, .low, _, _, _, _):
             trace.emit("dispatch", "low-confidence dispatch path=\(parsed.selectedPathDescription) reasoning=\"\(justification.prefix(160))\"")
             return .lowConfidence(reasoning: justification)
@@ -632,6 +664,8 @@ public final class Dispatcher: Dispatching, Sendable {
             lines.append(objective)
             lines.append("")
             lines.append("Your PRIMARY job is to pick the next concrete step that moves toward THIS objective. A step toward the stated objective is grounded work, not invented scope. Treat the objective as unmet until the work it describes is actually built and verified; keep driving the worker toward it rather than idling, unless a safety gate or the human says otherwise.")
+            lines.append("")
+            lines.append("FIRST judge completion: if the recent transcript and shipped work show the objective is ALREADY met (built and verified), return selected_path=objective_complete with a one-line summary of what was built in next_task_proposal. Do NOT invent a follow-on task past a met objective. Only when it is genuinely unmet do you pick the next step toward it.")
         } else {
             lines.append("(no opening prompt captured — fall back to local reasoning from recent work, PRODUCT-DIRECTION.md, and the backlog)")
         }
@@ -785,8 +819,9 @@ public final class Dispatcher: Dispatching, Sendable {
                             .string("continue_branch"),
                             .string("transition_to_issue"),
                             .string("low_confidence_no_action"),
+                            .string("objective_complete"),
                         ]),
-                        "description": .string("continue_branch = mechanical follow-on on the current branch; transition_to_issue = pick a sized issue from the queue; low_confidence_no_action = couldn't pick, surface to user.")
+                        "description": .string("continue_branch = mechanical follow-on on the current branch; transition_to_issue = pick a sized issue from the queue; low_confidence_no_action = couldn't pick a task, surface to user; objective_complete = the SESSION OBJECTIVE is already met by the work so far, so the loop should stop cleanly (put a one-line summary of what was built in next_task_proposal).")
                     ]),
                     "selected_issue_number": .object([
                         "type": .string("integer"),
@@ -1029,6 +1064,7 @@ extension DispatchResult {
         case let .ready(_, _, _, path, _, _, _): return path.rawValue
         case .lowConfidence: return "low_confidence_no_action"
         case .error: return "error"
+        case .objectiveComplete: return "objective_complete"
         }
     }
 }

@@ -65,6 +65,10 @@ public enum LoopStopReason: String, Sendable, Equatable {
     case fourHoursElapsed = "four_hours_elapsed"
     case threeConsecutiveLow = "three_consecutive_low_confidence"
     case explicitStop = "explicit_stop"
+    /// The session objective is built — the loop finished on success, not on a
+    /// hard stop. The cleaner termination the drive-to-objective slice adds: the
+    /// loop stops because the thing is DONE, not because it ran out of ideas.
+    case objectiveComplete = "objective_complete"
 
     /// Human-readable, shown to the owner (the raw value is for logs/traces).
     public var display: String {
@@ -77,6 +81,8 @@ public enum LoopStopReason: String, Sendable, Equatable {
             return "three dispatches in a row found no clear next step, so it's waiting for new direction."
         case .explicitStop:
             return "it was stopped manually."
+        case .objectiveComplete:
+            return "the session's objective is built, so the loop finished. Give it a new objective to start it again."
         }
     }
 }
@@ -273,6 +279,12 @@ public actor LoopController {
                 state.stopReason = .threeConsecutiveLow
                 trace.emit("loop", "STOPPED session=\(sessionId) reason=three_consecutive_low_confidence (counter hit \(state.consecutiveLowCount))")
             }
+        case .objectiveComplete:
+            // Objective met — terminal success, not a low. Reset the
+            // consecutive-low counter; the engine stops the loop separately
+            // (stop(reason: .objectiveComplete)) so the stop reads as "done".
+            state.consecutiveLowCount = 0
+            trace.emit("loop", "recorded objective_complete session=\(sessionId) total=\(state.totalDispatches)")
         @unknown default:
             break
         }

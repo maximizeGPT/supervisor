@@ -3410,3 +3410,31 @@ BUDGET (§9e): this build was $0 API — all local (swift build/test, no model
 calls). The §6d live canary (deferred to after step 3 + deploy) will incur a
 few DeepSeek dispatch calls, est. <$0.50. Spend-to-date well under the
 journal-justified tier; recorded per §9e as requested.
+
+## Drive-to-objective: step 3 — completion → loop stop + productDirection fold-in — 2026-06-13
+
+DONE — the full first slice now lands (objective in → drive → stop when met):
+- SelectedPath.objectiveComplete + DispatchResult.objectiveComplete(summary:) +
+  Equatable + all switches (selectedPathDescription, recordDispatch,
+  storedLoopDispatchRow). The result switch maps objective_complete FIRST (a
+  terminal judgment, wins over the low-confidence normalization).
+- Swift tool schema enum gains objective_complete; the Swift USER MESSAGE (not
+  the shared system-prompt .txt) instructs "judge completion FIRST → return
+  objective_complete if met." Kept Swift-only ON PURPOSE: the Python hook reads
+  the SAME dispatcher-system-prompt.txt and has its OWN schema without
+  objective_complete, so editing the shared prompt / assuming a shared schema
+  would break the production hook. User-message + Swift-schema = zero hook risk.
+- LoopController.objectiveComplete stop reason (success, distinct from the 3-low
+  backstop); engine remap stops the loop on .objectiveComplete + surfaces a
+  notify "Objective complete: <summary>" banner (no inject — nothing left).
+- productDirection FOLD-IN (§1c): the assemble now reads PRODUCT-DIRECTION.md
+  from cwd and populates SessionContext.productDirection — fixing the latent gap
+  where the in-app Swift dispatcher never read it (only the Python hook did).
+- Tests: dispatcher objective_complete → .objectiveComplete. Full suite 421 green.
+
+STILL NEXT: §6d live canary (give a session one objective, watch successive
+high-confidence steps then objective_complete + a clean stop) — the screen-rec
+demo. And Python-hook parity (objective anchor + objective_complete) if the hook
+path is also to drive-to-objective; deferred as its own coordinated change.
+
+BUDGET (§9e): step 3 also $0 API (local build/test only). Unchanged.

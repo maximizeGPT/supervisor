@@ -792,6 +792,22 @@ public final class TriageEngine {
                 nextTaskProposal: nil,
                 confidence: "low"
             )
+        case let .objectiveComplete(summary):
+            // The objective is built. Stop the loop cleanly (success — stop
+            // reason objective_complete, not the 3-low backstop) and surface a
+            // notify banner. No inject: there's nothing left to dispatch. The
+            // loop won't fire again for this session until it's given a new
+            // objective / reset.
+            trace.emit("dispatch", "objective_complete → stopping loop session=\(sessionId) summary=\"\(summary.prefix(120))\"")
+            await loopController?.stop(sessionId: sessionId, reason: .objectiveComplete)
+            return reconfigure(
+                candidate,
+                action: .notify,
+                asymmetryNote: redactor.redact("Objective complete: \(summary)"),
+                suggestedInjectText: nil,
+                nextTaskProposal: nil,
+                confidence: "low"
+            )
         }
     }
 
@@ -1192,6 +1208,18 @@ public final class TriageEngine {
                 selectedIssueNumber: nil,
                 taskProposalHead: "",
                 justification: reasoning,
+                priorDispatchesConsidered: priorDispatchesConsidered
+            )
+        case let .objectiveComplete(summary):
+            return StoredLoopDispatch(
+                sessionId: sessionId,
+                ts: ts,
+                responseShape: "objectiveComplete",
+                confidence: nil,
+                selectedPath: SelectedPath.objectiveComplete.rawValue,
+                selectedIssueNumber: nil,
+                taskProposalHead: String(summary.prefix(200)),
+                justification: summary,
                 priorDispatchesConsidered: priorDispatchesConsidered
             )
         }
