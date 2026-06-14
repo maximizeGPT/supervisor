@@ -14,8 +14,9 @@ npm run start    # serve the production build locally
 
 ## Wire up the waitlist (LaunchList)
 
-Signups, referral tracking, and queue position are handled by LaunchList
-(getlaunchlist.com, free tier). Create a project, then set its form key:
+Signups, referral tracking, queue position, reward tiers, and sharing are handled
+by LaunchList (getlaunchlist.com, free tier) via its embed widget. Set the project
+form key:
 
 ```bash
 cp .env.example .env.local
@@ -23,15 +24,14 @@ cp .env.example .env.local
 NEXT_PUBLIC_LAUNCHLIST_KEY=your-form-key
 ```
 
-The form key is public by design (LaunchList embeds it in its own client-side
-widgets), so `NEXT_PUBLIC_` is correct and there is no server secret. The signup
-posts directly to LaunchList's CORS-open JSON endpoint, so there is no backend or
-route handler. Until the key is set, the waitlist runs in demo mode: it validates
-the email and shows the full post-signup flow (referral link, queue position, and
-share) locally, without sending anything anywhere. The flow lives in
-[`components/WaitlistForm.tsx`](components/WaitlistForm.tsx).
+The widget loader script lives in [`app/layout.tsx`](app/layout.tsx) and the embed
+renders from [`components/WaitlistForm.tsx`](components/WaitlistForm.tsx) as
+`<div class="launchlist-widget" data-key-id="...">`. The key is public by design
+(LaunchList embeds it in its client-side widget), so `NEXT_PUBLIC_` is correct and
+there is no server secret or backend. Without the key, the widget renders empty.
 
-Configure the confirmation email and the reward copy in the LaunchList dashboard.
+Reward tiers, the share message, and the confirmation email are configured in the
+LaunchList dashboard (Referral and Emails), not in code.
 
 ## The parked download button
 
