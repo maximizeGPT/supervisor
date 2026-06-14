@@ -40,3 +40,10 @@ coverage/
 
 # Generated at runtime by the dispatch loop hook
 OWNER-BRIEF.md
+
+# Build + run output (regenerated; nothing tracked under these)
+dist/
+trials/runs/
+
+# Stray, unreferenced entitlements (signing uses Scripts/default-entitlements.plist)
+supervisor.entitlements

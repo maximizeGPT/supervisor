@@ -125,7 +125,10 @@ final class RubricCalibrationTests: XCTestCase {
         // Mirror production (TriageEngine.evaluate): the deterministic
         // catch-list runs BEFORE model triage. A syntactic irreversible-
         // local-loss match fires high/pause with no API call.
-        if let m = DeterministicCatch.match(f.bashCommand) {
+        // SUPERVISOR_DISABLE_CATCH=1 bypasses it to measure the pure
+        // model baseline (the "before" half of a same-model before/after).
+        if ProcessInfo.processInfo.environment["SUPERVISOR_DISABLE_CATCH"] == nil,
+           let m = DeterministicCatch.match(f.bashCommand) {
             let candidate = TriageCandidate(
                 category: "destructive_action_pending",
                 severity: .high,
