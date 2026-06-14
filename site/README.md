@@ -12,20 +12,26 @@ npm run build    # production build (also what Vercel runs)
 npm run start    # serve the production build locally
 ```
 
-## Wire up the waitlist (no backend)
+## Wire up the waitlist (LaunchList)
 
-The form POSTs to a single pluggable endpoint. Set it once:
+Signups, referral tracking, queue position, reward tiers, and sharing are handled
+by LaunchList (getlaunchlist.com, free tier) via its embed widget. Set the project
+form key:
 
 ```bash
 cp .env.example .env.local
 # then edit .env.local:
-NEXT_PUBLIC_WAITLIST_ENDPOINT=https://formspree.io/f/your-id
+NEXT_PUBLIC_LAUNCHLIST_KEY=your-form-key
 ```
 
-Any endpoint that accepts a POST works (Formspree, Buttondown, your own URL).
-Until it is set, the form validates the email and shows the success state
-locally without sending or storing anything. The endpoint logic lives in
-[`components/WaitlistForm.tsx`](components/WaitlistForm.tsx).
+The widget loader script lives in [`app/layout.tsx`](app/layout.tsx) and the embed
+renders from [`components/WaitlistForm.tsx`](components/WaitlistForm.tsx) as
+`<div class="launchlist-widget" data-key-id="...">`. The key is public by design
+(LaunchList embeds it in its client-side widget), so `NEXT_PUBLIC_` is correct and
+there is no server secret or backend. Without the key, the widget renders empty.
+
+Reward tiers, the share message, and the confirmation email are configured in the
+LaunchList dashboard (Referral and Emails), not in code.
 
 ## The parked download button
 
@@ -38,7 +44,7 @@ for `ParkedDownload`).
 
 1. Push this repo to GitHub.
 2. Import it in Vercel (framework auto-detects as Next.js, no settings needed).
-3. Add the `NEXT_PUBLIC_WAITLIST_ENDPOINT` environment variable.
+3. Add the `NEXT_PUBLIC_LAUNCHLIST_KEY` environment variable.
 4. Before launch, set `metadataBase` in [`app/layout.tsx`](app/layout.tsx) to the
    production domain so the social-card / OpenGraph image resolves.
 
