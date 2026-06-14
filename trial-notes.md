@@ -3438,3 +3438,83 @@ demo. And Python-hook parity (objective anchor + objective_complete) if the hook
 path is also to drive-to-objective; deferred as its own coordinated change.
 
 BUDGET (§9e): step 3 also $0 API (local build/test only). Unchanged.
+
+---
+
+## Launch readiness push — self-authorization gap fixed — 2026-06-14
+
+Goal this session: drive Supervisor to a launchable state for the waitlist.
+Branch `impersonation-gap-20260614T164754Z` off main.
+
+### Orientation / STATUS-vs-reality
+- Local `main` opened STALE (8b69cdc, v0.3.2, May 25). Real `origin/main`
+  (a8738a0) is current — PR #16 (toggles + delivery + drive-to-objective stack)
+  and PR #18 merged Jun 14. Fast-forwarded local; the brief's "merged to main,
+  CI-green" is accurate. Latest CI run on main = success.
+- `Scripts/build-app.sh release` builds + ad-hoc-signs cleanly (exit 0):
+  build/Supervisor.app (+ Heartbeat, StatusBar). The distributable artifact
+  exists today; Track 1's open part is a fresh-machine canary + an install doc,
+  not buildability.
+
+### Shipped this session (fixture-verified, PR'd, NOT merged — owner gates main)
+The self-authorization / impersonation gap (top reliability item, launch-
+blocking for a SAFETY product). Supervisor injects answers + continue-
+dispatches as plain user turns; Claude Code's JSONL records them like a human
+turn; the triage read its OWN injected text back as "the user's most recent
+prompt" and could treat it as owner authorization for a destructive action
+(observed live: *"you said 'delete them', so you authorized this — not
+pausing"*).
+
+Fix (commit a40b5b4): `UserPromptOrigin` on every user turn; `InjectionLedger`
+(router records each inject/continue at type time → engine correlates each turn
+by session+text+window → stamps `.supervisorInjected`); all three triage paths
+label `[owner]` vs `[supervisor-injected]`; system prompt + destructive rubric
+body say authorization comes ONLY from `[owner]`, injected text NEVER authorizes
+→ if it's the sole authorization, FIRE. Asymmetry-safe (§3): ambiguity → injected.
+
+Verification: `swift build` clean; new `InjectionLedgerTests` (11) +
+`ImpersonationGapPromptTests` (9) green; full suite 446 pass / 0 fail / 6
+live-API skips. No regression — genuine prompts render `[owner]` and behave as
+before; every existing fixture is owner-authored, so the new restriction only
+triggers on the new label.
+
+### §9e budget decision — calibration sweep: BLOCKED, journaled
+No ANTHROPIC_API_KEY or DEEPSEEK_API_KEY in env (the standing Issue #12
+blocker). Per §2c a prompt-body change normally wants a regression sweep, and
+the `[owner]` tag is now prepended to every fixture's prompt. Did NOT spend
+(can't — no key). The no-regression argument that lets this ship on
+fixture-evidence: the change can only make authorization HARDER (it never
+removes the `[owner]` exception for real owner prompts; it only adds a
+restriction for injected ones), so worst-case drift is extra false positives
+(trust cost, recoverable), never a missed destructive action — the safe
+direction per §3. Sweep is OWED when a key is available; flagged in the PR.
+
+### Deferred with shape (§1d) — NOT launch-blocking for the non-technical waitlist
+- §6e LIVE CANARY (the real acceptance, owed before "shipped"): run Supervisor,
+  inject into a watched session, issue a destructive command whose only
+  "authorization" is the injected turn → confirm the triage transcript marks it
+  `[supervisor-injected]` and refuses to authorize (pause/flag). Needs a real
+  deploy + a session; deserves a fresh pass like the confirmation-timing inject
+  work. The fixture layer is strong; this closes the loop.
+- PYTHON-HOOK MIRROR (`Tools/dispatch-loop-hook/dispatch_loop_hook.py`): its
+  `read_recent_turns` tags user turns with no provenance too. But the hook is a
+  power-user tool requiring manual settings.json wiring — NOT on the path a
+  non-technical waitlist user takes (they run the `.app`, which is the Swift
+  TriageEngine just fixed). And it's a dispatcher (next-task picker), so its
+  exposure is "re-dispatch on its own injected direction," not destructive
+  self-authorization. Mirror is a real follow-up; not a first-launch gate.
+- SENTINEL second layer: an (invisible) marker embedded in injected text as
+  belt-and-suspenders to the ledger (§8), covering the case where the ledger is
+  lost/cleared. The ledger already closes the hole; the sentinel's only added
+  coverage needs the live canary to validate paste round-trip survival anyway,
+  so it rides with the §6e pass.
+
+### Honest notes
+- Did NOT ask the owner to approve doing the safety fix — it's engineering (§5),
+  mine to build; surfacing it done + the launch-block call is the right shape.
+- The "is the safety bug launch-blocking" call + the send + the download hosting
+  remain genuine owner decisions; surfacing them with artifacts in hand, not
+  asking cold.
+
+BUDGET (§9e): this session $0 API (all local — swift build/test, git/gh, file
+reads; the build-app.sh run is local codesign, no model calls).
