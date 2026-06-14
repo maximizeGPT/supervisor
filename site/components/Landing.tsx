@@ -1,5 +1,6 @@
 import WaitlistForm from "@/components/WaitlistForm";
 import Wordmark from "@/components/Wordmark";
+import ProductHuntBadge from "@/components/ProductHuntBadge";
 
 const FEATURES = [
   {
@@ -75,6 +76,9 @@ export default function Landing() {
             <p className="mt-3 text-sm text-paper/45">One email when it&apos;s ready. No spam.</p>
             <div className="mt-5">
               <ParkedDownload />
+            </div>
+            <div className="mt-6">
+              <ProductHuntBadge theme="dark" />
             </div>
           </div>
 
@@ -158,9 +162,12 @@ export default function Landing() {
 
       {/* ── FOOTER ─────────────────────────────────────────────────────── */}
       <footer className="border-t border-black/10 bg-paper px-6 py-10">
-        <div className="mx-auto flex w-full max-w-5xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <Wordmark tone="light" symbolClass="size-5" textClass="text-base" />
-          <span className="text-sm text-mute">Runs on your Mac. macOS 13 or later.</span>
+        <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
+          <ProductHuntBadge theme="light" />
+          <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <Wordmark tone="light" symbolClass="size-5" textClass="text-base" />
+            <span className="text-sm text-mute">Runs on your Mac. macOS 13 or later.</span>
+          </div>
         </div>
       </footer>
     </main>
