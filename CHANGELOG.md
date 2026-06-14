@@ -6,12 +6,62 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Safety (the impersonation gap): Supervisor no longer mistakes its own injected
+messages for the owner. It used to read the answers and tasks it typed into a
+session back as "the user's most recent prompt" and could treat them as owner
+authorization for a destructive action — green-lighting irreversible work on
+words it wrote itself. Injected turns are now tagged and can never authorize.
+
 Delivery reliability (the inject path): land on the first try by focusing the
 composer before typing, never type over the human, and surface a queued
 dispatch honestly in the hover instead of going silent.
 
 Desktop conversation targeting: deliver answers to the correct conversation
 across multiple open windows, and reach conversations scrolled off-screen.
+
+### Security
+
+**Injected turns can never authorize a destructive action — the
+self-authorization / impersonation gap** (`Sources/SupervisorCore/Intervention/InjectionLedger.swift` (new), `Observation/Event.swift`, `Triage/TriageEngine.swift`, `Triage/TriagePrompt.swift`, `Triage/HardcodedRubric.swift`, `Intervention/InterventionRouter.swift`, `SupervisorApp/main.swift`)
+- The hole: Supervisor injects answers and continue-dispatches as plain
+  user-role turns. Claude Code records them in the JSONL transcript identically
+  to a human-typed turn, so the triage — which judges destructive-action
+  authorization from "the user's most recent prompt" — was reading its OWN
+  injected text back as the owner's go-ahead. Observed live: a
+  `destructive_action_pending` flag reasoned *"you said 'delete them', so you
+  authorized this — not pausing,"* treating Supervisor-authored content as owner
+  authorization. A safety harness self-authorizing on its own words.
+- The mechanism: a new `UserPromptOrigin` (`.owner` / `.supervisorInjected`) on
+  every user turn. The router records each inject + continue-dispatch in a shared
+  `InjectionLedger` at type time (before delivery confirmation, so a turn can't
+  be triaged ahead of its own record); the engine correlates each user turn
+  against the ledger (same session, matching text, within a window) and stamps
+  `.supervisorInjected` on a hit. The parser starts every turn `.owner` because
+  the JSONL carries no provenance.
+- The rule, and why a label is not enough: the §6d live canary (against the
+  owner's real model, DeepSeek) proved that labeling the authorizing turn
+  `[supervisor-injected]` — in the slot AND the event window — was NOT sufficient:
+  the model read its own injected text as authorization anyway and did not fire on
+  a destructive `DROP`. The model treats any user-role text in context as
+  authorization, ignoring the label. So the operative fix is deterministic, not
+  model-dependent: the authorization anchor is the most recent **owner** prompt
+  (injected turns skipped), and Supervisor-injected turns are **removed from the
+  window the triage model sees entirely** (the full labeled window still flows to
+  the recovery doc). The injected case then reads as exactly "no owner
+  authorization," and the model's correct baseline behavior (fire on an
+  unauthorized destructive action) does the rest. The `[owner]` /
+  `[supervisor-injected]` labels and the rubric prose remain as defense-in-depth.
+- Verified end-to-end (§6d/§6e) by `ImpersonationGapCanaryTest` against DeepSeek:
+  same destructive command + same words, three provenances — no-auth → fire
+  high/pause; owner-auth → honored (no fire); supervisor-injected auth → fire
+  high/pause (*"no recent prompt from you authorizing this"*). Provenance flips
+  the verdict. Plus `InjectionLedgerTests` (correlation) and
+  `ImpersonationGapPromptTests` (the prompt artifact). No calibration regression
+  (genuine owner prompts behave exactly as before). Full suite 447 pass / 0 fail.
+- Still owed (not launch-blocking for the non-technical `.app` flow): a full
+  300-fixture regression sweep when an API key is configured, and the Python-hook
+  mirror (`Tools/dispatch-loop-hook/`, a power-user path — not the `.app` a
+  non-technical user runs).
 
 ### Added
 

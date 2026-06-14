@@ -46,6 +46,12 @@ public final class InterventionRouter {
     /// paths defer (the engine re-fires on the next idle tick, so nothing is lost).
     private let humanActivity: any HumanActivityProbe
     private let humanActiveThresholdSeconds: TimeInterval
+    /// The record of what Supervisor itself typed into a session. Every inject
+    /// and continue-dispatch is recorded here at type time so the triage can
+    /// later tell its own injected turns apart from the owner's (the
+    /// self-authorization gap). Optional: nil disables recording (older wiring
+    /// and tests that don't exercise the gap) with no behavior change.
+    private let injectionLedger: InjectionLedger?
     private let trace: TraceLog
 
     public init(
@@ -57,6 +63,7 @@ public final class InterventionRouter {
         activeSessionCount: @escaping () -> Int = { 1 },
         humanActivity: any HumanActivityProbe = CGHumanActivityProbe(),
         humanActiveThresholdSeconds: TimeInterval = 2.0,
+        injectionLedger: InjectionLedger? = nil,
         trace: TraceLog = .shared
     ) {
         self.notifier = notifier
@@ -67,6 +74,7 @@ public final class InterventionRouter {
         self.activeSessionCount = activeSessionCount
         self.humanActivity = humanActivity
         self.humanActiveThresholdSeconds = humanActiveThresholdSeconds
+        self.injectionLedger = injectionLedger
         self.trace = trace
     }
 
@@ -204,6 +212,13 @@ public final class InterventionRouter {
             return
         }
         do {
+            // Record BEFORE typing (the self-authorization gap): the resulting
+            // user turn can land in the JSONL and be triaged before any
+            // delivery confirmation finishes, so the ledger must be ready
+            // first. An injection that never lands never correlates — harmless.
+            // This is what lets the triage label this turn [supervisor-injected]
+            // instead of reading it back as owner authorization.
+            injectionLedger?.record(sessionId: decision.sessionId, text: text)
             let preSize = transcriptSize(sessionId: decision.sessionId)
             let bytes = try await injector.inject(text: text, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readDesktopTitle(sessionId: decision.sessionId) ?? DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
             // The injector returns keystroke bytes POSTED, not proof of delivery:
@@ -381,6 +396,10 @@ public final class InterventionRouter {
             return
         }
         do {
+            // Record BEFORE typing (the self-authorization gap): a dispatched
+            // task prompt is a Supervisor-authored user turn; the ledger lets
+            // the triage tell it apart from owner direction. See injectOrDegrade.
+            injectionLedger?.record(sessionId: decision.sessionId, text: proposal)
             let preSize = transcriptSize(sessionId: decision.sessionId)
             let bytes = try await injector.inject(text: proposal, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readDesktopTitle(sessionId: decision.sessionId) ?? DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
             // Confirm the proposal actually landed as a turn (see inject path).
