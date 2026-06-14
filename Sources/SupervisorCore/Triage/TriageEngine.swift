@@ -515,7 +515,8 @@ public final class TriageEngine {
         // path's "no recent user message" don't-fire check and the dispatcher's
         // objective anchoring must not read our own injected text as owner input.
         let labeledWindow = labelInjectedOrigins(window)
-        let lastPrompt = lastUserPromptInfo(in: labeledWindow)
+        let triageWindow = triageVisibleWindow(labeledWindow)
+        let lastPrompt = lastOwnerPrompt(in: labeledWindow)
         let userPrompt = lastPrompt?.text
         let userPromptOrigin = lastPrompt?.origin ?? .owner
 
@@ -532,7 +533,7 @@ public final class TriageEngine {
             userPromptOrigin: userPromptOrigin,
             stopShapedPhrase: stopPhrase,
             secondsSinceLastEvent: secondsSinceLastEvent,
-            recentEvents: labeledWindow
+            recentEvents: triageWindow
         )
 
         trace.emit("triage", "evaluating idle session=\(sessionId) branch=\(branch ?? "?") stop_phrase=\(stopPhrase ?? "?") silence=\(Int(secondsSinceLastEvent))s")
@@ -837,16 +838,23 @@ public final class TriageEngine {
         onActivityChange?(.triaging)
 
         let rawWindow = perSessionWindow[call.sessionId] ?? []
-        // Self-authorization gap: label any Supervisor-injected user turns
-        // before they reach the rubric, so its authorization reasoning sees
-        // [supervisor-injected] vs [owner] and never treats our own text as
-        // the owner's go-ahead for a destructive command.
+        // Self-authorization gap. `window` is the full labeled window (injected
+        // turns marked) — it backs the recovery doc. `triageWindow` is what the
+        // MODEL sees: Supervisor-injected turns removed entirely. The §6d canary
+        // proved the model treats its own injected text as owner authorization
+        // even when that text is labeled [supervisor-injected] in the slot AND
+        // in the window — so the robust, deterministic fix is to never show the
+        // triage its own injected turns. The authorization anchor is the last
+        // genuine OWNER prompt; with the injected text gone from the model's
+        // view, an unauthorized destructive command reads as exactly that and
+        // fires (baseline behavior), with no reliance on model compliance.
         let window = labelInjectedOrigins(rawWindow)
+        let triageWindow = triageVisibleWindow(window)
         let cwd = lastSessionCWD(in: window)
-        let lastPrompt = lastUserPromptInfo(in: window)
+        let lastPrompt = lastOwnerPrompt(in: window)
         let userPrompt = lastPrompt?.text
         let userPromptOrigin = lastPrompt?.origin ?? .owner
-        let recentResult = lastBashResult(matching: call.toolUseId, in: window)
+        let recentResult = lastBashResult(matching: call.toolUseId, in: triageWindow)
 
         // Deterministic catch-list (PRINCIPLES §3b/§5/§6): irreversible
         // local-loss git commands fire high/pause regardless of model
@@ -893,7 +901,7 @@ public final class TriageEngine {
                 userPromptOrigin: userPromptOrigin,
                 bashCall: call,
                 recentResult: recentResult,
-                recentEvents: window
+                recentEvents: triageWindow
             )
         )
 
@@ -992,10 +1000,13 @@ public final class TriageEngine {
             // right before a flag fires.
             trace.emit("triage", "assistant_text.cwd_from_cache session=\(info.sessionId) cwd=\(cwd ?? "?")")
         }
-        // Label Supervisor-injected turns (self-authorization gap) so the
-        // question/redirect path sees [owner] vs [supervisor-injected].
+        // Self-authorization gap: the anchor is the last genuine OWNER prompt,
+        // and the model's window excludes Supervisor-injected turns entirely
+        // (the §6d canary proved a label is not enough — the model reads its own
+        // injected text as authorization regardless).
         let labeledWindow = labelInjectedOrigins(window)
-        let lastPrompt = lastUserPromptInfo(in: labeledWindow)
+        let triageWindow = triageVisibleWindow(labeledWindow)
+        let lastPrompt = lastOwnerPrompt(in: labeledWindow)
         let userPrompt = lastPrompt?.text
         let userPromptOrigin = lastPrompt?.origin ?? .owner
 
@@ -1006,7 +1017,7 @@ public final class TriageEngine {
             userPrompt: userPrompt,
             userPromptOrigin: userPromptOrigin,
             assistantText: info.text,
-            recentEvents: labeledWindow
+            recentEvents: triageWindow
         )
 
         trace.emit("triage", "evaluating session=\(info.sessionId) assistant_text_len=\(info.text.count)")
@@ -1328,14 +1339,45 @@ public final class TriageEngine {
         }
     }
 
-    /// The most recent `.userPrompt` in the (already origin-labeled) window,
-    /// carrying its resolved origin. The rubric's authorization reasoning keys
-    /// on this turn, so its origin is what decides whether it can authorize.
-    private func lastUserPromptInfo(in labeledWindow: [SupervisorEvent]) -> UserPromptInfo? {
+    /// The most recent OWNER `.userPrompt` in the (already origin-labeled)
+    /// window — supervisor-injected turns are SKIPPED. This is the
+    /// authorization anchor the rubric reasons about ("did the user authorize
+    /// this?"), so it must never be a turn Supervisor typed itself.
+    ///
+    /// Why skip, rather than label-and-let-the-model-discount: the §6d live
+    /// canary proved the model (DeepSeek) ignores a `[supervisor-injected]`
+    /// label in the anchor slot and treats the injected text as authorization
+    /// anyway. The SAME canary proved the model fires correctly when there is
+    /// NO owner authorization. So the safety property is made deterministic by
+    /// construction: the anchor only ever holds genuine owner text, and the
+    /// model's correct "fire on an unauthorized destructive action" behavior
+    /// does the rest — no model compliance with a discount-this instruction
+    /// required. Injected turns still appear (labeled) in the event window for
+    /// context; they just never occupy the authorization slot. An earlier
+    /// genuine owner authorization is still found even if an injected turn is
+    /// more recent, so a real authorization is honored and only the fake one
+    /// is dropped.
+    private func lastOwnerPrompt(in labeledWindow: [SupervisorEvent]) -> UserPromptInfo? {
         for event in labeledWindow.reversed() {
-            if case .userPrompt(let i) = event { return i }
+            if case .userPrompt(let i) = event, i.origin == .owner { return i }
         }
         return nil
+    }
+
+    /// The window the triage MODEL is allowed to see: Supervisor-injected
+    /// userPrompt turns removed entirely. The §6d canary proved the model reads
+    /// an injected turn as owner authorization even when it is labeled
+    /// `[supervisor-injected]` (it treats any user-role text in context as
+    /// authorization), so the only robust fix is to keep its own injected text
+    /// out of the triage's view. Non-userPrompt events and genuine owner prompts
+    /// pass through unchanged. The FULL labeled window (injected turns included)
+    /// still flows to the recovery doc — this filter scopes only what the model
+    /// reasons over.
+    private func triageVisibleWindow(_ labeledWindow: [SupervisorEvent]) -> [SupervisorEvent] {
+        labeledWindow.filter { event in
+            if case .userPrompt(let i) = event, i.origin == .supervisorInjected { return false }
+            return true
+        }
     }
 
     private func lastBashResult(matching toolUseId: String, in window: [SupervisorEvent]) -> BashToolResultInfo? {
