@@ -145,6 +145,11 @@ public struct SessionContext: Sendable {
     /// PRODUCT-DIRECTION.md content — the project's north star.
     /// Empty string if the file doesn't exist.
     public let productDirection: String
+    /// The session's objective — the user's opening ask, read from the
+    /// transcript. The through-line the loop drives toward: the dispatcher picks
+    /// the next concrete step toward THIS, not merely a local follow-on. nil when
+    /// no opening prompt is found (the loop falls back to local reasoning).
+    public let objective: String?
     /// Known Gaps section from trial-notes.md — standing record of
     /// unfinished, unticketed, or blocked work.
     public let knownGaps: String
@@ -167,6 +172,7 @@ public struct SessionContext: Sendable {
         currentBranchCommits: [DispatchCommit],
         priorDispatchesConsidered: Int = 0,
         productDirection: String = "",
+        objective: String? = nil,
         knownGaps: String = "",
         sourceMarkers: [String] = [],
         recentFilesChanged: [String] = [],
@@ -180,6 +186,7 @@ public struct SessionContext: Sendable {
         self.currentBranchCommits = currentBranchCommits
         self.priorDispatchesConsidered = priorDispatchesConsidered
         self.productDirection = productDirection
+        self.objective = objective
         self.knownGaps = knownGaps
         self.sourceMarkers = sourceMarkers
         self.recentFilesChanged = recentFilesChanged
@@ -390,6 +397,13 @@ public final class Dispatcher: Dispatching, Sendable {
         // empty (only the Python hook read it).
         let knownGaps = cwd.flatMap { $0.isEmpty ? nil : readKnownGaps(cwd: $0) } ?? ""
 
+        // The session's objective (its opening prompt) — the through-line the
+        // dispatcher drives toward, so it proposes the next step toward what the
+        // user actually asked for, not merely a local follow-on.
+        let objective = SessionObjective.read(sessionId: sessionUUID)
+        if let objective {
+            trace.emit("dispatch", "objective session=\(sessionUUID) bytes=\(objective.utf8.count)")
+        }
         let context = SessionContext(
             sessionUUID: sessionUUID,
             cwd: cwd,
@@ -398,6 +412,7 @@ public final class Dispatcher: Dispatching, Sendable {
             openIssues: issues,
             currentBranchCommits: commits,
             priorDispatchesConsidered: priorDispatchesConsidered,
+            objective: objective,
             knownGaps: knownGaps,
             recentDispatchProposals: recentProposals
         )
@@ -605,6 +620,20 @@ public final class Dispatcher: Dispatching, Sendable {
             for (idx, p) in context.recentDispatchProposals.enumerated() {
                 lines.append("\(idx + 1). \(p)")
             }
+        }
+        lines.append("")
+
+        // Session objective — the through-line, the single most important
+        // anchor. Drives the dispatcher toward what the user actually asked for
+        // instead of idling when the immediate thread looks done.
+        lines.append("# SESSION OBJECTIVE (the user's opening ask — the through-line you are driving toward)")
+        lines.append("")
+        if let objective = context.objective, !objective.isEmpty {
+            lines.append(objective)
+            lines.append("")
+            lines.append("Your PRIMARY job is to pick the next concrete step that moves toward THIS objective. A step toward the stated objective is grounded work, not invented scope. Treat the objective as unmet until the work it describes is actually built and verified; keep driving the worker toward it rather than idling, unless a safety gate or the human says otherwise.")
+        } else {
+            lines.append("(no opening prompt captured — fall back to local reasoning from recent work, PRODUCT-DIRECTION.md, and the backlog)")
         }
         lines.append("")
 

@@ -3375,3 +3375,38 @@ CI-green on the branch but NOT deployed. The running app is still on 6a44fc0
 (arc only), so the cross-session bleed can recur live until redeployed. Auto-
 closes on the next deploy.sh from this branch (it builds branch HEAD). Owner
 deferred the redeploy to avoid the Known Gap #1 Keychain re-prompt right now.
+
+---
+
+## Drive-to-objective: first slice — objective anchor (steps 1-2) — 2026-06-13
+
+Branch drive-to-completion-<ts> (off delivery-reliability, isolated from PR #15).
+Spec lives in PRODUCT-DIRECTION.md ("The next phase: drive a session to its
+objective"). Building the first slice in order (§1a): capture → feed → completion.
+
+DONE this turn (steps 1-2 — objective anchor, end-to-end, working):
+- SessionObjective.read(sessionId:) — first plain user prompt from the JSONL
+  (type=="user" + String content; tool_result array content skipped). Bounded
+  128KB head-read (opening prompt is at the top). JSONL is the persistence, so
+  it survives restarts + sessions that predate Supervisor watching. 4 tests.
+- SessionContext.objective + the in-app Dispatcher assembles it (reads at
+  dispatch time) and the prompt leads with a "# SESSION OBJECTIVE ... drive
+  toward THIS" block. Full suite 420 green.
+
+NEXT (step 3 — completion → loop stop, the closing half of the slice):
+- Add objective_complete to SelectedPath + a DispatchResult.objectiveComplete
+  case + the parse; instruct the dispatcher system prompt (dispatcher-system-
+  prompt.txt) to judge completion first; LoopController stop reason
+  objectiveComplete; engine stops on it. Then §6d live canary (also the demo).
+
+FINDINGS (flagged, not fixed here):
+- The in-app Swift Dispatcher never populates SessionContext.productDirection
+  (the 393 assemble omits it) — so it does NOT read PRODUCT-DIRECTION.md; only
+  the Python hook (dispatch_loop_hook.py) does. Latent divergence between the
+  two dispatchers. The objective anchor built here is Swift-side; the Python
+  hook would need parity for full production coverage.
+
+BUDGET (§9e): this build was $0 API — all local (swift build/test, no model
+calls). The §6d live canary (deferred to after step 3 + deploy) will incur a
+few DeepSeek dispatch calls, est. <$0.50. Spend-to-date well under the
+journal-justified tier; recorded per §9e as requested.
