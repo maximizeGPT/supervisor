@@ -285,6 +285,12 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         )
         let locator = LiveProcessLocator(trace: trace)
         let signalSender = DarwinSignalSender()
+        // Self-authorization gap (the impersonation gap): one ledger, shared by
+        // the router (which records every inject + continue-dispatch at type
+        // time) and the engine (which reads it to label injected turns), so the
+        // triage never reads Supervisor's own injected text back as the owner's
+        // authorization for a destructive action.
+        let injectionLedger = InjectionLedger()
         let router = InterventionRouter(
             notifier: notifier,
             locator: locator,
@@ -301,6 +307,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
                 let n = (try? store.all().filter { $0.lastSeenAt >= cutoff }.count) ?? 1
                 return max(n, 1)
             },
+            injectionLedger: injectionLedger,
             trace: trace
         )
         self.router = router
@@ -362,6 +369,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
                 let n = (try? store.all().filter { $0.cwd == cwd && $0.lastSeenAt >= cutoff }.count) ?? 1
                 return max(n, 1)
             },
+            injectionLedger: injectionLedger,
             trace: trace
         )
         engine.onActivityChange = { [weak self] activity in

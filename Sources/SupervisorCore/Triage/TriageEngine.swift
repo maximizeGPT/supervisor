@@ -71,6 +71,12 @@ public final class TriageEngine {
     private let model: String
     private let costStore: CostStore?
     private let redactor: any Redactor
+    /// Shared with the InterventionRouter: the record of what Supervisor itself
+    /// injected into each session. Consulted when assembling a triage prompt so
+    /// a turn Supervisor typed is labeled `[supervisor-injected]` rather than
+    /// read back as the owner's authorization (the self-authorization gap). nil
+    /// disables labeling (every turn stays `.owner`) — no behavior change.
+    private let injectionLedger: InjectionLedger?
 
     /// Per-session sliding window of events.
     private var perSessionWindow: [String: [SupervisorEvent]] = [:]
@@ -227,11 +233,13 @@ public final class TriageEngine {
         idleReTriageIntervalSeconds: TimeInterval = 60,
         idleCheckIntervalSeconds: TimeInterval = 1,
         liveSessionsSharingCwd: @escaping (String) -> Int = { _ in 1 },
+        injectionLedger: InjectionLedger? = nil,
         now: @escaping @MainActor () -> Date = { Date() },
         trace: TraceLog = .shared
     ) {
         self.client = client
         self.bus = bus
+        self.injectionLedger = injectionLedger
         self.model = model
         self.windowSize = windowSize
         self.costStore = costStore
@@ -503,7 +511,13 @@ public final class TriageEngine {
             return
         }
 
-        let userPrompt = lastUserPrompt(in: window)
+        // Label Supervisor-injected turns (self-authorization gap): the idle
+        // path's "no recent user message" don't-fire check and the dispatcher's
+        // objective anchoring must not read our own injected text as owner input.
+        let labeledWindow = labelInjectedOrigins(window)
+        let lastPrompt = lastUserPromptInfo(in: labeledWindow)
+        let userPrompt = lastPrompt?.text
+        let userPromptOrigin = lastPrompt?.origin ?? .owner
 
         let state = idleStates[sessionId]
         let stopPhrase = state?.lastStopShapedPhrase
@@ -515,9 +529,10 @@ public final class TriageEngine {
             cwd: cwd,
             gitBranch: branch,
             userPrompt: userPrompt,
+            userPromptOrigin: userPromptOrigin,
             stopShapedPhrase: stopPhrase,
             secondsSinceLastEvent: secondsSinceLastEvent,
-            recentEvents: window
+            recentEvents: labeledWindow
         )
 
         trace.emit("triage", "evaluating idle session=\(sessionId) branch=\(branch ?? "?") stop_phrase=\(stopPhrase ?? "?") silence=\(Int(secondsSinceLastEvent))s")
@@ -821,9 +836,16 @@ public final class TriageEngine {
         if RuntimeToggles.supervisorPaused { return }  // global pause (see evaluateIdle)
         onActivityChange?(.triaging)
 
-        let window = perSessionWindow[call.sessionId] ?? []
+        let rawWindow = perSessionWindow[call.sessionId] ?? []
+        // Self-authorization gap: label any Supervisor-injected user turns
+        // before they reach the rubric, so its authorization reasoning sees
+        // [supervisor-injected] vs [owner] and never treats our own text as
+        // the owner's go-ahead for a destructive command.
+        let window = labelInjectedOrigins(rawWindow)
         let cwd = lastSessionCWD(in: window)
-        let userPrompt = lastUserPrompt(in: window)
+        let lastPrompt = lastUserPromptInfo(in: window)
+        let userPrompt = lastPrompt?.text
+        let userPromptOrigin = lastPrompt?.origin ?? .owner
         let recentResult = lastBashResult(matching: call.toolUseId, in: window)
 
         // Deterministic catch-list (PRINCIPLES §3b/§5/§6): irreversible
@@ -868,6 +890,7 @@ public final class TriageEngine {
             input: .init(
                 cwd: cwd,
                 userPrompt: userPrompt,
+                userPromptOrigin: userPromptOrigin,
                 bashCall: call,
                 recentResult: recentResult,
                 recentEvents: window
@@ -969,15 +992,21 @@ public final class TriageEngine {
             // right before a flag fires.
             trace.emit("triage", "assistant_text.cwd_from_cache session=\(info.sessionId) cwd=\(cwd ?? "?")")
         }
-        let userPrompt = lastUserPrompt(in: window)
+        // Label Supervisor-injected turns (self-authorization gap) so the
+        // question/redirect path sees [owner] vs [supervisor-injected].
+        let labeledWindow = labelInjectedOrigins(window)
+        let lastPrompt = lastUserPromptInfo(in: labeledWindow)
+        let userPrompt = lastPrompt?.text
+        let userPromptOrigin = lastPrompt?.origin ?? .owner
 
         let request = TriagePrompt.buildAssistantQuestionRequest(
             model: model,
             sessionId: info.sessionId,
             cwd: cwd,
             userPrompt: userPrompt,
+            userPromptOrigin: userPromptOrigin,
             assistantText: info.text,
-            recentEvents: window
+            recentEvents: labeledWindow
         )
 
         trace.emit("triage", "evaluating session=\(info.sessionId) assistant_text_len=\(info.text.count)")
@@ -1282,9 +1311,29 @@ public final class TriageEngine {
         return nil
     }
 
-    private func lastUserPrompt(in window: [SupervisorEvent]) -> String? {
-        for event in window.reversed() {
-            if case .userPrompt(let i) = event { return i.text }
+    /// Self-authorization gap: re-stamp each `.userPrompt` in the window with
+    /// its true origin by correlating against the injection ledger. A turn
+    /// Supervisor typed becomes `.supervisorInjected`; everything else stays
+    /// `.owner`. Done at prompt-assembly time (not parse time) because the
+    /// parser has no ledger and an injection is recorded by the router moments
+    /// before its turn appears. No ledger → identity (every turn stays owner).
+    private func labelInjectedOrigins(_ window: [SupervisorEvent]) -> [SupervisorEvent] {
+        guard let ledger = injectionLedger else { return window }
+        return window.map { event in
+            guard case .userPrompt(let i) = event, i.origin == .owner else { return event }
+            guard ledger.isSupervisorInjected(sessionId: i.sessionId, text: i.text, asOf: i.ts) else { return event }
+            return .userPrompt(UserPromptInfo(
+                sessionId: i.sessionId, text: i.text, ts: i.ts, channel: i.channel, origin: .supervisorInjected
+            ))
+        }
+    }
+
+    /// The most recent `.userPrompt` in the (already origin-labeled) window,
+    /// carrying its resolved origin. The rubric's authorization reasoning keys
+    /// on this turn, so its origin is what decides whether it can authorize.
+    private func lastUserPromptInfo(in labeledWindow: [SupervisorEvent]) -> UserPromptInfo? {
+        for event in labeledWindow.reversed() {
+            if case .userPrompt(let i) = event { return i }
         }
         return nil
     }

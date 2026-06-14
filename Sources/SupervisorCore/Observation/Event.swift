@@ -19,6 +19,28 @@ public enum EventChannel: String, Sendable, Equatable {
     case hookSocket
 }
 
+/// Provenance of a `userPrompt` event. Claude Code's JSONL records every
+/// user turn identically — whether the human typed it or Supervisor
+/// injected it (an answer to a question, or a continue-dispatch). Without
+/// this distinction the triage reads its OWN injected text back as "the
+/// user's most recent prompt" and can treat it as owner authorization for
+/// a destructive action (the self-authorization / impersonation gap). The
+/// parser cannot know origin (the JSONL carries none), so every parsed
+/// turn starts `.owner`; the engine re-stamps `.supervisorInjected` when
+/// the turn correlates to a recorded injection (see `InjectionLedger`).
+/// The asymmetry is safe by construction: mislabel owner→injected and we
+/// withhold a real authorization (a recoverable false positive, one
+/// dismiss); mislabel injected→owner and we re-open the gap. So ambiguity
+/// resolves toward `.supervisorInjected`.
+public enum UserPromptOrigin: String, Sendable, Equatable {
+    /// Authored by the human owner. The only origin that can authorize a
+    /// destructive action.
+    case owner
+    /// Typed into the session by Supervisor itself. Never counts as owner
+    /// authorization.
+    case supervisorInjected
+}
+
 public enum SupervisorEvent: Sendable, Equatable {
 
     /// Emitted once per session discovery. Confirms the JSONL exists and
@@ -108,12 +130,17 @@ public struct UserPromptInfo: Sendable, Equatable {
     public let text: String
     public let ts: Date
     public var channel: EventChannel = .jsonl
+    /// Who authored this turn. Defaults to `.owner`: the parser cannot tell
+    /// (the JSONL carries no provenance), so a turn is the owner's until the
+    /// engine proves otherwise by correlating it to a recorded injection.
+    public var origin: UserPromptOrigin = .owner
 
-    public init(sessionId: String, text: String, ts: Date, channel: EventChannel = .jsonl) {
+    public init(sessionId: String, text: String, ts: Date, channel: EventChannel = .jsonl, origin: UserPromptOrigin = .owner) {
         self.sessionId = sessionId
         self.text = text
         self.ts = ts
         self.channel = channel
+        self.origin = origin
     }
 }
 
