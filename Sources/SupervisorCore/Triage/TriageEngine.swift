@@ -478,6 +478,10 @@ public final class TriageEngine {
     /// `evaluateAssistantText(info:)` — the same record_triage tool path,
     /// just scoped to the worker_idle_post_completion category.
     private func evaluateIdle(sessionId: String) async {
+        // Global pause (owner toggle): stay dormant — no triage, dispatch, or
+        // inject, and no API spend. consume() keeps tracking window/idle state,
+        // so resume is seamless. Same guard on evaluate + evaluateAssistantText.
+        if RuntimeToggles.supervisorPaused { return }
         onActivityChange?(.triaging)
 
         let window = perSessionWindow[sessionId] ?? []
@@ -814,6 +818,7 @@ public final class TriageEngine {
     // MARK: - Triage call
 
     private func evaluate(call: BashToolCallInfo, prePost: TriageDecision.PrePost) async {
+        if RuntimeToggles.supervisorPaused { return }  // global pause (see evaluateIdle)
         onActivityChange?(.triaging)
 
         let window = perSessionWindow[call.sessionId] ?? []
@@ -934,6 +939,7 @@ public final class TriageEngine {
     /// QuestionAnswerer call (engineering → inject text; taste →
     /// rewritten reasoning_plain; safety → pass through unchanged).
     private func evaluateAssistantText(info: AssistantTextInfo) async {
+        if RuntimeToggles.supervisorPaused { return }  // global pause (see evaluateIdle)
         onActivityChange?(.triaging)
 
         let window = perSessionWindow[info.sessionId] ?? []

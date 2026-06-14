@@ -47,6 +47,18 @@ public final class HoverViewModel: ObservableObject {
     /// Whether the expanded panel is visible.
     @Published public var isExpanded: Bool = false
 
+    // MARK: - Owner runtime toggles (panel controls)
+
+    /// Global pause — when true, Supervisor is dormant (no triage/dispatch/
+    /// inject). Mirrors the RuntimeToggles marker; the panel's Pause button
+    /// flips it and the engine reads the marker live, so it takes effect at once.
+    @Published public private(set) var supervisorPaused: Bool = RuntimeToggles.supervisorPaused
+
+    /// 4-hour loop-cap disabled — when true, the loop runs without the 4-hour
+    /// wall-clock hard stop (for long sessions / the screen-record demo). The
+    /// other hard stops still apply.
+    @Published public private(set) var loopCapDisabled: Bool = RuntimeToggles.loopCapDisabled
+
     // MARK: - Session metrics (v0.1.7 expanded panel)
 
     /// Number of assistant turns (user prompt → assistant response cycles).
@@ -154,6 +166,23 @@ public final class HoverViewModel: ObservableObject {
     public func toggleExpanded() {
         isExpanded.toggle()
         trace.emit("hover", "expanded panel \(isExpanded ? "opened" : "closed")")
+    }
+
+    /// Owner control: pause / resume Supervisor globally. The engine reads the
+    /// marker live, so the effect is immediate — no rebuild, no restart.
+    public func toggleSupervisorPaused() {
+        let next = !supervisorPaused
+        RuntimeToggles.setSupervisorPaused(next)
+        supervisorPaused = next
+        trace.emit("hover", "owner toggled supervisor_paused=\(next)")
+    }
+
+    /// Owner control: turn the 4-hour loop cap off / on for this machine.
+    public func toggleLoopCapDisabled() {
+        let next = !loopCapDisabled
+        RuntimeToggles.setLoopCapDisabled(next)
+        loopCapDisabled = next
+        trace.emit("hover", "owner toggled loop_cap_disabled=\(next)")
     }
 
     /// Record user response (dismiss / false positive) for a flag.

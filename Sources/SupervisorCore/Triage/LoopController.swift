@@ -136,12 +136,17 @@ public actor LoopController {
     private let trace: TraceLog
     private let now: @Sendable () -> Date
     private let seedCount: ((String) -> Int)?
+    /// Owner toggle: is the 4-hour wall-clock cap turned off? Defaults to the
+    /// live RuntimeToggles marker; injectable so tests exercise the gate without
+    /// writing the real marker (which the running app would pick up).
+    private let loopCapDisabled: @Sendable () -> Bool
 
     public init(
         maxLoopDuration: TimeInterval = LoopController.defaultMaxLoopDuration,
         sessionResetIdle: TimeInterval = LoopController.defaultSessionResetIdle,
         consecutiveLowThreshold: Int = LoopController.defaultConsecutiveLowThreshold,
         now: @escaping @Sendable () -> Date = { Date() },
+        loopCapDisabled: @escaping @Sendable () -> Bool = { RuntimeToggles.loopCapDisabled },
         trace: TraceLog = .shared,
         loopStore: LoopDispatchStore? = nil
     ) {
@@ -150,6 +155,7 @@ public actor LoopController {
         self.consecutiveLowThreshold = consecutiveLowThreshold
         self.trace = trace
         self.now = now
+        self.loopCapDisabled = loopCapDisabled
         if let store = loopStore {
             self.seedCount = { sessionId in
                 (try? store.count(sessionId: sessionId)) ?? 0
@@ -209,6 +215,16 @@ public actor LoopController {
         }
         state.lastSeenAt = nowTs
 
+        // Owner toggle: if the 4-hour cap is turned off, un-stick a session the
+        // cap previously stopped — so flipping the toggle resumes the loop
+        // instead of needing a relaunch. Only clears the four_hours_elapsed stop;
+        // kill and three-consecutive-low stops stand.
+        if loopCapDisabled(), state.stopped, state.stopReason == .fourHoursElapsed {
+            state.stopped = false
+            state.stopReason = nil
+            trace.emit("loop", "cleared four_hours_elapsed stop (loop cap disabled by owner) session=\(sessionId)")
+        }
+
         // .stopped sticks. Check it before anything else.
         if state.stopped {
             sessions[sessionId] = state
@@ -216,8 +232,11 @@ public actor LoopController {
             return .stopped(reason: "Supervisor paused: \(why)")
         }
 
-        // 4-hour budget check.
-        if nowTs.timeIntervalSince(state.loopStartedAt) >= maxLoopDuration {
+        // 4-hour budget check — skipped when the owner disabled the loop cap
+        // (the loop-cap-disabled toggle, for long sessions / the screen-record
+        // demo). The other hard stops still apply.
+        if !loopCapDisabled(),
+           nowTs.timeIntervalSince(state.loopStartedAt) >= maxLoopDuration {
             state.stopped = true
             state.stopReason = .fourHoursElapsed
             sessions[sessionId] = state
