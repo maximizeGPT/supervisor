@@ -24,11 +24,11 @@ export const metadata: Metadata = {
   metadataBase: new URL("https://supervisor.app"),
   title: "Supervisor",
   description:
-    "Auto-accept takes you out of the loop. Supervisor takes your place: it reads your repo to answer Claude Code's questions, keeps the session moving, and steps in when an action looks destructive.",
+    "Auto mode takes you out of the loop. Supervisor takes your place: it reads your repo to answer Claude Code's questions, keeps the session moving, and steps in when an action looks destructive.",
   openGraph: {
     title: "Supervisor",
     description:
-      "Auto-accept takes you out of the loop. Supervisor takes your place, answering Claude Code's questions, keeping the session moving, and stepping in when an action looks destructive.",
+      "Auto mode takes you out of the loop. Supervisor takes your place, answering Claude Code's questions, keeping the session moving, and stepping in when an action looks destructive.",
     type: "website",
     images: [{ url: "/branding/supervisor-social-card.png", width: 1280, height: 640 }],
   },
@@ -36,7 +36,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Supervisor",
     description:
-      "Auto-accept takes you out of the loop. Supervisor takes your place: it answers Claude Code's questions, keeps the session moving, and steps in when an action looks destructive.",
+      "Auto mode takes you out of the loop. Supervisor takes your place: it answers Claude Code's questions, keeps the session moving, and steps in when an action looks destructive.",
     images: ["/branding/supervisor-social-card.png"],
   },
   icons: {

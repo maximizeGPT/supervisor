@@ -61,7 +61,7 @@ export default function Landing() {
           </p>
 
           <h1 className="mt-4 max-w-3xl text-4xl font-semibold leading-[1.06] tracking-[-0.02em] text-paper sm:text-5xl lg:text-[3.5rem]">
-            <span className="text-paper/55">Auto-accept takes you out of the loop.</span>{" "}
+            <span className="text-paper/55">Auto mode takes you out of the loop.</span>{" "}
             Supervisor takes your place.
           </h1>
 
