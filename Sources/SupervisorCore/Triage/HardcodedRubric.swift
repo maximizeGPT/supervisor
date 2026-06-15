@@ -719,9 +719,18 @@ public enum HardcodedRubric {
             default 15s. The engine fires this rubric eval on a
             1Hz timer when the threshold trips, not on every
             event — see §6 calibration / cost discipline.)
-          - The session is on an `autonomous-*` branch. Sessions
-            on `main` or other branches are user-driven; don't
-            dispatch over the user.
+          - There is a concrete next step toward the session's
+            objective — the captured opening prompt that started this
+            session, an open issue, or the obvious mechanical follow-on
+            from the recent commits. The loop drives a session toward
+            its goal on ANY branch (this is the product: "Auto mode
+            takes you out of the loop; Supervisor takes your place").
+            It is NOT gated to a branch name. What keeps it from typing
+            over you is the "user is engaged" guard below — a recent
+            user message or a pending question — NOT the branch. If the
+            human has stepped away (no recent message) and the worker
+            has genuinely stopped with an unmet objective, dispatch the
+            next step regardless of branch.
           - No `user_question_pending` flag is pending for this
             session in the recent window. (The user-question
             pipeline is already handling that case via inject or
@@ -731,9 +740,12 @@ public enum HardcodedRubric {
             not to dispatch.
 
         Do NOT fire if ANY of the following hold:
-          - The session is on a non-autonomous branch. The user
-            is driving this session manually; the loop has no
-            mandate to dispatch.
+          - The user is actively engaged: a user message in the
+            session's last 30 seconds, or a pending user question.
+            An engaged human is driving; do not dispatch over them.
+            (This — not the branch name — is the real "is the human
+            in control" signal. A session on `main` with the human
+            away and the worker stopped IS a valid drive target.)
           - The session JSONL is still emitting events (worker
             is mid-task, not idle).
           - A `user_question_pending` candidate fired in the same
