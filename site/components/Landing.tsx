@@ -20,6 +20,24 @@ const FEATURES = [
   },
 ];
 
+const PRICING_POINTS = [
+  {
+    title: "$0 for the app",
+    body:
+      "No license fee, no subscription, no per-seat pricing. Download Supervisor and run it.",
+  },
+  {
+    title: "You bring the key",
+    body:
+      "It runs on the API key you already have, so your usage is billed to you directly, at cost. We never touch it.",
+  },
+  {
+    title: "No account, no lock-in",
+    body:
+      "Nothing to sign up for and nothing to cancel. Your machine, your key, your data.",
+  },
+];
+
 function Eyebrow({ children }: { children: React.ReactNode }) {
   return (
     <p className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-mute">
@@ -142,6 +160,28 @@ export default function Landing() {
             entirely on your Mac. Nothing leaves your machine except the same API
             calls you&apos;d make yourself.
           </p>
+        </div>
+      </section>
+
+      {/* ── PRICING (free, bring your own key) ─────────────────────────── */}
+      <section className="bg-paper px-6 py-20 sm:py-24">
+        <div className="mx-auto w-full max-w-5xl">
+          <Eyebrow>Pricing</Eyebrow>
+          <h2 className="mt-5 max-w-2xl text-3xl font-semibold tracking-[-0.02em] text-ink">
+            <span className="text-signal">Free.</span> Bring your own key.
+          </h2>
+          <p className="mt-5 max-w-2xl text-lg leading-relaxed text-ink/70">
+            Supervisor is free to download and run. The only thing you pay for is
+            the usage you&apos;d have paid for anyway, at cost, and never to us.
+          </p>
+          <div className="mt-10 grid gap-10 sm:grid-cols-3 sm:gap-8">
+            {PRICING_POINTS.map((point) => (
+              <div key={point.title} className="border-t border-black/10 pt-5">
+                <h3 className="text-lg font-semibold text-ink">{point.title}</h3>
+                <p className="mt-3 leading-relaxed text-ink/70">{point.body}</p>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
