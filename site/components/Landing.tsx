@@ -196,7 +196,7 @@ export default function Landing() {
       </section>
 
       {/* ── CLOSING / REPEAT CAPTURE ───────────────────────────────────── */}
-      <section className="bg-paper px-6 py-20 sm:py-24">
+      <section className="border-t border-black/5 bg-paper-warm px-6 py-20 sm:py-24">
         <div className="mx-auto w-full max-w-2xl">
           <h2 className="text-3xl font-semibold tracking-[-0.02em] text-ink">
             Join the waitlist
