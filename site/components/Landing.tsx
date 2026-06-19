@@ -84,6 +84,20 @@ export default function Landing() {
             Supervisor takes your place.
           </h1>
 
+          <div className="mt-7 flex flex-wrap items-center gap-3">
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/15 px-3.5 py-1.5 text-sm text-paper">
+              <span className="size-1.5 rounded-full bg-signal" aria-hidden="true" />
+              Claude Code
+              <span className="text-paper/45">Supported now</span>
+            </span>
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3.5 py-1.5 text-sm text-paper/70">
+              Codex
+              <span className="rounded-full bg-signal/15 px-2 py-0.5 text-xs font-medium text-signal">
+                Coming soon
+              </span>
+            </span>
+          </div>
+
           <p className="mt-6 max-w-xl text-lg leading-relaxed text-paper/70 sm:text-xl">
             It reads your repo to answer Claude Code&apos;s questions in plain
             language, keeps the session moving, and steps in the moment an action
@@ -170,37 +184,6 @@ export default function Landing() {
             entirely on your Mac. Nothing leaves your machine except the same API
             calls you&apos;d make yourself.
           </p>
-        </div>
-      </section>
-
-      {/* ── WHAT'S NEXT (expansion tease, Codex coming soon) ───────────── */}
-      <section className="bg-ink px-6 py-16 sm:py-20">
-        <div className="mx-auto w-full max-w-5xl">
-          <p className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-paper/45">
-            What&apos;s next
-          </p>
-          <h2 className="mt-5 max-w-2xl text-3xl font-semibold tracking-[-0.02em] text-paper">
-            Built for Claude Code today.{" "}
-            <span className="text-paper/55">Codex is next.</span>
-          </h2>
-          <p className="mt-5 max-w-xl text-lg leading-relaxed text-paper/70">
-            Supervisor watches Claude Code right now. Codex support is on the
-            roadmap, so the same safety net will reach more of the agents you
-            run.
-          </p>
-          <div className="mt-8 flex flex-wrap items-center gap-3">
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/15 px-4 py-1.5 text-sm text-paper">
-              <span className="size-1.5 rounded-full bg-signal" aria-hidden="true" />
-              Claude Code
-              <span className="text-paper/45">Supported now</span>
-            </span>
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/10 px-4 py-1.5 text-sm text-paper/70">
-              Codex
-              <span className="rounded-full bg-signal/15 px-2 py-0.5 text-xs font-medium text-signal">
-                Coming soon
-              </span>
-            </span>
-          </div>
         </div>
       </section>
 
