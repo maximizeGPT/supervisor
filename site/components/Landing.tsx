@@ -1,6 +1,7 @@
 import WaitlistForm from "@/components/WaitlistForm";
 import Wordmark from "@/components/Wordmark";
 import ProductHuntBadge from "@/components/ProductHuntBadge";
+import Countdown from "@/components/Countdown";
 
 const FEATURES = [
   {
@@ -88,6 +89,15 @@ export default function Landing() {
             language, keeps the session moving, and steps in the moment an action
             looks destructive.
           </p>
+
+          <div className="mt-8">
+            <p className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-paper/45">
+              Launches June 26, 2026
+            </p>
+            <div className="mt-4">
+              <Countdown tone="dark" />
+            </div>
+          </div>
 
           <div id="waitlist" className="mt-9 max-w-md scroll-mt-24">
             <WaitlistForm tone="dark" />
