@@ -47,44 +47,71 @@ function Eyebrow({ children }: { children: React.ReactNode }) {
   );
 }
 
-function ParkedDownload() {
-  return (
-    // Parked download CTA. The signed build does not exist yet.
-    // >>> When the .dmg is ready, replace this <button> with a real link:
-    //        <a href="https://YOUR-CDN/Supervisor.dmg" download className="...">Download for macOS</a>
-    //     and delete the "Available soon" tag. <<<
-    <button
-      type="button"
-      disabled
-      aria-disabled="true"
-      className="inline-flex cursor-not-allowed items-center gap-2 text-sm font-medium text-paper/45"
-    >
-      Download for macOS
-      <span className="rounded-full border border-white/15 px-2 py-0.5 text-xs text-paper/45">
-        Available soon
-      </span>
-    </button>
-  );
-}
-
 export default function Landing() {
   return (
     <main className="flex flex-col">
-      {/* ── HERO (dark Ink) ────────────────────────────────────────────── */}
+      {/* ── HERO (dark Ink, two-column) ────────────────────────────────── */}
       <section className="bg-ink px-6">
-        <div className="mx-auto w-full max-w-5xl pt-14 pb-20 sm:pt-20 sm:pb-28">
+        <div className="mx-auto w-full max-w-5xl pt-14 pb-14 sm:pt-20 sm:pb-16">
           <Wordmark tone="dark" />
 
-          <p className="mt-14 font-mono text-xs font-medium uppercase tracking-[0.2em] text-paper/45 sm:mt-20">
-            Early access for macOS
-          </p>
+          <div className="mt-12 grid items-center gap-12 lg:mt-16 lg:grid-cols-2 lg:gap-14">
+            {/* Left: copy + single CTA */}
+            <div>
+              <p className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-paper/45">
+                Early access for macOS
+              </p>
 
-          <h1 className="mt-4 max-w-3xl text-4xl font-semibold leading-[1.06] tracking-[-0.02em] text-paper sm:text-5xl lg:text-[3.5rem]">
-            <span className="text-paper/55">Auto mode takes you out of the loop.</span>{" "}
-            Supervisor takes your place.
-          </h1>
+              <h1 className="mt-4 max-w-xl text-4xl font-semibold leading-[1.06] tracking-[-0.02em] text-paper sm:text-5xl">
+                <span className="text-paper/55">Auto mode takes you out of the loop.</span>{" "}
+                Supervisor takes your place.
+              </h1>
 
-          <div className="mt-7 flex flex-wrap items-center gap-3">
+              <div id="waitlist" className="mt-8 max-w-md scroll-mt-24">
+                <WaitlistForm tone="dark" />
+                <p className="mt-3 text-sm text-paper/45">One email when it&apos;s ready. No spam.</p>
+                {/* When the signed .dmg ships, add a real Download button here. */}
+                <p className="mt-1 text-xs text-paper/35">macOS 13 or later. Download coming soon.</p>
+              </div>
+
+              <div className="mt-9">
+                <p className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-paper/45">
+                  Launches June 26, 2026
+                </p>
+                <div className="mt-4">
+                  <Countdown tone="dark" />
+                </div>
+              </div>
+            </div>
+
+            {/* Right: vertical teaser (stacks under the copy on mobile) */}
+            <div className="flex justify-center lg:justify-end">
+              <figure className="w-full max-w-[320px]">
+                <div className="overflow-hidden rounded-2xl border border-white/10 shadow-2xl shadow-black/40">
+                  {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+                  <video
+                    className="block aspect-[9/16] w-full bg-black"
+                    controls
+                    playsInline
+                    preload="metadata"
+                    poster="/supervisor-demo-poster.jpg"
+                    aria-label="Supervisor teaser"
+                  >
+                    <source src="/supervisor-demo.mp4" type="video/mp4" />
+                  </video>
+                </div>
+                <figcaption className="mt-3 text-center text-sm text-paper/45">
+                  What Supervisor does, in under a minute.
+                </figcaption>
+              </figure>
+            </div>
+          </div>
+
+          {/* Works-with strip (pills relocated out of the hero stack) */}
+          <div className="mt-12 flex flex-wrap items-center gap-3 border-t border-white/5 pt-6 lg:mt-14">
+            <span className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-paper/35">
+              Works with
+            </span>
             <span className="inline-flex items-center gap-2 rounded-full border border-white/15 px-3.5 py-1.5 text-sm text-paper">
               <span className="size-1.5 rounded-full bg-signal" aria-hidden="true" />
               Claude Code
@@ -97,52 +124,29 @@ export default function Landing() {
               </span>
             </span>
           </div>
+        </div>
+      </section>
 
-          <p className="mt-6 max-w-xl text-lg leading-relaxed text-paper/70 sm:text-xl">
-            It reads your repo to answer Claude Code&apos;s questions in plain
-            language, keeps the session moving, and steps in the moment an action
-            looks destructive.
-          </p>
-
-          <div className="mt-8">
-            <p className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-paper/45">
-              Launches June 26, 2026
-            </p>
-            <div className="mt-4">
-              <Countdown tone="dark" />
-            </div>
-          </div>
-
-          <div id="waitlist" className="mt-9 max-w-md scroll-mt-24">
-            <WaitlistForm tone="dark" />
-            <p className="mt-3 text-sm text-paper/45">One email when it&apos;s ready. No spam.</p>
-            <div className="mt-5">
-              <ParkedDownload />
-            </div>
-            <div className="mt-6">
-              <ProductHuntBadge theme="dark" />
-            </div>
-          </div>
-
-          {/* Demo: vertical founder walkthrough (sound on). Click-to-play with controls,
-              poster shown until played so the page stays light. Swap /public/supervisor-demo.mp4
-              + supervisor-demo-poster.jpg to update. */}
-          <figure className="mt-14 sm:mt-16">
-            <div className="mx-auto w-full max-w-[340px] overflow-hidden rounded-2xl border border-white/10 shadow-2xl shadow-black/40">
+      {/* ── SEE IT WORK (full-width landscape demo) ────────────────────── */}
+      <section className="bg-paper px-6 py-20 sm:py-24">
+        <div className="mx-auto w-full max-w-4xl">
+          <Eyebrow>See it work</Eyebrow>
+          <figure className="mt-8">
+            <div className="overflow-hidden rounded-2xl border border-black/10 shadow-2xl shadow-black/20">
               {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
               <video
-                className="block aspect-[9/16] w-full bg-black"
+                className="block aspect-video w-full bg-black"
                 controls
                 playsInline
                 preload="metadata"
-                poster="/supervisor-demo-poster.jpg"
-                aria-label="Supervisor walkthrough"
+                poster="/supervisor-demo-landscape-poster.jpg"
+                aria-label="Supervisor demo"
               >
-                <source src="/supervisor-demo.mp4" type="video/mp4" />
+                <source src="/supervisor-demo-landscape.mp4" type="video/mp4" />
               </video>
             </div>
-            <figcaption className="mt-3 text-center text-sm text-paper/45">
-              What Supervisor does, in under a minute.
+            <figcaption className="mt-4 text-center text-sm text-ink/50">
+              Supervisor answers a question, then catches a risky command. In real time.
             </figcaption>
           </figure>
         </div>
@@ -164,6 +168,10 @@ export default function Landing() {
       <section className="bg-paper px-6 py-20 sm:py-24">
         <div className="mx-auto w-full max-w-5xl">
           <Eyebrow>What it does</Eyebrow>
+          <p className="mt-5 max-w-2xl text-lg leading-relaxed text-ink/70">
+            It reads your repo to answer Claude Code&apos;s questions in plain language,
+            keeps the session moving, and steps in the moment an action looks destructive.
+          </p>
           <div className="mt-10 grid gap-10 sm:grid-cols-3 sm:gap-8">
             {FEATURES.map((feature) => (
               <div key={feature.title} className="border-t border-black/10 pt-5">
