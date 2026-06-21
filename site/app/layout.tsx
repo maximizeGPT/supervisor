@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
 import Script from "next/script";
+import { Analytics } from "@vercel/analytics/next";
+import Tracking from "@/components/Tracking";
 import "./globals.css";
 
 // Brand type system: Inter (400/500/600) for everything, JetBrains Mono for
@@ -53,6 +55,10 @@ export default function RootLayout({
     <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
       <body>
         {children}
+        {/* Vercel Web Analytics (pageviews, sources, UTM, custom events) + ad
+            pixels/UTM capture. Enable Web Analytics in the Vercel dashboard. */}
+        <Tracking />
+        <Analytics />
         {/* LaunchList embed widget loader. Scans for .launchlist-widget divs and
             renders the hosted signup + referral flow into each. */}
         <Script src="https://getlaunchlist.com/js/widget.js" strategy="afterInteractive" />
