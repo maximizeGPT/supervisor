@@ -12,6 +12,7 @@ build pipeline reads from here — don't move files without updating
 | `supervisor-appicon-1024.png` | 1024×1024 RGBA master with the macOS squircle baked in. `Scripts/make-icns.sh` rescales it through the standard 10-size iconset into `AppIcon.icns`. |
 | `supervisor-wordmark.svg`     | Three lockup variants in one file: `#lockup-horizontal`, `#lockup-stacked`, `#wordmark-only`. All glyphs are outlined paths from Inter Medium with -2% tracking — zero font dependency at render time. Used in docs, GitHub social card, and the (future v0.1.7+) expanded panel. |
 | `AppIcon.icns`                | Generated artifact (committed). Reflects the current state of `supervisor-appicon-1024.png`; `make-icns.sh` rebuilds it whenever the master is newer. The intermediate `AppIcon.iconset/` directory is `.gitignore`d. |
+| `supervisor-tiktok-endcard.{svg,png}` | 1080×1920 (9:16) vertical end card for TikTok / Reels / Shorts. Stacked lockup on the dark Ink→Ink-deep ground, mono tagline, `FREE • OPEN SOURCE`, and a `JUNE 26` launch headline. Built as a hold frame for a voiceover — no buttons/tap targets (there are none in-feed). Symbol + wordmark are the canonical outlined paths; only the marketing text uses a system sans/mono fallback. Regenerate the PNG from the SVG. |
 
 ## Palette
 
