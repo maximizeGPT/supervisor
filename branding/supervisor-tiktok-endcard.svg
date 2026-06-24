@@ -33,21 +33,7 @@
   <!-- Divider -->
   <line x1="430" y1="1175" x2="650" y2="1175" stroke="#2C2D30" stroke-width="2"/>
 
-  <!-- Value line: FREE  *  OPEN SOURCE  (absolute-positioned chunks) -->
-  <text x="218.6" y="1340" text-anchor="start" font-family="Liberation Sans, Arial, 'DejaVu Sans', sans-serif"
-        font-size="56" font-weight="bold" fill="#F7F6F2">FREE</text>
-  <text x="397.9" y="1340" text-anchor="start" font-family="Liberation Sans, Arial, 'DejaVu Sans', sans-serif"
-        font-size="56" font-weight="bold" fill="#2D7A4E">&#8226;</text>
-  <text x="447.5" y="1340" text-anchor="start" font-family="Liberation Sans, Arial, 'DejaVu Sans', sans-serif"
-        font-size="56" font-weight="bold" fill="#F7F6F2">OPEN SOURCE</text>
-
-  <!-- Date headline (clean type, no button — matches the voiceover) -->
-  <text x="540" y="1560" text-anchor="middle" font-family="Liberation Sans, Arial, 'DejaVu Sans', sans-serif"
-        font-size="100" font-weight="bold" letter-spacing="2" fill="#2D7A4E">JUNE 26</text>
-  <text x="540" y="1645" text-anchor="middle" font-family="Liberation Mono, 'DejaVu Sans Mono', monospace"
-        font-size="32" letter-spacing="8" fill="#A6A6A2">MARK YOUR CALENDAR</text>
-
-  <!-- Footer -->
-  <text x="540" y="1830" text-anchor="middle" font-family="Liberation Mono, 'DejaVu Sans Mono', monospace"
-        font-size="30" letter-spacing="1" fill="#5A5B57">github.com/supervisor</text>
+  <!-- Launch date headline -->
+  <text x="540" y="1370" text-anchor="middle" font-family="Liberation Sans, Arial, 'DejaVu Sans', sans-serif"
+        font-size="120" font-weight="bold" letter-spacing="2" fill="#2D7A4E">6.26.26</text>
 </svg>
