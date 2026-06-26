@@ -7,7 +7,7 @@
 <p>A native macOS app that supervises your <a href="https://www.anthropic.com/claude-code">Claude Code</a> sessions, so you can step away without them stalling or going off the rails.</p>
 
 <p>
-<a href="https://supervisor-site-taupe.vercel.app/download?src=readme"><img src="https://img.shields.io/badge/Download-macOS%2013%2B-3a7d44?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" /></a>
+<a href="https://github.com/maximizeGPT/supervisor/releases/latest/download/Supervisor.dmg"><img src="https://img.shields.io/badge/Download-macOS%2013%2B-3a7d44?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" /></a>
 </p>
 
 <p>
@@ -37,7 +37,7 @@ Everything runs on your Mac, on your own API key. Nothing leaves your machine ex
 
 ### Download (recommended)
 
-1. **[Download `Supervisor.dmg`](https://supervisor-site-taupe.vercel.app/download?src=readme)**. It is notarized by Apple, so it opens with no Gatekeeper warning.
+1. **[Download `Supervisor.dmg`](https://github.com/maximizeGPT/supervisor/releases/latest/download/Supervisor.dmg)**. It is notarized by Apple, so it opens with no Gatekeeper warning.
 2. Open it and drag **both** `Supervisor.app` and `SupervisorStatusBar.app` into Applications.
 3. Launch `Supervisor.app`. It walks you through a three-step setup: paste your API key, grant Accessibility, allow Notifications.
 
