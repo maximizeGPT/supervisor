@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 600" width="860" height="600" font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <title>Supervisor architecture — three processes, JSONL in, Anthropic out, SQLite + heartbeat for persistence.</title>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0E0F11"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2D7A4E"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="860" height="600" fill="#F7F6F2"/>
+
+  <!-- Title -->
+  <text x="430" y="40" text-anchor="middle" font-size="20" font-weight="600" fill="#0E0F11">Supervisor v0.1.0 — process + data model</text>
+  <text x="430" y="62" text-anchor="middle" font-size="12" fill="#A6A6A2">Three macOS processes. JSONL in, Anthropic API out, SQLite + heartbeat on the side.</text>
+
+  <!-- Claude Code JSONL source (external) -->
+  <rect x="40" y="220" width="180" height="80" rx="8" ry="8" fill="#EDEDEB" stroke="#A6A6A2" stroke-width="1.5"/>
+  <text x="130" y="252" text-anchor="middle" font-size="13" font-weight="600" fill="#0E0F11">~/.claude/projects/</text>
+  <text x="130" y="270" text-anchor="middle" font-size="12" fill="#0E0F11">&lt;project&gt;/*.jsonl</text>
+  <text x="130" y="290" text-anchor="middle" font-size="10" fill="#A6A6A2" font-style="italic">Claude Code transcript</text>
+
+  <!-- Supervisor.app (main) -->
+  <rect x="290" y="180" width="280" height="200" rx="10" ry="10" fill="#FFFFFF" stroke="#2D7A4E" stroke-width="2"/>
+  <text x="430" y="210" text-anchor="middle" font-size="14" font-weight="600" fill="#2D7A4E">Supervisor.app</text>
+  <text x="430" y="226" text-anchor="middle" font-size="10" fill="#A6A6A2">LSUIElement · @main · MainActor</text>
+  <line x1="305" y1="240" x2="555" y2="240" stroke="#EDEDEB" stroke-width="1"/>
+  <text x="305" y="260" font-size="12" fill="#0E0F11">• SessionDiscovery → SessionTail (kqueue)</text>
+  <text x="305" y="280" font-size="12" fill="#0E0F11">• EventParser → SupervisorEvent</text>
+  <text x="305" y="300" font-size="12" fill="#0E0F11">• TriageEngine (rolling-window prompt cap)</text>
+  <text x="305" y="320" font-size="12" fill="#0E0F11">• Notifier (UNUserNotificationCenter)</text>
+  <text x="305" y="340" font-size="12" fill="#0E0F11">• HoverWindow (240×40, top-right)</text>
+  <text x="305" y="360" font-size="12" fill="#0E0F11">• PermissionMonitor (AX/Notif polling)</text>
+
+  <!-- Anthropic API (external) -->
+  <rect x="640" y="200" width="180" height="80" rx="8" ry="8" fill="#EDEDEB" stroke="#A6A6A2" stroke-width="1.5"/>
+  <text x="730" y="232" text-anchor="middle" font-size="13" font-weight="600" fill="#0E0F11">api.anthropic.com</text>
+  <text x="730" y="250" text-anchor="middle" font-size="11" fill="#0E0F11">Haiku 4.5 · forced tool call</text>
+  <text x="730" y="268" text-anchor="middle" font-size="10" fill="#A6A6A2" font-style="italic">via Redactor (9 patterns)</text>
+
+  <!-- SupervisorHeartbeat -->
+  <rect x="290" y="430" width="180" height="80" rx="8" ry="8" fill="#FFFFFF" stroke="#0E0F11" stroke-width="1.5"/>
+  <text x="380" y="460" text-anchor="middle" font-size="13" font-weight="600" fill="#0E0F11">SupervisorHeartbeat</text>
+  <text x="380" y="478" text-anchor="middle" font-size="11" fill="#0E0F11">writes heartbeat.txt every 5s</text>
+  <text x="380" y="496" text-anchor="middle" font-size="10" fill="#A6A6A2" font-style="italic">spawned + tracked by app</text>
+
+  <!-- SupervisorStatusBar -->
+  <rect x="510" y="430" width="180" height="80" rx="8" ry="8" fill="#FFFFFF" stroke="#0E0F11" stroke-width="1.5"/>
+  <text x="600" y="460" text-anchor="middle" font-size="13" font-weight="600" fill="#0E0F11">SupervisorStatusBar</text>
+  <text x="600" y="478" text-anchor="middle" font-size="11" fill="#0E0F11">reads heartbeat every 2s</text>
+  <text x="600" y="496" text-anchor="middle" font-size="10" fill="#A6A6A2" font-style="italic">green/amber/red menu icon</text>
+
+  <!-- SQLite store -->
+  <rect x="40" y="430" width="180" height="80" rx="8" ry="8" fill="#FFFFFF" stroke="#0E0F11" stroke-width="1.5"/>
+  <text x="130" y="460" text-anchor="middle" font-size="13" font-weight="600" fill="#0E0F11">supervisor.sqlite</text>
+  <text x="130" y="478" text-anchor="middle" font-size="11" fill="#0E0F11">sessions · flags · cost</text>
+  <text x="130" y="496" text-anchor="middle" font-size="10" fill="#A6A6A2" font-style="italic">GRDB · per-session offsets</text>
+
+  <!-- Arrows -->
+  <!-- JSONL → app -->
+  <path d="M 220 260 L 285 260" stroke="#0E0F11" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="252" y="252" text-anchor="middle" font-size="10" fill="#0E0F11">tail</text>
+
+  <!-- app → Anthropic -->
+  <path d="M 575 260 L 635 240" stroke="#2D7A4E" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <text x="603" y="240" text-anchor="middle" font-size="10" fill="#2D7A4E">triage</text>
+
+  <!-- Anthropic → app (response) -->
+  <path d="M 635 260 L 575 280" stroke="#2D7A4E" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <text x="603" y="295" text-anchor="middle" font-size="10" fill="#2D7A4E">verdict</text>
+
+  <!-- app → SQLite (flag persist) -->
+  <path d="M 290 360 L 220 430" stroke="#0E0F11" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="220" y="395" text-anchor="middle" font-size="10" fill="#0E0F11">persist flag</text>
+
+  <!-- app → Heartbeat (spawn) -->
+  <path d="M 380 380 L 380 425" stroke="#0E0F11" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="395" y="405" font-size="10" fill="#0E0F11">spawn</text>
+
+  <!-- Heartbeat → StatusBar (via file) -->
+  <path d="M 470 470 L 505 470" stroke="#0E0F11" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="487" y="463" text-anchor="middle" font-size="9" fill="#0E0F11">heartbeat.txt</text>
+
+  <!-- Footer caption -->
+  <text x="430" y="555" text-anchor="middle" font-size="11" fill="#A6A6A2">Solid black: control / spawn / persistence. Brand green: every external API call (redacted at the boundary).</text>
+  <text x="430" y="572" text-anchor="middle" font-size="11" fill="#A6A6A2">SupervisorStatusBar runs detached so a crash of the main app turns the menu-bar icon red within 30 seconds.</text>
+</svg>

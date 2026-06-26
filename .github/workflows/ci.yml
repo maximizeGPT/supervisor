@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: swift build + test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: swift --version
+      # Single job (not two with `needs:`) because each GH Actions job
+      # runs on a fresh runner — splitting `swift build` and `swift test
+      # --skip-build` across jobs strands the .build artifacts and
+      # `--skip-build` fails with "No test bundle found." Doing both
+      # here lets `swift test` reuse the freshly-built artifacts.
+      - name: Build all targets
+        run: swift build
+      # `swift test` builds whatever the test bundle needs on top of
+      # what `swift build` already produced. The live-API test
+      # (testRealHaikuLiveCall) gates on ANTHROPIC_API_KEY at runtime —
+      # without the secret it self-skips, so we don't need a filter.
+      - name: Run unit tests
+        run: swift test
+
+  # Lint job removed in v0.1.6.2: swift-format isn't actually shipped
+  # with the macos-14 GitHub Actions Swift toolchain (my earlier comment
+  # claiming otherwise was wrong). The job failed on every push since
+  # the workflow landed with "unable to invoke subcommand: swift-format
+  # (No such file or directory)". Re-adding requires a `brew install
+  # swift-format` step; defer until we want strict linting badly
+  # enough to pay that build-time cost.
