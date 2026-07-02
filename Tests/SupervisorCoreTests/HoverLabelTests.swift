@@ -145,4 +145,47 @@ final class HoverLabelTests: XCTestCase {
         vm.clearDegraded()
         XCTAssertEqual(vm.activity, .idle)
     }
+
+    // MARK: - Paused-state honesty (F11)
+
+    /// The core honesty mapping: paused says "Supervisor paused", never
+    /// "All clear", and paints the amber (.degraded) presentation — a green
+    /// dot over a dormant engine would be the product lying.
+    func testPausedSetsLabelAndAmberDotNotAllClear() {
+        let vm = makeVM()
+        vm.reflectSupervisorPaused(true)
+        XCTAssertEqual(vm.plainLabel, HoverViewModel.pausedLabel)
+        XCTAssertNotEqual(vm.plainLabel, "Watching. All clear")
+        XCTAssertEqual(vm.activity, .degraded(reason: HoverViewModel.pausedLabel))
+    }
+
+    /// Un-pausing restores the green "All clear" idle state.
+    func testUnpauseRestoresAllClear() {
+        let vm = makeVM()
+        vm.reflectSupervisorPaused(true)
+        vm.reflectSupervisorPaused(false)
+        XCTAssertEqual(vm.activity, .idle)
+        XCTAssertEqual(vm.plainLabel, "Watching. All clear")
+    }
+
+    /// Precedence: a genuine network-degraded state ("can't watch") is a more
+    /// urgent truth than "paused" — paused must not overwrite it.
+    func testNetworkDegradedOutranksPaused() {
+        let vm = makeVM()
+        vm.enterDegraded(reason: "Can't reach Anthropic")
+        vm.reflectSupervisorPaused(true)
+        XCTAssertEqual(vm.plainLabel, "Can't reach Anthropic")
+        XCTAssertEqual(vm.activity, .degraded(reason: "Can't reach Anthropic"))
+    }
+
+    /// Precedence: a live safety flag outranks paused — pausing must not stomp
+    /// an active "about to delete things" flag.
+    func testSafetyFlagOutranksPaused() {
+        let vm = makeVM()
+        vm.flagRaised(severity: .high, action: .pause, reasoningPlain: "About to delete things.")
+        vm.reflectSupervisorPaused(true)
+        guard case .flagged = vm.activity else {
+            return XCTFail("paused must not overwrite a live flag; got \(vm.activity)")
+        }
+    }
 }

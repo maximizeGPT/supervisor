@@ -47,6 +47,44 @@ public enum KeyEntryError: Sendable, Equatable {
     case unexpected(message: String)
 }
 
+// MARK: - Launch gate (v0.3.0 F5)
+
+/// The launch-flow decision: re-run onboarding, or go straight to the running
+/// state? Modelled as a value so `LaunchGate.decide` is a pure, unit-testable
+/// function with no AppKit dependency.
+public enum LaunchDecision: Sendable, Equatable {
+    /// Enter the running state. `notifyOnlyDegraded` is true when the user is
+    /// onboarded but WITHOUT Accessibility (they chose "Skip for now"), so
+    /// Inject is unavailable and the app runs notify-only. Informational for
+    /// logging — the running state is entered either way.
+    case run(notifyOnlyDegraded: Bool)
+    /// Re-run onboarding: no API key, or AX is neither granted nor was it
+    /// deliberately skipped in a prior run.
+    case onboard
+}
+
+/// The launch gate. Extracted from `applicationDidFinishLaunching` so the
+/// decision is testable without a running app.
+///
+/// The F5 fix lives here: a user who chose "Skip for now" on Accessibility
+/// persisted an ax-skip marker, so `axSkipped == true`. They are fully
+/// onboarded and must NOT be dragged back through the whole wizard on every
+/// launch. They enter the running state degraded (notify-only) instead.
+public enum LaunchGate {
+    public static func decide(hasKey: Bool, axGranted: Bool, axSkipped: Bool) -> LaunchDecision {
+        // No key → nothing works; always onboard.
+        guard hasKey else { return .onboard }
+        // AX granted → the full experience (inject available).
+        if axGranted { return .run(notifyOnlyDegraded: false) }
+        // AX not granted, but the user deliberately skipped it before →
+        // honour that choice and run notify-only rather than re-onboarding.
+        if axSkipped { return .run(notifyOnlyDegraded: true) }
+        // Key present but AX neither granted nor previously skipped → the AX
+        // step was never resolved; onboard so the user can grant or skip it.
+        return .onboard
+    }
+}
+
 public extension OnboardingState {
     /// The numeric step (1, 2, 3, or 4) for progress indicators.
     var step: Int {

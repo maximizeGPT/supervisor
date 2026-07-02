@@ -42,17 +42,41 @@ public final class SessionDiscovery: @unchecked Sendable {
     private var rescanTimer: DispatchSourceTimer?
     private let rescanInterval: TimeInterval
 
+    /// Recency-filtered discovery (audit H4): only start a tail for a
+    /// transcript whose mtime is within this window at discovery time. A
+    /// heavy user accrues hundreds/thousands of historical JSONLs; tailing
+    /// every one holds an fd + DispatchSource + offset timer per file forever
+    /// and, past the process fd limit, it is the NEWEST live session whose
+    /// open() fails. A file written to later (a `claude --resume` bumps its
+    /// mtime) is adopted on a subsequent scan — the scan re-checks mtime for
+    /// every not-yet-tailed file each time it runs. Overridable via init for
+    /// tests.
+    static let defaultDiscoveryRecencyWindowSeconds: TimeInterval = 172_800  // 48h
+    private let discoveryRecencyWindow: TimeInterval
+
+    /// Injected into every SessionTail this discovery spawns. `nil` uses the
+    /// tail's own defaults; tests pass small values to exercise the
+    /// inactivity close cheaply.
+    private let tailInactivityTimeout: TimeInterval?
+    private let tailOffsetPersistInterval: TimeInterval
+
     public init(
         claudeProjectsDir: URL,
         bus: EventBus,
         sessionStore: SessionStore?,
         rescanInterval: TimeInterval = 3.0,
+        discoveryRecencyWindow: TimeInterval? = nil,
+        tailInactivityTimeout: TimeInterval? = nil,
+        tailOffsetPersistInterval: TimeInterval = 30,
         trace: TraceLog = .shared
     ) {
         self.claudeProjectsDir = claudeProjectsDir
         self.bus = bus
         self.sessionStore = sessionStore
         self.rescanInterval = rescanInterval
+        self.discoveryRecencyWindow = discoveryRecencyWindow ?? SessionDiscovery.defaultDiscoveryRecencyWindowSeconds
+        self.tailInactivityTimeout = tailInactivityTimeout
+        self.tailOffsetPersistInterval = tailOffsetPersistInterval
         self.trace = trace
     }
 
@@ -138,6 +162,20 @@ public final class SessionDiscovery: @unchecked Sendable {
         for entry in entries where entry.pathExtension == "jsonl" {
             let sessionId = entry.deletingPathExtension().lastPathComponent
             if tails[sessionId] != nil { continue }
+            // Recency filter: skip transcripts not written to within the
+            // window. This is re-evaluated on every scan, so a previously
+            // skipped file that later gets a write (mtime bumps into the
+            // window) is adopted on the next scan. A deleted-then-recreated
+            // same-id session is no longer blocked here either: its tail's
+            // delete handler pruned the tails[id] entry, and the fresh file
+            // has a current mtime.
+            if let mtime = (try? FileManager.default.attributesOfItem(atPath: entry.path))?[.modificationDate] as? Date {
+                let age = Date().timeIntervalSince(mtime)
+                if age > discoveryRecencyWindow {
+                    trace.emit("discovery", "skipping stale transcript session=\(sessionId) age=\(Int(age))s > window=\(Int(discoveryRecencyWindow))s — not tailed (will adopt if it is written to)")
+                    continue
+                }
+            }
             startTail(sessionId: sessionId, projectHash: projectHash, path: entry)
         }
     }
@@ -151,8 +189,26 @@ public final class SessionDiscovery: @unchecked Sendable {
             bus: bus,
             sessionStore: sessionStore,
             startOffset: savedOffset,
+            offsetPersistInterval: tailOffsetPersistInterval,
+            inactivityTimeout: tailInactivityTimeout,
             trace: trace
         )
+        // When the tail self-terminates (inactivity close or delete/rename),
+        // drop its entry so the fd is freed and the session can be re-adopted
+        // on a later scan (an inactive-then-re-opened tail resumes at the
+        // saved offset). Identity-guarded by ObjectIdentifier so we never
+        // remove a NEWER tail that a recreated same-id file installed under
+        // this key. Captures only a value + weak self — no retain cycle.
+        let tailIdentity = ObjectIdentifier(tail)
+        tail.onTerminated = { [weak self] sid in
+            self?.queue.async {
+                guard let self else { return }
+                if let current = self.tails[sid], ObjectIdentifier(current) == tailIdentity {
+                    self.tails.removeValue(forKey: sid)
+                    self.trace.emit("discovery", "pruned tail entry session=\(sid) after self-termination — re-tailable on next scan")
+                }
+            }
+        }
         do {
             try tail.start()
             tails[sessionId] = tail

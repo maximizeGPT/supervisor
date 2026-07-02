@@ -74,6 +74,19 @@ final class ActionFlashTests: XCTestCase {
         XCTAssertEqual(vm.recentActions.first?.action, .selfExtend)
     }
 
+    /// F11: paused must render a non-green (amber) dot in the actual view —
+    /// a green dot would read as "All clear" while the engine is dormant. This
+    /// ties the VM's paused presentation to the color HoverView actually draws.
+    func testPausedRendersAmberDotNotGreen() {
+        let vm = makeVM()
+        XCTAssertEqual(HoverView.dotColor(for: vm.activity), .green, "starts green/idle")
+        vm.reflectSupervisorPaused(true)
+        let color = HoverView.dotColor(for: vm.activity)
+        XCTAssertEqual(color, .orange, "paused must paint the amber dot")
+        XCTAssertNotEqual(color, .green, "paused must never read as green 'All clear'")
+        XCTAssertEqual(vm.plainLabel, HoverViewModel.pausedLabel)
+    }
+
     /// Every substantial action type surfaces a non-empty label with the flash
     /// (so the user always sees WHAT happened, not a bare glow).
     func testEverySubstantialActionSurfacesALabel() {

@@ -49,6 +49,11 @@ public final class OnboardingViewModel: ObservableObject {
     private let clientFactory: @Sendable (LLMProvider, String) -> LLMClient
     private let trace: TraceLog
 
+    /// v0.3.0 (F5): where the "user skipped AX" marker is persisted. Defaults
+    /// to the real ConfigPaths location; tests inject a temp URL so a run
+    /// never drops a real marker the deployed app would read.
+    private let axSkippedMarkerURL: URL
+
     // MARK: - Init
 
     /// Construct a view model that resumes at the right step based on what
@@ -61,12 +66,14 @@ public final class OnboardingViewModel: ObservableObject {
         keyStore: any ProviderKeyStore,
         activeProviderStore: any ActiveProviderStore,
         clientFactory: @escaping @Sendable (LLMProvider, String) -> LLMClient,
+        axSkippedMarkerURL: URL = ConfigPaths().axSkippedMarkerPath,
         trace: TraceLog = .shared
     ) {
         self.permissions = permissions
         self.keyStore = keyStore
         self.activeProviderStore = activeProviderStore
         self.clientFactory = clientFactory
+        self.axSkippedMarkerURL = axSkippedMarkerURL
         self.trace = trace
 
         // Pick the resume provider: whatever's marked active, falling back
@@ -150,6 +157,9 @@ public final class OnboardingViewModel: ObservableObject {
     public func recheckAX() async {
         guard case .axCheck = state else { return }
         if permissions.isAXGranted() {
+            // AX is now really on — clear any stale skip marker so a later
+            // revoke re-onboards rather than silently running notify-only.
+            clearAXSkip()
             let status = await permissions.notificationStatus()
             trace.emit("onboarding", "AX granted; advancing to notif step (notif=\(status))")
             state = .notifCheck(status: status)
@@ -173,6 +183,10 @@ public final class OnboardingViewModel: ObservableObject {
     public func confirmAX() async {
         guard case .axCheck = state else { return }
         let detected = permissions.isAXGranted()
+        // The user asserts AX is enabled — treat this as a grant, not a skip.
+        // Clear any stale skip marker so the app runs (and re-onboards on a
+        // real future revoke) rather than latching notify-only forever.
+        clearAXSkip()
         let status = await permissions.notificationStatus()
         trace.emit("onboarding", "AX confirmed by user (macOS reported granted=\(detected)); advancing to notif step (notif=\(status))")
         state = .notifCheck(status: status)
@@ -186,9 +200,36 @@ public final class OnboardingViewModel: ObservableObject {
     /// triggers an action that needs AX.
     public func skipAX() async {
         guard case .axCheck = state else { return }
+        // F5: persist the deliberate skip so the launch gate treats this
+        // notify-only setup as onboarded and never re-runs the full wizard.
+        persistAXSkip()
         let status = await permissions.notificationStatus()
-        trace.emit("onboarding", "AX skipped by user; advancing to notif step (notif=\(status))")
+        trace.emit("onboarding", "AX skipped by user (persisted); advancing to notif step (notif=\(status))")
         state = .notifCheck(status: status)
+    }
+
+    /// Write the ax-skip marker (empty file — presence is the signal).
+    /// Best-effort: a failed write only costs a re-shown wizard next launch.
+    private func persistAXSkip() {
+        let url = axSkippedMarkerURL
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            FileManager.default.createFile(atPath: url.path, contents: Data())
+            trace.emit("onboarding", "persisted ax-skipped marker at \(url.path)")
+        } catch {
+            trace.emit("onboarding", "ERROR persist ax-skip marker: \(error)")
+        }
+    }
+
+    /// Remove the ax-skip marker once AX is actually granted, so the marker's
+    /// meaning stays precise ("the user's last AX decision was to skip").
+    private func clearAXSkip() {
+        guard FileManager.default.fileExists(atPath: axSkippedMarkerURL.path) else { return }
+        try? FileManager.default.removeItem(at: axSkippedMarkerURL)
+        trace.emit("onboarding", "cleared ax-skipped marker (AX now granted)")
     }
 
     /// Ask macOS to prompt the user for notifications. On success, re-poll

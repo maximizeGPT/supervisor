@@ -138,9 +138,14 @@ public final class Notifier: Notifying, @unchecked Sendable {
         content.title = Self.plainTitle(for: .notifyOnly)
         content.body = body(for: decision)
         content.sound = .default
+        // F8: coalesce per session, and dedup — a stable identifier means a
+        // fresh plain flag for the same session REPLACES the prior one rather
+        // than stacking a new banner (the old fresh-UUID behaviour storm).
+        content.threadIdentifier = Self.threadIdentifier(sessionId: decision.sessionId)
+        content.userInfo = [Self.userInfoSessionId: decision.sessionId]
 
         let request = UNNotificationRequest(
-            identifier: "supervisor.flag.\(UUID().uuidString)",
+            identifier: "supervisor.flag.\(decision.sessionId).plain",
             content: content,
             trigger: nil  // post immediately
         )
@@ -170,6 +175,112 @@ public final class Notifier: Notifying, @unchecked Sendable {
     /// Banner body prefix — kept as a constant so tests and callers reference
     /// the same string and never drift. Trailing space is part of the prefix.
     public static let bannerPrefix = "Supervisor: "
+
+    // MARK: - Actionable notifications (v0.3.0 F8)
+    //
+    // The notification IS the interface at the moment of need: what happened,
+    // and one tap to act. Each identifier below is shared verbatim by the
+    // poster (this file) and the tap router (NotificationActionRouter in
+    // SupervisorApp/main.swift), so they can never drift. Every action maps to
+    // a capability that actually exists:
+    //   - Resume           → the hover's group-SIGCONT resume path
+    //   - Copy answer       → NSPasteboard (the "paste this" text, no longer
+    //                         buried in a truncated banner)
+    //   - Open recovery doc → NSWorkspace.open on the handoff markdown
+    //
+    // These are pure constructors/lookups so they're unit-testable without a
+    // live UNUserNotificationCenter (which aborts in the xctest harness).
+
+    /// UNNotificationAction identifiers.
+    public static let actionResume = "supervisor.action.resume"
+    public static let actionCopyAnswer = "supervisor.action.copyAnswer"
+    public static let actionOpenRecoveryDoc = "supervisor.action.openRecoveryDoc"
+
+    /// UNNotificationCategory identifiers (set on content.categoryIdentifier).
+    public static let categoryPaused = "supervisor.category.paused"
+    public static let categoryStopped = "supervisor.category.stopped"
+    public static let categoryAnswer = "supervisor.category.answer"
+    public static let categoryProposal = "supervisor.category.proposal"
+
+    /// userInfo keys the tap router reads to act.
+    public static let userInfoSessionId = "supervisor.sessionId"
+    public static let userInfoCwd = "supervisor.cwd"
+    public static let userInfoRecoveryDoc = "supervisor.recoveryDocPath"
+    public static let userInfoAnswer = "supervisor.answerText"
+
+    /// Stable per-session thread so repeated flags for ONE session coalesce in
+    /// Notification Center instead of stacking into a storm (the old behaviour:
+    /// a fresh UUID per post, no grouping).
+    public static func threadIdentifier(sessionId: String) -> String {
+        "supervisor.session.\(sessionId)"
+    }
+
+    /// Which category an outcome uses — i.e. which action buttons it carries.
+    /// nil means a plain, action-less banner (notify / already-succeeded
+    /// inject / already-fired continue: nothing left to tap).
+    public static func categoryIdentifier(for outcome: InterventionOutcome) -> String? {
+        switch outcome {
+        case .pauseSucceeded:         return categoryPaused      // Resume + Open recovery doc
+        case .killSucceeded:          return categoryStopped     // Open recovery doc
+        case .injectDegraded:         return categoryAnswer      // Copy answer
+        case .continueProposedMedium: return categoryProposal    // Copy suggestion
+        case .notifyOnly, .injectSucceeded, .continueFired,
+             .continueLowConfidence, .queued:
+            return nil
+        }
+    }
+
+    /// The categories to register on the center once at startup. Pure — builds
+    /// value objects, touches no singleton.
+    public static func categories() -> [UNNotificationCategory] {
+        let resume = UNNotificationAction(
+            identifier: actionResume, title: "Resume Claude Code", options: [.foreground])
+        let openDoc = UNNotificationAction(
+            identifier: actionOpenRecoveryDoc, title: "Open recovery doc", options: [.foreground])
+        let copyAnswer = UNNotificationAction(
+            identifier: actionCopyAnswer, title: "Copy answer", options: [])
+        let copySuggestion = UNNotificationAction(
+            identifier: actionCopyAnswer, title: "Copy suggestion", options: [])
+        return [
+            UNNotificationCategory(identifier: categoryPaused, actions: [resume, openDoc],
+                                   intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: categoryStopped, actions: [openDoc],
+                                   intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: categoryAnswer, actions: [copyAnswer],
+                                   intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: categoryProposal, actions: [copySuggestion],
+                                   intentIdentifiers: [], options: []),
+        ]
+    }
+
+    /// The userInfo payload a banner carries so its action taps can act.
+    /// Pure — testable without posting.
+    public static func userInfo(sessionId: String, cwd: String?, outcome: InterventionOutcome) -> [String: String] {
+        var info: [String: String] = [userInfoSessionId: sessionId]
+        switch outcome {
+        case .pauseSucceeded(_, let doc):
+            if let cwd = cwd { info[userInfoCwd] = cwd }
+            if let doc = doc { info[userInfoRecoveryDoc] = doc.path }
+        case .killSucceeded(let doc):
+            if let doc = doc { info[userInfoRecoveryDoc] = doc.path }
+        case .injectDegraded(let text, _):
+            info[userInfoAnswer] = text
+        case .continueProposedMedium(let proposal, _):
+            info[userInfoAnswer] = proposal
+        case .notifyOnly, .injectSucceeded, .continueFired,
+             .continueLowConfidence, .queued:
+            break
+        }
+        return info
+    }
+
+    /// Register the actionable-notification categories on the center. Call once
+    /// at startup (from the app) BEFORE the first banner is posted; also set the
+    /// center's delegate (in main.swift) so taps route. Idempotent.
+    public func registerCategories() {
+        center.setNotificationCategories(Set(Self.categories()))
+        trace.emit("notifier", "registered \(Self.categories().count) notification categories")
+    }
 
     /// Plain-language notification title. Uses the triage's plain
     /// reasoning to describe what happened, not raw category names.
@@ -259,9 +370,20 @@ public final class Notifier: Notifying, @unchecked Sendable {
         content.title = Self.plainTitle(for: outcome)
         content.body = body(for: decision, outcome: outcome)
         content.sound = .default
+        // F8: per-session thread (coalesce), outcome-mapped category (action
+        // buttons), and the userInfo payload the tap router acts on.
+        content.threadIdentifier = Self.threadIdentifier(sessionId: decision.sessionId)
+        if let category = Self.categoryIdentifier(for: outcome) {
+            content.categoryIdentifier = category
+        }
+        content.userInfo = Self.userInfo(sessionId: decision.sessionId, cwd: decision.cwd, outcome: outcome)
 
+        // Dedup within (session, category): a second pause banner for the same
+        // session replaces the first instead of stacking. Outcomes with no
+        // category fall back to the session's plain slot.
+        let slot = Self.categoryIdentifier(for: outcome) ?? "plain"
         let request = UNNotificationRequest(
-            identifier: "supervisor.flag.\(UUID().uuidString)",
+            identifier: "supervisor.flag.\(decision.sessionId).\(slot)",
             content: content,
             trigger: nil
         )

@@ -22,6 +22,7 @@ import Combine
 import Foundation
 import SupervisorCore
 import SupervisorUI
+import UserNotifications
 
 @MainActor
 final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
@@ -59,6 +60,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
     // Heartbeat child
     private var heartbeatProcess: Process?
+    // F13: respawn bookkeeping. If the heartbeat child dies on its own the
+    // menu-bar icon goes red while supervision is actually fine, so we relaunch
+    // it — with a backoff guard so a crash-on-launch can't become a tight
+    // respawn loop.
+    private var lastHeartbeatSpawn = Date.distantPast
+    private var heartbeatRespawnCount = 0
+
+    // Notification action router (F8) — retained here because the notification
+    // center holds its delegate weakly.
+    private var notificationActionRouter: NotificationActionRouter?
 
     override init() {
         try? paths.ensureDirectoriesExist()
@@ -89,12 +100,22 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         let activeProvider = (try? activeProviderStore.read()) ?? .anthropic
         let hasKey: Bool = ((try? keyStore.read(activeProvider)) ?? nil)?.isEmpty == false
         let axOK = permissions.isAXGranted()
+        // F5: a user who chose "Skip for now" on Accessibility persisted this
+        // marker. Feed it to the pure launch gate so a notify-only setup is
+        // treated as onboarded and doesn't re-run the whole wizard every launch.
+        let axSkipped = FileManager.default.fileExists(atPath: paths.axSkippedMarkerPath.path)
 
-        if !hasKey || !axOK {
-            trace.emit("app", "onboarding needed (provider=\(activeProvider.rawValue) hasKey=\(hasKey) axOK=\(axOK))")
+        switch LaunchGate.decide(hasKey: hasKey, axGranted: axOK, axSkipped: axSkipped) {
+        case .onboard:
+            trace.emit("app", "onboarding needed (provider=\(activeProvider.rawValue) hasKey=\(hasKey) axOK=\(axOK) axSkipped=\(axSkipped))")
             presentOnboarding()
-        } else {
-            trace.emit("app", "onboarding skipped; entering running state (provider=\(activeProvider.rawValue))")
+        case .run(let notifyOnly):
+            trace.emit("app", "onboarding skipped; entering running state (provider=\(activeProvider.rawValue) axOK=\(axOK) axSkipped=\(axSkipped) notifyOnly=\(notifyOnly))")
+            // notifDegraded here is specifically about NOTIFICATION denial, a
+            // separate concern from AX/notify-only — pass false and let the
+            // running-state entry probe notification status itself. A skipped-AX
+            // (notifyOnly) run just means Inject is unavailable; the runtime
+            // PermissionMonitor re-surfaces AX if an action ever needs it.
             enterRunningState(notifDegraded: false)
         }
     }
@@ -401,6 +422,29 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // 4b. Actionable notifications (F8). Register the categories (Resume /
+        // Copy answer / Open recovery doc) and install a delegate that routes
+        // action taps. Resume reuses the SAME locator + group-SIGCONT path as
+        // the hover's Resume button, so a tap from Notification Center and a
+        // click in the panel do exactly the same safe thing.
+        notifier.registerCategories()
+        let actionRouter = NotificationActionRouter(trace: trace)
+        actionRouter.onResume = { [weak self] cwd in
+            guard let self else { return }
+            guard let handle = locator.locate(targetCwd: cwd, allowDesktopFallback: false) else {
+                self.trace.emit("app", "notif resume: locator returned nil for cwd=\(cwd)")
+                return
+            }
+            do {
+                try signalSender.sendToGroup(SIGCONT, of: handle.pid)
+                self.trace.emit("app", "notif resume: SIGCONT sent to group of pid=\(handle.pid) cwd=\(cwd)")
+            } catch {
+                self.trace.emit("app", "notif resume: SIGCONT failed pid=\(handle.pid) error=\(error)")
+            }
+        }
+        UNUserNotificationCenter.current().delegate = actionRouter
+        self.notificationActionRouter = actionRouter
+
         // 5. Triage engine. v0.2.0: model comes from the active provider.
         // v0.3.0: optional QuestionAnswerer for the user_question_pending
         // secondary call. v0.4.0: optional Dispatcher + LoopController
@@ -623,9 +667,18 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         }
         let proc = Process()
         proc.executableURL = url
+        // F13: relaunch the heartbeat if it dies on its own. terminationHandler
+        // is cleared in stopHeartbeat before an INTENTIONAL terminate(), so our
+        // own teardown/restart never triggers a respawn — only an unexpected
+        // death does.
+        proc.terminationHandler = { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in self.handleHeartbeatDeath() }
+        }
         do {
             try proc.run()
             heartbeatProcess = proc
+            lastHeartbeatSpawn = Date()
             trace.emit("app", "spawned heartbeat pid=\(proc.processIdentifier) path=\(url.path)")
         } catch {
             trace.emit("app", "ERROR failed to spawn heartbeat: \(error)")
@@ -633,10 +686,42 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func stopHeartbeat() {
-        guard let proc = heartbeatProcess, proc.isRunning else { return }
-        trace.emit("app", "terminating heartbeat pid=\(proc.processIdentifier)")
-        proc.terminate()
+        guard let proc = heartbeatProcess else { return }
+        // Detach the respawn handler FIRST so an intentional stop (teardown or
+        // restart) doesn't get treated as an unexpected death and respawned.
+        proc.terminationHandler = nil
+        if proc.isRunning {
+            trace.emit("app", "terminating heartbeat pid=\(proc.processIdentifier)")
+            proc.terminate()
+        }
         heartbeatProcess = nil
+    }
+
+    /// F13: the heartbeat child terminated unexpectedly (not via stopHeartbeat,
+    /// which detaches this handler). Relaunch with a backoff so a crash-on-
+    /// launch can't spin. A death shortly after spawn counts as a fast failure;
+    /// after several consecutive fast failures we give up and let the icon go
+    /// red honestly rather than burning CPU. A death after a healthy run resets
+    /// the counter.
+    private func handleHeartbeatDeath() {
+        heartbeatProcess = nil
+        let sinceSpawn = Date().timeIntervalSince(lastHeartbeatSpawn)
+        if sinceSpawn < 2.0 {
+            heartbeatRespawnCount += 1
+        } else {
+            heartbeatRespawnCount = 1
+        }
+        guard heartbeatRespawnCount <= 5 else {
+            trace.emit("app", "heartbeat died \(heartbeatRespawnCount)x rapidly — giving up (icon will go red)")
+            return
+        }
+        let backoff = min(Double(heartbeatRespawnCount), 5.0)
+        trace.emit("app", "heartbeat died after \(String(format: "%.1f", sinceSpawn))s — respawning in \(backoff)s (attempt \(heartbeatRespawnCount))")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+            guard let self, self.heartbeatProcess == nil else { return }
+            self.startHeartbeat()
+        }
     }
 
     private func locateHeartbeatExecutable() -> URL? {
@@ -826,6 +911,77 @@ private func loadDispatcher(
     }
     trace.emit("app", "no PRINCIPLES.md found; Dispatcher disabled — worker_idle_post_completion flags will surface as plain notify (no auto-dispatch)")
     return nil
+}
+
+// MARK: - Notification action router (v0.3.0 F8)
+
+/// Routes taps on the actionable-notification buttons to real capabilities.
+/// Registered as the UNUserNotificationCenter delegate in enterRunningState.
+/// The action/category/userInfo identifiers are the pure constants defined on
+/// `Notifier`, so the poster and this router can never drift.
+///
+/// Not `@MainActor`-annotated: `UNUserNotificationCenterDelegate` is not itself
+/// main-actor-isolated in the SDK, and its callbacks are delivered on the main
+/// thread, so the AppKit calls below (NSPasteboard / NSWorkspace) are safe.
+final class NotificationActionRouter: NSObject, UNUserNotificationCenterDelegate {
+
+    private let trace: TraceLog
+
+    /// Resume the paused session at `cwd` (group SIGCONT). Wired in main to the
+    /// same locator + signal path the hover's Resume button uses.
+    var onResume: ((String) -> Void)?
+
+    init(trace: TraceLog) {
+        self.trace = trace
+        super.init()
+    }
+
+    /// Show banners even while Supervisor is frontmost. It runs .accessory so
+    /// this rarely matters, but without it a foreground delivery is silent.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let info = response.notification.request.content.userInfo
+        switch response.actionIdentifier {
+        case Notifier.actionResume:
+            if let cwd = info[Notifier.userInfoCwd] as? String {
+                trace.emit("notifier", "action tap: Resume cwd=\(cwd)")
+                onResume?(cwd)
+            } else {
+                trace.emit("notifier", "action tap: Resume — no cwd in userInfo, cannot resume")
+            }
+        case Notifier.actionCopyAnswer:
+            if let text = info[Notifier.userInfoAnswer] as? String {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                trace.emit("notifier", "action tap: Copy answer (\(text.count) chars) → pasteboard")
+            } else {
+                trace.emit("notifier", "action tap: Copy answer — no text in userInfo")
+            }
+        case Notifier.actionOpenRecoveryDoc:
+            if let path = info[Notifier.userInfoRecoveryDoc] as? String {
+                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                trace.emit("notifier", "action tap: Open recovery doc \(path)")
+            } else {
+                trace.emit("notifier", "action tap: Open recovery doc — no path in userInfo")
+            }
+        default:
+            // Default action (the user tapped the banner body) or dismiss —
+            // nothing extra to do; the banner already carried the information.
+            break
+        }
+        completionHandler()
+    }
 }
 
 // MARK: - Bootstrap

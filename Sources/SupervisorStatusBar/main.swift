@@ -73,26 +73,45 @@ extension HeartbeatHealth {
 
 final class StatusBarController: NSObject {
 
+    /// Bundle id of the MAIN Supervisor.app — the process this companion can
+    /// quit / restart. Mirrors the id used by the app's own single-instance
+    /// guard (terminatePriorInstances in SupervisorApp/main.swift).
+    private let mainBundleID = "live.supervisor.app"
+
     private let statusItem: NSStatusItem
     private var current: HeartbeatHealth = .red(reason: "starting")
     /// v0.3.0 (P0-3): non-nil while the network-down marker exists —
     /// the human-readable reason model triage is degraded.
     private var degradedReason: String?
+    /// v0.3.0 (F11): true while the owner has globally PAUSED Supervisor. A
+    /// live-but-paused process must NOT read as green "running" — paused is a
+    /// deliberate "not watching", shown with a distinct pause glyph + tooltip.
+    private var paused = false
     private var timer: DispatchSourceTimer?
+
+    /// True only when the process is alive (green heartbeat), not network-
+    /// degraded, and the owner has paused. A dead/stale heartbeat (the bigger
+    /// truth) and a network-degraded state both outrank paused.
+    private var isPausedDisplay: Bool {
+        if case .green = current, degradedReason == nil, paused { return true }
+        return false
+    }
 
     /// What to actually render. The heartbeat answers "is the process
     /// alive"; the marker answers "is it able to watch". A live process
     /// that can't reach its model shows amber, not green. A stale/missing
     /// heartbeat (amber/red) already wins — the process being dead is the
-    /// bigger truth.
+    /// bigger truth. Paused is handled separately (isPausedDisplay) with its
+    /// own glyph so it never borrows the amber "something's wrong" reading.
     private var displayHealth: HeartbeatHealth {
         if case .green = current, degradedReason != nil { return .amber }
         return current
     }
 
     private var displayTitle: String {
-        if case .green = current, let reason = degradedReason {
-            return "Supervisor: \(reason)"
+        if case .green = current {
+            if let reason = degradedReason { return "Supervisor: \(reason)" }
+            if paused { return "Supervisor: paused (not watching)" }
         }
         return current.menuTitle
     }
@@ -107,6 +126,20 @@ final class StatusBarController: NSObject {
 
     private func configureButton() {
         guard let button = statusItem.button else { return }
+
+        // F11: paused gets its own pause glyph + tooltip — distinct from the
+        // amber "warning" (something is wrong) and the green "all clear". A
+        // pause icon reads as an intentional, benign off-state.
+        if isPausedDisplay {
+            button.title = "⏸"
+            button.image = NSImage(
+                systemSymbolName: "pause.circle.fill",
+                accessibilityDescription: "Supervisor paused"
+            )
+            button.toolTip = displayTitle
+            return
+        }
+
         let health = displayHealth
         button.title = health.fallbackLabel
 
@@ -134,13 +167,11 @@ final class StatusBarController: NSObject {
         menu.addItem(NSMenuItem(title: displayTitle, action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if case .red = current {
-            let openNotif = NSMenuItem(
-                title: "Open System Settings → Notifications",
-                action: #selector(openNotifications),
-                keyEquivalent: ""
-            )
-            openNotif.target = self
-            menu.addItem(openNotif)
+            // F3: the red state is EXACTLY when the user needs a working
+            // remedy. The old "Open System Settings → Notifications" was
+            // unrelated to a dead/stale heartbeat (which is about the process,
+            // not notifications). Offer the two things that actually help:
+            // relaunch Supervisor, and read the trace log to see why it died.
             let restart = NSMenuItem(
                 title: "Restart Supervisor",
                 action: #selector(restartMain),
@@ -148,6 +179,13 @@ final class StatusBarController: NSObject {
             )
             restart.target = self
             menu.addItem(restart)
+            let openLogRemedy = NSMenuItem(
+                title: "Open Trace Log",
+                action: #selector(openTraceLog),
+                keyEquivalent: ""
+            )
+            openLogRemedy.target = self
+            menu.addItem(openLogRemedy)
             menu.addItem(NSMenuItem.separator())
         }
         // v0.1.4 Gap 4: a persistent-history surface for past flags. Until
@@ -193,10 +231,25 @@ final class StatusBarController: NSObject {
         )
         openLog.target = self
         menu.addItem(openLog)
-        let quitItem = NSMenuItem(
-            title: "Quit Status Bar",
-            action: #selector(quit),
+
+        menu.addItem(NSMenuItem.separator())
+        // F3: a working "Quit Supervisor" that actually stops the harness. The
+        // old only-quit ("Quit Status Bar") terminated JUST this companion —
+        // the main app kept running and kept spending. This terminates the main
+        // app (which tears down its heartbeat/discovery) and then this process.
+        let quitSupervisorItem = NSMenuItem(
+            title: "Quit Supervisor",
+            action: #selector(quitSupervisor),
             keyEquivalent: "q"
+        )
+        quitSupervisorItem.target = self
+        menu.addItem(quitSupervisorItem)
+        // Keep an explicit "just this icon" escape hatch, clearly labelled so
+        // it's never mistaken for stopping supervision.
+        let quitItem = NSMenuItem(
+            title: "Quit Status Bar Only",
+            action: #selector(quit),
+            keyEquivalent: ""
         )
         quitItem.target = self
         menu.addItem(quitItem)
@@ -218,9 +271,13 @@ final class StatusBarController: NSObject {
         let age = (try? heartbeat.ageSeconds()) ?? .infinity
         let new = HeartbeatHealth.evaluate(age: age)
         let newReason = networkDown.read()
-        if new != current || newReason != degradedReason {
+        // F11: the global-pause marker is owner-facing state the status bar
+        // must reflect honestly — a paused engine is not "running/all clear".
+        let newPaused = RuntimeToggles.supervisorPaused
+        if new != current || newReason != degradedReason || newPaused != paused {
             current = new
             degradedReason = newReason
+            paused = newPaused
             trace.emit("statusbar", "health -> \(displayTitle)")
             DispatchQueue.main.async { [weak self] in
                 self?.configureButton()
@@ -232,13 +289,70 @@ final class StatusBarController: NSObject {
     // MARK: - Actions
 
     @objc private func quit() {
-        trace.emit("statusbar", "quit requested by user")
+        trace.emit("statusbar", "quit status-bar only requested by user")
         NSApp.terminate(nil)
     }
 
+    /// F3: stop the WHOLE harness. Terminate the main Supervisor.app (its
+    /// applicationWillTerminate tears down the triage engine, discovery, and
+    /// the heartbeat child), then terminate this companion. Because the app is
+    /// .accessory (no Dock, no menu), this companion is the only place a user
+    /// can honestly quit — so it must actually stop supervision, not just hide
+    /// the icon.
+    @objc private func quitSupervisor() {
+        trace.emit("statusbar", "quit-supervisor requested — terminating main app + self")
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: mainBundleID)
+        for app in running {
+            trace.emit("statusbar", "terminating main app pid=\(app.processIdentifier)")
+            app.terminate()
+        }
+        // Give the main app a moment to run its teardown before we exit.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    /// F3: a working Restart. Terminate the running main app and relaunch it
+    /// from its bundle. Prefer the running instance's own bundleURL; fall back
+    /// to the sibling Supervisor.app next to this companion (both dragged from
+    /// the DMG). The main app's single-instance guard also clears any straggler
+    /// on relaunch, so a slow terminate can't leave two instances.
     @objc private func restartMain() {
-        trace.emit("statusbar", "restart-main requested (Phase B+ will wire this)")
-        // Phase B/C will spawn Supervisor.app here.
+        trace.emit("statusbar", "restart-supervisor requested")
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: mainBundleID)
+        let bundleURL = running.first?.bundleURL ?? siblingMainAppURL()
+        for app in running {
+            trace.emit("statusbar", "restart: terminating main app pid=\(app.processIdentifier)")
+            app.terminate()
+        }
+        guard let url = bundleURL else {
+            trace.emit("statusbar", "restart: no Supervisor.app URL found — cannot relaunch")
+            return
+        }
+        // Relaunch after a short delay so the old instance releases its
+        // resources (heartbeat child, status-item, etc.) before the new one
+        // boots and runs its own single-instance guard.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let cfg = NSWorkspace.OpenConfiguration()
+            cfg.createsNewApplicationInstance = true
+            NSWorkspace.shared.openApplication(at: url, configuration: cfg) { app, error in
+                if let error = error {
+                    trace.emit("statusbar", "restart: relaunch failed: \(error)")
+                } else {
+                    trace.emit("statusbar", "restart: relaunched main app pid=\(app?.processIdentifier ?? -1)")
+                }
+            }
+        }
+    }
+
+    /// Sibling Supervisor.app next to this companion. Both bundles ship side by
+    /// side (dragged from the DMG to /Applications; both under build/ in dev),
+    /// so the parent of this bundle contains the main app.
+    private func siblingMainAppURL() -> URL? {
+        let sibling = Bundle.main.bundleURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("Supervisor.app")
+        return FileManager.default.fileExists(atPath: sibling.path) ? sibling : nil
     }
 
     @objc private func openTraceLog() {
@@ -274,11 +388,6 @@ final class StatusBarController: NSObject {
         try? FileManager.default.createDirectory(at: paths.recoveryDir, withIntermediateDirectories: true)
         NSWorkspace.shared.activateFileViewerSelecting([paths.recoveryDir])
         trace.emit("statusbar", "open recovery folder requested → \(paths.recoveryDir.path)")
-    }
-
-    @objc private func openNotifications() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!
-        NSWorkspace.shared.open(url)
     }
 
     /// v0.1.4 Gap 4: write the last 20 `flags` rows to a pretty-printed

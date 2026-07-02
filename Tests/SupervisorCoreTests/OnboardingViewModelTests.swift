@@ -295,6 +295,127 @@ final class OnboardingViewModelTests: XCTestCase {
         }
     }
 
+    // MARK: - Launch gate (F5, pure)
+
+    func testLaunchGateReonboardsWhenNoKey() {
+        XCTAssertEqual(LaunchGate.decide(hasKey: false, axGranted: false, axSkipped: false), .onboard)
+        // Even AX-granted / AX-skipped can't rescue a missing key.
+        XCTAssertEqual(LaunchGate.decide(hasKey: false, axGranted: true, axSkipped: true), .onboard)
+    }
+
+    func testLaunchGateRunsCleanWhenKeyAndAX() {
+        XCTAssertEqual(LaunchGate.decide(hasKey: true, axGranted: true, axSkipped: false),
+                       .run(notifyOnlyDegraded: false))
+    }
+
+    /// The F5 fix: a user who skipped AX and has a key must NOT be re-onboarded
+    /// on every launch — they run notify-only.
+    func testLaunchGateRunsDegradedWhenKeyAndAXSkipped() {
+        XCTAssertEqual(LaunchGate.decide(hasKey: true, axGranted: false, axSkipped: true),
+                       .run(notifyOnlyDegraded: true))
+    }
+
+    /// Key present but AX neither granted nor previously skipped → the AX step
+    /// was never resolved, so onboard (so the user can grant or skip it).
+    func testLaunchGateReonboardsWhenKeyButAXUnresolved() {
+        XCTAssertEqual(LaunchGate.decide(hasKey: true, axGranted: false, axSkipped: false), .onboard)
+    }
+
+    // MARK: - AX-skip persistence (F5)
+
+    private func makeVMWithMarker(
+        _ markerURL: URL,
+        checker: StubChecker,
+        store: ProviderKeyStore
+    ) -> OnboardingViewModel {
+        let session = mockSession()
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("supervisor-onboarding-\(UUID().uuidString).log"))
+        return OnboardingViewModel(
+            permissions: checker,
+            keyStore: store,
+            activeProviderStore: InMemoryActiveProviderStore(),
+            clientFactory: { provider, key in
+                LLMClient(
+                    provider: provider,
+                    apiKey: key,
+                    redactor: DefaultRedactor(),
+                    baseURL: URL(string: "https://mock.anthropic.test")!,
+                    session: session,
+                    traceLog: trace
+                )
+            },
+            axSkippedMarkerURL: markerURL,
+            trace: trace
+        )
+    }
+
+    func testSkipAXPersistsMarker() async throws {
+        let checker = StubChecker()
+        checker.ax = false
+        checker.notif = .authorized
+        let store = InMemoryProviderKeyStore()
+        try store.write("sk-ant-x", for: .anthropic)
+        let markerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ax-skip-\(UUID().uuidString).marker")
+        defer { try? FileManager.default.removeItem(at: markerURL) }
+
+        let vm = makeVMWithMarker(markerURL, checker: checker, store: store)
+        XCTAssertEqual(vm.state, .axCheck())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markerURL.path),
+                       "marker must not exist before the user skips")
+
+        await vm.skipAX()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: markerURL.path),
+                      "skipAX must persist the ax-skip marker so the gate doesn't re-onboard")
+        XCTAssertEqual(vm.state, .notifCheck(status: .authorized))
+    }
+
+    /// The skipped-marker + key-present combination the persistence feeds:
+    /// re-decoding it through the pure gate must NOT re-onboard.
+    func testSkippedAXThenKeyPresentDoesNotReonboard() async throws {
+        let checker = StubChecker()
+        checker.ax = false
+        checker.notif = .authorized
+        let store = InMemoryProviderKeyStore()
+        try store.write("sk-ant-x", for: .anthropic)
+        let markerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ax-skip-\(UUID().uuidString).marker")
+        defer { try? FileManager.default.removeItem(at: markerURL) }
+
+        let vm = makeVMWithMarker(markerURL, checker: checker, store: store)
+        await vm.skipAX()
+
+        // Simulate the next launch's gate reading persisted facts:
+        let hasKey = (try? store.read(.anthropic))?.isEmpty == false
+        let axSkipped = FileManager.default.fileExists(atPath: markerURL.path)
+        XCTAssertEqual(LaunchGate.decide(hasKey: hasKey, axGranted: false, axSkipped: axSkipped),
+                       .run(notifyOnlyDegraded: true),
+                       "a notify-only user must go straight to running, not the wizard")
+    }
+
+    /// Granting AX (via confirmAX) clears a stale skip marker, so a later revoke
+    /// re-onboards instead of silently latching notify-only.
+    func testConfirmAXClearsSkipMarker() async throws {
+        let checker = StubChecker()
+        checker.ax = true
+        checker.notif = .authorized
+        let store = InMemoryProviderKeyStore()
+        try store.write("sk-ant-x", for: .anthropic)
+        let markerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ax-skip-\(UUID().uuidString).marker")
+        defer { try? FileManager.default.removeItem(at: markerURL) }
+        // Pretend the user skipped on a prior run — marker already present.
+        FileManager.default.createFile(atPath: markerURL.path, contents: Data())
+
+        let vm = makeVMWithMarker(markerURL, checker: checker, store: store)
+        await vm.confirmAX()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markerURL.path),
+                       "confirming AX must clear the stale skip marker")
+    }
+
     // MARK: - Step number for progress bar
 
     func testStepNumbers() {

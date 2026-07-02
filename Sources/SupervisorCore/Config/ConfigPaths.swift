@@ -75,6 +75,17 @@ public struct ConfigPaths: Sendable {
         appSupportDir.appendingPathComponent("self-rebuild.marker", isDirectory: false)
     }
 
+    /// `~/Library/Application Support/Supervisor/ax-skipped.marker`
+    /// v0.3.0 (F5): written when the user chose "Skip for now" on the
+    /// Accessibility step of onboarding. Its presence means "the user
+    /// deliberately declined AX" — a notify-only setup. The launch gate
+    /// treats that as fully onboarded and does NOT re-run the wizard on
+    /// every launch. Harmless once AX is actually granted: the gate checks
+    /// the live AX grant first and only consults this marker when AX is off.
+    public var axSkippedMarkerPath: URL {
+        appSupportDir.appendingPathComponent("ax-skipped.marker", isDirectory: false)
+    }
+
     /// `~/Library/Logs/Supervisor/supervisor.log`
     public var traceLogPath: URL {
         logsDir.appendingPathComponent("supervisor.log", isDirectory: false)

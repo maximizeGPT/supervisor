@@ -49,6 +49,18 @@ let queue = DispatchQueue(label: "supervisor.heartbeat", qos: .utility)
 let timer = DispatchSource.makeTimerSource(queue: queue)
 timer.schedule(deadline: .now(), repeating: 5.0)
 timer.setEventHandler {
+    // F4: parent-liveness. This process is spawned as a direct child of the
+    // main Supervisor.app (see startHeartbeat in SupervisorApp/main.swift). If
+    // the main app crashes, this orphaned child is reparented to launchd, so
+    // getppid() returns 1. Without this check the orphan keeps writing a fresh
+    // heartbeat forever and the menu-bar icon stays green over a dead
+    // supervisor — the exact "green dot lying" the product must never do. Stop
+    // writing so the heartbeat goes stale and the icon honestly turns red.
+    if getppid() == 1 {
+        trace.emit("heartbeat", "parent gone (getppid=1) — stopping so the icon can go red")
+        trace.sync()
+        exit(0)
+    }
     let beat = Heartbeat(timestamp: Date(), flags: [])
     do {
         let bytes = try heartbeat.write(beat)

@@ -152,6 +152,56 @@ public final class HoverViewModel: ObservableObject {
         if initialFlagCount > 0 {
             trace.emit("hover", "seeded flagCount=\(initialFlagCount) from history")
         }
+        // F11: if the app launches while globally paused, the hover must say so
+        // from the first frame — never a green "All clear" over a dormant engine.
+        if supervisorPaused {
+            reflectSupervisorPaused(true)
+        }
+    }
+
+    // MARK: - Paused-state honesty (v0.3.0 F11)
+
+    /// The hover label shown while Supervisor is globally paused. Deliberately
+    /// NOT "All clear": the engine is dormant, spending nothing and watching
+    /// nothing, so a green "watching" reading would be the product lying.
+    public static let pausedLabel = "Supervisor paused"
+
+    /// Reflect the global-pause state on the hover. Pure presentation — does
+    /// NOT touch the marker file (the toggle setter owns that), so tests can
+    /// exercise the precedence without writing a real marker.
+    ///
+    /// Precedence: a live safety flag or a genuine network-degraded state is a
+    /// more urgent truth than "paused", so paused never overwrites either — it
+    /// only paints when the hover is otherwise idle/triaging. It reuses the
+    /// `.degraded` presentation (amber dot — "alive, but not model-watching"
+    /// is literally true when paused).
+    public func reflectSupervisorPaused(_ paused: Bool) {
+        supervisorPaused = paused
+        if paused {
+            switch activity {
+            case .flagged, .degraded:
+                // A safety flag / network-degraded state outranks paused.
+                trace.emit("hover", "paused: presentation held (\(activity) outranks paused)")
+            case .idle, .triaging:
+                activity = .degraded(reason: Self.pausedLabel)
+                plainLabel = Self.pausedLabel
+                detailLabel = ""
+                acknowledgeDebouncerTask?.cancel()
+                trace.emit("hover", "activity -> paused")
+            }
+        } else {
+            // Leaving paused: restore idle only if the paused presentation is
+            // what's currently showing (don't stomp a flag/network-degraded
+            // state that landed while paused).
+            if case .degraded(let reason) = activity, reason == Self.pausedLabel {
+                activity = .idle
+                plainLabel = projectName.isEmpty
+                    ? "Watching. All clear"
+                    : "Watching \(projectName). All clear"
+                detailLabel = ""
+                trace.emit("hover", "unpaused; activity -> idle")
+            }
+        }
     }
 
     // MARK: - Expanded panel data
@@ -179,8 +229,10 @@ public final class HoverViewModel: ObservableObject {
     public func toggleSupervisorPaused() {
         let next = !supervisorPaused
         RuntimeToggles.setSupervisorPaused(next)
-        supervisorPaused = next
         trace.emit("hover", "owner toggled supervisor_paused=\(next)")
+        // F11: keep every surface honest — reflect the pause on the hover
+        // (label + amber dot) the instant it's toggled, not just in the engine.
+        reflectSupervisorPaused(next)
     }
 
     /// Owner control: turn the 4-hour loop cap off / on for this machine.

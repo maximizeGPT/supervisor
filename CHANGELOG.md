@@ -6,6 +6,84 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+v0.3.0 Wave 3 — lifecycle dignity, the moment of need, and safety
+(2026-07-02): the harness can be turned off, tells the truth on every
+surface, acts through a notification you can actually use, never types a
+dangerous command into your session, and stops leaking file descriptors
+for heavy users.
+
+### Added
+
+**A working way to turn it off, and honest lifecycle on every surface**
+(`SupervisorStatusBar/main.swift`, `SupervisorHeartbeat/main.swift`,
+`SupervisorApp/main.swift`, `HoverViewModel.swift`, `OnboardingViewModel.swift`,
+`OnboardingState.swift`, `ConfigPaths.swift`)
+- There was no way to quit or restart Supervisor from any UI — the only
+  "quit" stopped the menu-bar companion while the harness kept running and
+  kept spending, and "Restart Supervisor" was a stub. The status-bar menu
+  now has a real "Quit Supervisor" (terminates the harness), a clearly
+  labelled "Quit Status Bar Only" escape hatch, a working "Restart
+  Supervisor", and "Open Trace Log" replacing the dead red-state remedy.
+- A crash of the main app left the heartbeat child writing forever, so the
+  health icon stayed green over a dead harness. The child now checks
+  `getppid()` each tick and exits when reparented to launchd; and if the
+  child alone dies, the main app respawns it (with a backoff guard).
+- Global pause used to leave the hover reading green "Watching. All clear."
+  It now reads "Supervisor paused" with an amber dot — yielding only to a
+  live safety flag or a network-degraded state, which outrank it.
+- "Skip for now" on Accessibility is now persisted, so notify-only users
+  stop getting the full onboarding wizard on every launch (a pure
+  `LaunchGate.decide` gate).
+
+**Notifications you can act on** (`Notifier.swift`, `SupervisorApp/main.swift`)
+- Flags posted a fresh-UUID banner with no actions, no threading, and
+  "paste this into Claude Code:" answers buried in truncated text. Banners
+  now carry per-session `threadIdentifier` (repeat flags for one session
+  coalesce) and `UNNotificationCategory` actions — Resume (a paused
+  session), Open recovery doc, Copy answer / Copy suggestion — routed by a
+  `UNUserNotificationCenterDelegate` wired in the app.
+
+### Security
+
+**Supervisor can no longer be tricked into typing a dangerous command into
+your session** (`InjectionSafetyScreen.swift` (new), `InterventionRouter.swift`,
+`Dispatcher.swift`)
+- Transcript content is attacker-influenceable (a malicious repo prints text
+  into build output or an echoed question), and Supervisor typed
+  model-generated `wrong_trajectory` redirects and answers into the live
+  session with no deterministic screen — a crafted repo could steer the
+  cheap triage model into injecting `curl … | sh`, which the catch-list
+  didn't cover. A new deterministic `InjectionSafetyScreen` runs before every
+  keystroke-injection chokepoint and blocks (→ withhold + notify, never type)
+  pipe-to-shell, `bash -c <remote-url>`, base64-pipe-to-shell, `eval` of
+  fetched content, downloaded-then-`chmod +x`, writes to shell rc / `~/.ssh`,
+  `sudo`, disabling SIP/firewall, force-push to protected branches,
+  credential-exfil shapes, destructive escalation (via the existing catch),
+  and imperative "run the following / disable your safety" phrasing.
+- Third-party GitHub issue bodies that feed the dispatch prompt are now
+  fenced as explicitly-untrusted data, and issue-derived proposals run
+  through the safety screen and never auto-inject at high confidence
+  (downgraded to propose-and-wait). Owner-identity isn't in the fetched
+  data, so all issue-authored proposals are treated as untrusted — noted
+  in code as a future relaxation if author identity becomes available.
+
+### Fixed
+
+**The tail no longer leaks a file descriptor per transcript forever**
+(`SessionDiscovery.swift`, `SessionTail.swift`)
+- Every `.jsonl` under `~/.claude/projects` was tailed and never pruned —
+  one open fd + DispatchSource + serial queue + 30s timer per file, so a
+  heavy user (thousands of transcripts) could hit the process fd limit, and
+  it was the newest live session that failed to open. Discovery now only
+  tails sessions written within a 48h recency window; a tail with no new
+  bytes for 30 min is closed (fd/source/timer released, entry pruned) and
+  re-adopted at its saved offset — resuming, not replaying — if it becomes
+  active again. Delete/rename now actually prunes the entry (it used to leak
+  a live timer), and a deleted-then-recreated session id is re-tailable.
+
+~55 new tests across launch gate, paused honesty, notification categories,
+the injection safety screen, dispatcher fencing, and tail lifecycle.
+
 v0.3.0 Wave 2 — money and honesty (2026-07-02): the README's two money
 promises become true, and the harness stops lying about whether it's
 watching.

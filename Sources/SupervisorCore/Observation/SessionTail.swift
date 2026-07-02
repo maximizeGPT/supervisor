@@ -37,6 +37,18 @@ public final class SessionTail: @unchecked Sendable {
     static let defaultFastForwardSizeThresholdBytes: Int64 = 131_072       // 128 KB
     static let defaultFastForwardMtimeThresholdSeconds: TimeInterval = 300 // 5 min
 
+    // Inactivity close (audit H4): a heavy user accrues hundreds/thousands
+    // of transcripts. Holding an fd + DispatchSource + offset timer open for
+    // every one until the process dies exhausts the fd limit — and it's the
+    // NEWEST, live session whose open() then fails. When a tail sees no new
+    // bytes for this long we tear it down (cancel source, close fd, cancel
+    // timer) and signal SessionDiscovery to drop its entry, freeing the fd.
+    // The offset is flushed first, so a later scan re-opens with a saved
+    // offset > 0 and RESUMES from there — it does NOT re-run the seek policy's
+    // fast-forward or byte-0 branch (those only apply at savedOffset <= 0).
+    // Overridable via init so tests can exercise the close cheaply.
+    static let defaultInactivityTimeoutSeconds: TimeInterval = 1_800  // 30 min
+
     /// Cap on how much of the head is scanned for the sessionStart-bearing
     /// line during a fast-forward start. The parser emits sessionStart from
     /// the first cwd-bearing line, normally within the first few lines; the
@@ -53,6 +65,14 @@ public final class SessionTail: @unchecked Sendable {
     private let offsetPersistInterval: TimeInterval
     private let fastForwardSizeThresholdBytes: Int64
     private let fastForwardMtimeThresholdSeconds: TimeInterval
+    private let inactivityTimeout: TimeInterval
+
+    /// Invoked, ON THIS TAIL'S OWN QUEUE, when the tail SELF-terminates —
+    /// inactivity close or the file being deleted/renamed. SessionDiscovery
+    /// sets this to prune its `tails[id]` entry so the fd is freed and the
+    /// session can be re-adopted later (for inactivity, re-opened at the saved
+    /// offset). NOT called by the external `stop()` teardown path.
+    public var onTerminated: ((String) -> Void)?
 
     /// Set once the real cwd has been persisted to the session record, so we
     /// only write the UPDATE once per tail (the placeholder -> real transition).
@@ -66,6 +86,12 @@ public final class SessionTail: @unchecked Sendable {
     private var lastPersistedOffset: Int64 = 0
     private var currentOffset: Int64 = 0
 
+    /// Wall-clock of the last read that yielded new bytes. Drives the
+    /// inactivity close. Accessed only on `queue` (handleEvent + timer tick).
+    private var lastActivityAt = Date()
+    /// Guards the teardown paths (terminate / stop) so they run once.
+    private var terminated = false
+
     public init(
         sessionId: String,
         path: URL,
@@ -76,6 +102,7 @@ public final class SessionTail: @unchecked Sendable {
         offsetPersistInterval: TimeInterval = 30,
         fastForwardSizeThresholdBytes: Int64? = nil,
         fastForwardMtimeThresholdSeconds: TimeInterval? = nil,
+        inactivityTimeout: TimeInterval? = nil,
         trace: TraceLog = .shared
     ) {
         self.sessionId = sessionId
@@ -86,6 +113,7 @@ public final class SessionTail: @unchecked Sendable {
         self.offsetPersistInterval = offsetPersistInterval
         self.fastForwardSizeThresholdBytes = fastForwardSizeThresholdBytes ?? SessionTail.defaultFastForwardSizeThresholdBytes
         self.fastForwardMtimeThresholdSeconds = fastForwardMtimeThresholdSeconds ?? SessionTail.defaultFastForwardMtimeThresholdSeconds
+        self.inactivityTimeout = inactivityTimeout ?? SessionTail.defaultInactivityTimeoutSeconds
         self.trace = trace
         self.queue = DispatchQueue(label: "supervisor.tail.\(sessionId)", qos: .utility)
         self.lastPersistedOffset = startOffset ?? 0
@@ -157,12 +185,41 @@ public final class SessionTail: @unchecked Sendable {
             self?.handleEvent(mask: [])
         }
 
-        // Periodic offset persistence.
+        // Periodic offset persistence + inactivity check. Fresh start counts
+        // as activity so a just-opened (or fast-forwarded) tail isn't closed
+        // before it has had a chance to see any writes.
+        lastActivityAt = Date()
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + offsetPersistInterval, repeating: offsetPersistInterval)
-        t.setEventHandler { [weak self] in self?.persistOffsetIfNeeded() }
+        t.setEventHandler { [weak self] in self?.onTimerTick() }
         t.resume()
         self.offsetTimer = t
+    }
+
+    /// Timer-driven housekeeping (runs on `queue`): flush the offset if it
+    /// moved, then close the tail if it has gone quiet for `inactivityTimeout`.
+    private func onTimerTick() {
+        persistOffsetIfNeeded()
+        if Date().timeIntervalSince(lastActivityAt) > inactivityTimeout {
+            terminate(reason: "inactive \(Int(inactivityTimeout))s+ with no new bytes")
+        }
+    }
+
+    /// Self-termination (inactivity close or delete/rename). MUST run on
+    /// `queue`. Cancels the offset timer + file source (whose cancel handler
+    /// closes the fd), flushes the offset so a later re-open RESUMES from the
+    /// saved offset rather than fast-forwarding, then signals
+    /// SessionDiscovery to drop the entry. Idempotent.
+    private func terminate(reason: String) {
+        guard !terminated else { return }
+        terminated = true
+        offsetTimer?.cancel()
+        offsetTimer = nil
+        source?.cancel()
+        source = nil
+        persistOffsetIfNeeded(force: true)
+        trace.emit("tail", "session=\(sessionId) tail closed (\(reason)) finalOffset=\(currentOffset) — entry pruned; a later scan re-opens at the saved offset")
+        onTerminated?(sessionId)
     }
 
     // MARK: - Fast-forward start (backfill skip)
@@ -224,13 +281,20 @@ public final class SessionTail: @unchecked Sendable {
     }
 
     public func stop() {
-        queue.sync {
-            self.offsetTimer?.cancel()
-            self.offsetTimer = nil
-            self.source?.cancel()
-            self.source = nil
-            // Final offset persist on the way out.
+        // External teardown (SessionDiscovery.stop / tests). Distinct from
+        // terminate(): does NOT call onTerminated — the caller owns the entry.
+        // Shares the `terminated` guard so a tail that already self-closed
+        // (inactivity / delete) is a no-op here.
+        let alreadyTornDown = queue.sync { () -> Bool in
+            if terminated { return true }
+            terminated = true
+            offsetTimer?.cancel()
+            offsetTimer = nil
+            source?.cancel()
+            source = nil
+            return false
         }
+        guard !alreadyTornDown else { return }
         persistOffsetIfNeeded(force: true)
         trace.emit("tail", "stop session=\(sessionId) finalOffset=\(currentOffset)")
     }
@@ -244,9 +308,12 @@ public final class SessionTail: @unchecked Sendable {
 
     private func handleEvent(mask: DispatchSource.FileSystemEvent) {
         if mask.contains(.delete) || mask.contains(.rename) {
-            trace.emit("tail", "session=\(sessionId) file disappeared (delete/rename) — stopping tail")
-            source?.cancel()
-            source = nil
+            // Full self-termination — NOT just a source cancel. The old code
+            // cancelled the source but left SessionDiscovery's tails[id] entry
+            // and this tail's offset timer alive (a leak; the entry also made
+            // a deleted-then-recreated same-id session un-tailable). terminate()
+            // cancels the timer, flushes the offset, and prunes the entry.
+            terminate(reason: "file disappeared (delete/rename)")
             return
         }
 
@@ -255,6 +322,7 @@ public final class SessionTail: @unchecked Sendable {
         // Drain everything new from the fd into our buffer.
         let chunk = 65_536
         var scratch = Data(count: chunk)
+        var readAny = false
         while true {
             let n = scratch.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Int in
                 guard let base = raw.baseAddress else { return -1 }
@@ -263,7 +331,10 @@ public final class SessionTail: @unchecked Sendable {
             if n <= 0 { break }
             buffer.append(scratch.prefix(n))
             currentOffset += Int64(n)
+            readAny = true
         }
+        // Any new bytes count as activity and defer the inactivity close.
+        if readAny { lastActivityAt = Date() }
 
         // Split on newlines. Lines without a trailing newline stay in the
         // buffer for the next event (kqueue coalesces; we may have read a

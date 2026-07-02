@@ -204,6 +204,20 @@ public final class InterventionRouter {
             await postNotify(decision)
             return
         }
+        // INJECTION SAFETY SCREEN (audit E1). `text` is model-generated and its
+        // source context is attacker-influenceable (a poisoned transcript can
+        // steer the cheap answer/triage model into "run `curl … | sh`"). This is
+        // the single chokepoint before EITHER delivery route for the inject path
+        // — the composer paste below AND the desktop-MCQ operator — so screen
+        // here, once, before any keystroke. A block WITHHOLDS the text entirely
+        // (degrades to a plain notify, NOT a paste-this banner: we must not hand
+        // the user a pre-typed unsafe command either) and records a
+        // discriminating trace tag.
+        if case let .block(reason) = InjectionSafetyScreen.screen(text) {
+            trace.emit("router", "injection_screen_blocked op=inject reason=\(reason) session=\(decision.sessionId)")
+            await postNotify(decision)
+            return
+        }
         guard let cwd = decision.cwd, !cwd.isEmpty else {
             trace.emit("router", "intervention.inject.degraded reason=no_cwd_on_decision session=\(decision.sessionId)")
             await postInjectDegraded(decision, intendedText: text, reason: "no_cwd_on_decision")
@@ -486,6 +500,20 @@ public final class InterventionRouter {
                     reasoning: "Dispatcher returned high confidence with no proposal text. Falling back to user pick."
                 )
             )
+            return
+        }
+        // INJECTION SAFETY SCREEN (audit E1/E2). `proposal` is model-generated
+        // from dispatch context that includes third-party-writable GitHub issue
+        // bodies; a high-confidence dispatch types it verbatim into the worker.
+        // Screen before the one keystroke chokepoint below. A block withholds the
+        // proposal (plain notify — NOT the propose-and-wait banner, which would
+        // surface the unsafe text as pasteable) and traces the reason. The
+        // Dispatcher separately gates issue-derived proposals (see
+        // Dispatcher.dispatch); this is the belt-and-suspenders at the type site
+        // that also covers the wrong_trajectory/local dispatch paths.
+        if case let .block(reason) = InjectionSafetyScreen.screen(proposal) {
+            trace.emit("router", "injection_screen_blocked op=continue reason=\(reason) session=\(decision.sessionId)")
+            await postNotify(decision)
             return
         }
 
