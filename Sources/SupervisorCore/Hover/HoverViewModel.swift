@@ -24,6 +24,12 @@ public final class HoverViewModel: ObservableObject {
         /// Carries severity (dot color), action (overlay icon), and
         /// the triage's plain-voice reasoning (hover headline).
         case flagged(severity: FlagSeverity, action: FlagAction, reasoningPlain: String? = nil)
+        /// v0.3.0 (P0-3): Supervisor is alive but model triage is NOT
+        /// running — provider unreachable, dead API key, or the daily
+        /// cost cap. Amber dot; `reason` is the hover headline ("Can't
+        /// reach Anthropic — check your API key"). A green "All clear"
+        /// in this state would be the product lying about watching.
+        case degraded(reason: String)
     }
 
     // MARK: - Published surface
@@ -306,6 +312,8 @@ public final class HoverViewModel: ObservableObject {
             return "Checking something..."
         case let .flagged(_, action, reasoningPlain):
             return Self.plainLabelForFlag(action: action, reasoningPlain: reasoningPlain)
+        case let .degraded(reason):
+            return reason
         }
     }
 
@@ -339,6 +347,46 @@ public final class HoverViewModel: ObservableObject {
 
     // MARK: - Triage state hooks
 
+    /// v0.3.0 (P0-3): the degraded reason while the engine can't complete
+    /// model calls (provider unreachable / dead key / daily cap). Non-nil
+    /// keeps the hover honest across transient label changes: a flag
+    /// auto-acknowledge settles back to `.degraded`, never to a false
+    /// "All clear". Set by `enterDegraded`, cleared by `clearDegraded`
+    /// (wired to the engine's recovery hook) and by the success-path
+    /// `triageFinishedNoFlag`.
+    private var degradedReason: String?
+
+    /// Called (via the app's onActivityChange wiring) when TriageEngine
+    /// enters or re-asserts the degraded state. The reason IS the label —
+    /// the hover must say "Can't reach Anthropic — check your API key",
+    /// not "Watching. All clear", while triage is dead.
+    public func enterDegraded(reason: String) {
+        degradedReason = reason
+        activity = .degraded(reason: reason)
+        plainLabel = reason
+        detailLabel = ""
+        // A pending flag auto-acknowledge would reset the label to "All
+        // clear" seconds after this honest state lands — cancel it. The
+        // degraded state clears only on a successful model call.
+        acknowledgeDebouncerTask?.cancel()
+        trace.emit("hover", "activity -> degraded reason=\(reason)")
+    }
+
+    /// Called on recovery (first successful model call after degraded).
+    /// Restores idle if the hover is still showing the degraded state;
+    /// silent by design — the green dot returning IS the announcement.
+    public func clearDegraded() {
+        guard degradedReason != nil else { return }
+        degradedReason = nil
+        if case .degraded = activity {
+            activity = .idle
+            plainLabel = projectName.isEmpty
+                ? "Watching. All clear"
+                : "Watching \(projectName). All clear"
+            trace.emit("hover", "degraded cleared; activity -> idle")
+        }
+    }
+
     /// Called by TriageEngine when it starts a Haiku call.
     public func triageStarted() {
         // Don't stomp an active action flash. On a busy session the triage
@@ -350,6 +398,14 @@ public final class HoverViewModel: ObservableObject {
             trace.emit("hover", "triage started — label held (action flash active)")
             return
         }
+        // While degraded, hold the amber state through retry attempts —
+        // flashing "Checking something..." per retry reads as recovered
+        // when it isn't. A successful retry restores idle via
+        // triageFinishedNoFlag / clearDegraded.
+        if case .degraded = activity {
+            trace.emit("hover", "triage started — label held (degraded)")
+            return
+        }
         activity = .triaging
         plainLabel = "Checking something..."
         trace.emit("hover", "activity -> triaging")
@@ -357,6 +413,9 @@ public final class HoverViewModel: ObservableObject {
 
     /// Called by TriageEngine when a Haiku batch finishes without flags.
     public func triageFinishedNoFlag() {
+        // A completed batch means the model call succeeded — the degraded
+        // state (if any) is over regardless of the flash guard below.
+        degradedReason = nil
         guard !actionFlash else {
             trace.emit("hover", "triage idle — label held (action flash active)")
             return
@@ -393,6 +452,16 @@ public final class HoverViewModel: ObservableObject {
     /// Resets the activity dot to idle. UI calls after a flag has been
     /// acknowledged by the user, or after a debounce timer expires.
     public func acknowledgeFlag() {
+        // While degraded, a flag ack (e.g. a deterministic-catch pause,
+        // which needs no model call) settles back to the amber degraded
+        // state — never to a green "All clear" the engine can't back up.
+        if let reason = degradedReason {
+            activity = .degraded(reason: reason)
+            plainLabel = reason
+            detailLabel = ""
+            trace.emit("hover", "flag acknowledged; activity -> degraded (still can't reach model)")
+            return
+        }
         activity = .idle
         plainLabel = projectName.isEmpty
             ? "Watching. All clear"

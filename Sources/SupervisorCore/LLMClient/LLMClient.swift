@@ -51,6 +51,32 @@ public final class LLMClient: Sendable {
     /// Anthropic-version header. Only sent when talking to Anthropic.
     private let anthropicVersion: String
 
+    /// v0.3.0 cost hook (P0-4). Called once per successful `createMessage`
+    /// with the requested model id and the usage block the provider
+    /// returned — createMessage is the single choke point every network
+    /// call flows through, so wiring this records ALL spend (triage,
+    /// QuestionAnswerer, Dispatcher, LLMConversationMatcher) with no
+    /// per-call-site plumbing. nil (the default) = no recording, i.e.
+    /// exactly the pre-v0.3.0 behavior.
+    ///
+    /// Wired in exactly ONE place in production: SupervisorApp's
+    /// enterRunningState hands the shared running-state client a recorder
+    /// backed by the same CostStore the panel reads. TriageEngine's old
+    /// per-call-site recordHaiku calls were removed at the same time —
+    /// recording lives here and ONLY here, or spend double-counts.
+    private let costRecorder: (@Sendable (_ model: String, _ usage: AnthropicUsage) -> Void)?
+
+    /// v0.3.0 daily-cap gate (P0-4). Consulted at the top of every
+    /// `createMessage`; when it returns a (cap, spent) pair with
+    /// spent >= cap, the call throws `DailyCapExceededError` WITHOUT
+    /// making a network request. Return nil for "no cap configured /
+    /// don't gate". nil closure (the default) = no gating at all.
+    ///
+    /// Wired next to `costRecorder` in SupervisorApp's enterRunningState:
+    /// reads UserConfig.dailyCostCapUSD (re-loaded per call, so cap edits
+    /// apply live) against CostStore.todayTotalUSD().
+    private let capCheck: (@Sendable () -> (cap: Double, spent: Double)?)?
+
     public init(
         provider: LLMProvider,
         apiKey: String,
@@ -58,7 +84,9 @@ public final class LLMClient: Sendable {
         baseURL: URL? = nil,
         session: URLSession = .shared,
         traceLog: TraceLog = .shared,
-        anthropicVersion: String = "2023-06-01"
+        anthropicVersion: String = "2023-06-01",
+        costRecorder: (@Sendable (_ model: String, _ usage: AnthropicUsage) -> Void)? = nil,
+        capCheck: (@Sendable () -> (cap: Double, spent: Double)?)? = nil
     ) {
         self.provider = provider
         self.apiKey = apiKey
@@ -67,6 +95,8 @@ public final class LLMClient: Sendable {
         self.session = session
         self.traceLog = traceLog
         self.anthropicVersion = anthropicVersion
+        self.costRecorder = costRecorder
+        self.capCheck = capCheck
     }
 
     // MARK: - Public surface
@@ -104,6 +134,17 @@ public final class LLMClient: Sendable {
     /// of the wire shape so call sites don't branch.
     @discardableResult
     public func createMessage(_ request: AnthropicMessageRequest) async throws -> AnthropicMessageResponse {
+        // v0.3.0 daily-cap gate: refuse BEFORE any network work. The
+        // check sits ahead of encoding/redaction on purpose — a capped
+        // call should cost nothing, not even CPU.
+        if let capCheck, let limit = capCheck(), limit.spent >= limit.cap {
+            traceLog.emit(
+                "api",
+                "daily cap reached: spent=\(limit.spent) cap=\(limit.cap) provider=\(provider.rawValue) — call refused"
+            )
+            throw DailyCapExceededError(capUSD: limit.cap, spentUSD: limit.spent)
+        }
+
         // First redaction pass, over the PLAINTEXT. JSONEncoder writes a
         // newline as the two characters `\n`, so on the encoded body the
         // `(?m)^` line anchors and the `\b` boundaries at line starts never
@@ -113,12 +154,21 @@ public final class LLMClient: Sendable {
         // it was written against. The encoded-body pass inside each POST
         // path stays as a second layer.
         let redactedRequest = plaintextRedacted(request)
+        let response: AnthropicMessageResponse
         switch provider.apiShape {
         case .anthropic:
-            return try await postAnthropic(redactedRequest)
+            response = try await postAnthropic(redactedRequest)
         case .openAICompat:
-            return try await postOpenAICompat(redactedRequest)
+            response = try await postOpenAICompat(redactedRequest)
         }
+
+        // v0.3.0 cost hook: record the spend of every successful call at
+        // the choke point. Passes the REQUESTED model id (the pricing
+        // table is keyed on the ids we configure, e.g. "deepseek-chat"),
+        // not the wire-echoed one. See the `costRecorder` doc comment for
+        // the double-counting handoff with TriageEngine.
+        costRecorder?(request.model, response.usage)
+        return response
     }
 
     // MARK: - Plaintext redaction (first pass, pre-encoding)

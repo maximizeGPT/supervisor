@@ -116,7 +116,10 @@ final class InterventionRouterTests: XCTestCase {
         cwd: String? = "/tmp/test-cwd",
         sessionId: String = "s1",
         suggestedInjectText: String? = nil,
-        category: String = "destructive_action_pending"
+        category: String = "destructive_action_pending",
+        justification: String? = nil,
+        nextTaskProposal: String? = nil,
+        confidence: String? = nil
     ) -> TriageDecision {
         TriageDecision(
             sessionId: sessionId,
@@ -128,7 +131,10 @@ final class InterventionRouterTests: XCTestCase {
                 action: action,
                 reasoningPlain: "fake plain",
                 reasoningTechnical: "fake technical",
-                suggestedInjectText: suggestedInjectText
+                asymmetryNote: justification,
+                suggestedInjectText: suggestedInjectText,
+                nextTaskProposal: nextTaskProposal,
+                confidence: confidence
             ),
             triggeringEvent: BashToolCallInfo(
                 sessionId: sessionId,
@@ -156,7 +162,10 @@ final class InterventionRouterTests: XCTestCase {
         // gate never fires for tests that aren't exercising it — otherwise the
         // live CGHumanActivityProbe would read the dev's real keyboard and make
         // every inject/continue test flaky. The human-active tests override this.
-        humanActivity: any HumanActivityProbe = StubHumanActivityProbe(idleSeconds: 999)
+        humanActivity: any HumanActivityProbe = StubHumanActivityProbe(idleSeconds: 999),
+        // Injected clock for the proposal-dedup window tests; everything else
+        // keeps the wall clock.
+        now: @escaping @MainActor () -> Date = { Date() }
     ) -> (router: InterventionRouter, notifier: MockNotifier, sender: CapturingSignalSender, injector: MockInjector) {
         let notifier = MockNotifier()
         let router = InterventionRouter(
@@ -166,6 +175,7 @@ final class InterventionRouterTests: XCTestCase {
             injector: injector,
             activeSessionCount: activeSessionCount,
             humanActivity: humanActivity,
+            now: now,
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("router-test-\(UUID().uuidString).log"))
         )
@@ -559,6 +569,127 @@ final class InterventionRouterTests: XCTestCase {
             XCTAssertEqual(head, "the answer", "queued indicator carries what's pending")
         } else {
             XCTFail("expected .queued, got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    // MARK: - Proposal dedup on medium/low continue banners (audit H5)
+
+    /// The H5 spam shape: a dispatcher that stabilizes at medium re-fires
+    /// the same proposal every idle tick — each fire posted a fresh
+    /// "Supervisor proposes …" banner indefinitely. Within the dedup
+    /// window the same (normalized) proposal must banner exactly once,
+    /// even if the repeat reflows whitespace or case.
+    func testSameMediumProposalTwiceWithinWindowPostsOneBanner() async {
+        let (router, notifier, _, _) = makeRouter()
+        await router.dispatch(decision: makeDecision(
+            action: .continue,
+            sessionId: "s-dedup",
+            category: "worker_idle_post_completion",
+            justification: "Plausible follow-on.",
+            nextTaskProposal: "Deploy the build to staging.",
+            confidence: "medium"
+        ))
+        // Second fire: identical proposal modulo whitespace + case.
+        await router.dispatch(decision: makeDecision(
+            action: .continue,
+            sessionId: "s-dedup",
+            category: "worker_idle_post_completion",
+            justification: "Plausible follow-on.",
+            nextTaskProposal: "  deploy THE build\n to staging.  ",
+            confidence: "medium"
+        ))
+        XCTAssertEqual(notifier.calls.count, 1,
+                       "the repeat medium proposal must be suppressed within the dedup window")
+        if case .continueProposedMedium = notifier.calls.first?.outcome {
+            // OK — the one banner is the first fire's.
+        } else {
+            XCTFail("expected .continueProposedMedium, got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    /// Distinct proposals are distinct suggestions — both must surface.
+    func testDifferentMediumProposalsBothBanner() async {
+        let (router, notifier, _, _) = makeRouter()
+        await router.dispatch(decision: makeDecision(
+            action: .continue,
+            sessionId: "s-dedup",
+            category: "worker_idle_post_completion",
+            nextTaskProposal: "Deploy the build to staging.",
+            confidence: "medium"
+        ))
+        await router.dispatch(decision: makeDecision(
+            action: .continue,
+            sessionId: "s-dedup",
+            category: "worker_idle_post_completion",
+            nextTaskProposal: "Write the CHANGELOG entry for v0.4.1.",
+            confidence: "medium"
+        ))
+        XCTAssertEqual(notifier.calls.count, 2,
+                       "a DIFFERENT proposal is a new suggestion and must banner")
+    }
+
+    /// Dedup is per-session: the same proposal for two different sessions
+    /// is two independent suggestions.
+    func testSameProposalOnDifferentSessionsBothBanner() async {
+        let (router, notifier, _, _) = makeRouter()
+        for session in ["s-a", "s-b"] {
+            await router.dispatch(decision: makeDecision(
+                action: .continue,
+                sessionId: session,
+                category: "worker_idle_post_completion",
+                nextTaskProposal: "Deploy the build to staging.",
+                confidence: "medium"
+            ))
+        }
+        XCTAssertEqual(notifier.calls.count, 2,
+                       "dedup must be scoped per session, not global")
+    }
+
+    /// After the window expires the same proposal banners again — a
+    /// reminder after 30 quiet minutes, not spam.
+    func testSameMediumProposalAfterWindowExpiryBannersAgain() async {
+        let clock = ClockBox(initial: Date(timeIntervalSince1970: 1_700_000_000))
+        let (router, notifier, _, _) = makeRouter(now: { clock.now })
+        let fire: @MainActor () async -> Void = {
+            await router.dispatch(decision: self.makeDecision(
+                action: .continue,
+                sessionId: "s-dedup",
+                category: "worker_idle_post_completion",
+                nextTaskProposal: "Deploy the build to staging.",
+                confidence: "medium"
+            ))
+        }
+        await fire()
+        // Inside the 30-minute window: suppressed.
+        clock.advance(by: 60)
+        await fire()
+        XCTAssertEqual(notifier.calls.count, 1)
+        // Past the window (measured from the first POSTING): banners again.
+        clock.advance(by: 1801)
+        await fire()
+        XCTAssertEqual(notifier.calls.count, 2,
+                       "the same proposal must re-banner once the dedup window has expired")
+    }
+
+    /// The low-confidence banner's body is the justification — a repeating
+    /// one is the same spam shape and dedupes the same way.
+    func testRepeatedLowConfidenceReasoningDeduped() async {
+        let (router, notifier, _, _) = makeRouter()
+        for _ in 0..<2 {
+            await router.dispatch(decision: makeDecision(
+                action: .continue,
+                sessionId: "s-dedup",
+                category: "worker_idle_post_completion",
+                justification: "Queue is empty; no grounded next step.",
+                confidence: "low"
+            ))
+        }
+        XCTAssertEqual(notifier.calls.count, 1,
+                       "a repeated low-confidence reason must banner once within the window")
+        if case .continueLowConfidence = notifier.calls.first?.outcome {
+            // OK
+        } else {
+            XCTFail("expected .continueLowConfidence, got \(String(describing: notifier.calls.first?.outcome))")
         }
     }
 

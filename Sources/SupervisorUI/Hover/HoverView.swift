@@ -80,9 +80,17 @@ public struct HoverView: View {
     }
 
     private var dotColor: Color {
-        switch vm.activity {
+        Self.dotColor(for: vm.activity)
+    }
+
+    /// Dot color per activity. Static so the mapping is testable without
+    /// rendering the view — `.degraded` → amber is trust-critical (a green
+    /// dot with a dead API key is worse than no product).
+    static func dotColor(for activity: HoverViewModel.Activity) -> Color {
+        switch activity {
         case .idle:                          return .green
         case .triaging:                      return .blue
+        case .degraded:                      return .orange  // amber: alive, but not model-watching
         case .flagged(let severity, _, _):
             switch severity {
             case .low:     return .yellow

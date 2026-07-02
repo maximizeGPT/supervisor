@@ -13,10 +13,13 @@
 //
 //   1. The loop-start timestamp (when did this run begin?). Used for
 //      the 4-hour wall-clock hard-stop.
-//   2. The consecutive-low counter. Resets to zero on every
-//      ready-high / ready-medium / ready-low (ready is signal even
-//      at low). Increments on lowConfidence/error returns.
-//      Trips the hard-stop at 3.
+//   2. The consecutive-low counter. Resets to zero on ready-high /
+//      ready-medium. Increments on ready-low / lowConfidence / error
+//      returns. Trips the hard-stop at 3. Its sibling (audit H5): the
+//      identical-medium chain — consecutive ready-mediums repeating
+//      the SAME normalized proposal trip a repeated_medium_proposal
+//      stop at the same threshold, so a dispatcher stuck at medium
+//      goes quiet the way consecutive lows do.
 //   3. The paused flag. Set when a user prompt arrives (the human
 //      took the wheel; loop holds until they explicitly resume) OR
 //      when the rubric fires user_question_pending (the worker is
@@ -64,6 +67,13 @@ public enum LoopStopReason: String, Sendable, Equatable {
     case killFired = "kill_fired"
     case fourHoursElapsed = "four_hours_elapsed"
     case threeConsecutiveLow = "three_consecutive_low_confidence"
+    /// Audit H5 (2026-07-02): the dispatcher stabilized at medium,
+    /// re-proposing the SAME task (by normalized fingerprint) over and
+    /// over. Like three lows, that's "no new grounded step" — without
+    /// this stop the loop re-fires the identical proposal every idle
+    /// tick indefinitely. Cleared by new user direction (notePause) or
+    /// the long-idle session reset, same as three_consecutive_low.
+    case repeatedMediumProposal = "repeated_medium_proposal"
     case explicitStop = "explicit_stop"
     /// The session objective is built — the loop finished on success, not on a
     /// hard stop. The cleaner termination the drive-to-objective slice adds: the
@@ -79,6 +89,8 @@ public enum LoopStopReason: String, Sendable, Equatable {
             return "it's been running for 4 hours straight. It resets on its own after a couple of hours idle (or relaunch Supervisor to reset now)."
         case .threeConsecutiveLow:
             return "three dispatches in a row found no clear next step, so it's waiting for new direction."
+        case .repeatedMediumProposal:
+            return "it kept proposing the same next step with no new signal, so it's waiting for new direction."
         case .explicitStop:
             return "it was stopped manually."
         case .objectiveComplete:
@@ -150,6 +162,14 @@ public actor LoopController {
         /// the first genuine operator turn. Defaulted so the existing
         /// SessionState(...) construction sites need no change.
         var lastOwnerMessageAt: Date? = nil
+        /// Audit H5 (2026-07-02): fingerprint of the most recent ready-medium
+        /// proposal, and how many consecutive ready-mediums repeated it. An
+        /// IDENTICAL medium (same normalized proposal) grows the chain and
+        /// trips the repeated_medium_proposal stop at the same threshold as
+        /// consecutive lows; a DISTINCT medium or a ready-high restarts it.
+        /// Defaulted so the existing SessionState(...) sites need no change.
+        var lastMediumProposalFingerprint: UInt64? = nil
+        var consecutiveIdenticalMediumCount: Int = 0
     }
 
     private var sessions: [String: SessionState] = [:]
@@ -196,6 +216,31 @@ public actor LoopController {
         } else {
             self.seedCount = nil
         }
+    }
+
+    // MARK: - Proposal fingerprinting (audit H5)
+
+    /// Stable fingerprint of a proposal's text, used to detect the
+    /// dispatcher re-proposing the SAME task (the repeated-medium stop
+    /// here) and the router re-surfacing the same banner (proposal dedup
+    /// in InterventionRouter). Normalization mirrors
+    /// InjectionLedger.normalize — trim + collapse whitespace — plus
+    /// lowercasing, so cosmetic reflows of an identical proposal still
+    /// correlate. FNV-1a over the normalized UTF-8: deterministic across
+    /// runs, and at the handful-of-entries scale this sees a 64-bit
+    /// collision is not a practical concern.
+    static func proposalFingerprint(_ text: String) -> UInt64 {
+        let normalized = text
+            .lowercased()
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325   // FNV-1a offset basis
+        for byte in normalized.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3   // FNV-1a prime
+        }
+        return hash
     }
 
     // MARK: - Engine-facing API
@@ -245,6 +290,8 @@ public actor LoopController {
             state.stopReason = nil
             state.totalDispatches = 0
             state.consecutiveLowCount = 0
+            state.consecutiveIdenticalMediumCount = 0
+            state.lastMediumProposalFingerprint = nil
         }
         state.lastSeenAt = nowTs
 
@@ -326,9 +373,33 @@ public actor LoopController {
         state.totalDispatches += 1
 
         switch result {
-        case let .ready(_, _, conf, _, _, _, _) where conf != .low:
-            // Forward progress — reset the consecutive-low counter.
+        case .ready(let prompt, _, .medium, _, _, _, _):
+            // A medium found a real proposal, so it still resets the LOW
+            // counter — but a dispatcher STUCK at medium re-proposing the
+            // SAME task must not stay noisy forever (audit H5): identical
+            // proposals (by normalized fingerprint) count toward their own
+            // hard stop, so a stuck loop goes quiet the way three lows do.
+            // A DISTINCT medium is genuine new signal and restarts the chain.
             state.consecutiveLowCount = 0
+            let fingerprint = Self.proposalFingerprint(prompt)
+            if state.lastMediumProposalFingerprint == fingerprint {
+                state.consecutiveIdenticalMediumCount += 1
+            } else {
+                state.lastMediumProposalFingerprint = fingerprint
+                state.consecutiveIdenticalMediumCount = 1
+            }
+            trace.emit("loop", "recorded ready session=\(sessionId) confidence=medium identical_medium=\(state.consecutiveIdenticalMediumCount)/\(consecutiveLowThreshold) total=\(state.totalDispatches)")
+            if state.consecutiveIdenticalMediumCount >= consecutiveLowThreshold {
+                state.stopped = true
+                state.stopReason = .repeatedMediumProposal
+                trace.emit("loop", "STOPPED session=\(sessionId) reason=repeated_medium_proposal (counter hit \(state.consecutiveIdenticalMediumCount))")
+            }
+        case let .ready(_, _, conf, _, _, _, _) where conf != .low:
+            // High: forward progress — reset the consecutive-low counter AND
+            // the identical-medium chain (a high dispatch is real new work).
+            state.consecutiveLowCount = 0
+            state.consecutiveIdenticalMediumCount = 0
+            state.lastMediumProposalFingerprint = nil
             trace.emit("loop", "recorded ready session=\(sessionId) confidence=\(conf.rawValue) total=\(state.totalDispatches)")
         case .ready(_, _, .low, _, _, _, _),
              .lowConfidence,
@@ -380,14 +451,21 @@ public actor LoopController {
         // 4-hour stops are terminal and stay.
         if state.stopped {
             // New owner DIRECTION (a real user message / pending question) clears a
-            // "ran out of grounded work" stop so the loop re-engages. A SAFETY pause
-            // must NOT — it's holding a risky session, not giving new direction — so
-            // it leaves a stopped session stopped (already held) and returns.
-            guard reason != .safetyPause, state.stopReason == .threeConsecutiveLow else { return }
+            // "ran out of grounded work" stop — three_consecutive_low OR the
+            // repeated-medium stop (audit H5) — so the loop re-engages. A SAFETY
+            // pause must NOT — it's holding a risky session, not giving new
+            // direction — so it leaves a stopped session stopped (already held)
+            // and returns.
+            guard reason != .safetyPause,
+                  state.stopReason == .threeConsecutiveLow || state.stopReason == .repeatedMediumProposal
+            else { return }
+            let cleared = state.stopReason?.rawValue ?? "?"
             state.stopped = false
             state.stopReason = nil
             state.consecutiveLowCount = 0
-            trace.emit("loop", "cleared three_consecutive_low stop on new user direction session=\(sessionId)")
+            state.consecutiveIdenticalMediumCount = 0
+            state.lastMediumProposalFingerprint = nil
+            trace.emit("loop", "cleared \(cleared) stop on new user direction session=\(sessionId)")
         }
         // A REAL operator message marks the operator as present: stamp it so the
         // presence backoff (canDispatch) holds the loop off until they go quiet.

@@ -229,6 +229,23 @@ final class StorageTests: XCTestCase {
         XCTAssertEqual(today.estimatedCostUsd, 0.0021, accuracy: 0.0001)
     }
 
+    // v0.3.0: the daily-cap gate reads this before every model call.
+    func testCostTodayTotalUSDSumsTodayOnly() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let store = CostStore(database: db)
+        XCTAssertEqual(try store.todayTotalUSD(), 0.0, accuracy: 0.000001,
+                       "no rows yet must read as $0.00, not throw")
+
+        try store.recordHaiku(inputTokens: 10, outputTokens: 5, costUSD: 0.50)
+        try store.recordSonnet(inputTokens: 10, outputTokens: 5, costUSD: 1.25)
+        XCTAssertEqual(try store.todayTotalUSD(), 1.75, accuracy: 0.0001)
+
+        // Yesterday's spend must not count against today's cap.
+        try store.recordHaiku(inputTokens: 1, outputTokens: 1, costUSD: 9.0,
+                              on: Date().addingTimeInterval(-86_400))
+        XCTAssertEqual(try store.todayTotalUSD(), 1.75, accuracy: 0.0001)
+    }
+
     func testCostRollingSevenDayCovers7Days() throws {
         let db = try SupervisorDatabase.inMemory()
         let store = CostStore(database: db)

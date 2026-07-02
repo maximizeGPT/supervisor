@@ -19,6 +19,11 @@ try paths.ensureDirectoriesExist()
 
 let trace = TraceLog(path: paths.traceLogPath)
 let heartbeat = HeartbeatFile(path: paths.heartbeatPath)
+// v0.3.0 (P0-3): the main app writes this marker while model triage is
+// degraded (provider unreachable / dead key / daily cap) and clears it on
+// the first success. A fresh heartbeat + this marker = amber, because a
+// green check over a dead API key would be the icon lying.
+let networkDown = NetworkDownMarker.alongside(heartbeatPath: paths.heartbeatPath)
 
 trace.emit("statusbar", "boot pid=\(ProcessInfo.processInfo.processIdentifier) heartbeat=\(paths.heartbeatPath.path)")
 
@@ -70,7 +75,27 @@ final class StatusBarController: NSObject {
 
     private let statusItem: NSStatusItem
     private var current: HeartbeatHealth = .red(reason: "starting")
+    /// v0.3.0 (P0-3): non-nil while the network-down marker exists —
+    /// the human-readable reason model triage is degraded.
+    private var degradedReason: String?
     private var timer: DispatchSourceTimer?
+
+    /// What to actually render. The heartbeat answers "is the process
+    /// alive"; the marker answers "is it able to watch". A live process
+    /// that can't reach its model shows amber, not green. A stale/missing
+    /// heartbeat (amber/red) already wins — the process being dead is the
+    /// bigger truth.
+    private var displayHealth: HeartbeatHealth {
+        if case .green = current, degradedReason != nil { return .amber }
+        return current
+    }
+
+    private var displayTitle: String {
+        if case .green = current, let reason = degradedReason {
+            return "Supervisor: \(reason)"
+        }
+        return current.menuTitle
+    }
 
     init(statusItem: NSStatusItem) {
         self.statusItem = statusItem
@@ -82,7 +107,8 @@ final class StatusBarController: NSObject {
 
     private func configureButton() {
         guard let button = statusItem.button else { return }
-        button.title = current.fallbackLabel
+        let health = displayHealth
+        button.title = health.fallbackLabel
 
         // Prefer the branded V1 symbol when one is wired up for this state.
         // Asset Catalog SVG is honored by NSImage(named:) on macOS 12+;
@@ -90,22 +116,22 @@ final class StatusBarController: NSObject {
         // applied automatically (light vs dark mode). If the asset lookup
         // fails for any reason (resource stripped, bundle not yet loaded),
         // fall through to the SF Symbol so we never go iconless.
-        if let assetName = current.brandedImageName,
+        if let assetName = health.brandedImageName,
            let branded = Bundle.module.image(forResource: assetName) {
             branded.isTemplate = true
             button.image = branded
         } else {
             button.image = NSImage(
-                systemSymbolName: current.symbolName,
+                systemSymbolName: health.symbolName,
                 accessibilityDescription: "Supervisor"
             )
         }
-        button.toolTip = current.menuTitle
+        button.toolTip = displayTitle
     }
 
     private func rebuildMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: current.menuTitle, action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: displayTitle, action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if case .red = current {
             let openNotif = NSMenuItem(
@@ -191,9 +217,11 @@ final class StatusBarController: NSObject {
     private func tick() {
         let age = (try? heartbeat.ageSeconds()) ?? .infinity
         let new = HeartbeatHealth.evaluate(age: age)
-        if new != current {
+        let newReason = networkDown.read()
+        if new != current || newReason != degradedReason {
             current = new
-            trace.emit("statusbar", "health -> \(new.menuTitle)")
+            degradedReason = newReason
+            trace.emit("statusbar", "health -> \(displayTitle)")
             DispatchQueue.main.async { [weak self] in
                 self?.configureButton()
                 self?.rebuildMenu()

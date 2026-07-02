@@ -33,6 +33,13 @@ public protocol Notifying: Sendable {
         decision: TriageDecision,
         outcome: InterventionOutcome
     ) async -> Notifier.Outcome
+
+    /// v0.3.0 (P0-3): post a system-status banner that is not tied to any
+    /// TriageDecision — "can't reach the provider", "paused at your daily
+    /// cap". Used by TriageEngine when it enters the degraded state (once
+    /// per entry; the engine latches). Has a no-op default implementation
+    /// so existing mocks keep compiling.
+    func postStatus(title: String, body: String) async -> Notifier.Outcome
 }
 
 public extension Notifying {
@@ -41,6 +48,10 @@ public extension Notifying {
         outcome: InterventionOutcome
     ) async -> Notifier.Outcome {
         await post(decision: decision)
+    }
+
+    func postStatus(title: String, body: String) async -> Notifier.Outcome {
+        .posted
     }
 }
 
@@ -272,6 +283,39 @@ public final class Notifier: Notifying, @unchecked Sendable {
             }
         } catch {
             trace.emit("notifier", "ERROR center.add threw outcome=\(outcome): \(error)")
+            return .failed(reason: "\(error)")
+        }
+    }
+
+    /// v0.3.0 (P0-3): system-status banner — degraded watching / daily cap.
+    /// Not tied to a TriageDecision, so it composes from the given strings
+    /// directly. Rate-limiting lives with the caller (TriageEngine latches
+    /// on the degraded transition); this just posts.
+    @discardableResult
+    public func postStatus(title: String, body: String) async -> Outcome {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "supervisor.status.\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        let settings = await currentSettings()
+        do {
+            try await center.add(request)
+            switch settings.authorizationStatus {
+            case .denied:
+                trace.emit("notifier", "status added to Notification Center (banner suppressed): \(title)")
+                return .skippedDeniedSilently
+            default:
+                trace.emit("notifier", "posted status: \(title)")
+                return .posted
+            }
+        } catch {
+            trace.emit("notifier", "ERROR center.add threw for status \"\(title)\": \(error)")
             return .failed(reason: "\(error)")
         }
     }

@@ -136,6 +136,34 @@ final class ExpandedPanelTests: XCTestCase {
         XCTAssertEqual(ExpandedPanelView.formatCost(42.50), "$42.50")
     }
 
+    // MARK: - Footer cost line (v0.3.0, audit F1)
+
+    /// The exact string the footer renders next to the flag count.
+    func testFooterCostText() {
+        XCTAssertEqual(ExpandedPanelView.footerCostText(0.43), "$0.43 today")
+        XCTAssertEqual(ExpandedPanelView.footerCostText(0), "$0.00 today")
+        XCTAssertEqual(ExpandedPanelView.footerCostText(0.005), "$0.00 today")
+        XCTAssertEqual(ExpandedPanelView.footerCostText(12.345), "$12.35 today")
+    }
+
+    /// End-to-end for the footer's data path: spend recorded in the
+    /// CostStore comes back through vm.todayCostUSD() and formats into
+    /// the footer string. (todayCostUSD existed since v0.1.7 but was
+    /// never rendered — the footer now reads it.)
+    func testFooterCostReflectsRecordedSpend() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let costStore = CostStore(database: db)
+        try costStore.recordHaiku(inputTokens: 100_000, outputTokens: 10_000, costUSD: 0.43)
+
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("panel-test-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(bus: bus, trace: trace, costStore: costStore)
+
+        XCTAssertEqual(vm.todayCostUSD(), 0.43, accuracy: 0.0001)
+        XCTAssertEqual(ExpandedPanelView.footerCostText(vm.todayCostUSD()), "$0.43 today")
+    }
+
     // MARK: - Relative time
 
     func testRelativeTimeJustNow() {

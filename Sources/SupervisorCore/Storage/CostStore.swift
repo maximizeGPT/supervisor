@@ -42,6 +42,12 @@ public struct CostStore: Sendable {
         }
     }
 
+    /// Today's total estimated spend in USD. Cheap single-row read used
+    /// by the daily-cap gate before every model call (v0.3.0).
+    public func todayTotalUSD(on date: Date = Date()) throws -> Double {
+        try today(on: date).estimatedCostUsd
+    }
+
     /// 7-day rolling sum of estimated_cost_usd. Used by the Settings view.
     public func rollingSevenDayCostUSD(asOf date: Date = Date()) throws -> Double {
         let cal = Calendar(identifier: .iso8601)

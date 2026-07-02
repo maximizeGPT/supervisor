@@ -58,6 +58,20 @@ public final class InterventionRouter {
     /// self-authorization gap). Optional: nil disables recording (older wiring
     /// and tests that don't exercise the gap) with no behavior change.
     private let injectionLedger: InjectionLedger?
+    /// Proposal dedup (audit H5, 2026-07-02): a dispatcher that stabilizes at
+    /// medium re-fires every idle tick, and without dedup each fire posts a
+    /// fresh "Supervisor proposes …" banner — a suggestion every ~60s
+    /// indefinitely. The router remembers which proposal texts (by normalized
+    /// fingerprint) it surfaced per session and suppresses repeats inside this
+    /// window; after it expires the same proposal may banner again (a
+    /// reminder after 30 quiet minutes, not spam).
+    private let proposalDedupWindowSeconds: TimeInterval
+    /// Per-session record of recently surfaced medium/low continue banners:
+    /// proposal fingerprint → when it was first posted. Pruned on every check.
+    private var recentProposalBanners: [String: [UInt64: Date]] = [:]
+    /// Injected clock for the dedup window; production uses Date(). Same
+    /// pattern as TriageEngine's clock so tests drive time deterministically.
+    private let now: @MainActor () -> Date
     private let trace: TraceLog
 
     public init(
@@ -70,6 +84,8 @@ public final class InterventionRouter {
         humanActivity: any HumanActivityProbe = CGHumanActivityProbe(),
         humanActiveThresholdSeconds: TimeInterval = 2.0,
         injectionLedger: InjectionLedger? = nil,
+        proposalDedupWindowSeconds: TimeInterval = 30 * 60,
+        now: @escaping @MainActor () -> Date = { Date() },
         trace: TraceLog = .shared
     ) {
         self.notifier = notifier
@@ -81,6 +97,8 @@ public final class InterventionRouter {
         self.humanActivity = humanActivity
         self.humanActiveThresholdSeconds = humanActiveThresholdSeconds
         self.injectionLedger = injectionLedger
+        self.proposalDedupWindowSeconds = proposalDedupWindowSeconds
+        self.now = now
         self.trace = trace
     }
 
@@ -363,6 +381,32 @@ public final class InterventionRouter {
         return false
     }
 
+    /// Proposal dedup (audit H5): true when this session already surfaced the
+    /// same (normalized) proposal text within the dedup window — the caller
+    /// suppresses the banner instead of re-posting it on every idle re-fire.
+    /// The fingerprint is LoopController.proposalFingerprint (trimmed,
+    /// lowercased, whitespace-collapsed — mirrors InjectionLedger.normalize),
+    /// so cosmetic reflows still dedupe. The timestamp is recorded at FIRST
+    /// posting and not refreshed on suppression, so the window measures
+    /// "since the user last SAW this" and an expired entry re-arms.
+    private func shouldSuppressDuplicateProposal(_ text: String, sessionId: String, op: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        let nowTs = now()
+        let fingerprint = LoopController.proposalFingerprint(text)
+        // Prune expired entries so the per-session map stays bounded.
+        var bySession = (recentProposalBanners[sessionId] ?? [:]).filter {
+            nowTs.timeIntervalSince($0.value) < proposalDedupWindowSeconds
+        }
+        if let lastPosted = bySession[fingerprint] {
+            recentProposalBanners[sessionId] = bySession
+            trace.emit("router", "proposal_deduped op=\(op) session=\(sessionId) age=\(Int(nowTs.timeIntervalSince(lastPosted)))s window=\(Int(proposalDedupWindowSeconds))s")
+            return true
+        }
+        bySession[fingerprint] = nowTs
+        recentProposalBanners[sessionId] = bySession
+        return false
+    }
+
     /// v0.4.0 Part B: dispatch a worker_idle_post_completion flag. The
     /// engine has already populated `nextTaskProposal` (the prompt to
     /// inject) and `confidence` (which decides whether to inject vs.
@@ -386,6 +430,13 @@ public final class InterventionRouter {
             // theoretically happen, medium means we DON'T inject — we
             // surface and let the user decide. Same path the spec calls
             // out as "propose and wait" from Part A.
+            //
+            // Dedup (audit H5): a dispatcher stuck at medium re-fires the
+            // same proposal every idle tick — the first banner already told
+            // the user; repeats within the window are suppressed.
+            if shouldSuppressDuplicateProposal(proposal, sessionId: decision.sessionId, op: "continue.medium") {
+                return
+            }
             trace.emit("router", "intervention.continue.proposed_medium_confidence session=\(decision.sessionId) proposal_bytes=\(proposal.utf8.count)")
             _ = await notifier.postInterventionResult(
                 decision: decision,
@@ -398,6 +449,12 @@ public final class InterventionRouter {
             // .low (and anything else — defensive fallback). Surface the
             // dispatcher's reasoning so the user understands why
             // supervisor went quiet rather than just hanging.
+            //
+            // Dedup (audit H5): the low banner's body IS the justification;
+            // a repeating one is the same spam shape as a repeated medium.
+            if shouldSuppressDuplicateProposal(justification, sessionId: decision.sessionId, op: "continue.low") {
+                return
+            }
             trace.emit("router", "intervention.continue.degraded_low_confidence session=\(decision.sessionId) reason=\"\(justification.prefix(120))\"")
             _ = await notifier.postInterventionResult(
                 decision: decision,

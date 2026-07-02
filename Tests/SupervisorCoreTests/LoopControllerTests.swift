@@ -74,6 +74,18 @@ final class LoopControllerTests: XCTestCase {
         )
     }
 
+    private func readyMedium(_ prompt: String) -> DispatchResult {
+        .ready(
+            prompt: prompt,
+            justification: "Plausible next step, but the queue is ambiguous.",
+            confidence: .medium,
+            selectedPath: .continueBranch,
+            selectedIssueNumber: nil,
+            priorDispatchesEchoed: nil,
+            requiresHumanPresence: false
+        )
+    }
+
     // MARK: - Tests
 
     // Fix D (2026-06-15): owner-presence backoff. After a REAL operator message
@@ -651,5 +663,137 @@ final class LoopControllerTests: XCTestCase {
         guard case .proceed = afterClear else {
             return XCTFail("expected proceed after idle-detection clear, got \(afterClear)")
         }
+    }
+
+    // MARK: - Repeated-medium stop (audit H5, 2026-07-02)
+
+    /// A dispatcher stuck at medium re-proposing the SAME task must go quiet
+    /// the way three consecutive lows do — the H5 spam shape: `ready` at
+    /// medium used to reset the low counter, so an identical medium every
+    /// idle tick re-fired forever. Three identical mediums (fingerprint
+    /// match survives whitespace/case reflows) now trip a hard stop.
+    func testRepeatedIdenticalMediumProposalsTripStop() async {
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock)
+
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build to staging."))
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build to staging."))
+        let mid = await lc.canDispatch(sessionId: "s-1")
+        if case .stopped = mid { XCTFail("must NOT stop at 2 identical mediums") }
+
+        // Third repeat differs only in whitespace + case — the normalized
+        // fingerprint must still correlate it.
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("  deploy THE build\n to staging.  "))
+        let final = await lc.canDispatch(sessionId: "s-1")
+        guard case let .stopped(reason) = final else {
+            return XCTFail("expected .stopped after 3 identical mediums, got \(final)")
+        }
+        XCTAssertTrue(reason.contains("same next step"),
+                      "stop reason must explain the repeated-proposal trigger in plain language: \(reason)")
+        let snap = await lc.snapshot(sessionId: "s-1")
+        XCTAssertEqual(snap?.stopReason, .repeatedMediumProposal)
+    }
+
+    /// The over-correction guard: DISTINCT mediums are genuine signal —
+    /// a dispatcher proposing different plausible tasks must never trip
+    /// the repeated-medium stop, no matter how many in a row.
+    func testDistinctMediumProposalsDoNotTripStop() async {
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock)
+
+        for (i, task) in ["Fix the flaky redactor test.",
+                          "Write the CHANGELOG entry for v0.4.1.",
+                          "Add fixtures for the heredoc catch.",
+                          "Close Issue #12 with a regression test."].enumerated() {
+            await lc.recordDispatch(sessionId: "s-1", result: readyMedium(task))
+            let decision = await lc.canDispatch(sessionId: "s-1")
+            if case .stopped = decision {
+                XCTFail("distinct medium #\(i) must not stop the loop")
+            }
+        }
+        let snap = await lc.snapshot(sessionId: "s-1")
+        XCTAssertFalse(snap?.stopped ?? true)
+        XCTAssertEqual(snap?.consecutiveLowCount, 0,
+                       "mediums still reset the consecutive-low counter (ready is signal)")
+    }
+
+    /// A ready-high between identical mediums restarts the chain — real
+    /// dispatched work means the loop is NOT stuck, even if the same medium
+    /// proposal shows up again later.
+    func testHighConfidenceBreaksIdenticalMediumChain() async {
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock)
+
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build."))
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build."))
+        await lc.recordDispatch(sessionId: "s-1", result: readyHigh())
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build."))
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build."))
+
+        let decision = await lc.canDispatch(sessionId: "s-1")
+        if case .stopped = decision {
+            XCTFail("a high between the mediums must restart the identical-medium chain")
+        }
+
+        // …but a third identical medium after the restart still trips it.
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build."))
+        let final = await lc.canDispatch(sessionId: "s-1")
+        guard case .stopped = final else {
+            return XCTFail("expected .stopped once the restarted chain hits 3, got \(final)")
+        }
+    }
+
+    /// Lows interleaved with the SAME medium must not launder the repeat:
+    /// medium(A), low, medium(A), low, medium(A) is still a loop stuck on A
+    /// (the alternation would otherwise reset both counters forever and
+    /// banner-spam every other fire).
+    func testLowsBetweenIdenticalMediumsDoNotResetTheMediumChain() async {
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock)
+
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build."))
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "queue empty"))
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build."))
+        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "queue empty"))
+        await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build."))
+
+        let snap = await lc.snapshot(sessionId: "s-1")
+        XCTAssertEqual(snap?.stopReason, .repeatedMediumProposal,
+                       "alternating low/identical-medium must still trip the repeated-medium stop")
+    }
+
+    /// Mirror of testUserMessageClearsThreeConsecutiveLowStopAndReEngages:
+    /// a repeated-medium stop is a "ran out of grounded work" stop, so new
+    /// user direction clears it and the loop re-engages.
+    func testUserMessageClearsRepeatedMediumStop() async {
+        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
+        let lc = makeController(clock: clock)
+        for _ in 0..<3 {
+            await lc.recordDispatch(sessionId: "s-1", result: readyMedium("Deploy the build."))
+        }
+        guard case .stopped = await lc.canDispatch(sessionId: "s-1") else {
+            return XCTFail("precondition: stopped after 3 identical mediums")
+        }
+
+        await lc.notePause(sessionId: "s-1", reason: .userMessage)
+        let snap = await lc.snapshot(sessionId: "s-1")
+        XCTAssertNil(snap?.stopReason, "user message must clear the repeated-medium stop")
+        await lc.clearPause(sessionId: "s-1")
+        if case .stopped = await lc.canDispatch(sessionId: "s-1") {
+            XCTFail("loop must re-engage after new direction + resume")
+        }
+    }
+
+    /// The fingerprint is the dedup identity shared with the router's
+    /// banner dedup: whitespace reflows and case changes correlate;
+    /// different text does not.
+    func testProposalFingerprintNormalizesWhitespaceAndCase() {
+        XCTAssertEqual(LoopController.proposalFingerprint("Fix  the\n\tflaky test. "),
+                       LoopController.proposalFingerprint("fix the FLAKY test."))
+        XCTAssertNotEqual(LoopController.proposalFingerprint("fix the flaky test."),
+                          LoopController.proposalFingerprint("fix the flaky tests."))
+        XCTAssertEqual(LoopController.proposalFingerprint("   "),
+                       LoopController.proposalFingerprint(""),
+                       "whitespace-only text normalizes to the empty fingerprint")
     }
 }

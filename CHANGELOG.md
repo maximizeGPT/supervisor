@@ -6,6 +6,63 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+v0.3.0 Wave 2 — money and honesty (2026-07-02): the README's two money
+promises become true, and the harness stops lying about whether it's
+watching.
+
+### Added
+
+**The daily spend cap exists, and every model call is counted — for every
+provider** (`LLMClient.swift`, `TokenAccounting.swift`, `CostStore.swift`,
+`UserConfig.swift`, `Errors.swift`, `SupervisorApp/main.swift`)
+- README/INSTALL promised "the in-app cost view shows your real spend, and
+  you can set a hard daily cap." Reality: no cap existed anywhere; cost was
+  recorded for only 3 of the ~6 call paths (Dispatcher — the heaviest —
+  recorded nothing); non-Anthropic providers priced everything at $0.00; and
+  no cost was displayed anywhere in the app.
+- Cost recording now lives at the single network choke point
+  (`LLMClient.createMessage`) — triage, QuestionAnswerer, Dispatcher, and
+  the conversation matcher all record exactly once; the engine's
+  per-call-site recording was removed. DeepSeek / Kimi / MiniMax / Qwen get
+  real (approximate list) prices.
+- `cost.daily_cap_usd` in config.yaml is a hard gate checked before every
+  model call — at the cap the call throws without touching the network,
+  the hover goes amber ("Paused at your $X daily cap"), ONE banner explains
+  that model triage stopped and the deterministic catch-list keeps running,
+  and cap edits apply live without a restart. README/INSTALL document it.
+- The expanded panel footer now shows today's real spend ("$0.43 today").
+
+**A dead API key can no longer look like "All clear" — degraded state on
+every surface** (`TriageEngine.swift`, `HoverViewModel.swift`,
+`HoverView.swift`, `Heartbeat.swift`, `SupervisorStatusBar/main.swift`,
+`Notifier.swift`)
+- Every triage failure used to be a trace line + a green dot. Three
+  consecutive client failures now flip the hover to an amber
+  `.degraded` state with a human reason ("Can't reach Anthropic — check
+  your API key" on 401-shapes), post exactly one banner (latched, not
+  per-failure), write a `network-down.marker` the menu-bar companion
+  renders as an amber icon with the reason as tooltip, and clear silently
+  on the next success. Honesty guards keep retry flickers and
+  deterministic-catch flags from repainting a false "All clear" while
+  degraded.
+
+### Fixed
+
+**Idle sessions no longer bill you every minute forever**
+(`TriageEngine.swift`, `LoopController.swift`, `InterventionRouter.swift`)
+- The idle loop re-triaged every idle session every 60s regardless of how
+  many consecutive all-clears it produced — five open-but-idle terminals
+  overnight burned 5 model calls a minute all night. Consecutive all-clears
+  now stretch the per-session interval 60s → 5min → 30min (cap); any real
+  event snaps it back to 60s.
+- A dispatcher stuck at medium confidence re-bannered "Supervisor has a
+  suggestion" every ~60s indefinitely, and medium outcomes RESET the
+  3-consecutive-low stop counter — the loop could never go quiet. Repeat
+  proposals now dedupe per session for 30 min (normalized-text fingerprint),
+  and three identical mediums trip a new `repeatedMediumProposal` stop that
+  new user direction clears — same unstick semantics as the low-counter
+  stop.
+
 v0.3.0 Wave 1 — pipeline truth (2026-07-02, from the four-dimension audit in
 `docs/V0.3.0-PLAN.md`): five trust-critical fixes to what the pipeline
 observes, whom it signals, and what it sends over the wire.

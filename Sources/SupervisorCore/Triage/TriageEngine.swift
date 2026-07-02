@@ -69,6 +69,12 @@ public final class TriageEngine {
     private let bus: EventBus
     private let trace: TraceLog
     private let model: String
+    /// v0.3.0 (P0-4): UNUSED — cost recording moved to the LLMClient
+    /// `costRecorder` hook (the single choke point every call site shares:
+    /// triage, QuestionAnswerer, Dispatcher, LLMConversationMatcher), wired
+    /// in SupervisorApp/main.swift. Recording here again would double-count
+    /// triage spend. The parameter is kept so existing constructors and
+    /// tests compile; passing a store records nothing.
     private let costStore: CostStore?
     private let redactor: any Redactor
     /// Shared with the InterventionRouter: the record of what Supervisor itself
@@ -135,6 +141,17 @@ public final class TriageEngine {
         /// rubric and it returned no-fire, don't re-ask every tick.
         /// Cleared when a new event arrives (the world has changed).
         var lastIdleTriageTs: Date?
+        /// Idle-loop economics (audit H5, 2026-07-02): how many
+        /// consecutive idle-evaluation triage calls came back with
+        /// nothing to act on — an empty candidate list, or a
+        /// worker_idle fire the loop state held silently (paused /
+        /// stopped / kill-switch). Drives the exponential re-triage
+        /// backoff in `effectiveIdleReTriageInterval` so an idle-but-
+        /// open session stops costing one model call per minute
+        /// forever. Reset to 0 whenever a real event arrives (the same
+        /// condition that clears `lastIdleTriageTs`) and whenever an
+        /// idle evaluation actually surfaces a decision.
+        var consecutiveIdleAllClears: Int = 0
     }
 
     /// v0.4.0 (Part A): seconds of silence after a stop-shaped event
@@ -180,6 +197,13 @@ public final class TriageEngine {
     /// Hook for FlagRouter — called when Haiku fires.
     public var onDecision: ((TriageDecision) -> Void)?
 
+    /// v0.3.0 (P0-3): fired exactly once on each degraded-state TRANSITION —
+    /// `(true, reason)` on entry, `(false, nil)` on the first successful
+    /// model call after. The app wires this to the heartbeat's network-down
+    /// marker (status-bar amber) and the hover's clearDegraded; the per-
+    /// failure `.degraded` activity above keeps the hover label asserted.
+    public var onDegradedChange: ((Bool, String?) -> Void)?
+
     private var busSubscription: AnyCancellable?
 
     /// v0.3.0: optional secondary-call dependency. When non-nil,
@@ -218,6 +242,12 @@ public final class TriageEngine {
     /// Nil disables persistence (tests without a SupervisorDatabase).
     private let loopStore: LoopDispatchStore?
 
+    /// v0.3.0 (P0-3): optional notifier for the degraded-state banner.
+    /// Posted exactly once per degraded ENTRY (latched — never per
+    /// failure), via `postStatus`. Nil (tests / no wiring) skips the
+    /// banner; the activity state and onDegradedChange still fire.
+    private let notifier: (any Notifying)?
+
     /// cwd-exclusivity gate (2026-06-13): how many LIVE sessions currently share
     /// a given cwd. git HEAD/branch/commits are directory-global, so they may
     /// only be attributed to a session that is the SOLE live worker in that dir.
@@ -241,6 +271,7 @@ public final class TriageEngine {
         dispatcher: (any Dispatching)? = nil,
         loopController: LoopController? = nil,
         loopStore: LoopDispatchStore? = nil,
+        notifier: (any Notifying)? = nil,
         idleThresholdSeconds: TimeInterval = 15,
         idleReTriageIntervalSeconds: TimeInterval = 60,
         idleCheckIntervalSeconds: TimeInterval = 1,
@@ -261,6 +292,7 @@ public final class TriageEngine {
         self.dispatcher = dispatcher
         self.loopController = loopController
         self.loopStore = loopStore
+        self.notifier = notifier
         self.idleThresholdSeconds = idleThresholdSeconds
         self.idleReTriageIntervalSeconds = idleReTriageIntervalSeconds
         self.idleCheckIntervalSeconds = idleCheckIntervalSeconds
@@ -306,6 +338,109 @@ public final class TriageEngine {
         idleCheckTask?.cancel()
         idleCheckTask = nil
         trace.emit("triage", "engine stopped")
+    }
+
+    // MARK: - Failure visibility (P0-3)
+
+    /// Consecutive primary-triage client failures required before the
+    /// engine admits it can't watch. One or two failures are routine
+    /// (blips, 529s); three in a row with zero successes means the user
+    /// is trusting a green dot the engine can't back up.
+    static let degradedFailureThreshold = 3
+
+    /// Count of consecutive `createMessage` throws across the three
+    /// primary triage paths (bash / assistant-text / idle). Reset to 0 on
+    /// ANY success. DailyCapExceededError does not count — the cap is a
+    /// deliberate local refusal, not a client failure — it enters the
+    /// degraded state directly with its own reason.
+    private var consecutiveClientFailures = 0
+
+    /// True while the engine is in the degraded state. Drives the
+    /// once-per-transition `onDegradedChange` hook.
+    private(set) var isDegraded = false
+
+    /// Latch for the degraded-entry notification: one banner per entry,
+    /// never per failure. Cleared on the next success so a later relapse
+    /// notifies again.
+    private var degradedNotified = false
+
+    /// Hover reason for a client failure. 401-shaped errors get the
+    /// actionable "check your API key" copy; everything else names the
+    /// provider we couldn't reach.
+    nonisolated static func degradedReason(for error: Error, provider: LLMProvider) -> String {
+        if let clientError = error as? AnthropicClientError, case .invalidKey = clientError {
+            return "Can't reach \(provider.displayName) — check your API key"
+        }
+        return "Can't reach \(provider.displayName)"
+    }
+
+    /// Hover reason for the daily-cap state — distinct from an outage:
+    /// nothing is broken, the user's own limit held.
+    nonisolated static func capDegradedReason(capUSD: Double) -> String {
+        String(format: "Paused at your $%.2f daily cap", capUSD)
+    }
+
+    /// Called after every successful `createMessage` on a primary triage
+    /// path. Resets the failure streak; on the first success after a
+    /// degraded stretch, exits the degraded state. Deliberately silent —
+    /// no "watching again" banner; the green dot returning is the
+    /// announcement.
+    private func noteClientSuccess() {
+        if isDegraded {
+            trace.emit("triage", "degraded cleared: model call succeeded after \(consecutiveClientFailures) consecutive failures")
+            isDegraded = false
+            onDegradedChange?(false, nil)
+        }
+        consecutiveClientFailures = 0
+        degradedNotified = false
+    }
+
+    /// Called from every primary-triage catch block. Below the threshold
+    /// this behaves exactly like the old code (activity → .idle); at the
+    /// threshold it enters the degraded state. The daily cap short-circuits
+    /// into its own degraded reason immediately — it isn't a failure streak,
+    /// it's a policy stop that will hold for the rest of the day.
+    private func noteClientFailure(_ error: Error) {
+        if let cap = error as? DailyCapExceededError {
+            enterDegraded(
+                reason: Self.capDegradedReason(capUSD: cap.capUSD),
+                notificationTitle: "Supervisor paused at your daily cap",
+                notificationBody: String(
+                    format: "Today's model spend reached your $%.2f cap, so model triage is stopped until tomorrow. Deterministic protections (the irreversible-command catch-list) still run. Raise or remove cost.daily_cap_usd in config.yaml to resume sooner.",
+                    cap.capUSD
+                )
+            )
+            return
+        }
+        consecutiveClientFailures += 1
+        guard consecutiveClientFailures >= Self.degradedFailureThreshold else {
+            onActivityChange?(.idle)
+            return
+        }
+        let reason = Self.degradedReason(for: error, provider: client.provider)
+        enterDegraded(
+            reason: reason,
+            notificationTitle: "Supervisor can't watch right now",
+            notificationBody: "\(reason). Model triage is paused until the connection recovers — the hover shows amber until then. Deterministic protections (the irreversible-command catch-list) still run."
+        )
+    }
+
+    /// Enter (or re-assert) the degraded state: activity for the hover,
+    /// the transition hook for the heartbeat marker, and — once per entry —
+    /// the notification.
+    private func enterDegraded(reason: String, notificationTitle: String, notificationBody: String) {
+        if !isDegraded {
+            isDegraded = true
+            onDegradedChange?(true, reason)
+        }
+        onActivityChange?(.degraded(reason: reason))
+        if !degradedNotified {
+            degradedNotified = true
+            trace.emit("triage", "DEGRADED reason=\"\(reason)\" — notifying once")
+            if let notifier {
+                Task { await notifier.postStatus(title: notificationTitle, body: notificationBody) }
+            }
+        }
     }
 
     // MARK: - Event consumption
@@ -408,6 +543,13 @@ public final class TriageEngine {
         // has changed since the rubric last said "no fire," so let the
         // timer re-ask if conditions hold.
         state.lastIdleTriageTs = nil
+        // Idle backoff (audit H5): a real event also resets the all-clear
+        // streak — the re-triage interval snaps back to the base so the
+        // now-active session is watched at full cadence again.
+        if state.consecutiveIdleAllClears > 0 {
+            trace.emit("triage", "idle_backoff reset session=\(sessionId) reason=new_event interval=\(Int(idleReTriageIntervalSeconds))s")
+            state.consecutiveIdleAllClears = 0
+        }
 
         switch event {
         case .userPrompt:
@@ -477,6 +619,50 @@ public final class TriageEngine {
         }
     }
 
+    /// Idle-loop economics (audit H5, 2026-07-02): stretched re-triage
+    /// intervals after consecutive all-clear idle evaluations. Without
+    /// backoff, every open-but-idle session costs one model call per
+    /// `idleReTriageIntervalSeconds` FOREVER — five idle terminals left
+    /// open overnight is 5 calls/minute all night. After the first
+    /// all-clear the base interval still applies (one re-check is
+    /// cheap); after the second it stretches to 5 minutes; from the
+    /// third on it caps at 30 minutes. Any real event on the session
+    /// resets the streak (see `updateIdleState`), so an active session
+    /// is never under-watched.
+    static let idleBackoffFirstStep: TimeInterval = 5 * 60
+    static let idleBackoffCap: TimeInterval = 30 * 60
+
+    /// The re-triage interval currently in force for a session, given
+    /// its all-clear streak: base → base → 5min → 30min (cap). `max`
+    /// keeps a configured base LONGER than a ladder step from ever
+    /// shrinking the interval.
+    func effectiveIdleReTriageInterval(consecutiveAllClears: Int) -> TimeInterval {
+        switch consecutiveAllClears {
+        case ..<2: return idleReTriageIntervalSeconds
+        case 2:    return max(idleReTriageIntervalSeconds, Self.idleBackoffFirstStep)
+        default:   return max(idleReTriageIntervalSeconds, Self.idleBackoffCap)
+        }
+    }
+
+    /// Idle-backoff bookkeeping, called by `evaluateIdle` once its verdict
+    /// is known. All-clear grows the streak (and thereby the effective
+    /// re-triage interval); a surfaced decision resets it. The
+    /// `lastIdleTriageTs != nil` guard skips the update when a new event
+    /// raced in during the async model call — `updateIdleState` already
+    /// reset the streak for that event, and this now-stale verdict must
+    /// not overwrite it.
+    private func noteIdleOutcome(sessionId: String, allClear: Bool) {
+        guard var state = idleStates[sessionId], state.lastIdleTriageTs != nil else { return }
+        if allClear {
+            state.consecutiveIdleAllClears += 1
+            let interval = effectiveIdleReTriageInterval(consecutiveAllClears: state.consecutiveIdleAllClears)
+            trace.emit("triage", "idle_backoff session=\(sessionId) consecutive_all_clears=\(state.consecutiveIdleAllClears) interval=\(Int(interval))s")
+        } else {
+            state.consecutiveIdleAllClears = 0
+        }
+        idleStates[sessionId] = state
+    }
+
     /// Walk every session's idle state. For each session where (a) a
     /// stop-shape has been seen AND (b) `idleThresholdSeconds` of silence
     /// have passed since the last event AND (c) the re-triage gate is
@@ -494,12 +680,15 @@ public final class TriageEngine {
             guard silenceElapsed >= idleThresholdSeconds else { continue }
 
             // Re-triage gate: if we already asked Haiku since the last
-            // event change, wait `idleReTriageIntervalSeconds` before
-            // asking again. `lastIdleTriageTs` is cleared by
-            // `updateIdleState` when a new event arrives.
+            // event change, wait the session's EFFECTIVE re-triage
+            // interval before asking again — the base interval,
+            // stretched by the idle-backoff ladder when prior asks kept
+            // coming back all-clear. `lastIdleTriageTs` is cleared by
+            // `updateIdleState` when a new event arrives (which also
+            // resets the backoff to base).
             if let lastTriage = state.lastIdleTriageTs {
                 let sinceLast = nowTs.timeIntervalSince(lastTriage)
-                if sinceLast < idleReTriageIntervalSeconds { continue }
+                if sinceLast < effectiveIdleReTriageInterval(consecutiveAllClears: state.consecutiveIdleAllClears) { continue }
             }
 
             // Stamp the triage timestamp BEFORE the async call lands so
@@ -578,18 +767,12 @@ public final class TriageEngine {
             response = try await client.createMessage(request)
         } catch {
             trace.emit("triage", "Idle triage call failed: \(error)")
-            onActivityChange?(.idle)
+            noteClientFailure(error)  // P0-3: three in a row → .degraded, not a silent green dot
             return
         }
-
-        if let costStore {
-            let cost = TokenAccounting.costUSD(model: model, usage: response.usage)
-            try? costStore.recordHaiku(
-                inputTokens: response.usage.input_tokens,
-                outputTokens: response.usage.output_tokens,
-                costUSD: cost
-            )
-        }
+        noteClientSuccess()
+        // Cost recording happens inside LLMClient's costRecorder hook (P0-4) —
+        // recording here again would double-count.
 
         guard let candidates = extractCandidates(from: response) else {
             trace.emit("triage", "Idle triage: no record_triage call from Haiku session=\(sessionId)")
@@ -598,6 +781,7 @@ public final class TriageEngine {
         }
         if candidates.isEmpty {
             trace.emit("triage", "Idle triage all-clear session=\(sessionId) (rubric don't-fire condition held)")
+            noteIdleOutcome(sessionId: sessionId, allClear: true)
             onActivityChange?(.idle)
             return
         }
@@ -643,6 +827,9 @@ public final class TriageEngine {
                 // Re-enable by deleting the marker — no restart needed.
                 if Self.autoDispatchDisabled {
                     trace.emit("loop", "auto-dispatch DISABLED by marker — worker_idle silent (safety detection unaffected) session=\(sessionId)")
+                    // Silent outcome — the rubric call was still spent, so it
+                    // counts toward the idle backoff like an all-clear.
+                    noteIdleOutcome(sessionId: sessionId, allClear: true)
                     onActivityChange?(.idle)
                     return
                 }
@@ -674,16 +861,22 @@ public final class TriageEngine {
                 case let .paused(reason):
                     // Loop paused (the human is in the chat). Stay SILENT — re-
                     // posting an "idle but paused" banner on every idle tick is
-                    // noise while the owner is actively working.
+                    // noise while the owner is actively working. Counts toward
+                    // the idle backoff: the rubric call was spent and produced
+                    // nothing the user sees.
                     trace.emit("loop", "skip dispatch session=\(sessionId) state=paused reason=\(reason) (silent)")
+                    noteIdleOutcome(sessionId: sessionId, allClear: true)
                     onActivityChange?(.idle)
                     return
                 case let .stopped(reason):
                     // Loop stopped (e.g. 3 consecutive lows = queue exhausted).
                     // The dispatch that TRIPPED the stop already posted its low-
                     // confidence banner explaining why, so go SILENT now instead
-                    // of re-announcing "still stopped" on every idle tick.
+                    // of re-announcing "still stopped" on every idle tick. Counts
+                    // toward the idle backoff — a stopped loop's idle rubric call
+                    // is exactly the overnight spend the backoff exists to stop.
                     trace.emit("loop", "skip dispatch session=\(sessionId) state=stopped reason=\(reason) (silent)")
+                    noteIdleOutcome(sessionId: sessionId, allClear: true)
                     onActivityChange?(.idle)
                     return
                 }
@@ -707,6 +900,9 @@ public final class TriageEngine {
             onActivityChange?(.flagged(severity: finalCandidate.severity, action: finalCandidate.action, reasoningPlain: finalCandidate.reasoningPlain))
             onDecision?(decision)
         }
+        // Idle backoff: a decision actually surfaced — not an all-clear, so
+        // the streak (and the stretched re-triage interval) resets.
+        noteIdleOutcome(sessionId: sessionId, allClear: false)
     }
 
     /// v0.4.0 Part B: run the dispatcher and rewrite the candidate's
@@ -773,11 +969,16 @@ public final class TriageEngine {
         // still sees the banner/inject outcome.
         if let lc = loopController {
             await lc.recordDispatch(sessionId: sessionId, result: result)
-            // v0.8.0: if we just recorded a high/medium confidence
-            // result, clear any prior consecutive-low stop so the loop
-            // recovers. This handles the case where false lows caused
-            // a stop but subsequent dispatches found real work.
-            if case let .ready(_, _, conf, _, _, _, _) = result, conf != .low {
+            // v0.8.0: if we just recorded a HIGH confidence result, clear
+            // any prior consecutive-low stop so the loop recovers. This
+            // handles the case where false lows caused a stop but
+            // subsequent dispatches found real work. Medium no longer
+            // clears it (audit H5, 2026-07-02): a dispatcher stuck
+            // re-proposing the same medium must be allowed to trip the
+            // repeated-medium stop in LoopController.recordDispatch — a
+            // medium clearing stops here would reset that kill switch on
+            // every fire.
+            if case let .ready(_, _, conf, _, _, _, _) = result, conf == .high {
                 await lc.clearConsecutiveLowStop(sessionId: sessionId)
             }
         }
@@ -970,19 +1171,12 @@ public final class TriageEngine {
             response = try await client.createMessage(request)
         } catch {
             trace.emit("triage", "Haiku call failed: \(error)")
-            onActivityChange?(.idle)
+            noteClientFailure(error)  // P0-3: three in a row → .degraded, not a silent green dot
             return
         }
-
-        // Cost accounting (best-effort).
-        if let costStore {
-            let cost = TokenAccounting.costUSD(model: model, usage: response.usage)
-            try? costStore.recordHaiku(
-                inputTokens: response.usage.input_tokens,
-                outputTokens: response.usage.output_tokens,
-                costUSD: cost
-            )
-        }
+        noteClientSuccess()
+        // Cost recording happens inside LLMClient's costRecorder hook (P0-4) —
+        // recording here again would double-count.
 
         guard let candidates = extractCandidates(from: response) else {
             trace.emit("triage", "Haiku didn't return record_triage call (stop_reason=\(response.stop_reason ?? "?"))")
@@ -1093,18 +1287,12 @@ public final class TriageEngine {
             response = try await client.createMessage(request)
         } catch {
             trace.emit("triage", "Assistant-text triage call failed: \(error)")
-            onActivityChange?(.idle)
+            noteClientFailure(error)  // P0-3: three in a row → .degraded, not a silent green dot
             return
         }
-
-        if let costStore {
-            let cost = TokenAccounting.costUSD(model: model, usage: response.usage)
-            try? costStore.recordHaiku(
-                inputTokens: response.usage.input_tokens,
-                outputTokens: response.usage.output_tokens,
-                costUSD: cost
-            )
-        }
+        noteClientSuccess()
+        // Cost recording happens inside LLMClient's costRecorder hook (P0-4) —
+        // recording here again would double-count.
 
         guard let candidates = extractCandidates(from: response) else {
             trace.emit("triage", "Assistant-text: no record_triage call from Haiku")

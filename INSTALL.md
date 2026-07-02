@@ -57,6 +57,19 @@ the clear). Invalid / rate-limited / network errors show inline with a retry.
   ~$5/month at the same usage). The key field tells you the estimated cost for
   whichever provider your key is for before you paste it.
 
+> **Setting the daily cap:** create (or edit)
+> `~/Library/Application Support/Supervisor/config.yaml` and add:
+>
+> ```yaml
+> cost:
+>   daily_cap_usd: 5.00
+> ```
+>
+> When today's spend reaches the cap, model calls stop until tomorrow —
+> Supervisor notifies you and the menu-bar icon turns amber, while the
+> deterministic protections keep running. No restart needed; delete the
+> lines to remove the cap.
+
 ### Step 2 of 3 — Accessibility
 
 Supervisor needs macOS **Accessibility** permission to do more than notify — to

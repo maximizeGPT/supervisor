@@ -374,6 +374,183 @@ final class LLMClientProviderTests: XCTestCase {
                      "Anthropic must NOT receive a Bearer header")
     }
 
+    // MARK: - v0.3.0: cost recorder hook + daily-cap gate
+
+    /// Thread-safe capture box for the @Sendable hooks under test.
+    private final class HookCapture: @unchecked Sendable {
+        var recordedModel: String?
+        var recordedUsage: AnthropicUsage?
+        var recorderCalls = 0
+    }
+
+    func testCostRecorderFiresWithUsageAfterSuccessfulCall() async throws {
+        let mockResponse: Data = Data(#"""
+        {"id":"chatcmpl-1","model":"deepseek-chat","choices":[
+          {"index":0,"message":{"role":"assistant","content":"ok","tool_calls":null},"finish_reason":"stop"}
+        ],"usage":{"prompt_tokens":42,"completion_tokens":3,"total_tokens":45}}
+        """#.utf8)
+        LLMProviderMockURLProtocol.responses = [
+            "/v1/chat/completions": (200, mockResponse, [:]),
+        ]
+
+        let capture = HookCapture()
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [LLMProviderMockURLProtocol.self]
+        let client = LLMClient(
+            provider: .deepseek,
+            apiKey: "sk-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.deepseek.test")!,
+            session: URLSession(configuration: cfg),
+            costRecorder: { model, usage in
+                capture.recordedModel = model
+                capture.recordedUsage = usage
+                capture.recorderCalls += 1
+            }
+        )
+
+        let req = AnthropicMessageRequest(
+            model: "deepseek-chat", max_tokens: 16,
+            system: nil,
+            messages: [.init(role: "user", content: .string("hi"))],
+            tools: nil, tool_choice: nil
+        )
+        _ = try await client.createMessage(req)
+
+        XCTAssertEqual(capture.recorderCalls, 1, "recorder must fire exactly once per call")
+        XCTAssertEqual(capture.recordedModel, "deepseek-chat",
+                       "recorder must receive the requested model id (pricing-table key)")
+        XCTAssertEqual(capture.recordedUsage?.input_tokens, 42)
+        XCTAssertEqual(capture.recordedUsage?.output_tokens, 3)
+    }
+
+    func testCapCheckAtCapThrowsWithoutNetworkRequest() async throws {
+        LLMProviderMockURLProtocol.responses = [
+            "/v1/chat/completions": (200, Data("{}".utf8), [:]),
+        ]
+        LLMProviderMockURLProtocol.requestCount = 0
+
+        let capture = HookCapture()
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [LLMProviderMockURLProtocol.self]
+        let client = LLMClient(
+            provider: .deepseek,
+            apiKey: "sk-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.deepseek.test")!,
+            session: URLSession(configuration: cfg),
+            costRecorder: { _, _ in capture.recorderCalls += 1 },
+            capCheck: { return (cap: 5.0, spent: 5.0) }  // exactly at cap
+        )
+
+        let req = AnthropicMessageRequest(
+            model: "deepseek-chat", max_tokens: 16,
+            system: nil,
+            messages: [.init(role: "user", content: .string("hi"))],
+            tools: nil, tool_choice: nil
+        )
+        do {
+            _ = try await client.createMessage(req)
+            XCTFail("call at cap must throw DailyCapExceededError")
+        } catch let e as DailyCapExceededError {
+            XCTAssertEqual(e, DailyCapExceededError(capUSD: 5.0, spentUSD: 5.0))
+        }
+        XCTAssertEqual(LLMProviderMockURLProtocol.requestCount, 0,
+                       "a capped call must make NO network request")
+        XCTAssertEqual(capture.recorderCalls, 0,
+                       "a capped call records nothing (nothing was spent)")
+    }
+
+    func testCapCheckOverCapThrows() async throws {
+        LLMProviderMockURLProtocol.requestCount = 0
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [LLMProviderMockURLProtocol.self]
+        let client = LLMClient(
+            provider: .anthropic,
+            apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: URLSession(configuration: cfg),
+            capCheck: { return (cap: 2.0, spent: 3.75) }  // over cap
+        )
+        let req = AnthropicMessageRequest(
+            model: "claude-haiku-4-5-20251001", max_tokens: 1,
+            system: nil,
+            messages: [.init(role: "user", content: .string("ping"))],
+            tools: nil, tool_choice: nil
+        )
+        do {
+            _ = try await client.createMessage(req)
+            XCTFail("call over cap must throw DailyCapExceededError")
+        } catch let e as DailyCapExceededError {
+            XCTAssertEqual(e, DailyCapExceededError(capUSD: 2.0, spentUSD: 3.75))
+        }
+        XCTAssertEqual(LLMProviderMockURLProtocol.requestCount, 0)
+    }
+
+    func testCapCheckUnderCapProceeds() async throws {
+        let mockResponse: Data = Data(#"""
+        {"id":"chatcmpl-1","model":"deepseek-chat","choices":[
+          {"index":0,"message":{"role":"assistant","content":"ok","tool_calls":null},"finish_reason":"stop"}
+        ],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+        """#.utf8)
+        LLMProviderMockURLProtocol.responses = [
+            "/v1/chat/completions": (200, mockResponse, [:]),
+        ]
+        LLMProviderMockURLProtocol.requestCount = 0
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [LLMProviderMockURLProtocol.self]
+        let client = LLMClient(
+            provider: .deepseek,
+            apiKey: "sk-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.deepseek.test")!,
+            session: URLSession(configuration: cfg),
+            capCheck: { return (cap: 5.0, spent: 4.99) }  // under cap
+        )
+        let req = AnthropicMessageRequest(
+            model: "deepseek-chat", max_tokens: 16,
+            system: nil,
+            messages: [.init(role: "user", content: .string("hi"))],
+            tools: nil, tool_choice: nil
+        )
+        let resp = try await client.createMessage(req)
+        XCTAssertEqual(resp.usage.input_tokens, 1)
+        XCTAssertEqual(LLMProviderMockURLProtocol.requestCount, 1,
+                       "under-cap call must proceed to the network")
+    }
+
+    func testNilCapCheckReturningNilMeansNoGating() async throws {
+        // capCheck wired but reporting "no cap configured" — must not gate.
+        let mockResponse: Data = Data(#"""
+        {"id":"chatcmpl-1","model":"deepseek-chat","choices":[
+          {"index":0,"message":{"role":"assistant","content":"ok","tool_calls":null},"finish_reason":"stop"}
+        ],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+        """#.utf8)
+        LLMProviderMockURLProtocol.responses = [
+            "/v1/chat/completions": (200, mockResponse, [:]),
+        ]
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [LLMProviderMockURLProtocol.self]
+        let client = LLMClient(
+            provider: .deepseek,
+            apiKey: "sk-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.deepseek.test")!,
+            session: URLSession(configuration: cfg),
+            capCheck: { nil }
+        )
+        let req = AnthropicMessageRequest(
+            model: "deepseek-chat", max_tokens: 16,
+            system: nil,
+            messages: [.init(role: "user", content: .string("hi"))],
+            tools: nil, tool_choice: nil
+        )
+        _ = try await client.createMessage(req)  // must not throw
+    }
+
     // MARK: - Pre-encoding redaction (gold test)
 
     func testLineLeadingTokenIsRedactedBeforeReachingTheWire() async throws {
@@ -425,11 +602,15 @@ final class LLMProviderMockURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var responses: [String: (Int, Data, [String: String])] = [:]
     nonisolated(unsafe) static var lastRequestHeaders: [String: String] = [:]
     nonisolated(unsafe) static var lastRequestBody: Data = Data()
+    /// v0.3.0: total requests that reached the mock. Lets the daily-cap
+    /// tests assert a capped call made NO network request at all.
+    nonisolated(unsafe) static var requestCount: Int = 0
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        Self.requestCount += 1
         // Record the request headers + body for assertions. URLSession hands
         // URLProtocol the body as a stream, not via `httpBody`, so drain it.
         if let headers = request.allHTTPHeaderFields {

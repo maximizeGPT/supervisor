@@ -10,6 +10,7 @@
 // `bundleID.map(claudeCodeHostApps.contains) ?? false`. If that returns
 // the wrong answer for a bundle ID, hover behavior breaks.
 
+import SwiftUI
 import XCTest
 @testable import SupervisorCore
 @testable import SupervisorUI
@@ -110,5 +111,21 @@ final class HoverHostAppsTests: XCTestCase {
                       "live set must include the newly-merged bundle ID")
         XCTAssertTrue(controller.claudeCodeHostApps.contains("com.apple.Terminal"),
                       "defaults must survive the merge")
+    }
+
+    // MARK: - Hover dot mapping (v0.3.0, P0-3)
+
+    /// `.degraded` must render an amber dot — the trust-critical mapping.
+    /// A green dot with a dead API key is the exact lie v0.3.0 exists to
+    /// remove; the other states are pinned so a refactor can't swap them.
+    func testDegradedActivityRendersAmberDot() {
+        XCTAssertEqual(
+            HoverView.dotColor(for: .degraded(reason: "Can't reach Anthropic — check your API key")),
+            .orange)
+        XCTAssertEqual(HoverView.dotColor(for: .idle), .green)
+        XCTAssertEqual(HoverView.dotColor(for: .triaging), .blue)
+        XCTAssertEqual(
+            HoverView.dotColor(for: .flagged(severity: .high, action: .pause, reasoningPlain: nil)),
+            .red)
     }
 }

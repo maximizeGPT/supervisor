@@ -286,14 +286,44 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             trace.emit("app", "FATAL: no API key for provider=\(activeProvider.rawValue) after onboarding; aborting")
             return
         }
+        // v0.3.0 (P0-4): both LLMClient hooks are wired HERE, on the one
+        // client instance every model call flows through — TriageEngine,
+        // QuestionAnswerer, Dispatcher, and the injector's conversation
+        // matcher all share `client` — so every createMessage is recorded
+        // exactly once and gated by the cap. TriageEngine's old per-call
+        // recordHaiku sites are gone; recording there again would
+        // double-count. (The onboarding clientFactory above stays unhooked
+        // on purpose: it exists before the DB opens, and its 1-token
+        // validation call must not be refused by a spent cap.)
+        guard let hookCostStore = self.costStore else {
+            trace.emit("app", "FATAL: costStore missing before LLM client construction")
+            return
+        }
+        let configPath = paths.configPath
         let client = LLMClient(
             provider: activeProvider,
             apiKey: key,
             redactor: DefaultRedactor(),
-            traceLog: trace
+            traceLog: trace,
+            costRecorder: { model, usage in
+                try? hookCostStore.recordHaiku(
+                    inputTokens: usage.input_tokens,
+                    outputTokens: usage.output_tokens,
+                    costUSD: TokenAccounting.costUSD(model: model, usage: usage)
+                )
+            },
+            capCheck: {
+                // Re-read config.yaml at each gate so a cap edit takes
+                // effect without a restart (same live-config posture as
+                // ConfigWatcher). The file is tiny; model calls are
+                // network-bound and seconds apart.
+                guard let cap = UserConfig.load(from: configPath).dailyCostCapUSD else { return nil }
+                let spent = (try? hookCostStore.todayTotalUSD()) ?? 0
+                return (cap: cap, spent: spent)
+            }
         )
         self.llm = client
-        trace.emit("app", "LLM client ready provider=\(activeProvider.rawValue) model=\(activeProvider.defaultTriageModel)")
+        trace.emit("app", "LLM client ready provider=\(activeProvider.rawValue) model=\(activeProvider.defaultTriageModel) costRecorder=on capCheck=on")
 
         // 4. Notifier + Intervention router (v0.1.4 Part A3) + v0.1.6
         // RecoveryDocWriter (writes handoff markdown before SIGSTOP/SIGTERM).
@@ -393,12 +423,17 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             bus: bus,
             model: activeProvider.defaultTriageModel,
             windowSize: 30,
-            costStore: costStore,
+            // costStore intentionally NOT passed (v0.3.0): spend is recorded
+            // by the LLMClient costRecorder hook above; the engine records
+            // nothing itself anymore.
             redactor: DefaultRedactor(),
             questionAnswerer: questionAnswerer,
             dispatcher: dispatcher,
             loopController: loopController,
             loopStore: loopDispatchStore,
+            // P0-3: the engine posts ONE banner when it enters the degraded
+            // state (can't reach the provider / daily cap hit).
+            notifier: notifier,
             // cwd-exclusivity gate: count live sessions (last 10 min) sharing a
             // cwd, so repo grounding is omitted when this isn't the sole worker
             // in that dir — prevents one session's git state bleeding into a
@@ -422,6 +457,25 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             case .triaging:           self?.hoverVM?.triageStarted()
             case .idle:                                self?.hoverVM?.triageFinishedNoFlag()
             case .flagged(let sev, let action, let plain): self?.hoverVM?.flagRaised(severity: sev, action: action, reasoningPlain: plain)
+            case .degraded(let reason):                self?.hoverVM?.enterDegraded(reason: reason)
+            }
+        }
+        // P0-3: degraded TRANSITIONS drive the status-bar amber via the
+        // heartbeat's network-down side channel (see NetworkDownMarker —
+        // the heartbeat file itself is rewritten every 5s by the companion,
+        // so the marker is the durable signal). Set on entry, cleared on
+        // the first successful model call; also cleared at wiring time so
+        // a marker orphaned by a crash can't show stale amber forever.
+        let networkDownMarker = NetworkDownMarker.alongside(heartbeatPath: paths.heartbeatPath)
+        networkDownMarker.clear()
+        engine.onDegradedChange = { [weak self] degraded, reason in
+            if degraded {
+                networkDownMarker.set(reason: reason ?? "model triage degraded")
+                self?.trace.emit("app", "degraded — network-down marker set (\(reason ?? "?"))")
+            } else {
+                networkDownMarker.clear()
+                self?.hoverVM?.clearDegraded()
+                self?.trace.emit("app", "recovered — network-down marker cleared")
             }
         }
         engine.onDecision = { [weak self] decision in

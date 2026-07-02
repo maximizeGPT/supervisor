@@ -537,6 +537,190 @@ final class TriageEngineTests: XCTestCase {
         XCTAssertEqual(captured.snapshot.first?.triggeringEvent.toolUseId, "t-rm")
     }
 
+    // MARK: - Failure visibility (P0-3): degraded state
+
+    /// A 401-shaped Anthropic error envelope, the "dead API key" case.
+    private static func invalidKeyErrorBody() -> Data {
+        let body: [String: Any] = [
+            "type": "error",
+            "error": ["type": "authentication_error", "message": "invalid x-api-key"]
+        ]
+        return try! JSONSerialization.data(withJSONObject: body)
+    }
+
+    /// Engine wired the way main.swift wires it for degraded testing:
+    /// a status-capturing notifier + activity/transition logs.
+    private func makeDegradedTestEngine(
+        capCheck: (@Sendable () -> (cap: Double, spent: Double)?)? = nil
+    ) -> (TriageEngine, EventBus, StatusSpyNotifier, ActivityLog) {
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("triage-degraded-\(UUID().uuidString).log"))
+        let bus = EventBus(trace: trace)
+        let client = LLMClient(provider: .anthropic,
+            apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: mockSession(),
+            traceLog: trace,
+            capCheck: capCheck
+        )
+        let spy = StatusSpyNotifier()
+        let engine = TriageEngine(
+            client: client,
+            bus: bus,
+            model: "claude-haiku-4-5-20251001",
+            windowSize: 30,
+            notifier: spy,
+            idleCheckIntervalSeconds: 3600,  // park the idle timer; we drive the bash path
+            trace: trace
+        )
+        let log = ActivityLog()
+        engine.onActivityChange = { log.all.append($0) }
+        engine.onDegradedChange = { log.transitions.append(($0, $1)) }
+        engine.start()
+        return (engine, bus, spy, log)
+    }
+
+    private func waitUntil(
+        _ timeout: TimeInterval = 3.0,
+        _ what: String,
+        _ cond: () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if cond() { return }
+            try? await Task.sleep(nanoseconds: 80_000_000)
+        }
+        XCTFail("timed out waiting for: \(what)")
+    }
+
+    /// The full P0-3 contract in one flow: two failures stay quiet (blips
+    /// happen), the third enters `.degraded` with the 401-specific reason
+    /// and posts EXACTLY one notification; a fourth failure re-asserts the
+    /// state but never re-notifies; the next success silently restores
+    /// `.idle` (no "watching again" banner) and fires the exit transition.
+    func testThreeConsecutiveFailuresEnterDegradedNotifyOnceAndSuccessResets() async throws {
+        Self.canned["/v1/messages"] = (401, Self.invalidKeyErrorBody(), [:])
+        let (engine, bus, spy, log) = makeDegradedTestEngine()
+        defer { engine.stop() }
+
+        // Two failures: below the threshold — no degraded state, no banner.
+        publishBashCall(bus, command: "chmod -R 000 /Users/main/a", toolUseId: "t-f1")
+        publishBashCall(bus, command: "chmod -R 000 /Users/main/b", toolUseId: "t-f2")
+        await waitUntil(3.0, "two failed calls") { Self.requestCount >= 2 }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(log.degradedReasons.isEmpty,
+                      "two consecutive failures must NOT enter degraded — got \(log.all)")
+        XCTAssertEqual(spy.statuses.count, 0)
+
+        // Third failure: degraded, with the check-your-API-key reason.
+        publishBashCall(bus, command: "chmod -R 000 /Users/main/c", toolUseId: "t-f3")
+        await waitUntil(3.0, "degraded after third failure") { !log.degradedReasons.isEmpty }
+        XCTAssertEqual(log.degradedReasons.last, "Can't reach Anthropic — check your API key")
+        await waitUntil(2.0, "one degraded notification") { spy.statuses.count == 1 }
+        XCTAssertEqual(spy.statuses.count, 1, "entering degraded posts exactly one notification")
+        XCTAssertTrue(spy.statuses.first?.body.contains("catch-list") == true,
+                      "the banner must say deterministic protections still run; got: \(spy.statuses.first?.body ?? "")")
+        XCTAssertEqual(log.transitions.count, 1)
+        XCTAssertEqual(log.transitions.first?.degraded, true)
+
+        // Fourth failure: still degraded, still ONE notification (latched).
+        publishBashCall(bus, command: "chmod -R 000 /Users/main/d", toolUseId: "t-f4")
+        await waitUntil(3.0, "fourth failed call") { Self.requestCount >= 4 }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(spy.statuses.count, 1, "per-failure re-notification is exactly the spam this latch prevents")
+        XCTAssertEqual(log.transitions.count, 1, "no duplicate entry transition")
+
+        // Recovery: one successful (all-clear) call restores idle, fires the
+        // exit transition, and posts NO second banner — silence is fine.
+        Self.canned["/v1/messages"] = (200, Self.haikuAllClearResponse(), [:])
+        publishBashCall(bus, command: "chmod -R 000 /Users/main/e", toolUseId: "t-ok")
+        await waitUntil(3.0, "recovery: exit transition + idle activity") {
+            log.transitions.count == 2 && log.all.last == .idle
+        }
+        XCTAssertEqual(log.transitions.last?.degraded, false)
+        XCTAssertEqual(log.all.last, .idle, "success must restore the idle activity")
+        XCTAssertEqual(spy.statuses.count, 1, "recovery is silent — no second notification")
+    }
+
+    /// DailyCapExceededError is DISTINCT from an outage: it enters degraded
+    /// immediately (no 3-strike threshold — the cap holds all day), with the
+    /// cap-specific reason and its own banner copy, and it never touches the
+    /// network (the gate throws before any request).
+    func testDailyCapProducesCapSpecificDegradedStateWithoutNetwork() async throws {
+        let (engine, bus, spy, log) = makeDegradedTestEngine(
+            capCheck: { (cap: 5.0, spent: 6.10) }  // over cap
+        )
+        defer { engine.stop() }
+
+        publishBashCall(bus, command: "chmod -R 000 /Users/main/x", toolUseId: "t-cap")
+        await waitUntil(3.0, "cap-degraded state") { !log.degradedReasons.isEmpty }
+        XCTAssertEqual(log.degradedReasons.last, "Paused at your $5.00 daily cap")
+        await waitUntil(2.0, "one cap notification") { spy.statuses.count == 1 }
+        XCTAssertEqual(spy.statuses.first?.title, "Supervisor paused at your daily cap")
+        XCTAssertTrue(spy.statuses.first?.body.contains("catch-list") == true,
+                      "cap banner must say deterministic protections remain active")
+        XCTAssertTrue(spy.statuses.first?.body.contains("daily_cap_usd") == true,
+                      "cap banner should point at the config knob")
+        XCTAssertEqual(Self.requestCount, 0, "a capped call must never reach the network")
+    }
+
+    /// Reason mapping is pure and pinned: 401-shaped errors get the
+    /// actionable API-key copy, everything else names the provider.
+    /// The cap reason formats the configured dollar amount.
+    func testDegradedReasonMapping() {
+        XCTAssertEqual(
+            TriageEngine.degradedReason(
+                for: AnthropicClientError.invalidKey(message: "authentication_error"),
+                provider: .anthropic),
+            "Can't reach Anthropic — check your API key")
+        XCTAssertEqual(
+            TriageEngine.degradedReason(
+                for: AnthropicClientError.network(underlying: "offline"),
+                provider: .anthropic),
+            "Can't reach Anthropic")
+        XCTAssertEqual(
+            TriageEngine.degradedReason(
+                for: AnthropicClientError.serverError(status: 529, message: "overloaded"),
+                provider: .deepseek),
+            "Can't reach DeepSeek")
+        XCTAssertEqual(TriageEngine.capDegradedReason(capUSD: 5.0),
+                       "Paused at your $5.00 daily cap")
+        XCTAssertEqual(TriageEngine.capDegradedReason(capUSD: 12.5),
+                       "Paused at your $12.50 daily cap")
+    }
+
+    // MARK: - Degraded-state capture helpers
+
+    final class StatusSpyNotifier: Notifying, @unchecked Sendable {
+        private let lock = NSLock()
+        private var inner: [(title: String, body: String)] = []
+        func post(decision: TriageDecision) async -> Notifier.Outcome { .posted }
+        func postStatus(title: String, body: String) async -> Notifier.Outcome {
+            lock.lock(); defer { lock.unlock() }
+            inner.append((title, body))
+            return .posted
+        }
+        var statuses: [(title: String, body: String)] {
+            lock.lock(); defer { lock.unlock() }
+            return inner
+        }
+    }
+
+    /// Both engine hooks land on the main actor, same as the test body,
+    /// so a plain class is safe here.
+    @MainActor
+    final class ActivityLog {
+        var all: [HoverViewModel.Activity] = []
+        var transitions: [(degraded: Bool, reason: String?)] = []
+        var degradedReasons: [String] {
+            all.compactMap {
+                if case let .degraded(reason) = $0 { return reason }
+                return nil
+            }
+        }
+    }
+
     // MARK: - Capture helper
 
     final class CapturedDecisions: @unchecked Sendable {

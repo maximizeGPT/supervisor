@@ -403,9 +403,18 @@ public struct ExpandedPanelView: View {
     // MARK: - Footer
 
     private var footer: some View {
-        HStack {
+        HStack(spacing: 4) {
             Spacer()
             Text("\(vm.flagCount) flags this session")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+            Text("\u{00B7}")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+            // v0.3.0 (audit F1): today's spend, finally rendered — the
+            // README's cost-view claim lives here. Cheap single-row read;
+            // querying inside body follows the recentFlags pattern above.
+            Text(Self.footerCostText(vm.todayCostUSD()))
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
             Spacer()
@@ -414,6 +423,12 @@ public struct ExpandedPanelView: View {
     }
 
     // MARK: - Helpers
+
+    /// Footer spend line, e.g. "$0.43 today". Static so tests pin the
+    /// exact string the footer renders.
+    static func footerCostText(_ usd: Double) -> String {
+        "\(formatCost(usd)) today"
+    }
 
     static func formatCost(_ usd: Double) -> String {
         if usd < 0.01 { return "$0.00" }

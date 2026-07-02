@@ -79,4 +79,70 @@ final class HoverLabelTests: XCTestCase {
         let label = HoverViewModel.plainLabelForFlag(action: .pause, reasoningPlain: nil)
         XCTAssertEqual(label, "Paused Claude Code. Needs your attention.")
     }
+
+    // MARK: - Degraded state (P0-3)
+
+    private func makeVM() -> HoverViewModel {
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("hover-label-\(UUID()).log"))
+        return HoverViewModel(bus: EventBus(trace: trace), trace: trace)
+    }
+
+    /// The core honesty mapping: `.degraded`'s reason IS the hover label —
+    /// never "Watching. All clear" while the engine can't reach its model.
+    func testEnterDegradedSetsActivityAndReasonAsLabel() {
+        let vm = makeVM()
+        vm.enterDegraded(reason: "Can't reach Anthropic — check your API key")
+        XCTAssertEqual(vm.activity, .degraded(reason: "Can't reach Anthropic — check your API key"))
+        XCTAssertEqual(vm.plainLabel, "Can't reach Anthropic — check your API key")
+        XCTAssertEqual(vm.detailLabel, "")
+    }
+
+    /// A retry attempt must not flash "Checking something..." over the
+    /// degraded state — that reads as recovered when it isn't. The state
+    /// holds until a call actually succeeds.
+    func testTriageStartedHoldsDegradedState() {
+        let vm = makeVM()
+        vm.enterDegraded(reason: "Can't reach Anthropic")
+        vm.triageStarted()
+        XCTAssertEqual(vm.activity, .degraded(reason: "Can't reach Anthropic"))
+        XCTAssertEqual(vm.plainLabel, "Can't reach Anthropic")
+    }
+
+    /// A successful (no-flag) triage batch is the recovery signal: idle
+    /// activity, "All clear" label, no residue.
+    func testTriageFinishedNoFlagClearsDegraded() {
+        let vm = makeVM()
+        vm.enterDegraded(reason: "Can't reach Anthropic")
+        vm.triageFinishedNoFlag()
+        XCTAssertEqual(vm.activity, .idle)
+        XCTAssertEqual(vm.plainLabel, "Watching. All clear")
+        // And triageStarted works normally again (no stale degraded hold).
+        vm.triageStarted()
+        XCTAssertEqual(vm.activity, .triaging)
+    }
+
+    /// A deterministic-catch flag can fire WHILE degraded (the catch-list
+    /// needs no model). Its acknowledge must settle back to the amber
+    /// degraded state, never to a green "All clear" the engine can't back up.
+    func testAcknowledgeFlagSettlesBackToDegradedNotAllClear() {
+        let vm = makeVM()
+        vm.enterDegraded(reason: "Paused at your $5.00 daily cap")
+        vm.flagRaised(severity: .high, action: .pause, reasoningPlain: "About to delete things.")
+        vm.acknowledgeFlag()
+        XCTAssertEqual(vm.activity, .degraded(reason: "Paused at your $5.00 daily cap"))
+        XCTAssertEqual(vm.plainLabel, "Paused at your $5.00 daily cap")
+    }
+
+    /// The engine's recovery hook (clearDegraded) restores idle silently.
+    func testClearDegradedRestoresIdle() {
+        let vm = makeVM()
+        vm.enterDegraded(reason: "Can't reach DeepSeek")
+        vm.clearDegraded()
+        XCTAssertEqual(vm.activity, .idle)
+        XCTAssertEqual(vm.plainLabel, "Watching. All clear")
+        // Idempotent when not degraded.
+        vm.clearDegraded()
+        XCTAssertEqual(vm.activity, .idle)
+    }
 }

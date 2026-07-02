@@ -98,6 +98,62 @@ public struct HeartbeatFile: Sendable {
     }
 }
 
+/// v0.3.0 (P0-3): writer side of the heartbeat's `network_down` signal.
+///
+/// The heartbeat FILE is rewritten every 5s by the SupervisorHeartbeat
+/// companion, which has no view into triage failures — any flags the main
+/// app wrote into that file would be stomped within seconds. So the main
+/// app records "model triage is not running" (provider unreachable, or the
+/// daily cost cap) in this sibling marker file instead: the contents are
+/// the human-readable reason; presence means degraded. SupervisorStatusBar
+/// reads the marker alongside the heartbeat and shows amber + the reason
+/// while it exists. Folding the flag into the heartbeat line itself (so
+/// `Heartbeat.Flag.networkDown` is carried on the wire format) requires a
+/// SupervisorHeartbeat-side merge of this marker — left for the lifecycle
+/// wave; the marker is the transport until then.
+public struct NetworkDownMarker: Sendable {
+
+    public let path: URL
+
+    public init(path: URL) {
+        self.path = path
+    }
+
+    /// Conventional location: `network-down.marker` next to the heartbeat
+    /// file, so writer (main app) and reader (status bar) agree without a
+    /// new ConfigPaths entry.
+    public static func alongside(heartbeatPath: URL) -> NetworkDownMarker {
+        NetworkDownMarker(path: heartbeatPath
+            .deletingLastPathComponent()
+            .appendingPathComponent("network-down.marker", isDirectory: false))
+    }
+
+    /// Write (or overwrite) the marker with the degraded reason. Best-effort:
+    /// a failed write only costs the status-bar amber, never the pipeline.
+    public func set(reason: String) {
+        try? FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? Data(reason.utf8).write(to: path, options: .atomic)
+    }
+
+    /// Remove the marker (recovery). Safe when the marker doesn't exist.
+    public func clear() {
+        try? FileManager.default.removeItem(at: path)
+    }
+
+    /// The degraded reason, or nil when not degraded. An empty/unreadable
+    /// marker still reads as degraded with a generic reason — presence is
+    /// the signal, the text is a nicety.
+    public func read() -> String? {
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        let text = (try? String(contentsOf: path, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.isEmpty ? "model triage degraded" : text
+    }
+}
+
 /// Pure evaluator used by the status-bar process. Lives in Core so it can
 /// be unit-tested without an AppKit runtime.
 public enum HeartbeatHealth: Equatable, Sendable {

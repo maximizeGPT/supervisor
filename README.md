@@ -70,7 +70,14 @@ The architecture diagram is in **[docs/architecture.svg](./docs/architecture.svg
 
 ## Pricing
 
-Free and open source. The only thing you pay for is the model usage you would have paid for anyway, billed to you directly and never to us. The in-app cost view shows your real spend, and you can set a hard daily cap.
+Free and open source. The only thing you pay for is the model usage you would have paid for anyway, billed to you directly and never to us. The in-app cost view shows your real spend, and you can set a hard daily cap in `~/Library/Application Support/Supervisor/config.yaml`:
+
+```yaml
+cost:
+  daily_cap_usd: 5.00
+```
+
+Once today's spend reaches the cap, model calls stop until tomorrow — Supervisor tells you it paused, and the deterministic protections keep running. Delete the lines to remove the cap; changes apply without a restart.
 
 ## Contributing
 

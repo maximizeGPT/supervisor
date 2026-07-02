@@ -392,6 +392,154 @@ final class IdleDetectionTests: XCTestCase {
                        "but the engine MUST have asked the rubric — branch-name is a rubric-body responsibility, not an engine gate (ED-4)")
     }
 
+    // MARK: - Idle backoff (audit H5, 2026-07-02)
+
+    /// Poll until the mock has seen exactly `target` requests, then let the
+    /// engine's post-response bookkeeping (the all-clear streak update)
+    /// settle before the caller advances the clock and ticks again.
+    private func waitForRequests(_ target: Int, within seconds: TimeInterval = 3.0) async throws {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if Self.requestCount >= target { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(Self.requestCount, target,
+                       "expected exactly \(target) idle triage requests")
+        try await Task.sleep(nanoseconds: 250_000_000)
+    }
+
+    /// Consecutive all-clear idle evaluations must stretch the re-triage
+    /// interval 60s → 5min → 30min (cap) instead of re-spending a model
+    /// call every minute forever (five idle terminals overnight = 5
+    /// calls/minute all night — audit H5). Assert per step: no call fires
+    /// before the stretched deadline, exactly one fires after it.
+    func testConsecutiveAllClearsStretchReTriageInterval() async throws {
+        Self.canned["/v1/messages"] = (200, Self.haikuAllClearResponse(), [:])
+        let clockBox = ClockBox(initial: Date(timeIntervalSince1970: 1_700_000_000))
+        let (engine, bus, captured) = makeEngine(clock: { clockBox.now })
+        defer { engine.stop() }
+
+        publishAutonomousSessionStart(bus, at: clockBox.now)
+        clockBox.advance(by: 1)
+        // Stop-shaped text WITHOUT a question-prefilter phrase, so the only
+        // model calls in this test come from checkIdleStates (mirrors A4-2).
+        bus.publish(.assistantText(.init(
+            sessionId: "s-idle",
+            text: "All done — ready for next.",
+            turnUUID: "u-backoff-stop",
+            ts: clockBox.now
+        )))
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // Eval 1 at 15s of silence.
+        clockBox.advance(by: 15)
+        engine.checkIdleStates()
+        try await waitForRequests(1)
+
+        // All-clear #1 → interval still base (60s): 61s later it re-asks.
+        clockBox.advance(by: 61)
+        engine.checkIdleStates()
+        try await waitForRequests(2)
+
+        // All-clear #2 → interval stretches to 5min: 61s is no longer enough…
+        clockBox.advance(by: 61)
+        engine.checkIdleStates()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(Self.requestCount, 2,
+                       "after two consecutive all-clears the 60s re-ask must be suppressed (interval = 5min)")
+
+        // …but past the 5-minute deadline it fires.
+        clockBox.advance(by: 245)   // 61 + 245 = 306s since eval 2
+        engine.checkIdleStates()
+        try await waitForRequests(3)
+
+        // All-clear #3 → interval caps at 30min: 5min of silence is not enough…
+        clockBox.advance(by: 306)
+        engine.checkIdleStates()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(Self.requestCount, 3,
+                       "after three consecutive all-clears a 5min re-ask must be suppressed (interval = 30min cap)")
+
+        // …the 30-minute deadline fires again (and the cap holds — this is
+        // the steady overnight cadence).
+        clockBox.advance(by: 1501)  // 306 + 1501 = 1807s since eval 3
+        engine.checkIdleStates()
+        try await waitForRequests(4)
+
+        XCTAssertEqual(captured.snapshot.count, 0,
+                       "all-clear evaluations must never emit a decision")
+    }
+
+    /// A real event on the session resets the backoff to the base interval:
+    /// the re-ask after the next all-clear honors 60s again, not the 30min
+    /// cap the streak had reached.
+    func testFreshEventResetsIdleBackoffToBaseInterval() async throws {
+        Self.canned["/v1/messages"] = (200, Self.haikuAllClearResponse(), [:])
+        let clockBox = ClockBox(initial: Date(timeIntervalSince1970: 1_700_000_000))
+        let (engine, bus, captured) = makeEngine(clock: { clockBox.now })
+        defer { engine.stop() }
+
+        publishAutonomousSessionStart(bus, at: clockBox.now)
+        clockBox.advance(by: 1)
+        bus.publish(.assistantText(.init(
+            sessionId: "s-idle",
+            text: "All done — ready for next.",
+            turnUUID: "u-reset-stop",
+            ts: clockBox.now
+        )))
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // Grow the streak to 3 all-clears (interval now at the 30min cap).
+        clockBox.advance(by: 15)
+        engine.checkIdleStates()
+        try await waitForRequests(1)
+        clockBox.advance(by: 61)
+        engine.checkIdleStates()
+        try await waitForRequests(2)
+        clockBox.advance(by: 306)
+        engine.checkIdleStates()
+        try await waitForRequests(3)
+
+        // A real event lands (a fresh stop-shaped assistant turn).
+        clockBox.advance(by: 10)
+        bus.publish(.assistantText(.init(
+            sessionId: "s-idle",
+            text: "All done — ready for next.",
+            turnUUID: "u-reset-fresh",
+            ts: clockBox.now
+        )))
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // 16s of silence later the idle check fires immediately (the event
+        // cleared the re-triage stamp)…
+        clockBox.advance(by: 16)
+        engine.checkIdleStates()
+        try await waitForRequests(4)
+
+        // …and the STREAK was reset to base: 61s after that all-clear the
+        // engine re-asks again. Had the streak survived the event, the
+        // interval would still be the 30min cap and this call could not fire.
+        clockBox.advance(by: 61)
+        engine.checkIdleStates()
+        try await waitForRequests(5)
+
+        XCTAssertEqual(captured.snapshot.count, 0)
+    }
+
+    /// Pure ladder coverage: base for the first two states, 5min after the
+    /// second consecutive all-clear, the 30min cap from the third onward.
+    func testEffectiveIdleReTriageIntervalLadder() {
+        let clockBox = ClockBox(initial: Date(timeIntervalSince1970: 1_700_000_000))
+        let (engine, _, _) = makeEngine(clock: { clockBox.now })
+        defer { engine.stop() }
+        XCTAssertEqual(engine.effectiveIdleReTriageInterval(consecutiveAllClears: 0), 60)
+        XCTAssertEqual(engine.effectiveIdleReTriageInterval(consecutiveAllClears: 1), 60)
+        XCTAssertEqual(engine.effectiveIdleReTriageInterval(consecutiveAllClears: 2), 5 * 60)
+        XCTAssertEqual(engine.effectiveIdleReTriageInterval(consecutiveAllClears: 3), 30 * 60)
+        XCTAssertEqual(engine.effectiveIdleReTriageInterval(consecutiveAllClears: 10), 30 * 60,
+                       "the ladder must cap at 30min, not keep growing")
+    }
+
     // MARK: - detectWorkerStopped unit coverage
 
     func testDetectWorkerStoppedReturnsTrueForTextOnlyAssistant() {
