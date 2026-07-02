@@ -19,6 +19,36 @@ cd "$(dirname "$0")/.."
 
 CONFIG="${1:-debug}"   # debug | release
 
+# ---- Version stamp ------------------------------------------------------
+# Was hardcoded CFBundleShortVersionString=0.1.0 / CFBundleVersion=1 forever,
+# so every build across the whole history was indistinguishable once
+# installed. Derive both from git:
+#   CFBundleShortVersionString ← `git describe --tags` (nearest tag, minus the
+#                                 leading v), reduced to the semver core so it
+#                                 stays a valid dotted-numeric "marketing"
+#                                 version; falls back to VERSION_FALLBACK.
+#   CFBundleVersion            ← `git rev-list --count HEAD` (monotonic build
+#                                 number); falls back to 1.
+# Robust when git or tags are absent (fresh clone with no tags, tarball build).
+VERSION_FALLBACK="0.3.0"
+if GIT_DESCRIBE=$(git describe --tags --always --dirty 2>/dev/null); then
+    SHORT_VERSION="${GIT_DESCRIBE#v}"          # v0.3.0 -> 0.3.0
+else
+    GIT_DESCRIBE=""
+    SHORT_VERSION="$VERSION_FALLBACK"
+fi
+# Marketing version = semver core, before any `-<N>-g<sha>` / `-dirty` suffix.
+MARKETING_VERSION="${SHORT_VERSION%%-*}"
+# If describe returned only a bare SHA (repo never tagged), that isn't a
+# valid dotted version — fall back so CFBundleShortVersionString stays legal.
+if [[ ! "$MARKETING_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    MARKETING_VERSION="$VERSION_FALLBACK"
+fi
+if ! BUILD_NUMBER=$(git rev-list --count HEAD 2>/dev/null); then
+    BUILD_NUMBER=1
+fi
+echo "[build-app] version: $MARKETING_VERSION (build $BUILD_NUMBER; describe: ${GIT_DESCRIBE:-none})"
+
 echo "[build-app] swift build --configuration $CONFIG"
 swift build --configuration "$CONFIG"
 
@@ -79,9 +109,9 @@ make_bundle() {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>${MARKETING_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>${BUILD_NUMBER}</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -122,11 +152,21 @@ Scripts/sign-adhoc.sh "$HB_APP"
 Scripts/sign-adhoc.sh "$SB_APP"
 Scripts/sign-adhoc.sh "$APP_APP"
 
+# Record the resolved version so the release/notarize step can name the DMG
+# without re-deriving it (Scripts/notarize.sh names the DMG via DMG_NAME).
+# See docs/RELEASE-CHECKLIST.md for the versioned-DMG + stable-copy step.
+printf '%s\n' "$MARKETING_VERSION" > "$OUT_DIR/VERSION"
+
 echo
-echo "[build-app] ✓ built and signed:"
+echo "[build-app] ✓ built and signed $MARKETING_VERSION (build $BUILD_NUMBER):"
 echo "    $APP_APP   ← main (LSUIElement; menu-bar-app shape)"
 echo "    $HB_APP    ← heartbeat companion (also embedded inside Supervisor.app)"
 echo "    $SB_APP    ← status-bar companion"
+echo
+echo "To package a versioned, notarized DMG for release (keeps the stable"
+echo "Supervisor.dmg the README download URL points at):"
+echo "    DMG_NAME=\"Supervisor-$MARKETING_VERSION\" Scripts/notarize.sh"
+echo "    cp \"dist/Supervisor-$MARKETING_VERSION.dmg\" dist/Supervisor.dmg"
 echo
 echo "First-run flow:"
 echo "    open $APP_APP        # presents onboarding window"

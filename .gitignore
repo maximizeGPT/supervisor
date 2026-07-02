@@ -1,7 +1,10 @@
 # Swift / SPM
 .build/
 .swiftpm/
-Package.resolved
+# Package.resolved is COMMITTED (not ignored): pinning GRDB/KeychainAccess to
+# exact revisions is what makes two builds of one tag byte-reproducible. The
+# maintainer regenerates it with `swift package resolve` and commits it — see
+# docs/RELEASE-CHECKLIST.md.
 *.xcodeproj/
 *.xcworkspace/
 DerivedData/

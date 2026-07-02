@@ -12,7 +12,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Version label shown in the "Supervisor updated itself" hover. When not
+# passed explicitly, derive it from git (same source build-app.sh stamps into
+# CFBundleShortVersionString) so the announcement matches the installed bundle
+# instead of being a generic blank. Falls back to empty if git/tags are absent.
 VERSION="${1:-}"
+if [[ -z "$VERSION" ]]; then
+    if VERSION=$(git describe --tags --always --dirty 2>/dev/null); then
+        VERSION="${VERSION#v}"
+    else
+        VERSION=""
+    fi
+fi
 SRC="build/Supervisor.app"
 SRC_STATUSBAR="build/SupervisorStatusBar.app"
 DEST="/Applications/Supervisor.app"

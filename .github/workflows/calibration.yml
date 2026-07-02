@@ -1,0 +1,75 @@
+name: calibration
+
+# Live calibration sweep + safety canaries. These hit a real provider API
+# and bill against a key, so they do NOT run on push (that's the `ci`
+# workflow). They run nightly and on manual dispatch.
+#
+# REQUIRED SECRET: `ANTHROPIC_API_KEY` must be configured in the repo
+# secrets (Settings → Secrets and variables → Actions). Until it is, this
+# job still runs green: every live test self-skips (XCTSkip) when no
+# usable key is present, so the workflow does not hard-fail before the
+# secret is added. Add the secret to make the gate real.
+#
+# NEVER put a key value in this file — only the `${{ secrets.* }}`
+# reference below.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 08:00 UTC nightly. Cron is UTC; GitHub may delay scheduled runs
+    # under load, which is fine for a nightly calibration.
+    - cron: "0 8 * * *"
+
+permissions:
+  contents: read
+
+# One run at a time: overlapping sweeps would double-spend the API budget
+# and race on the report directory. A newer run supersedes an in-flight one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  calibration:
+    name: live calibration sweep + canaries
+    runs-on: macos-14
+    # The full 302-fixture sweep paces at ~2s/call (~10 min) plus the
+    # question sweep, canaries, and a cold `swift build`. 60 min leaves
+    # headroom without letting a hung provider call run forever.
+    timeout-minutes: 60
+    env:
+      # SUPERVISOR_LIVE_API gates every live test. The key is injected from
+      # the repo secret; when the secret is absent it expands to an empty
+      # string and the tests self-skip on "no usable key".
+      SUPERVISOR_LIVE_API: "1"
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: swift --version
+      # Single job (matches ci.yml's rationale): build then test on the same
+      # runner so `swift test` reuses the freshly-built artifacts.
+      - name: Build all targets
+        run: swift build
+      # The live calibration sweep (full-corpus + question) and the two
+      # safety canaries. Each self-skips via XCTSkip when SUPERVISOR_LIVE_API
+      # or a usable key is missing, so this step is green until the secret is
+      # configured, and becomes a real gate once it is.
+      - name: Run live calibration sweep + canaries
+        run: |
+          swift test \
+            --filter RubricCalibrationTests/testCalibrateFullCorpus \
+            --filter RubricCalibrationTests/testCalibrateQuestionFixtures \
+            --filter ImpersonationGapCanaryTest \
+            --filter v0_3_0_CanaryTest
+      # Preserve the JSON/Markdown reports the sweep writes under
+      # Tests/Calibration/runs/<timestamp>/ so a nightly regression can be
+      # inspected after the runner is gone. Best-effort — no reports when the
+      # sweep self-skipped (secret not yet set).
+      - name: Upload calibration reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibration-reports
+          path: Tests/Calibration/runs/
+          if-no-files-found: ignore
