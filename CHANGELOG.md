@@ -6,6 +6,52 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+v0.3.0 Wave 4 — the dogfood proof and reproducible release (2026-07-02):
+the trust-critical fixes of Waves 1-3 are now pinned by headless
+end-to-end tests that drive the real user flows, the calibration gate
+is enforced instead of prose, and a release can be cut reproducibly.
+
+### Added
+
+**Headless dogfood suite — real user flows, proven offline in CI**
+(`Tests/SupervisorCoreTests/Dogfood*.swift`, `Sources/FakeClaudeCLI/main.swift`)
+- Thirteen new end-to-end tests drive the real pipeline (discovery → tail →
+  parser → bus → engine → router → SQLite → hover) with no API key, no
+  Accessibility, and no display, so CI proves the product behaves for a real
+  user, not just its units:
+  - **Destructive-pause, full wire, zero model calls** — a fresh `rm -rf
+    ~/Documents` fires the deterministic catch, persists a `pause` flag,
+    SIGSTOPs the session's process group (never Desktop), writes a recovery
+    doc, and paints the hover red — with a request-counting mock proving no
+    network call happened.
+  - **Resume-replay protection** — an old `claude --resume` copy never
+    replays its historical destructive line (fast-forward + age gate, zero
+    spend) while the fresh tail stays live.
+  - **Session churn** — truncation/rotation resets cleanly; an atomic-save
+    rename re-tails the swapped-in file.
+  - **Queued-when-typing** — a dispatch defers while the human is typing and
+    delivers once they pause, logged as two honest entries.
+  - **Health walk** — heartbeat age → green/amber/red, network-down and
+    pause markers → amber/paused.
+- `FakeClaudeCLI` gained a `--replay <fixture.jsonl>` mode and tool_result /
+  assistant-text shapes so process-based scenarios replay faithfully.
+
+**The calibration gate is enforced, and releases are reproducible**
+- The full-corpus sweep now asserts per-category pass-rate floors (it had
+  zero assertions and could not fail); the nightly `calibration.yml` workflow
+  runs it plus both live canaries behind the API-key secret.
+- `build-app.sh` stamps the real version from git (no more hardcoded 0.1.0);
+  `Package.resolved` is committed so dependency revisions are pinned;
+  `docs/RELEASE-CHECKLIST.md` makes a tag-to-release cut reproducible.
+
+### Fixed
+
+**The v0.3.0 canary loads PRINCIPLES.md from a checkout-relative path**
+(`Tests/SupervisorCoreTests/v0_3_0_CanaryTest.swift`)
+- It hardcoded `/Users/main/supervisor/PRINCIPLES.md`, so it would have failed
+  on any CI runner once the calibration secret was configured. It now derives
+  the repo root from `#filePath`, so the nightly canary can actually go green.
+
 v0.3.0 Wave 3 — lifecycle dignity, the moment of need, and safety
 (2026-07-02): the harness can be turned off, tells the truth on every
 surface, acts through a notification you can actually use, never types a

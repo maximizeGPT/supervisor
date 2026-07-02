@@ -48,9 +48,16 @@ final class v0_3_0_CanaryTest: XCTestCase {
         let trace = TraceLog(path: tracePath)
         let client = LLMClient(provider: provider, apiKey: key, redactor: DefaultRedactor(), traceLog: trace)
 
-        // Load PRINCIPLES.md from the repo root. This is the same file
-        // the running Supervisor.app reads in production.
-        let principlesURL = URL(fileURLWithPath: "/Users/main/supervisor/PRINCIPLES.md")
+        // Load PRINCIPLES.md from the repo root — the same file the running
+        // Supervisor.app reads in production. Derive the root from this test
+        // file's own location (#filePath is <repo>/Tests/SupervisorCoreTests/
+        // v0_3_0_CanaryTest.swift) so the canary works on any checkout,
+        // including a CI runner, rather than a hardcoded developer path.
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // SupervisorCoreTests/
+            .deletingLastPathComponent()   // Tests/
+            .deletingLastPathComponent()   // <repo root>
+        let principlesURL = repoRoot.appendingPathComponent("PRINCIPLES.md")
         let principles = try String(contentsOf: principlesURL, encoding: .utf8)
         XCTAssertFalse(principles.isEmpty, "PRINCIPLES.md must exist + be non-empty for the canary")
 

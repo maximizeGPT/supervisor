@@ -31,6 +31,18 @@
 //                         one matches a given target cwd.
 //   --session-id <uuid>   Override the generated session ID. Useful when
 //                         tests need a predictable JSONL filename.
+//   --replay <path>       Scenario-replay mode (v0.3.0 Wave 4). Instead of
+//                         the synthetic prompt/Bash loop, read a fixture
+//                         JSONL from <path> and replay its lines VERBATIM to
+//                         the target transcript, one every --interval-ms, so
+//                         a process-based dogfood scenario is driven by a
+//                         hand-authored transcript (destructive line, resume
+//                         copy, tool_result turn, …). The fixture owns all
+//                         content — no queue-operation header is synthesized
+//                         in this mode (the fixture supplies its own
+//                         cwd-bearing lead-in). --pid-file / --cwd / fd-hold
+//                         behave exactly as in the default mode, so a replay
+//                         process is still locatable by ProcessLocator.
 //   --child               Internal flag — set when this process was
 //                         spawned by a --multi-instance parent. Suppresses
 //                         further self-spawning (no infinite recursion)
@@ -78,6 +90,7 @@ struct Args {
     var multiInstance: Bool = false
     var isChild: Bool = false
     var sessionId: String = UUID().uuidString
+    var replayPath: String? = nil
 }
 
 func parseArgs() -> Args {
@@ -101,6 +114,7 @@ func parseArgs() -> Args {
         case "--interval-ms":    args.intervalMs = Int(value()) ?? args.intervalMs
         case "--max-events":     args.maxEvents = Int(value()) ?? args.maxEvents
         case "--session-id":     args.sessionId = value()
+        case "--replay":         args.replayPath = value()
         case "--no-fd-hold":     args.holdFd = false
         case "--multi-instance": args.multiInstance = true
         case "--child":          args.isChild = true
@@ -177,9 +191,7 @@ if args.holdFd {
     }
 }
 
-func writeEvent(_ json: [String: Any]) {
-    guard var data = try? JSONSerialization.data(withJSONObject: json, options: []) else { return }
-    data.append(0x0A) // newline
+func writeData(_ data: Data) {
     if args.holdFd {
         _ = data.withUnsafeBytes { ptr -> Int in
             write(heldFd, ptr.baseAddress, data.count)
@@ -193,6 +205,43 @@ func writeEvent(_ json: [String: Any]) {
         }
         close(fd)
     }
+}
+
+func writeEvent(_ json: [String: Any]) {
+    guard var data = try? JSONSerialization.data(withJSONObject: json, options: []) else { return }
+    data.append(0x0A) // newline
+    writeData(data)
+}
+
+/// Append a preformed JSONL line verbatim (used by --replay so a
+/// hand-authored fixture's exact bytes — timestamps, sidechain flags,
+/// destructive commands — reach the transcript unmodified).
+func writeRawLine(_ line: String) {
+    var data = Data(line.utf8)
+    if data.last != 0x0A { data.append(0x0A) }
+    writeData(data)
+}
+
+// MARK: - Replay mode (v0.3.0 Wave 4)
+//
+// Drive a process-based dogfood scenario from a fixture transcript. Each
+// line is replayed on the --interval-ms cadence so the tail sees writes
+// arrive over time (realistic), not as one atomic dump. The fixture owns
+// all content, INCLUDING the cwd-bearing lead-in the parser needs for
+// sessionStart, so no synthetic header is written here.
+if let replayPath = args.replayPath {
+    guard let contents = try? String(contentsOfFile: replayPath, encoding: .utf8) else {
+        FileHandle.standardError.write(Data("FakeClaudeCLI: --replay \(replayPath) unreadable\n".utf8))
+        exit(1)
+    }
+    let interval = TimeInterval(args.intervalMs) / 1000.0
+    for raw in contents.split(separator: "\n", omittingEmptySubsequences: true) {
+        Thread.sleep(forTimeInterval: interval)
+        writeRawLine(String(raw))
+    }
+    if args.holdFd && heldFd >= 0 { close(heldFd) }
+    unlink(pidFilePath)
+    exit(0)
 }
 
 // MARK: - Event sequence
@@ -210,6 +259,12 @@ writeEvent([
 // Alternating user prompt + assistant tool_use cycle. Realistic-ish:
 // matches the shape EventParser handles (user message with string content,
 // assistant message with content array containing a Bash tool_use block).
+// v0.3.0 Wave 4: the cycle now also emits the matching tool_result after
+// each Bash call and an occasional assistant text block, so the fake covers
+// the full turn shape (call → result → prose), not just call. The original
+// prompt/Bash alternation is preserved so ProcessLocator tests — which only
+// care that a process is writing on a cadence in a known cwd — are
+// unaffected.
 for i in 0..<args.maxEvents {
     Thread.sleep(forTimeInterval: TimeInterval(args.intervalMs) / 1000.0)
     let ts = isoFormatter.string(from: Date())
@@ -238,6 +293,45 @@ for i in 0..<args.maxEvents {
                         "id": "t-\(i)",
                         "name": "Bash",
                         "input": ["command": "echo fake-claude tick \(i)"] as [String: Any],
+                    ] as [String: Any]
+                ] as [Any],
+            ] as [String: Any],
+        ])
+        // The matching tool_result for the Bash call above — a user-role turn
+        // carrying a tool_result block (the shape EventParser turns into
+        // .bashToolResult).
+        writeEvent([
+            "type": "user",
+            "timestamp": isoFormatter.string(from: Date()),
+            "sessionId": args.sessionId,
+            "uuid": "r-\(i)",
+            "message": [
+                "role": "user",
+                "content": [
+                    [
+                        "type": "tool_result",
+                        "tool_use_id": "t-\(i)",
+                        "content": "fake-claude tick \(i)",
+                        "is_error": false,
+                    ] as [String: Any]
+                ] as [Any],
+            ] as [String: Any],
+        ])
+    }
+    // Occasional assistant prose (a stop-shaped "done" turn), so the
+    // assistant-text shape is exercised too.
+    if i % 5 == 4 {
+        writeEvent([
+            "type": "assistant",
+            "timestamp": isoFormatter.string(from: Date()),
+            "sessionId": args.sessionId,
+            "uuid": "at-\(i)",
+            "message": [
+                "role": "assistant",
+                "content": [
+                    [
+                        "type": "text",
+                        "text": "Done with step \(i). Let me know what to do next.",
                     ] as [String: Any]
                 ] as [Any],
             ] as [String: Any],
