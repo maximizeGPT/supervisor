@@ -349,15 +349,21 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // v0.1.7: wire the resume handler for the expanded panel's
         // Resume button. Uses the same locator + signal sender as the
         // router's pause path, but sends SIGCONT instead of SIGSTOP.
+        // Group-wide, mirroring the pause: SIGSTOP now lands on the whole
+        // process group (so the forked bash child actually stops), and a
+        // single-pid SIGCONT would leave those children stopped — the
+        // parent resumes, then hangs waiting on a frozen child. Desktop
+        // fallback is off for the same reason it's off on the pause path:
+        // a resume signal must never land on Claude Desktop's PID.
         hoverVM.resumeHandler = { [weak self] cwd in
             guard let self else { return false }
-            guard let handle = locator.locate(targetCwd: cwd) else {
+            guard let handle = locator.locate(targetCwd: cwd, allowDesktopFallback: false) else {
                 self.trace.emit("hover", "resume: locator returned nil for cwd=\(cwd)")
                 return false
             }
             do {
-                try signalSender.send(SIGCONT, to: handle.pid)
-                self.trace.emit("hover", "resume: SIGCONT sent pid=\(handle.pid) cwd=\(cwd)")
+                try signalSender.sendToGroup(SIGCONT, of: handle.pid)
+                self.trace.emit("hover", "resume: SIGCONT sent to group of pid=\(handle.pid) cwd=\(cwd)")
                 return true
             } catch {
                 self.trace.emit("hover", "resume: SIGCONT failed pid=\(handle.pid) error=\(error)")

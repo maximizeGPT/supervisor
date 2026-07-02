@@ -15,6 +15,17 @@
 // thinking blocks, non-Bash tool calls) parses successfully but emits
 // nothing. The verbose-line discipline keeps the EventBus traffic
 // proportional to what the rest of the system actually needs.
+//
+// Provenance guard (2026-07-02): not every line is main-session,
+// owner-authored content. Sidechain lines (`isSidechain: true` — a
+// subagent's transcript interleaved into the same JSONL, whose opening
+// user-role turn is really the ASSISTANT's Task prompt) emit nothing past
+// sessionStart. Machine-generated user-role turns (`isMeta: true` caveats,
+// <command-*>/<local-command-stdout> slash-command echoes, and
+// compact-continuation summaries) never become userPrompt. Any of these
+// would otherwise read downstream as the owner's words — the
+// destructive-action authorization anchor (TriageEngine.lastOwnerPrompt)
+// and the session objective.
 
 import Foundation
 
@@ -84,6 +95,15 @@ public final class EventParser: Sendable {
             emittedSessionStart = true
         }
 
+        // Sidechain lines are a subagent's transcript, not the main session:
+        // nothing on them may interleave into the main-session window. The
+        // sidechain's opening user-role turn is assistant-authored (the Task
+        // tool prompt) and would otherwise become lastOwnerPrompt; its
+        // assistant/tool events aren't the observed session's work either.
+        // sessionStart above still fires — the line carries the real cwd even
+        // when its content is skippable.
+        if (obj["isSidechain"] as? Bool) == true { return emitted }
+
         switch type {
         case "user":
             emitted.append(contentsOf: parseUserMessage(obj))
@@ -107,10 +127,18 @@ public final class EventParser: Sendable {
 
         var out: [SupervisorEvent] = []
 
+        // A user-role turn the human didn't type must never become userPrompt
+        // (it would be `.owner` downstream). isMeta covers CLI-generated
+        // caveat turns; the text-shape check covers slash-command echoes and
+        // compact-continuation summaries.
+        let isMeta = (obj["isMeta"] as? Bool) == true
+
         // content may be a String (a plain user prompt) or an array of
         // blocks (containing tool_result entries).
         if let str = message["content"] as? String, !str.isEmpty {
-            out.append(.userPrompt(.init(sessionId: sessionId, text: str, ts: ts)))
+            if !isMeta, !Self.isMachineGeneratedUserText(str) {
+                out.append(.userPrompt(.init(sessionId: sessionId, text: str, ts: ts)))
+            }
             return out
         }
         guard let blocks = message["content"] as? [[String: Any]] else { return [] }
@@ -131,7 +159,8 @@ public final class EventParser: Sendable {
                     )))
                 }
             case "text":
-                if let str = block["text"] as? String, !str.isEmpty {
+                if let str = block["text"] as? String, !str.isEmpty,
+                   !isMeta, !Self.isMachineGeneratedUserText(str) {
                     out.append(.userPrompt(.init(sessionId: sessionId, text: str, ts: ts)))
                 }
             default:
@@ -240,6 +269,24 @@ public final class EventParser: Sendable {
     private func parseTS(_ raw: Any?) -> Date? {
         guard let str = raw as? String else { return nil }
         return Self.isoFormatter.date(from: str) ?? Self.isoFormatterNoFrac.date(from: str)
+    }
+
+    /// True when a user-role message's text is machine-generated, not typed
+    /// by the owner: slash-command echoes (the CLI records the expansion as a
+    /// user turn wrapped in <command-name>/<command-message>/
+    /// <local-command-stdout> tags) and compact-continuation summaries (a
+    /// resumed session opens with a generated recap that can DESCRIBE
+    /// destructive work and would otherwise read as authorizing it). Shared
+    /// with SessionObjective so the objective reader skips the same shapes.
+    static func isMachineGeneratedUserText(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let machinePrefixes = [
+            "<command-name>",
+            "<command-message>",
+            "<local-command-stdout>",
+            "This session is being continued from a previous conversation",
+        ]
+        return machinePrefixes.contains { trimmed.hasPrefix($0) }
     }
 
     /// Render an AskUserQuestion tool input into plain text the

@@ -135,7 +135,9 @@ final class RecoveryDocWriterTests: XCTestCase {
         let writer = RecoveryDocWriter(directory: dir)
         let url = await writer.write(decision: makeDecision(), action: .pause, pid: 5555)
         let body = try String(contentsOf: url!, encoding: .utf8)
-        XCTAssertTrue(body.contains("kill -CONT 5555"), "pause section must show kill -CONT with PID baked in")
+        XCTAssertTrue(body.contains("kill -CONT -\"$(ps -o pgid= -p 5555"),
+                      "pause section must show a group-wide kill -CONT with the PID baked in — " +
+                      "the pause is group-wide, so a single-pid resume would leave children stopped")
         XCTAssertTrue(body.contains("If YES"), "pause section must offer YES branch")
         XCTAssertTrue(body.contains("If NO"), "pause section must offer NO branch")
         XCTAssertTrue(body.contains("If UNSURE"), "pause section must offer UNSURE branch")

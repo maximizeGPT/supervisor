@@ -104,11 +104,60 @@ public final class LLMClient: Sendable {
     /// of the wire shape so call sites don't branch.
     @discardableResult
     public func createMessage(_ request: AnthropicMessageRequest) async throws -> AnthropicMessageResponse {
+        // First redaction pass, over the PLAINTEXT. JSONEncoder writes a
+        // newline as the two characters `\n`, so on the encoded body the
+        // `(?m)^` line anchors and the `\b` boundaries at line starts never
+        // fire — an `export FOO=...` line or a line-leading `ghp_`/`AKIA`
+        // token would sail through an encoded-body pass alone. Redacting
+        // here, before any encoding, gives every pattern the real newlines
+        // it was written against. The encoded-body pass inside each POST
+        // path stays as a second layer.
+        let redactedRequest = plaintextRedacted(request)
         switch provider.apiShape {
         case .anthropic:
-            return try await postAnthropic(request)
+            return try await postAnthropic(redactedRequest)
         case .openAICompat:
-            return try await postOpenAICompat(request)
+            return try await postOpenAICompat(redactedRequest)
+        }
+    }
+
+    // MARK: - Plaintext redaction (first pass, pre-encoding)
+
+    /// Returns a copy of `request` with every human-content string — the
+    /// system prompt and each message's content — run through the redactor
+    /// while it is still plaintext. Fail-closed the same way the
+    /// encoded-body pass is: the redacted copy is built before any request
+    /// body exists and is the only value handed to the POST paths, so no
+    /// code path can encode or send the original strings.
+    private func plaintextRedacted(_ request: AnthropicMessageRequest) -> AnthropicMessageRequest {
+        AnthropicMessageRequest(
+            model: request.model,
+            max_tokens: request.max_tokens,
+            system: request.system.map { redactor.redact($0) },
+            messages: request.messages.map { message in
+                AnthropicMessage(role: message.role, content: plaintextRedacted(message.content))
+            },
+            tools: request.tools,
+            tool_choice: request.tool_choice
+        )
+    }
+
+    private func plaintextRedacted(_ content: AnthropicContent) -> AnthropicContent {
+        switch content {
+        case .string(let s):
+            return .string(redactor.redact(s))
+        case .blocks(let blocks):
+            return .blocks(blocks.map { block in
+                AnthropicContentBlock(
+                    type: block.type,
+                    text: block.text.map { redactor.redact($0) },
+                    id: block.id,
+                    name: block.name,
+                    input: block.input,
+                    tool_use_id: block.tool_use_id,
+                    content: block.content
+                )
+            })
         }
     }
 
@@ -123,6 +172,9 @@ public final class LLMClient: Sendable {
         } catch {
             throw AnthropicClientError.decodingFailed(reason: "request encode: \(error)")
         }
+        // Second-layer pass over the encoded body. The plaintext pass in
+        // createMessage() already ran; this catches anything assembled by
+        // the encoder itself.
         let redacted = redactor.redact(String(decoding: bodyData, as: UTF8.self))
         let outgoing = Data(redacted.utf8)
 
@@ -162,6 +214,9 @@ public final class LLMClient: Sendable {
         } catch {
             throw AnthropicClientError.decodingFailed(reason: "request encode: \(error)")
         }
+        // Second-layer pass over the encoded body. The plaintext pass in
+        // createMessage() already ran; this catches anything assembled by
+        // the encoder itself.
         let redacted = redactor.redact(String(decoding: bodyData, as: UTF8.self))
         let outgoing = Data(redacted.utf8)
 

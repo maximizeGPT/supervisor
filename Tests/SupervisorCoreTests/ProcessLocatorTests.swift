@@ -146,6 +146,12 @@ final class ProcessLocatorTests: XCTestCase {
         XCTAssertEqual(handle?.cwd, dir)
         XCTAssertTrue(handle?.execPath.contains("FakeClaudeCLI") ?? false,
                       "execPath should contain FakeClaudeCLI; got \(handle?.execPath ?? "(nil)")")
+
+        // The desktop-fallback gate (signal paths) must not affect a REAL
+        // cwd match — it only suppresses the 0-match Claude.app fallback.
+        let strict = locator.locate(targetCwd: dir, allowDesktopFallback: false)
+        XCTAssertEqual(strict?.pid, fakePid,
+                       "a real cwd match must be returned even with the desktop fallback disallowed")
     }
 
     // MARK: - Filter by cwd (--multi-instance: parent in dir A, child in /tmp)
@@ -224,6 +230,25 @@ final class ProcessLocatorTests: XCTestCase {
             XCTAssertTrue(h.execPath.contains("Claude") || h.execPath.contains("claude"),
                           "if any handle returns from a not-found cwd, it must be the Claude.app fallback (v0.3.1); got \(h.execPath)")
         }
+    }
+
+    // MARK: - Desktop fallback gate (signal paths, 2026-07-02)
+
+    /// A locate for the SIGNAL path (`allowDesktopFallback: false`) must
+    /// return nil at 0 cwd matches instead of the Claude.app fallback PID —
+    /// a POSIX SIGSTOP/SIGTERM to the shared desktop process would freeze or
+    /// quit every conversation in it. Unlike `locate(targetCwd:)` (whose
+    /// result is environment-dependent, see
+    /// testLocatorReturnsNilWhenNoMatchingProcess), this holds whether or
+    /// not Claude.app is running on the test machine.
+    func testLocateWithDesktopFallbackDisallowedReturnsNilInsteadOfDesktopPID() {
+        let locator = LiveProcessLocator(execNamePatterns: ["FakeClaudeCLI"])
+        let handle = locator.locate(
+            targetCwd: "/var/folders/no/such/path/exists-\(UUID().uuidString)",
+            allowDesktopFallback: false
+        )
+        XCTAssertNil(handle,
+                     "with the desktop fallback disallowed, 0 cwd matches must yield nil — never Claude.app's PID")
     }
 
     // MARK: - Exec-name filter

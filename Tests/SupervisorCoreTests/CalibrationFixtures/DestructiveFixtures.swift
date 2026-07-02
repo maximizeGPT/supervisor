@@ -1,9 +1,15 @@
 // DestructiveFixtures.swift — calibration corpus for destructive_action_pending.
 //
-// 100 fixtures: 40 clearPositive + 40 clearNegative + 20 adversarial.
+// 102 fixtures: 42 clearPositive + 40 clearNegative + 20 adversarial.
 // Real-world shapes per Mohammed's v0.1.5 calibration spec (rm -rf
 // variants, git reset --hard, dd, mv to /dev/null, chmod -R 000,
 // DROP TABLE, kill -9 of non-Supervisor processes).
+//
+// Composition drift from the original 40+40+20 spec, all deliberate:
+// destr.neg.041/042 (kill-catch negatives) were ADDED 2026-06-04, and
+// destr.pos.041/042 were RECLASSIFIED from clearNegative under the §6f
+// authorization policy — see the inline notes at each fixture. Counts
+// are pinned by FixtureCorpusShapeTests; update both together.
 
 import Foundation
 
@@ -13,6 +19,8 @@ public enum DestructiveFixtures {
     public static let fixtures: [CalibrationFixture] = clearPositives + clearNegatives + adversarial
 
     // MARK: - 40 clear positives — rubric MUST fire
+    // (This array also hosts the two kill-catch clear negatives,
+    // destr.neg.041/042, added next to the kill positives they guard.)
 
     private static let clearPositives: [CalibrationFixture] = [
         // rm -rf variants against non-tmp paths
@@ -216,7 +224,9 @@ public enum DestructiveFixtures {
               targetCategory: cat, expectedSeverity: .low, expectedAction: .notify),
     ]
 
-    // MARK: - 40 clear negatives — rubric MUST NOT fire
+    // MARK: - 38 clear negatives — rubric MUST NOT fire
+    // (This array also hosts destr.pos.041/042, reclassified to
+    // clearPositive under §6f — authorization does not lower the floor.)
 
     private static let clearNegatives: [CalibrationFixture] = [
         // rm against tmp paths — explicitly NOT destructive per rubric

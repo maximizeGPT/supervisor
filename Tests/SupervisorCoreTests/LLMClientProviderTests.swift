@@ -373,6 +373,50 @@ final class LLMClientProviderTests: XCTestCase {
         XCTAssertNil(LLMProviderMockURLProtocol.lastRequestHeaders["Authorization"],
                      "Anthropic must NOT receive a Bearer header")
     }
+
+    // MARK: - Pre-encoding redaction (gold test)
+
+    func testLineLeadingTokenIsRedactedBeforeReachingTheWire() async throws {
+        // Regression: JSONEncoder writes `\n` as two characters, so a token
+        // at the start of a line loses its leading `\b` on the encoded body
+        // (it is preceded by the word-char `n` of the escape) and an
+        // encoded-body-only redaction pass lets it through. createMessage's
+        // plaintext pass must strip it before encoding — the raw token must
+        // never appear in the captured outgoing body.
+        let mockResponse: Data = Data(#"""
+        {"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}
+        """#.utf8)
+        LLMProviderMockURLProtocol.responses = [
+            "/v1/messages": (200, mockResponse, [:]),
+        ]
+        LLMProviderMockURLProtocol.lastRequestBody = Data()
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [LLMProviderMockURLProtocol.self]
+        let client = LLMClient(
+            provider: .anthropic,
+            apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: URLSession(configuration: cfg)
+        )
+
+        let token = "ghp_" + String(repeating: "A", count: 36)
+        let req = AnthropicMessageRequest(
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 16,
+            system: nil,
+            messages: [.init(role: "user", content: .string("tool output:\n\(token)\nend"))],
+            tools: nil,
+            tool_choice: nil
+        )
+        _ = try await client.createMessage(req)
+
+        let body = String(decoding: LLMProviderMockURLProtocol.lastRequestBody, as: UTF8.self)
+        XCTAssertFalse(body.isEmpty, "mock must capture the outgoing body")
+        XCTAssertFalse(body.contains(token), "line-leading token must never reach the wire")
+        XCTAssertTrue(body.contains("<redacted:github-token>"))
+    }
 }
 
 // MARK: - URL protocol mock
@@ -380,14 +424,30 @@ final class LLMClientProviderTests: XCTestCase {
 final class LLMProviderMockURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var responses: [String: (Int, Data, [String: String])] = [:]
     nonisolated(unsafe) static var lastRequestHeaders: [String: String] = [:]
+    nonisolated(unsafe) static var lastRequestBody: Data = Data()
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        // Record the request headers for assertions.
+        // Record the request headers + body for assertions. URLSession hands
+        // URLProtocol the body as a stream, not via `httpBody`, so drain it.
         if let headers = request.allHTTPHeaderFields {
             Self.lastRequestHeaders = headers
+        }
+        if let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var body = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let read = stream.read(&buffer, maxLength: buffer.count)
+                guard read > 0 else { break }
+                body.append(contentsOf: buffer[0..<read])
+            }
+            Self.lastRequestBody = body
+        } else if let body = request.httpBody {
+            Self.lastRequestBody = body
         }
         let path = request.url?.path ?? ""
         guard let (status, body, extraHeaders) = Self.responses[path] else {

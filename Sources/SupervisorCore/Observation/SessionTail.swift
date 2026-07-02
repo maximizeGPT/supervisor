@@ -3,7 +3,9 @@
 // kqueue-backed tail of a single Claude Code session JSONL.
 //
 // Lifecycle:
-//   1. Open file at saved offset (from SessionStore.jsonlOffset) or EOF.
+//   1. Open file at saved offset (from SessionStore.jsonlOffset). With no
+//      saved offset: byte 0 for small fresh files, fast-forward to EOF for
+//      pre-existing history (see the seek policy in start()).
 //   2. Register DispatchSourceFileSystemObject(.write|.extend|.delete|.rename)
 //      on the fd. Handler reads to EOF, buffers partial lines, parses
 //      complete lines via EventParser, publishes to EventBus.
@@ -20,6 +22,27 @@ import Foundation
 
 public final class SessionTail: @unchecked Sendable {
 
+    // Backfill skip (the v0.1.1 "mtime heuristic", finally): when a tail
+    // starts with NO saved offset, a file that is already large or hasn't
+    // been written to in a while is pre-existing history — Supervisor
+    // installed/restarted over a live transcript, or a `claude --resume` /
+    // post-compact continuation whose new JSONL carries the FULL copied
+    // conversation. Replaying it pushes every historical Bash line through
+    // triage: one model call each, deterministic pauses for commands that
+    // ran long ago, a notification storm. A fast-forward start emits only
+    // sessionStart (derived from the head) and tails new appends from EOF.
+    // Small fresh files — the common brand-new session — still replay from
+    // byte 0 so the opening prompt reaches Triage. Both thresholds are
+    // overridable via init so tests can exercise both paths cheaply.
+    static let defaultFastForwardSizeThresholdBytes: Int64 = 131_072       // 128 KB
+    static let defaultFastForwardMtimeThresholdSeconds: TimeInterval = 300 // 5 min
+
+    /// Cap on how much of the head is scanned for the sessionStart-bearing
+    /// line during a fast-forward start. The parser emits sessionStart from
+    /// the first cwd-bearing line, normally within the first few lines; the
+    /// cap just bounds pathological files.
+    private static let headScanCapBytes: Int64 = 262_144
+
     public let sessionId: String
 
     private let path: URL
@@ -28,6 +51,8 @@ public final class SessionTail: @unchecked Sendable {
     private let sessionStore: SessionStore?
     private let trace: TraceLog
     private let offsetPersistInterval: TimeInterval
+    private let fastForwardSizeThresholdBytes: Int64
+    private let fastForwardMtimeThresholdSeconds: TimeInterval
 
     /// Set once the real cwd has been persisted to the session record, so we
     /// only write the UPDATE once per tail (the placeholder -> real transition).
@@ -49,6 +74,8 @@ public final class SessionTail: @unchecked Sendable {
         sessionStore: SessionStore?,
         startOffset: Int64? = nil,
         offsetPersistInterval: TimeInterval = 30,
+        fastForwardSizeThresholdBytes: Int64? = nil,
+        fastForwardMtimeThresholdSeconds: TimeInterval? = nil,
         trace: TraceLog = .shared
     ) {
         self.sessionId = sessionId
@@ -57,6 +84,8 @@ public final class SessionTail: @unchecked Sendable {
         self.bus = bus
         self.sessionStore = sessionStore
         self.offsetPersistInterval = offsetPersistInterval
+        self.fastForwardSizeThresholdBytes = fastForwardSizeThresholdBytes ?? SessionTail.defaultFastForwardSizeThresholdBytes
+        self.fastForwardMtimeThresholdSeconds = fastForwardMtimeThresholdSeconds ?? SessionTail.defaultFastForwardMtimeThresholdSeconds
         self.trace = trace
         self.queue = DispatchQueue(label: "supervisor.tail.\(sessionId)", qos: .utility)
         self.lastPersistedOffset = startOffset ?? 0
@@ -75,14 +104,17 @@ public final class SessionTail: @unchecked Sendable {
         self.fd = fd
 
         // Seek policy:
-        //   - savedOffset == 0 (we've never observed this session): read
-        //     from byte 0. This means the first events of the session —
-        //     sessionStart, the user's opening prompt — flow through the
-        //     pipeline so Triage has context. Cost: if Supervisor is
-        //     installed mid-session over an existing large JSONL, the
-        //     whole history replays through Haiku once. Acceptable for
-        //     v0.1.0; v0.1.1 adds a mtime heuristic that skips backfill
-        //     on multi-MB pre-existing files.
+        //   - savedOffset == 0 (we've never observed this session) and the
+        //     file looks pre-existing (large, or not written to recently):
+        //     fast-forward start — emit sessionStart from the head, then
+        //     tail from EOF. Replaying the history would push every old
+        //     Bash line through triage (model calls, deterministic pauses
+        //     for commands that already ran) — see the threshold comment
+        //     at the top of the class.
+        //   - savedOffset == 0 and the file is small and fresh: read from
+        //     byte 0 so the first events of the session — sessionStart,
+        //     the user's opening prompt — flow through the pipeline and
+        //     Triage has context.
         //   - savedOffset > 0 and <= EOF: resume from saved.
         //   - savedOffset > EOF (file truncated/rotated since last run):
         //     reset to byte 0 — the saved offset is stale.
@@ -90,6 +122,10 @@ public final class SessionTail: @unchecked Sendable {
         let resumeOff: off_t
         if lastPersistedOffset > 0 && lastPersistedOffset <= endOff {
             resumeOff = lseek(fd, off_t(lastPersistedOffset), SEEK_SET)
+        } else if lastPersistedOffset <= 0 && shouldFastForward(fileSize: Int64(endOff)) {
+            emitSessionStartFromHead(fd: fd, fileSize: Int64(endOff))
+            resumeOff = lseek(fd, 0, SEEK_END)
+            trace.emit("tail", "fast_forward session=\(sessionId) skippedBytes=\(resumeOff) — pre-existing history not replayed; sessionStart emitted from head")
         } else {
             resumeOff = lseek(fd, 0, SEEK_SET)
         }
@@ -127,6 +163,64 @@ public final class SessionTail: @unchecked Sendable {
         t.setEventHandler { [weak self] in self?.persistOffsetIfNeeded() }
         t.resume()
         self.offsetTimer = t
+    }
+
+    // MARK: - Fast-forward start (backfill skip)
+
+    /// Should a no-saved-offset start skip the existing content? True when
+    /// the file is bigger than the size threshold OR its mtime is older
+    /// than the mtime threshold — both are strong signals the content is
+    /// pre-existing history, not a session that just started.
+    private func shouldFastForward(fileSize: Int64) -> Bool {
+        guard fileSize > 0 else { return false }
+        if fileSize > fastForwardSizeThresholdBytes { return true }
+        if let mtime = (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date,
+           Date().timeIntervalSince(mtime) > fastForwardMtimeThresholdSeconds {
+            return true
+        }
+        return false
+    }
+
+    /// Read just enough of the head to let the parser derive sessionStart
+    /// (it emits one from the first cwd-bearing line) and publish ONLY that
+    /// event — none of the historical ones. Parsing through the shared
+    /// parser also marks its sessionStart as emitted, so the live tail
+    /// won't produce a duplicate. If no cwd-bearing line appears within the
+    /// scan cap we publish nothing; the live tail may still surface a
+    /// sessionStart from a later appended line. Caller re-seeks afterwards.
+    private func emitSessionStartFromHead(fd: Int32, fileSize: Int64) {
+        guard lseek(fd, 0, SEEK_SET) == 0 else { return }
+        let scanCap = min(fileSize, Self.headScanCapBytes)
+        var head = Data()
+        var scanned: Int64 = 0
+        let chunk = 65_536
+        var scratch = Data(count: chunk)
+        headScan: while scanned < scanCap {
+            let n = scratch.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return read(fd, base, chunk)
+            }
+            if n <= 0 { break }
+            head.append(scratch.prefix(n))
+            scanned += Int64(n)
+            while let nlIndex = head.firstIndex(of: 0x0A) {
+                let lineData = head.prefix(upTo: nlIndex)
+                head.removeSubrange(0...nlIndex)
+                guard let line = String(data: lineData, encoding: .utf8) else { continue }
+                for event in parser.parse(line: line) {
+                    guard case .sessionStart(let info) = event else { continue }
+                    bus.publish(event)
+                    // Same placeholder → real cwd transition as handleEvent.
+                    if !persistedResolvedCwd,
+                       info.cwd != "<resolving>", info.cwd != "<unknown>", !info.cwd.isEmpty {
+                        try? sessionStore?.updateResolvedCwd(sessionId: sessionId, cwd: info.cwd)
+                        persistedResolvedCwd = true
+                        trace.emit("tail", "session=\(sessionId) resolved cwd=\(info.cwd) branch=\(info.gitBranch ?? "?") (fast-forward head scan)")
+                    }
+                    break headScan
+                }
+            }
+        }
     }
 
     public func stop() {

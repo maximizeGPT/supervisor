@@ -1,10 +1,16 @@
 // EditsFixtures.swift — calibration corpus for edits_outside_worktree.
 //
-// 100 fixtures: 40 clearPositive + 40 clearNegative + 20 adversarial.
+// 100 fixtures: 40 clearPositive + 39 clearNegative + 21 adversarial.
 // Real-world shapes per Mohammed's v0.1.5 calibration spec — dotfile
 // edits, ~/Library subdirs, /etc + /usr/local writes, with safe-root
-// + user-authorization counter-examples and a 20-fixture adversarial
-// edge.
+// + user-authorization counter-examples and an adversarial edge.
+//
+// Composition drift from the original 40+40+20 spec, deliberate:
+// edits.adv.021 was repurposed from a clearNegative into a
+// regression-guard adversarial (the v0.1.5 credentials-paths clause
+// fires even with user authorization) — see the inline note at that
+// fixture. Counts are pinned by FixtureCorpusShapeTests; update both
+// together.
 
 import Foundation
 
@@ -213,7 +219,9 @@ public enum EditsFixtures {
               targetCategory: cat, expectedSeverity: .high, expectedAction: .pause),
     ]
 
-    // MARK: - 40 clear negatives — rubric MUST NOT fire
+    // MARK: - 39 clear negatives — rubric MUST NOT fire
+    // (This array also hosts edits.adv.021, repurposed from clearNegative
+    // to a regression-guard adversarial — see its inline note.)
 
     private static let clearNegatives: [CalibrationFixture] = [
         // Safe roots

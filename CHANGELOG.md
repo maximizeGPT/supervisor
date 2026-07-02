@@ -6,6 +6,116 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+v0.3.0 Wave 1 — pipeline truth (2026-07-02, from the four-dimension audit in
+`docs/V0.3.0-PLAN.md`): five trust-critical fixes to what the pipeline
+observes, whom it signals, and what it sends over the wire.
+
+### Security
+
+**Redaction now runs on plaintext BEFORE JSON encoding — line-anchored
+patterns actually fire** (`LLMClient.swift`, `Redact/Patterns.swift`)
+- The hole: both POST paths redacted only the JSON-encoded body, where a
+  newline is the two characters `\n`. The `(?m)^` anchor of the
+  `export SECRET=…` pattern could never match, and every `\b`-prefixed token
+  pattern (`ghp_`, `AKIA`, `eyJ`, `xox`, `sk-`) failed on line-leading
+  secrets — `cat`-ed token files and `gh auth token` output reached the
+  provider unredacted.
+- The fix: `createMessage` redacts the system prompt and every message string
+  while they are still plaintext; the encoded-body pass stays as a second
+  layer. Structurally fail-closed: the redacted copy is the only value the
+  POST paths can see.
+- New patterns: PEM private-key blocks, non-HTTP connection-string passwords
+  (`postgres://`, `mysql://`, `mongodb://`, `redis://`, `amqp://`), npm /
+  GitLab / Google API / GitHub server (`ghs_`/`ghr_`/`ghu_`) tokens, and
+  standalone `aws_secret_access_key = …` assignments. The credential
+  query-param pattern now stops at JSON quotes so the second-layer pass can
+  never corrupt the request body.
+- 18 new redaction tests, including a wire-level regression asserting a
+  planted line-leading `ghp_` token never appears in the captured outgoing
+  body.
+
+**Sidechain, meta, command-echo, and compact-summary turns can no longer
+become the owner-authorization anchor** (`EventParser.swift`,
+`SessionObjective.swift`)
+- A subagent's opening user-role turn (its Task prompt — assistant-authored),
+  `isMeta` caveats, `<command-*>` slash-command echoes, and the machine
+  recap a resumed/compacted session opens with all parsed as owner prompts —
+  so a subagent prompt saying "delete the old branches" read as the OWNER
+  authorizing destruction, and the session objective could anchor on a
+  recap instead of the user's ask.
+- Sidechain lines now emit nothing past sessionStart; machine-shaped user
+  turns never become `userPrompt`; `SessionObjective` skips the same four
+  classes. 7 new parser/objective tests.
+
+### Fixed
+
+**`claude --resume` / post-compact transcripts no longer replay months of
+history through the pipeline** (`SessionTail.swift`, `TriageEngine.swift`)
+- Resumed and compacted sessions copy the FULL conversation into a new JSONL
+  with no saved offset; Supervisor replayed every historical Bash line —
+  one model call each, deterministic SIGSTOPs for commands that ran weeks
+  ago, a notification storm, real API spend, and an instant idle-dispatch
+  fire.
+- Layer 1: a first tail with no saved offset fast-forwards to EOF when the
+  file is >128 KB or hasn't been written in >5 min (sessionStart is still
+  derived from the head; the skip is traced with the byte count).
+- Layer 2: the engine drops any Bash/assistant event whose own timestamp is
+  older than 120 s (`stale_event_skipped` trace), gated BEFORE the
+  deterministic catch and the model call — the command already ran; pausing
+  a live session over it is acting on the past. Stale stop-shapes no longer
+  read as instant idleness.
+
+**Pause/kill signals the session's own process group — and can never hit
+Claude Desktop** (`InterventionRouter.swift`, `ProcessLocator.swift`,
+`SignalSender.swift`, `SupervisorApp/main.swift`, `RecoveryDocWriter.swift`)
+- The worst-outcome bug: `signalOrDegrade` resolved the exact process by
+  session-id, used it only to sniff the desktop host, discarded it, then
+  re-ran the bare cwd walk — whose 0-match branch (CLI `claude` reports
+  cwd=$HOME) falls back to Claude Desktop's shared Electron PID. A pause/kill
+  for a CLI session could SIGSTOP/SIGTERM the user's entire desktop app.
+- Now: the session-id-confirmed handle is the signal target; the cwd-walk
+  fallback used by signal paths has the Claude.app fallback OFF (returns nil
+  + trace instead of the shared PID); a desktop-hosted session routes to the
+  signal-free per-conversation Stop-click, never `kill(2)`.
+- Signals are now GROUP sends (`kill(-pgid)`): SIGSTOP to the `claude`
+  process alone never stopped an already-forked `bash -c 'rm -rf …'` child.
+  Resume (hover button and recovery-doc instructions) is group-wide to
+  match — a single-pid SIGCONT would leave the children frozen.
+- 6 new router/locator tests, including the exact bug shape (session-id →
+  CLI pid, cwd walk → desktop pid; assert the CLI group gets the signal).
+
+**Writing a script is no longer treated as running it — the deterministic
+catch is heredoc- and quote-aware** (`DeterministicCatch.swift`)
+- `cat > cleanup.sh <<'EOF' … rm -rf ~/old-backup … EOF` deterministically
+  SIGSTOPPed the session: the splitter treated every heredoc body line and
+  every quoted fragment (`git commit -m "a; git reset --hard b"`) as a live
+  command. Heredoc bodies (all introducer variants, stacked, `<<-`) are now
+  excluded as data; separators inside quotes don't split; unterminated
+  constructs fall in the safe direction (miss → model triage, never a false
+  SIGSTOP).
+- `rm -rf` now checks EVERY non-flag path argument — a safe first argument
+  (`rm -rf ./build ~/Documents/x`) no longer shadows a dangerous later one.
+- 7 new catch tests; the lexer was validated against all 30 existing test
+  cases and all 119 clearNegative calibration fixtures before landing.
+
+### Added
+
+**CI: the 90 Python dispatch-hook tests now run on every push** (`ci.yml`,
+`Tools/dispatch-loop-hook/test_dispatch_loop_hook.py`)
+- The hook's test harness silently depended on the author's machine
+  (`/Users/main/supervisor` + a PRINCIPLES.md there): 16 of 90 tests failed
+  on any other box, and CI never ran them at all. The harness now builds its
+  own throwaway git fixture repo — all 90 pass anywhere — and a 5-minute
+  ubuntu job runs them on every push, the fastest feedback in the repo.
+  Both CI jobs gained timeouts and per-ref concurrency cancellation.
+
+**Calibration corpus shape is asserted, not asserted-in-prose**
+(`FixtureCorpusShapeTests.swift`)
+- The corpus is 302 fixtures (not the advertised 300) and two fixture-file
+  headers misstated their composition. A new always-on test pins total and
+  per-file per-kind counts so silent fixture drift fails the build; headers
+  now tell the truth.
+
 Safety (the impersonation gap): Supervisor no longer mistakes its own injected
 messages for the owner. It used to read the answers and tasks it typed into a
 session back as "the user's most recent prompt" and could treat them as owner

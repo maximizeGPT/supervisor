@@ -9,10 +9,17 @@ on:
 permissions:
   contents: read
 
+# One run per ref: a new push supersedes the in-flight run for the same
+# branch/PR, so stale commits don't hold macOS runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     name: swift build + test
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Show toolchain
@@ -30,6 +37,18 @@ jobs:
       # without the secret it self-skips, so we don't need a filter.
       - name: Run unit tests
         run: swift test
+
+  python-hook-tests:
+    name: python hook tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # The dispatch-loop hook and its tests are stdlib-only Python; the
+      # tests are hermetic (they build their own throwaway git fixture
+      # repo), so a plain checkout is all they need.
+      - name: Run hook unit tests
+        run: python3 -m unittest discover -s Tools/dispatch-loop-hook -v
 
   # Lint job removed in v0.1.6.2: swift-format isn't actually shipped
   # with the macos-14 GitHub Actions Swift toolchain (my earlier comment

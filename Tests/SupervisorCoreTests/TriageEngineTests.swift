@@ -13,10 +13,15 @@ import Combine
 final class TriageEngineTests: XCTestCase {
 
     nonisolated(unsafe) static var canned: [String: (Int, Data, [String: String])] = [:]
+    // Counts every request the mock sees, so the stale-event test can
+    // assert "no network at all", not just "no flag" (mirrors
+    // IdleDetectionTests.requestCount).
+    nonisolated(unsafe) static var requestCount: Int = 0
 
     override func setUp() {
         super.setUp()
         Self.canned.removeAll()
+        Self.requestCount = 0
     }
 
     private func mockSession() -> URLSession {
@@ -294,6 +299,81 @@ final class TriageEngineTests: XCTestCase {
         XCTAssertEqual(captured.snapshot.first?.prePost, .preExecution)
     }
 
+    // MARK: - Event-age gate (backfill layer 2, 2026-07-02)
+
+    /// A Bash tool_use stamped 10 minutes in the past is replayed history
+    /// (`claude --resume` / post-compact JSONLs copy the full conversation
+    /// into a fresh file the tail has no offset for). It must produce NO
+    /// triage: no model call (requestCount stays flat) AND no deterministic
+    /// catch — `rm -rf` IS on the catch-list, so zero decisions here proves
+    /// the gate runs before the catch. A fresh event on the same session
+    /// must then triage exactly as before.
+    func testStaleBashEventSkipsTriageButFreshEventStillFires() async throws {
+        Self.canned["/v1/messages"] = (200, Self.haikuFlagResponse(), [:])
+        let traceURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("triage-stale-\(UUID().uuidString).log")
+        let trace = TraceLog(path: traceURL)
+        let bus = EventBus(trace: trace)
+        let client = LLMClient(provider: .anthropic,
+            apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: mockSession(),
+            traceLog: trace
+        )
+        // Injected clock (same mechanism as IdleDetectionTests) so the
+        // 10-minute age is deterministic, not wall-clock-dependent.
+        let clock = ClockBox(initial: Date(timeIntervalSince1970: 1_700_000_000))
+        let engine = TriageEngine(
+            client: client,
+            bus: bus,
+            model: "claude-haiku-4-5-20251001",
+            windowSize: 30,
+            costStore: nil,
+            idleCheckIntervalSeconds: 3600,   // park the idle timer
+            now: { clock.now },
+            trace: trace
+        )
+        let captured = CapturedDecisions()
+        engine.onDecision = { d in captured.append(d) }
+        engine.start()
+        defer { engine.stop() }
+
+        bus.publish(.sessionStart(.init(
+            sessionId: "s-stale", cwd: "/Users/test", gitBranch: "main",
+            projectHash: "-tmp", jsonlPath: "/tmp/x.jsonl", ts: clock.now
+        )))
+        let baseline = Self.requestCount
+
+        // Backfill: catch-listed command, 10 minutes old.
+        bus.publish(.bashToolCall(.init(
+            sessionId: "s-stale", command: "rm -rf /Users/main/important",
+            description: nil, toolUseId: "t-old", turnUUID: "u-old",
+            ts: clock.now.addingTimeInterval(-600)
+        )))
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(captured.snapshot.count, 0,
+                       "a stale rm -rf must not fire the deterministic catch — it already ran; got: \(captured.snapshot)")
+        XCTAssertEqual(Self.requestCount, baseline,
+                       "a stale event must not spend a model call")
+        trace.sync()  // drain the write queue before reading the file back
+        let traceText = (try? String(contentsOf: traceURL, encoding: .utf8)) ?? ""
+        XCTAssertTrue(traceText.contains("stale_event_skipped"),
+                      "engine must trace the skip with the stale_event_skipped tag")
+
+        // Fresh event (age 0 on the injected clock; NOT catch-listed so it
+        // exercises the mocked model path) still triages normally.
+        bus.publish(.bashToolCall(.init(
+            sessionId: "s-stale", command: "chmod -R 000 /Users/main/important",
+            description: nil, toolUseId: "t-new", turnUUID: "u-new",
+            ts: clock.now
+        )))
+        try await captured.waitFor(count: 1, within: 3.0)
+        XCTAssertEqual(captured.snapshot.first?.triggeringEvent.toolUseId, "t-new")
+        XCTAssertEqual(Self.requestCount, baseline + 1,
+                       "the fresh event must spend exactly one triage call")
+    }
+
     // MARK: - v0.3.1 Issue #6: per-session cwd cache
 
     /// Helper: a record_triage response that fires user_question_pending
@@ -487,6 +567,7 @@ private final class TriageMockURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
+        TriageEngineTests.requestCount += 1
         let path = request.url?.path ?? ""
         guard let (status, body, headers) = TriageEngineTests.canned[path] else {
             let err = NSError(domain: NSURLErrorDomain, code: NSURLErrorResourceUnavailable)

@@ -152,6 +152,18 @@ public final class TriageEngine {
     /// production per ED-2; tests can crank it lower.
     private let idleCheckIntervalSeconds: TimeInterval
 
+    /// Event-age gate (backfill layer 2, 2026-07-02): an event whose OWN
+    /// timestamp is older than this, relative to the engine's clock, is
+    /// replayed history — a `claude --resume` / post-compact JSONL copies
+    /// the FULL conversation into a new file the tail has no offset for.
+    /// Acting on it (a model call per historical Bash line, a deterministic
+    /// SIGSTOP for an rm -rf that ran months ago, a notification) would be
+    /// acting on the past. 120s is generous for live parse/bus latency
+    /// (normally sub-second) while still shutting out any real backfill.
+    /// SessionTail's fast-forward start is layer 1; this catches whatever
+    /// slips past it (small fresh resume files, stale-offset resets).
+    private let staleEventThresholdSeconds: TimeInterval
+
     /// v0.4.0 (Part A): injected clock for the idle check so tests can
     /// drive time deterministically without `Task.sleep`. Production
     /// uses `Date.init`.
@@ -232,6 +244,7 @@ public final class TriageEngine {
         idleThresholdSeconds: TimeInterval = 15,
         idleReTriageIntervalSeconds: TimeInterval = 60,
         idleCheckIntervalSeconds: TimeInterval = 1,
+        staleEventThresholdSeconds: TimeInterval = 120,
         liveSessionsSharingCwd: @escaping (String) -> Int = { _ in 1 },
         injectionLedger: InjectionLedger? = nil,
         now: @escaping @MainActor () -> Date = { Date() },
@@ -251,6 +264,7 @@ public final class TriageEngine {
         self.idleThresholdSeconds = idleThresholdSeconds
         self.idleReTriageIntervalSeconds = idleReTriageIntervalSeconds
         self.idleCheckIntervalSeconds = idleCheckIntervalSeconds
+        self.staleEventThresholdSeconds = staleEventThresholdSeconds
         self.liveSessionsSharingCwd = liveSessionsSharingCwd
         self.now = now
         self.trace = trace
@@ -405,9 +419,16 @@ public final class TriageEngine {
             state.lastStopShapedPhrase = nil
         case .assistantText:
             // Any assistantText with no subsequent tool_use means the
-            // worker stopped. Always mark as stopped; bashToolCall clears.
-            state.lastStopShapedTs = ts
-            state.lastStopShapedPhrase = "no_tool_use"
+            // worker stopped. Mark as stopped; bashToolCall clears.
+            // Event-age gate: a STALE assistantText is replayed history,
+            // not the worker stopping now — recording its stop-shape next
+            // to its old lastEventTs would read as instant idleness and
+            // spend an idle-triage call on a session that was merely
+            // re-discovered. Fresh events behave exactly as before.
+            if now().timeIntervalSince(ts) <= staleEventThresholdSeconds {
+                state.lastStopShapedTs = ts
+                state.lastStopShapedPhrase = "no_tool_use"
+            }
         case .bashToolCall:
             // Tool call means the worker is actively working again;
             // clear any prior stop-shape.
@@ -863,6 +884,15 @@ public final class TriageEngine {
 
     private func evaluate(call: BashToolCallInfo, prePost: TriageDecision.PrePost) async {
         if RuntimeToggles.supervisorPaused { return }  // global pause (see evaluateIdle)
+        // Event-age gate: replayed history must not spend a model call OR
+        // fire the deterministic catch (the command already ran). Sits
+        // before the catch on purpose — pausing a live session over a
+        // months-old rm -rf is the storm this gate exists to stop.
+        let eventAge = now().timeIntervalSince(call.ts)
+        if eventAge > staleEventThresholdSeconds {
+            trace.emit("triage", "stale_event_skipped session=\(call.sessionId) age=\(Int(eventAge))s threshold=\(Int(staleEventThresholdSeconds))s cmd=\(call.command.prefix(60))")
+            return
+        }
         onActivityChange?(.triaging)
 
         let rawWindow = perSessionWindow[call.sessionId] ?? []
@@ -999,6 +1029,14 @@ public final class TriageEngine {
     /// rewritten reasoning_plain; safety → pass through unchanged).
     private func evaluateAssistantText(info: AssistantTextInfo) async {
         if RuntimeToggles.supervisorPaused { return }  // global pause (see evaluateIdle)
+        // Event-age gate: same backfill guard as evaluate(call:) — a
+        // historical question was answered (or abandoned) long ago; a
+        // model call + banner for it is pure replay noise and spend.
+        let eventAge = now().timeIntervalSince(info.ts)
+        if eventAge > staleEventThresholdSeconds {
+            trace.emit("triage", "stale_event_skipped session=\(info.sessionId) age=\(Int(eventAge))s threshold=\(Int(staleEventThresholdSeconds))s assistant_text_len=\(info.text.count)")
+            return
+        }
         onActivityChange?(.triaging)
 
         let window = perSessionWindow[info.sessionId] ?? []

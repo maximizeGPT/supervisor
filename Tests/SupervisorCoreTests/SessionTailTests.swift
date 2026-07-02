@@ -124,6 +124,145 @@ final class SessionTailTests: XCTestCase {
                        "should not re-emit the pre-restart command")
     }
 
+    // MARK: - Fast-forward start (backfill skip)
+
+    /// Two-line "history" fixture: a cwd-bearing lead-in line (the parser
+    /// derives sessionStart from it) plus a Bash tool_use that must NEVER
+    /// replay through the bus on a fast-forward start.
+    private func writeHistoryFixture(to file: URL, sessionId: String) throws {
+        let history = (
+            #"{"type":"queue-operation","timestamp":"2026-05-21T19:36:22Z","sessionId":"\#(sessionId)","cwd":"/c"}"#
+            + "\n"
+            + #"{"type":"assistant","timestamp":"2026-05-21T19:36:22.1Z","sessionId":"\#(sessionId)","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"rm -rf /old/history"}}]}}"#
+            + "\n"
+        )
+        try Data(history.utf8).write(to: file)
+    }
+
+    private func appendLiveLine(to file: URL, sessionId: String) throws {
+        let newLine = #"{"type":"assistant","timestamp":"2026-05-21T19:36:23Z","sessionId":"\#(sessionId)","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"echo live-append"}}]}}"#
+            + "\n"
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(newLine.utf8))
+    }
+
+    /// Pre-existing file with an old mtime + no saved offset → fast-forward:
+    /// historical lines never replay, sessionStart still surfaces, and a
+    /// line appended after start is tailed normally.
+    func testTailFastForwardsStaleFileEmittingSessionStartButNotHistory() async throws {
+        let file = tempDir.appendingPathComponent("session-ff.jsonl")
+        try writeHistoryFixture(to: file, sessionId: "session-ff")
+        // Age the file past the 5-minute mtime threshold — the "Supervisor
+        // (re)starts over a pre-existing transcript" shape.
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -3600)],
+            ofItemAtPath: file.path
+        )
+
+        let bus = EventBus(trace: TraceLog(path: tempDir.appendingPathComponent("trace-ff.log")))
+        let collector = EventCollector()
+        let sub = bus.subscribe { event in collector.append(event) }
+        defer { sub.cancel() }
+
+        let tail = SessionTail(
+            sessionId: "session-ff",
+            path: file,
+            projectHash: "-tmp",
+            bus: bus,
+            sessionStore: nil,
+            startOffset: 0
+        )
+        try tail.start()
+        defer { tail.stop() }
+
+        try appendLiveLine(to: file, sessionId: "session-ff")
+        try await waitForEvents(collector: collector, count: 1, within: 2.0)
+
+        let commands = collector.snapshot.compactMap { e -> String? in
+            if case .bashToolCall(let v) = e { return v.command }
+            return nil
+        }
+        XCTAssertEqual(commands, ["echo live-append"],
+                       "historical lines must never replay on a fast-forward start")
+        XCTAssertTrue(collector.snapshot.contains {
+            if case .sessionStart(let v) = $0, v.cwd == "/c" { return true }
+            return false
+        }, "fast-forward must still emit sessionStart from the file head; got: \(collector.snapshot)")
+    }
+
+    /// The size prong: a FRESH file above the (overridden, tiny) size
+    /// threshold also fast-forwards. Production default is 128 KB.
+    func testTailFastForwardsLargeFileViaSizeThreshold() async throws {
+        let file = tempDir.appendingPathComponent("session-big.jsonl")
+        try writeHistoryFixture(to: file, sessionId: "session-big")  // ~400 bytes, fresh mtime
+
+        let bus = EventBus(trace: TraceLog(path: tempDir.appendingPathComponent("trace-big.log")))
+        let collector = EventCollector()
+        let sub = bus.subscribe { event in collector.append(event) }
+        defer { sub.cancel() }
+
+        let tail = SessionTail(
+            sessionId: "session-big",
+            path: file,
+            projectHash: "-tmp",
+            bus: bus,
+            sessionStore: nil,
+            startOffset: 0,
+            fastForwardSizeThresholdBytes: 64
+        )
+        try tail.start()
+        defer { tail.stop() }
+
+        try appendLiveLine(to: file, sessionId: "session-big")
+        try await waitForEvents(collector: collector, count: 1, within: 2.0)
+
+        let commands = collector.snapshot.compactMap { e -> String? in
+            if case .bashToolCall(let v) = e { return v.command }
+            return nil
+        }
+        XCTAssertEqual(commands, ["echo live-append"],
+                       "above-size-threshold file must fast-forward, not replay")
+    }
+
+    /// A small fresh pre-existing file (the common brand-new session, or a
+    /// tiny fixture in tests) still replays from byte 0 — the opening
+    /// context must keep flowing to Triage. Default thresholds.
+    func testTailReplaysSmallFreshFileFromByteZero() async throws {
+        let file = tempDir.appendingPathComponent("session-fresh.jsonl")
+        try writeHistoryFixture(to: file, sessionId: "session-fresh")
+
+        let bus = EventBus(trace: TraceLog(path: tempDir.appendingPathComponent("trace-fresh.log")))
+        let collector = EventCollector()
+        let sub = bus.subscribe { event in collector.append(event) }
+        defer { sub.cancel() }
+
+        let tail = SessionTail(
+            sessionId: "session-fresh",
+            path: file,
+            projectHash: "-tmp",
+            bus: bus,
+            sessionStore: nil,
+            startOffset: 0
+        )
+        try tail.start()
+        defer { tail.stop() }
+
+        // The existing content itself must arrive (initial drain from 0).
+        try await waitForEvents(collector: collector, count: 1, within: 2.0)
+        let commands = collector.snapshot.compactMap { e -> String? in
+            if case .bashToolCall(let v) = e { return v.command }
+            return nil
+        }
+        XCTAssertEqual(commands, ["rm -rf /old/history"],
+                       "a small fresh file must still replay from byte 0")
+        XCTAssertTrue(collector.snapshot.contains {
+            if case .sessionStart(let v) = $0, v.cwd == "/c" { return true }
+            return false
+        })
+    }
+
     // MARK: - SessionDiscovery picks up new files
 
     func testDiscoveryPicksUpNewSessionFile() async throws {

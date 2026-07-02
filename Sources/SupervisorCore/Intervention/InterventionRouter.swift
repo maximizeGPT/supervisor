@@ -16,6 +16,12 @@
 //             pattern as .pause. SIGKILL escalation deferred to a
 //             follow-up — v0.1.4 ships SIGTERM only.
 //
+// Signal-target safety (2026-07-02): pause/kill resolve THIS session's
+// process by session-id first (the same primitive inject trusts), signal
+// its PROCESS GROUP (so an already-forked `bash -c` child stops too), and
+// NEVER send a POSIX signal to the shared Claude Desktop PID — desktop
+// sessions get the per-conversation Stop-click, or degrade to notify.
+//
 // Every degradation path emits a discriminating trace tag so the
 // `intervention.<op>.degraded` line carries the precise reason — useful
 // for diagnosis when a user reports "Supervisor said it injected but
@@ -510,28 +516,73 @@ public final class InterventionRouter {
         )
     }
 
+    /// True when the handle is the SHARED Claude Desktop (Electron) process —
+    /// the host every desktop conversation multiplexes into. Injection may
+    /// target it (delivery goes through keystrokes), but a POSIX signal to it
+    /// would freeze/quit the user's entire desktop app, so the signal paths
+    /// must never use it.
+    private func isDesktopHost(_ handle: ProcessHandle) -> Bool {
+        handle.execPath.contains("Claude.app/Contents/MacOS/Claude")
+    }
+
     private func signalOrDegrade(_ decision: TriageDecision, signal: Int32, opName: String) async {
         guard let cwd = decision.cwd, !cwd.isEmpty else {
             trace.emit("router", "intervention.\(opName).degraded reason=no_cwd_on_decision session=\(decision.sessionId)")
             await postNotify(decision)
             return
         }
-        // DESKTOP: Claude Desktop multiplexes every conversation into ONE Electron
-        // process, so a real SIGSTOP/SIGTERM would freeze/kill ALL of them. pause/
-        // kill there is a UI interrupt instead — click the TARGET conversation's
-        // Stop button (per-conversation, click-only so it can't bleed text). Detect
-        // the desktop host the same way the inject path does (session-id / cwd
-        // resolve to the Claude.app exec), then route to the Stop-click. CLI hosts
-        // fall through to the real signal path below, unchanged.
-        if let target = resolveInjectTarget(decision, cwd: cwd, op: opName),
-           target.handle.execPath.contains("Claude.app/Contents/MacOS/Claude") {
-            await interruptDesktopOrDegrade(decision, handle: target.handle, opName: opName)
+        // TARGETING (2026-07-02 fix): resolve THIS session's process with the
+        // session-id argv match — the same primitive the inject path trusts —
+        // and signal THAT handle. The old code resolved it, used it only to
+        // sniff the desktop host, threw it away, then re-ran the bare cwd
+        // walk, whose 0-match branch falls back to Claude Desktop's shared
+        // PID. A CLI `claude` process reports cwd=$HOME, so that walk missed
+        // whenever the desktop app was running — and the SIGSTOP/SIGTERM
+        // landed on Claude Desktop, freezing/quitting every conversation.
+        let sessionTarget: ProcessHandle?
+        if !decision.sessionId.isEmpty,
+           let byId = locator.locate(bySessionId: decision.sessionId) {
+            trace.emit("router", "intervention.\(opName).target_by_session_id pid=\(byId.pid) session=\(decision.sessionId) exec=\(byId.execPath)")
+            sessionTarget = byId
+        } else {
+            sessionTarget = nil
+        }
+        // Signal target: the session-id-confirmed handle wins. Only when it's
+        // absent fall back to the cwd walk — with the Claude.app fallback OFF,
+        // because a locate result destined for kill(2) must never be the
+        // shared desktop PID.
+        let resolved = sessionTarget ?? locator.locate(targetCwd: cwd, allowDesktopFallback: false)
+
+        // DESKTOP: Claude Desktop multiplexes every conversation into ONE
+        // Electron process, so a real SIGSTOP/SIGTERM would freeze/kill ALL of
+        // them. pause/kill there is a UI interrupt instead — click the TARGET
+        // conversation's Stop button (per-conversation, click-only so it can't
+        // bleed text). NEVER a POSIX signal.
+        if let desktop = resolved, isDesktopHost(desktop) {
+            await interruptDesktopOrDegrade(decision, handle: desktop, opName: opName)
             return
         }
-        guard let handle = locator.locate(targetCwd: cwd) else {
+        guard let handle = resolved else {
+            // No signalable CLI process. If the session is desktop-hosted, the
+            // plain cwd walk (fallback ON) resolves Claude.app → interrupt it
+            // via the signal-free Stop-click.
+            if let fallback = locator.locate(targetCwd: cwd) {
+                if isDesktopHost(fallback) {
+                    await interruptDesktopOrDegrade(decision, handle: fallback, opName: opName)
+                    return
+                }
+                // A candidate the strict walk refused (defensive — production
+                // suppression only ever withholds the desktop PID). Surface
+                // the candidate PID, never signal it.
+                trace.emit("router", "intervention.\(opName).degraded reason=unsignalable_candidate candidate_pids=\(fallback.pid) cwd=\(cwd)")
+                await postNotify(decision)
+                return
+            }
             // Locator already logged its own discriminating tag
-            // (locator.not_found / locator.ambiguous / locator.sysctl_failed).
-            // The router's degraded line gives the operational layer.
+            // (locator.not_found / locator.ambiguous — which carries the
+            // candidate pids — / locator.sysctl_failed /
+            // locator.desktop_fallback_suppressed). The router's degraded
+            // line gives the operational layer.
             trace.emit("router", "intervention.\(opName).degraded reason=locator_nil cwd=\(cwd)")
             await postNotify(decision)
             return
@@ -548,8 +599,12 @@ public final class InterventionRouter {
             pid: handle.pid
         )
         do {
-            try signalSender.send(signal, to: handle.pid)
-            trace.emit("router", "intervention.\(opName).fired pid=\(handle.pid) signal=\(signal) cwd=\(cwd) recoveryDoc=\(recoveryDocPath?.path ?? "nil")")
+            // GROUP send (2026-07-02): SIGSTOP to the `claude` process alone
+            // does not stop an already-forked child (`bash -c 'rm -rf …'`
+            // keeps running). Signal the whole process group; the sender
+            // falls back to the single pid when the group can't be resolved.
+            try signalSender.sendToGroup(signal, of: handle.pid)
+            trace.emit("router", "intervention.\(opName).fired pid=\(handle.pid) signal=\(signal) target=process_group cwd=\(cwd) recoveryDoc=\(recoveryDocPath?.path ?? "nil")")
             // v0.1.4 Gap 1+2+3 + v0.1.6: post the outcome-aware banner
             // with the recovery doc path so the user has a visible
             // signal + a pointer to the handoff.
@@ -584,7 +639,7 @@ public final class InterventionRouter {
             ?? DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId)
             ?? decision.branch
         guard let title, !title.isEmpty else {
-            trace.emit("router", "intervention.\(opName).degraded reason=desktop_no_target_title session=\(decision.sessionId)")
+            trace.emit("router", "intervention.\(opName).degraded reason=desktop_no_target_title session=\(decision.sessionId) candidate_pids=\(handle.pid)")
             await postNotify(decision)
             return
         }

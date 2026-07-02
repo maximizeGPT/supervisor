@@ -42,23 +42,110 @@ public enum DeterministicCatch {
     // MARK: - Splitting
 
     /// Split on `&&`, `||`, `;`, `|`, and newlines so a catch form buried in a
-    /// compound line (`git reset --hard && echo ok`) is still examined.
+    /// compound line (`git reset --hard && echo ok`) is still examined — but
+    /// ONLY where the shell itself would treat them as separators:
+    ///
+    ///   - QUOTES: separators inside single or double quotes are literal text,
+    ///     so `git commit -m "revert; git reset --hard fix"` is ONE command
+    ///     (the message is data, not a reset). Single quotes have no escapes
+    ///     in POSIX sh; inside double quotes a backslash escapes the next
+    ///     character (enough to keep `\"` from closing the string). An
+    ///     UNCLOSED quote swallows the rest of the input into one fragment —
+    ///     conservative: under-splitting can only MISS a catch (the model
+    ///     still triages the call), never false-fire.
+    ///   - BACKSLASH (unquoted): escapes the next character, so `\;` does not
+    ///     split and `\<newline>` is a line continuation.
+    ///   - HEREDOCS: `<<TAG`, `<<'TAG'`, `<<"TAG"`, and the tab-stripping
+    ///     `<<-` variants introduce a heredoc (TAG = word characters; `<<<`
+    ///     is a here-STRING, not a heredoc). The introducer's own line is
+    ///     still a subcommand — `cat > cleanup.sh <<'EOF'` is a write, and it
+    ///     still passes through the catch list — but the BODY lines
+    ///     (everything after the introducer's newline, up to and including
+    ///     the line that is exactly TAG, modulo leading tabs for `<<-`) are
+    ///     DATA the shell feeds to stdin, not commands, and are excluded.
+    ///     Sessions write scripts via heredoc constantly; treating a body
+    ///     line like `rm -rf ~/old-backup` as a live command would SIGSTOP a
+    ///     session for WRITING a file. If the closing TAG never appears
+    ///     (unterminated heredoc), the entire remainder is treated as body
+    ///     and excluded — the shell would consume it as data too, and the
+    ///     conservative direction is the same: a miss falls through to model
+    ///     triage, while a false fire burns the trust budget.
     static func subcommands(of line: String) -> [String] {
         var parts: [String] = []
         var cur = ""
         let ch = Array(line)
         var i = 0
+        /// Heredoc bodies owed at the next unquoted newline, in the order the
+        /// shell will consume them (several `<<` on one line stack up).
+        var pendingHeredocs: [(tag: String, stripTabs: Bool)] = []
         func flush() {
             if !cur.trimmingCharacters(in: .whitespaces).isEmpty { parts.append(cur) }
             cur = ""
         }
+        /// Consume heredoc body lines starting at ch[i] (just past the
+        /// introducer line's newline): skip every line through the closing
+        /// TAG line. An unterminated heredoc skips to end of input.
+        func skipHeredocBodies() {
+            while let doc = pendingHeredocs.first {
+                pendingHeredocs.removeFirst()
+                while i < ch.count {
+                    var bodyLine: [Character] = []
+                    while i < ch.count, ch[i] != "\n" { bodyLine.append(ch[i]); i += 1 }
+                    if i < ch.count { i += 1 }                       // past the newline
+                    if doc.stripTabs { while bodyLine.first == "\t" { bodyLine.removeFirst() } }
+                    if String(bodyLine) == doc.tag { break }         // terminator: this doc is done
+                }
+            }
+        }
         while i < ch.count {
             let c = ch[i]
             let n = i + 1 < ch.count ? ch[i + 1] : " "
+            // Single-quoted string: no escapes in POSIX sh; runs to the next
+            // `'` or, if unclosed, to end of input. Kept verbatim in cur.
+            if c == "'" {
+                cur.append(c); i += 1
+                while i < ch.count, ch[i] != "'" { cur.append(ch[i]); i += 1 }
+                if i < ch.count { cur.append(ch[i]); i += 1 }        // closing '
+                continue
+            }
+            // Double-quoted string: backslash escapes the next character (so
+            // `\"` does not close it); runs to the closing `"` or end of input.
+            if c == "\"" {
+                cur.append(c); i += 1
+                while i < ch.count, ch[i] != "\"" {
+                    if ch[i] == "\\", i + 1 < ch.count { cur.append(ch[i]); i += 1 }
+                    cur.append(ch[i]); i += 1
+                }
+                if i < ch.count { cur.append(ch[i]); i += 1 }        // closing "
+                continue
+            }
+            // Unquoted backslash: escapes the next character (`\;` is literal;
+            // `\<newline>` is a line continuation) — never a split point.
+            if c == "\\", i + 1 < ch.count {
+                cur.append(c); cur.append(ch[i + 1])
+                i += 2
+                continue
+            }
+            // Heredoc introducer: register the tag; the introducer stays part
+            // of the current subcommand. Requires exactly `<<` — a `<` on
+            // either side means a here-string `<<<` (data, no body lines).
+            if c == "<", n == "<",
+               i == 0 || ch[i - 1] != "<",
+               i + 2 >= ch.count || ch[i + 2] != "<" {
+                if let intro = parseHeredocIntroducer(ch, at: i) {
+                    pendingHeredocs.append((tag: intro.tag, stripTabs: intro.stripTabs))
+                    cur.append(contentsOf: ch[i..<(i + intro.consumed)])
+                    i += intro.consumed
+                    continue
+                }
+            }
+            // Separators — only reached when unquoted and unescaped.
             if c == "\n" || c == ";" || c == "|" || (c == "&" && n == "&") {
                 flush()
                 if (c == "&" && n == "&") || (c == "|" && n == "|") { i += 1 }
                 i += 1
+                // Heredoc bodies begin after the introducer line's newline.
+                if c == "\n" { skipHeredocBodies() }
                 continue
             }
             cur.append(c)
@@ -66,6 +153,33 @@ public enum DeterministicCatch {
         }
         flush()
         return parts
+    }
+
+    /// Try to parse a heredoc introducer at `start` in `ch` (the caller has
+    /// checked ch[start..start+1] is `<<` and not `<<<`). Recognizes `<<TAG`,
+    /// `<<'TAG'`, `<<"TAG"`, and the `<<-` variants, with optional whitespace
+    /// before the tag (TAG = word characters). Returns the tag, whether
+    /// leading tabs are stripped from the terminator (`<<-`), and how many
+    /// characters were consumed — or nil if what follows is not a well-formed
+    /// heredoc, in which case `<<` is scanned as ordinary text.
+    static func parseHeredocIntroducer(_ ch: [Character], at start: Int)
+        -> (tag: String, stripTabs: Bool, consumed: Int)? {
+        var j = start + 2                                            // past `<<`
+        var stripTabs = false
+        if j < ch.count, ch[j] == "-" { stripTabs = true; j += 1 }
+        while j < ch.count, ch[j] == " " || ch[j] == "\t" { j += 1 } // `<< EOF` is legal
+        var quote: Character? = nil
+        if j < ch.count, ch[j] == "'" || ch[j] == "\"" { quote = ch[j]; j += 1 }
+        var tag = ""
+        while j < ch.count, ch[j].isLetter || ch[j].isNumber || ch[j] == "_" {
+            tag.append(ch[j]); j += 1
+        }
+        guard !tag.isEmpty else { return nil }
+        if let q = quote {
+            guard j < ch.count, ch[j] == q else { return nil }       // unbalanced quote → not a heredoc
+            j += 1
+        }
+        return (tag, stripTabs, j - start)
     }
 
     /// Whitespace tokenizer with minimal surrounding-quote stripping. git
@@ -257,10 +371,11 @@ public enum DeterministicCatch {
         return matchRm(Array(t.dropFirst()))
     }
 
-    /// `rm -rf <path>` permanently deletes a tree. Fires ONLY when the target
-    /// is an absolute or home (`~` / `$HOME`) path that is NOT a temp / build
-    /// / cache location — i.e. a user-data, system, or home path. Deliberately
-    /// conservative:
+    /// `rm -rf <path>...` permanently deletes trees. EVERY non-flag argument
+    /// is a deletion target (`rm -rf ./build ~/Documents/x` deletes both), so
+    /// the catch fires when ANY target is an absolute or home (`~` / `$HOME`)
+    /// path that is NOT a temp / build / cache location — i.e. a user-data,
+    /// system, or home path. Deliberately conservative:
     ///   - Relative paths (`./x`, bare `x`, even `../x`) are NOT caught: they
     ///     are at or near cwd, the worktree, which the model handles. Better
     ///     to miss than to false-fire.
@@ -278,8 +393,14 @@ public enum DeterministicCatch {
         let recursive = s.contains("r") || s.contains("R") || l.contains("recursive")
         let force = s.contains("f") || l.contains("force")
         guard recursive && force else { return nil }          // only the rm -rf class
-        guard let path = nonFlagArgs(a).first else { return nil }   // no path (e.g. piped via xargs)
-        guard isAbsoluteOrHome(path), !isTempBuildCachePath(path) else { return nil }
+        let paths = nonFlagArgs(a)
+        guard !paths.isEmpty else { return nil }              // no path (e.g. piped via xargs)
+        // Any single dangerous target fires — a safe first argument must not
+        // shadow a dangerous later one. The first dangerous target is the one
+        // named in the effect text.
+        guard let path = paths.first(where: { isAbsoluteOrHome($0) && !isTempBuildCachePath($0) }) else {
+            return nil                                        // all targets relative or temp/build/cache
+        }
         return Match(pattern: "rm -rf",
                      effect: "permanently deletes \(path) and everything inside it, with no way to recover it")
     }

@@ -228,6 +228,60 @@ final class DeterministicCatchTests: XCTestCase {
         assertCatch("/usr/bin/git checkout -- .", pattern: "git checkout -- <pathspec>")
     }
 
+    // MARK: - Quote- and heredoc-aware splitting (false-positive killers)
+
+    func testHeredocBodyIsNotTreatedAsCommands() {
+        // Writing a script via heredoc is a WRITE — the body lines are DATA
+        // fed to stdin, not commands. Freezing a session for writing a file
+        // is a trust-budget killer.
+        assertSafe("cat > cleanup.sh <<'EOF'\nrm -rf ~/old-backup\nEOF")
+        assertSafe("cat > notes.txt <<EOF\ngit reset --hard origin/main\nEOF")
+        assertSafe("cat > doc.md <<\"END\"\nkill -9 1234\nEND")
+    }
+
+    func testHeredocDashVariantStripsLeadingTabs() {
+        // `<<-` allows the body AND the closing tag to be tab-indented.
+        assertSafe("cat > x.sh <<-EOF\n\trm -rf ~/old-backup\n\tEOF")
+    }
+
+    func testUnterminatedHeredocBodyIsStillExcluded() {
+        // No closing tag: the remainder was destined to be heredoc DATA (the
+        // shell would consume it as such), so it is excluded. A miss falls
+        // through to model triage; treating data as live commands false-fires.
+        assertSafe("cat > x.sh <<'EOF'\nrm -rf ~/old-backup")
+    }
+
+    func testCommandAfterHeredocTerminatorIsStillExamined() {
+        // Once the heredoc closes, later lines are real commands again.
+        assertCatch("cat > x.sh <<'EOF'\necho data\nEOF\nrm -rf ~/Documents/x",
+                    pattern: "rm -rf")
+    }
+
+    func testSeparatorsInsideQuotesDoNotSplit() {
+        // `;` inside a quoted commit message is text, not a separator — the
+        // post-`;` fragment must NOT be examined as `git reset --hard fix"`.
+        assertSafe("git commit -m \"revert; git reset --hard fix\"")
+        assertSafe("git commit -m 'a; git reset --hard b'")
+        // rm -rf inside a double-quoted string argument is text too.
+        assertSafe("echo \"first; rm -rf ~/old-backup\"")
+    }
+
+    func testRealCompoundPipedAndMultilineCommandsStillFire() {
+        // Quote/heredoc awareness must not weaken the compound-command reach.
+        assertCatch("cd /tmp && rm -rf ~/x", pattern: "rm -rf")
+        assertCatch("echo yes | rm -rf ~/x", pattern: "rm -rf")
+        // rm on its own line, OUTSIDE any heredoc or quote, is a real command.
+        assertCatch("echo starting\nrm -rf ~/Documents/x", pattern: "rm -rf")
+    }
+
+    func testRmFiresOnAnyDangerousPathArgument() {
+        // Every rm argument is a deletion target; a safe first argument must
+        // not shadow a dangerous later one.
+        assertCatch("rm -rf ./build ~/Documents/x", pattern: "rm -rf")
+        assertCatch("rm -rf /tmp/scratch /Users/main/notes", pattern: "rm -rf")
+        assertSafe("rm -rf ./build ./dist")   // all targets relative → still safe
+    }
+
     // MARK: - The reasoning text stays coherent (high severity, names the loss)
 
     func testEffectTextNamesTheIrreversibility() {

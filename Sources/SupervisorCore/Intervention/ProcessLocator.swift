@@ -49,6 +49,17 @@ public struct ProcessHandle: Sendable, Equatable {
 public protocol ProcessLocator: Sendable {
     func locate(targetCwd: String) -> ProcessHandle?
 
+    /// Same cwd walk, with the v0.3.1 Claude.app desktop fallback gated by
+    /// `allowDesktopFallback`. The SIGNAL paths (pause/kill) pass `false`:
+    /// the fallback PID is the SHARED desktop Electron process, and a POSIX
+    /// SIGSTOP/SIGTERM to it would freeze/quit every conversation in the
+    /// app — so a locate destined for `kill(2)` must return nil rather than
+    /// that PID. Inject paths keep the fallback (typing into the desktop
+    /// app is legitimate — delivery goes through keystrokes, not signals).
+    /// Default forwards to `locate(targetCwd:)` so existing conformers
+    /// (test stubs) stay source-compatible.
+    func locate(targetCwd: String, allowDesktopFallback: Bool) -> ProcessHandle?
+
     /// Locate the process for a specific session by its session id (the
     /// transcript UUID), matched against the process argv (`--resume <id>`
     /// / `--session-id <id>`). This is the RELIABLE primitive when cwd
@@ -64,6 +75,9 @@ public protocol ProcessLocator: Sendable {
 
 public extension ProcessLocator {
     func locate(bySessionId sessionId: String) -> ProcessHandle? { nil }
+    func locate(targetCwd: String, allowDesktopFallback: Bool) -> ProcessHandle? {
+        locate(targetCwd: targetCwd)
+    }
 }
 
 /// Production implementation backed by libproc on macOS. No entitlements
@@ -84,6 +98,10 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
     }
 
     public func locate(targetCwd: String) -> ProcessHandle? {
+        locate(targetCwd: targetCwd, allowDesktopFallback: true)
+    }
+
+    public func locate(targetCwd: String, allowDesktopFallback: Bool) -> ProcessHandle? {
         let pids: [pid_t]
         do {
             pids = try Self.enumerateAllPIDs()
@@ -169,6 +187,15 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
             // pipeline answer hit `intervention.inject.degraded
             // reason=locator_nil` despite cwd resolving correctly.
             if let claudeAppPID = Self.findClaudeDesktopAppPID() {
+                guard allowDesktopFallback else {
+                    // Signal path: the fallback PID is the shared desktop
+                    // Electron process — a POSIX signal to it would freeze/
+                    // quit EVERY conversation in Claude Desktop. Surface the
+                    // candidate PID for diagnosis, return nil so the caller
+                    // degrades instead of signaling it.
+                    trace.emit("locator", "locator.desktop_fallback_suppressed pid=\(claudeAppPID) targetCwd=\(targetCwd) note=caller disallowed the Claude.app fallback (signal path) — returning nil instead of the shared desktop PID")
+                    return nil
+                }
                 trace.emit("locator", "locator.claude_app_fallback pid=\(claudeAppPID) targetCwd=\(targetCwd) note=cli-locator missed; using Claude.app NSRunningApplication PID for inject delivery")
                 return ProcessHandle(pid: claudeAppPID, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
             }

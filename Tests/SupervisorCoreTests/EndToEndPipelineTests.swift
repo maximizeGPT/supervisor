@@ -137,10 +137,17 @@ final class EndToEndPipelineTests: XCTestCase {
         // call instead of short-circuiting on the catch before the model.
         let bashCommand = "chmod -R 000 /Users/test/important"
         let jsonl = projectHashDir.appendingPathComponent("\(sessionId).jsonl")
+        // Timestamps must be NOW, not hardcoded: the engine's stale-event gate
+        // (staleEventThresholdSeconds) skips historical events by design, and
+        // this test drives the live-event wire, not a backfill replay.
+        let isoNow = ISO8601DateFormatter()
+        let t0 = isoNow.string(from: Date())
+        let t1 = isoNow.string(from: Date().addingTimeInterval(1))
+        let t2 = isoNow.string(from: Date().addingTimeInterval(2))
         let lines = [
-            #"{"type":"queue-operation","timestamp":"2026-05-21T19:36:19Z","sessionId":"\#(sessionId)","cwd":"/Users/test","gitBranch":"main"}"#,
-            #"{"type":"user","timestamp":"2026-05-21T19:36:20Z","sessionId":"\#(sessionId)","uuid":"u1","message":{"role":"user","content":"clean up please"}}"#,
-            #"{"type":"assistant","timestamp":"2026-05-21T19:36:21Z","sessionId":"\#(sessionId)","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"\#(bashCommand)"}}]}}"#,
+            #"{"type":"queue-operation","timestamp":"\#(t0)","sessionId":"\#(sessionId)","cwd":"/Users/test","gitBranch":"main"}"#,
+            #"{"type":"user","timestamp":"\#(t1)","sessionId":"\#(sessionId)","uuid":"u1","message":{"role":"user","content":"clean up please"}}"#,
+            #"{"type":"assistant","timestamp":"\#(t2)","sessionId":"\#(sessionId)","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"\#(bashCommand)"}}]}}"#,
         ]
         let payload = lines.joined(separator: "\n") + "\n"
         try Data(payload.utf8).write(to: jsonl)

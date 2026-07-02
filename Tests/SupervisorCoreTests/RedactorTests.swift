@@ -88,6 +88,62 @@ final class RedactorTests: XCTestCase {
         XCTAssertEqual(redactor.redact(near), near)
     }
 
+    func testRedactsGitHubServerSideTokens() {
+        for prefix in ["ghs_", "ghr_", "ghu_"] {
+            let token = prefix + String(repeating: "C", count: 36)
+            let out = redactor.redact("token: \(token)")
+            XCTAssertFalse(out.contains(token), "failed to redact \(prefix) token")
+            XCTAssertTrue(out.contains("<redacted:github-token>"))
+        }
+    }
+
+    func testGitHubUnknownPrefixNotRedacted() {
+        // ghx_ is not a GitHub token family.
+        let near = "ghx_" + String(repeating: "C", count: 36)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    // MARK: - GitLab / npm / Google tokens
+
+    func testRedactsGitLabToken() {
+        let token = "glpat-" + String(repeating: "x", count: 20)
+        let out = redactor.redact("clone with \(token)")
+        XCTAssertFalse(out.contains(token))
+        XCTAssertTrue(out.contains("<redacted:gitlab-token>"))
+    }
+
+    func testShortGitLabTokenNotRedacted() {
+        // 19 chars after the prefix — under the 20 lower bound.
+        let near = "glpat-" + String(repeating: "x", count: 19)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    func testRedactsNpmToken() {
+        let token = "npm_" + String(repeating: "a", count: 36)
+        let out = redactor.redact("//registry.npmjs.org/:_authToken=\(token)")
+        XCTAssertFalse(out.contains(token))
+        XCTAssertTrue(out.contains("<redacted:npm-token>"))
+    }
+
+    func testNpmTokenWrongLengthNotRedacted() {
+        // 35 chars instead of 36 — should NOT match.
+        let near = "npm_" + String(repeating: "a", count: 35)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    func testRedactsGoogleAPIKey() {
+        let key = "AIzaSy" + String(repeating: "D", count: 33)   // AIza + 35-char body
+        let out = redactor.redact("maps key is \(key)")
+        XCTAssertFalse(out.contains(key))
+        XCTAssertTrue(out.contains("<redacted:google-api-key>"))
+    }
+
+    func testShortAIzaStringNotRedacted() {
+        // Body under the fixed 35-char shape — not a Google key.
+        let near = "AIzaSy" + String(repeating: "D", count: 20)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
     // MARK: - Slack tokens
 
     func testRedactsSlackBotToken() {
@@ -133,6 +189,26 @@ final class RedactorTests: XCTestCase {
         XCTAssertEqual(redactor.redact(input), input)
     }
 
+    // MARK: - AWS credentials (standalone secret assignment)
+
+    func testRedactsStandaloneAWSSecretAssignment() {
+        // ~/.aws/credentials shape: the secret line with no AKIA id nearby,
+        // so the pair pattern can't fire.
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        let input = "aws_secret_access_key = \(secret)"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains(secret))
+        XCTAssertTrue(out.contains("aws_secret_access_key = <redacted:aws-credential>"))
+    }
+
+    func testAWSSecretAssignmentIgnoresLongerBlob() {
+        // 41 base64 chars — the trailing lookahead pins the value at
+        // exactly 40, so a longer blob must not half-match.
+        let blob = String(repeating: "A", count: 41)
+        let input = "aws_secret_access_key=\(blob)"
+        XCTAssertEqual(redactor.redact(input), input)
+    }
+
     // MARK: - JWT
 
     func testRedactsJWT() {
@@ -145,6 +221,36 @@ final class RedactorTests: XCTestCase {
     func testShortJWTLikeStringNotRedacted() {
         // Three short segments; below the 20-char minimum per segment.
         let input = "eyJ.eyJ.eyJ"
+        XCTAssertEqual(redactor.redact(input), input)
+    }
+
+    // MARK: - PEM private keys
+
+    func testRedactsPEMPrivateKeyBlock() {
+        // Whole multiline block goes, surrounding output stays.
+        let input = """
+        writing key to disk
+        -----BEGIN RSA PRIVATE KEY-----
+        MIIEpAIBAAKCAQEAfakebody0123456789
+        moreFakeBody/lines+here==
+        -----END RSA PRIVATE KEY-----
+        done
+        """
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("MIIEpAIBAAKCAQEA"))
+        XCTAssertFalse(out.contains("BEGIN RSA PRIVATE KEY"))
+        XCTAssertTrue(out.contains("<redacted:private-key>"))
+        XCTAssertTrue(out.contains("writing key to disk"))
+        XCTAssertTrue(out.contains("done"))
+    }
+
+    func testDoesNotRedactPEMPublicKeyBlock() {
+        // No "PRIVATE KEY" in the header — public keys are fine to send.
+        let input = """
+        -----BEGIN PUBLIC KEY-----
+        MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJ
+        -----END PUBLIC KEY-----
+        """
         XCTAssertEqual(redactor.redact(input), input)
     }
 
@@ -195,6 +301,42 @@ final class RedactorTests: XCTestCase {
         XCTAssertEqual(redactor.redact(input), input)
     }
 
+    func testQueryParamRedactionStopsAtJSONQuote() {
+        // Regression for the encoded-body second pass: the value class
+        // excludes `"` and `\`, so redaction must stop at the JSON closing
+        // quote instead of eating `","next":"..."` and corrupting the body.
+        let encoded = #"{"url":"https://x.test/?token=abc123","next":"keep-me"}"#
+        let out = redactor.redact(encoded)
+        XCTAssertFalse(out.contains("abc123"))
+        XCTAssertTrue(
+            out.contains(#"token=<redacted:url-credentials>","next":"keep-me""#),
+            "redaction consumed across the JSON string boundary: \(out)"
+        )
+    }
+
+    // MARK: - Connection strings
+
+    func testRedactsPostgresConnectionStringPassword() {
+        let input = "psql postgres://admin:hunter2@db.internal:5432/prod"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("hunter2"))
+        // Username and host survive for triage context.
+        XCTAssertTrue(out.contains("postgres://admin:<redacted:url-credentials>@db.internal:5432/prod"))
+    }
+
+    func testRedactsMongoDBSRVConnectionStringPassword() {
+        let input = "mongodb+srv://app:s3cr3tpw@cluster0.mongodb.net/db"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("s3cr3tpw"))
+        XCTAssertTrue(out.contains("mongodb+srv://app:<redacted:url-credentials>@cluster0.mongodb.net/db"))
+    }
+
+    func testConnectionStringWithoutCredentialsUnchanged() {
+        // Host:port but no `user:pass@` — nothing to redact.
+        let input = "postgres://db.example.com:5432/mydb"
+        XCTAssertEqual(redactor.redact(input), input)
+    }
+
     // MARK: - Shell export
 
     func testRedactsExportValue() {
@@ -224,6 +366,31 @@ final class RedactorTests: XCTestCase {
         // — no value to leak.
         let input = "export FOO"
         XCTAssertEqual(redactor.redact(input), input)
+    }
+
+    func testRedactsIndentedExportOnLaterLine() {
+        // `(?m)^\s*export` needs a REAL newline before it. This is the
+        // plaintext shape LLMClient now redacts before JSON-encoding; on
+        // the encoded body (`\n` as two chars) this line anchor can never
+        // fire.
+        let input = "setting up environment\n  export SECRET_TOKEN=hunter2abc\ndone"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("hunter2abc"))
+        XCTAssertTrue(out.contains("export SECRET_TOKEN=<redacted>"))
+    }
+
+    // MARK: - Line-start regressions (plaintext-before-encoding)
+
+    func testRedactsLineLeadingGitHubToken() {
+        // A token at the start of a line: its leading `\b` sits right after
+        // a newline. In plaintext that's a boundary; in a JSON-encoded body
+        // the preceding char is the `n` of the `\n` escape and the boundary
+        // vanishes. The redactor must see this shape as plaintext.
+        let token = "ghp_" + String(repeating: "Z", count: 36)
+        let input = "output\n\(token)"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains(token))
+        XCTAssertTrue(out.contains("<redacted:github-token>"))
     }
 
     // MARK: - Idempotence

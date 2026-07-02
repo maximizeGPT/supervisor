@@ -12,6 +12,13 @@
 //   - .pause, missing cwd  → notifier.post fired (degrade), locator not called
 //   - double pause         → second SIGSTOP no-ops on the sender (no-throw)
 //   - kill after pause     → SIGSTOP then SIGTERM, both fire
+//
+// Signal-target safety (2026-07-02):
+//   - pause/kill signal the PROCESS GROUP of the resolved pid (an
+//     already-forked `bash -c` child must stop/terminate too)
+//   - the session-id-confirmed PID is preferred over the cwd walk
+//   - the shared Claude Desktop PID is NEVER signaled — desktop-only
+//     resolution degrades to notify (no OCR target in the test env)
 
 import XCTest
 import Darwin
@@ -51,11 +58,32 @@ final class InterventionRouterTests: XCTestCase {
 
     struct StubLocator: ProcessLocator {
         let handle: ProcessHandle?
+        /// What `locate(bySessionId:)` returns — nil (the default) models
+        /// a session whose id isn't visible in any argv.
+        var sessionHandle: ProcessHandle? = nil
         func locate(targetCwd: String) -> ProcessHandle? { handle }
+        func locate(targetCwd: String, allowDesktopFallback: Bool) -> ProcessHandle? {
+            // Mirror LiveProcessLocator's gate: with the fallback disallowed
+            // a desktop-shaped handle is withheld (signal paths must see nil,
+            // never the shared Claude Desktop PID).
+            if !allowDesktopFallback,
+               let h = handle,
+               h.execPath.contains("Claude.app/Contents/MacOS/Claude") {
+                return nil
+            }
+            return handle
+        }
+        func locate(bySessionId sessionId: String) -> ProcessHandle? { sessionHandle }
     }
 
     final class CapturingSignalSender: SignalSender, @unchecked Sendable {
-        struct Sent: Equatable { let signal: Int32; let pid: pid_t }
+        struct Sent: Equatable {
+            let signal: Int32
+            let pid: pid_t
+            /// True when the router used the process-GROUP primitive
+            /// (`sendToGroup`) rather than the single-pid `send`.
+            var group: Bool = false
+        }
         private let lock = NSLock()
         private var _sent: [Sent] = []
         var sent: [Sent] {
@@ -69,7 +97,15 @@ final class InterventionRouterTests: XCTestCase {
                 throwOnNext = nil
                 throw err
             }
-            _sent.append(Sent(signal: signal, pid: pid))
+            _sent.append(Sent(signal: signal, pid: pid, group: false))
+        }
+        func sendToGroup(_ signal: Int32, of pid: pid_t) throws {
+            lock.lock(); defer { lock.unlock() }
+            if let err = throwOnNext {
+                throwOnNext = nil
+                throw err
+            }
+            _sent.append(Sent(signal: signal, pid: pid, group: true))
         }
     }
 
@@ -112,6 +148,7 @@ final class InterventionRouterTests: XCTestCase {
 
     private func makeRouter(
         handle: ProcessHandle? = ProcessHandle(pid: 4242, execPath: "/path/claude", cwd: "/tmp/test-cwd"),
+        sessionHandle: ProcessHandle? = nil,
         sender: CapturingSignalSender = CapturingSignalSender(),
         injector: MockInjector = MockInjector(),
         activeSessionCount: @escaping () -> Int = { 1 },
@@ -124,7 +161,7 @@ final class InterventionRouterTests: XCTestCase {
         let notifier = MockNotifier()
         let router = InterventionRouter(
             notifier: notifier,
-            locator: StubLocator(handle: handle),
+            locator: StubLocator(handle: handle, sessionHandle: sessionHandle),
             signalSender: sender,
             injector: injector,
             activeSessionCount: activeSessionCount,
@@ -151,7 +188,8 @@ final class InterventionRouterTests: XCTestCase {
         // an outcome-aware banner carrying the recovery doc path.
         let (router, notifier, sender, _) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .pause))
-        XCTAssertEqual(sender.sent, [.init(signal: SIGSTOP, pid: 4242)])
+        XCTAssertEqual(sender.sent, [.init(signal: SIGSTOP, pid: 4242, group: true)],
+                       "pause must signal the PROCESS GROUP so already-forked children stop too")
         XCTAssertEqual(notifier.calls.count, 1,
                        "successful pause must post one outcome-aware banner")
         if case let .pauseSucceeded(pid, _) = notifier.calls.first?.outcome {
@@ -164,7 +202,8 @@ final class InterventionRouterTests: XCTestCase {
     func testKillDispatchSendsSIGTERMAndPostsKillBanner() async {
         let (router, notifier, sender, _) = makeRouter()
         await router.dispatch(decision: makeDecision(action: .kill))
-        XCTAssertEqual(sender.sent, [.init(signal: SIGTERM, pid: 4242)])
+        XCTAssertEqual(sender.sent, [.init(signal: SIGTERM, pid: 4242, group: true)],
+                       "kill must signal the PROCESS GROUP so already-forked children terminate too")
         XCTAssertEqual(notifier.calls.count, 1,
                        "successful kill must post one outcome-aware banner")
         if case .killSucceeded = notifier.calls.first?.outcome {
@@ -221,8 +260,8 @@ final class InterventionRouterTests: XCTestCase {
         await router.dispatch(decision: makeDecision(action: .pause))
         await router.dispatch(decision: makeDecision(action: .pause))
         XCTAssertEqual(sender.sent, [
-            .init(signal: SIGSTOP, pid: 4242),
-            .init(signal: SIGSTOP, pid: 4242),
+            .init(signal: SIGSTOP, pid: 4242, group: true),
+            .init(signal: SIGSTOP, pid: 4242, group: true),
         ])
     }
 
@@ -231,9 +270,85 @@ final class InterventionRouterTests: XCTestCase {
         await router.dispatch(decision: makeDecision(action: .pause))
         await router.dispatch(decision: makeDecision(action: .kill))
         XCTAssertEqual(sender.sent, [
-            .init(signal: SIGSTOP, pid: 4242),
-            .init(signal: SIGTERM, pid: 4242),
+            .init(signal: SIGSTOP, pid: 4242, group: true),
+            .init(signal: SIGTERM, pid: 4242, group: true),
         ])
+    }
+
+    // MARK: - Signal-target safety (2026-07-02: never signal Claude Desktop)
+
+    /// The worst-outcome bug shape: the session-id argv match pins THIS
+    /// session's CLI process (pid 777, cwd=$HOME — the real `claude` shape),
+    /// while the cwd walk would fall back to the shared Claude Desktop PID.
+    /// The signal must land on 777's process group — never on the desktop.
+    func testSessionIdConfirmedPIDPreferredOverCwdLookup() async {
+        let cli = ProcessHandle(pid: 777, execPath: "/usr/local/bin/claude", cwd: "/Users/dev")
+        let desktop = ProcessHandle(pid: 94716, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+        let (router, notifier, sender, _) = makeRouter(handle: desktop, sessionHandle: cli)
+        await router.dispatch(decision: makeDecision(action: .pause))
+        XCTAssertEqual(sender.sent, [.init(signal: SIGSTOP, pid: 777, group: true)],
+                       "the session-id-confirmed PID must be signaled — NEVER the desktop fallback")
+        if case let .pauseSucceeded(pid, _) = notifier.calls.first?.outcome {
+            XCTAssertEqual(pid, 777, "banner must carry the session-confirmed PID")
+        } else {
+            XCTFail("expected pauseSucceeded, got \(String(describing: notifier.calls.first?.outcome))")
+        }
+    }
+
+    /// When the ONLY resolvable handle is the shared Claude Desktop process,
+    /// pause/kill must never send it a POSIX signal. The router routes to the
+    /// per-conversation UI interrupt, which in this test environment (no
+    /// desktop session store for a synthetic session id, no branch) degrades
+    /// to a notify banner. Either way: zero signals.
+    func testDesktopAppHandleIsNeverSignaled_DegradesToNotify() async {
+        let desktop = ProcessHandle(pid: 94716, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+        let (router, notifier, sender, _) = makeRouter(handle: desktop)
+        await router.dispatch(decision: makeDecision(
+            action: .pause,
+            sessionId: "desktop-pause-\(UUID().uuidString)"
+        ))
+        await router.dispatch(decision: makeDecision(
+            action: .kill,
+            sessionId: "desktop-kill-\(UUID().uuidString)"
+        ))
+        XCTAssertTrue(sender.sent.isEmpty,
+                      "the shared Claude Desktop PID must NEVER receive a POSIX signal")
+        XCTAssertEqual(notifier.calls.count, 2, "each dispatch degrades to exactly one banner")
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly)
+        XCTAssertEqual(notifier.calls.last?.outcome, .notifyOnly)
+    }
+
+    /// Even when the session-id match ITSELF resolves to the desktop host,
+    /// no signal may be sent to it.
+    func testSessionIdResolvingToDesktopHostIsNeverSignaled() async {
+        let desktop = ProcessHandle(pid: 94716, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+        let (router, notifier, sender, _) = makeRouter(handle: nil, sessionHandle: desktop)
+        await router.dispatch(decision: makeDecision(
+            action: .kill,
+            sessionId: "desktop-by-id-\(UUID().uuidString)"
+        ))
+        XCTAssertTrue(sender.sent.isEmpty,
+                      "a session-id match on the desktop host must still never be signaled")
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly)
+    }
+
+    /// The router must use the sender's GROUP primitive for pause/kill —
+    /// a single-pid SIGSTOP would leave an already-forked `bash -c` child
+    /// running while its parent freezes.
+    func testPauseUsesProcessGroupSignal() async {
+        let (router, _, sender, _) = makeRouter()
+        await router.dispatch(decision: makeDecision(action: .pause))
+        XCTAssertEqual(sender.sent.count, 1)
+        XCTAssertTrue(sender.sent.first?.group ?? false,
+                      "pause must go through sendToGroup, not the single-pid send")
+    }
+
+    /// Live smoke of `DarwinSignalSender.sendToGroup`: signal 0 is a pure
+    /// existence/permission probe (nothing is delivered), so it's safe to
+    /// aim at our own process. Exercises the getpgid resolution path (and
+    /// the own-group fallback guard) without side effects.
+    func testDarwinSignalSenderGroupSendSignalZeroDoesNotThrow() throws {
+        XCTAssertNoThrow(try DarwinSignalSender().sendToGroup(0, of: getpid()))
     }
 
     // MARK: - Inject tests (v0.3.0)

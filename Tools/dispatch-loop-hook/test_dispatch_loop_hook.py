@@ -22,6 +22,83 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dispatch_loop_hook as hook
 
 
+# ---------------------------------------------------------------------------
+# Hermetic harness support.
+#
+# DEFAULTS["supervisor_repo_path"] points at the author's checkout
+# ("/Users/main/supervisor"), which exists only on that machine. Any test
+# that drives main() (or the git-grep grounding helpers) therefore needs a
+# repo path that is real on THIS machine, or it silent-exits with
+# no_principles_md before reaching the behavior under test:
+#
+#   * REPO_ROOT — this checkout's root. Used by the grounding tests, which
+#     deliberately assert against the REAL tree (detect_stale_build is a
+#     real function, TriageEngineTests is a real test class, ...).
+#   * _fixture_repo() — a throwaway git repo containing a PRINCIPLES.md and
+#     a Sources/ file that defines exactly the code symbols the mocked
+#     main() tests propose against. main()'s PRINCIPLES.md gate and its
+#     real `git grep` grounding then behave identically on any machine.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = str(Path(__file__).resolve().parents[2])
+
+_FIXTURE_REPO: str | None = None
+
+
+def _fixture_repo() -> str:
+    """Create (once per test run) a minimal stand-in supervisor repo."""
+    global _FIXTURE_REPO
+    if _FIXTURE_REPO is not None:
+        return _FIXTURE_REPO
+
+    import atexit
+    import shutil
+    import subprocess
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="dispatch-hook-fixture-repo-")
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+    root = str(Path(tmp).resolve())
+
+    # main() gates on a non-empty PRINCIPLES.md at the repo root.
+    (Path(root) / "PRINCIPLES.md").write_text(
+        "# Principles\n\nHermetic test stand-in for the real PRINCIPLES.md.\n",
+        encoding="utf-8",
+    )
+    # Real (tracked, non-test, non-markdown) code defining the symbols the
+    # harness proposals name, so `git grep` grounding passes for them —
+    # and ONLY them (e.g. `stale_binary` stays ungrounded on purpose).
+    sources = Path(root) / "Sources"
+    sources.mkdir()
+    (sources / "HarnessSymbols.swift").write_text(
+        "// Symbols referenced by grounded test proposals.\n"
+        "final class LoopController {}\n"
+        "struct ExpandedPanelView {}\n"
+        "func write_owner_brief() {}\n"
+        "func detect_stale_build() {}\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+    for cmd in (
+        ["git", "init", "-q", root],
+        ["git", "-C", root, "add", "-A"],
+        ["git", "-C", root, "-c", "user.name=hook-tests",
+         "-c", "user.email=hook-tests@example.invalid",
+         "commit", "-qm", "fixture repo"],
+    ):
+        subprocess.run(cmd, check=True, env=env, capture_output=True)
+
+    _FIXTURE_REPO = root
+    return root
+
+
+def _hermetic_cfg() -> dict:
+    """DEFAULTS with supervisor_repo_path pinned to the fixture repo."""
+    cfg = dict(hook.DEFAULTS)
+    cfg["supervisor_repo_path"] = _fixture_repo()
+    return cfg
+
+
 class TestParseRetry(unittest.TestCase):
     """v0.4.1: JSON parse error retry — one retry, then silent-exit."""
 
@@ -49,7 +126,7 @@ class TestParseRetry(unittest.TestCase):
         with patch.object(hook, 'call_dispatcher', side_effect=fake_call), \
              patch.object(hook, 'silent_exit', side_effect=fake_silent_exit), \
              patch.object(hook, 'try_self_extend', side_effect=fake_self_extend), \
-             patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
+             patch.object(hook, 'load_config', return_value=_hermetic_cfg()), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
              patch.object(hook, 'write_owner_brief'), \
@@ -66,7 +143,7 @@ class TestParseRetry(unittest.TestCase):
              patch.object(hook, 'ENABLED_FLAG', new=MagicMock(exists=MagicMock(return_value=True))), \
              patch('sys.stdin', MagicMock(read=MagicMock(return_value=json.dumps({
                  "session_id": "s1",
-                 "cwd": "/Users/main/supervisor",
+                 "cwd": _fixture_repo(),
                  "transcript_path": "/tmp/test.jsonl",
              })))):
             try:
@@ -157,7 +234,7 @@ class TestRequiresHumanPresenceGate(unittest.TestCase):
 
         with patch.object(hook, 'call_dispatcher', side_effect=fake_call), \
              patch.object(hook, 'silent_exit', side_effect=fake_silent_exit), \
-             patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
+             patch.object(hook, 'load_config', return_value=_hermetic_cfg()), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
              patch.object(hook, 'write_owner_brief'), \
@@ -174,7 +251,7 @@ class TestRequiresHumanPresenceGate(unittest.TestCase):
              patch.object(hook, 'ENABLED_FLAG', new=MagicMock(exists=MagicMock(return_value=True))), \
              patch('sys.stdin', MagicMock(read=MagicMock(return_value=json.dumps({
                  "session_id": "s1",
-                 "cwd": "/Users/main/supervisor",
+                 "cwd": _fixture_repo(),
                  "transcript_path": "/tmp/test.jsonl",
              })))):
             try:
@@ -201,7 +278,7 @@ class TestRequiresHumanPresenceGate(unittest.TestCase):
 
         with patch.object(hook, 'call_dispatcher', side_effect=fake_call), \
              patch.object(hook, 'emit_block') as mock_block, \
-             patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)), \
+             patch.object(hook, 'load_config', return_value=_hermetic_cfg()), \
              patch.object(hook, 'load_state', return_value={}), \
              patch.object(hook, 'save_state'), \
              patch.object(hook, 'write_owner_brief'), \
@@ -218,7 +295,7 @@ class TestRequiresHumanPresenceGate(unittest.TestCase):
              patch.object(hook, 'ENABLED_FLAG', new=MagicMock(exists=MagicMock(return_value=True))), \
              patch('sys.stdin', MagicMock(read=MagicMock(return_value=json.dumps({
                  "session_id": "s1",
-                 "cwd": "/Users/main/supervisor",
+                 "cwd": _fixture_repo(),
                  "transcript_path": "/tmp/test.jsonl",
              })))):
             try:
@@ -992,7 +1069,7 @@ class TestThrashFixV090(unittest.TestCase):
                 patch.object(hook, 'load_state', side_effect=fake_load_state),
                 patch.object(hook, 'save_state', side_effect=fake_save_state),
                 patch.object(hook, 'write_owner_brief'),
-                patch.object(hook, 'load_config', return_value=dict(hook.DEFAULTS)),
+                patch.object(hook, 'load_config', return_value=_hermetic_cfg()),
                 patch.object(hook, 'detect_worker_stopped', return_value=True),
                 patch.object(hook, 'read_recent_turns', return_value=[
                     {"role": "assistant", "text": "All done.", "ts": ""}
@@ -1007,7 +1084,7 @@ class TestThrashFixV090(unittest.TestCase):
                              new=MagicMock(exists=MagicMock(return_value=True))),
                 patch('sys.stdin', MagicMock(read=MagicMock(return_value=json.dumps({
                     "session_id": "s1",
-                    "cwd": "/Users/main/supervisor",
+                    "cwd": _fixture_repo(),
                     "transcript_path": "/tmp/test.jsonl",
                 })))),
             ]
@@ -1273,7 +1350,7 @@ class TestGrounding(unittest.TestCase):
 
     def test_ground_flags_hallucinated_symbol(self):
         grounded, reason = hook._ground_proposal(
-            "/Users/main/supervisor",
+            REPO_ROOT,
             "Fix the frobnicate_the_widget helper",  # exists nowhere
             "", timeout=10)
         self.assertFalse(grounded)
@@ -1281,14 +1358,14 @@ class TestGrounding(unittest.TestCase):
 
     def test_ground_passes_real_symbol(self):
         grounded, _ = hook._ground_proposal(
-            "/Users/main/supervisor",
+            REPO_ROOT,
             "Fix detect_stale_build in the hook",   # real function
             "", timeout=10)
         self.assertTrue(grounded)
 
     def test_ground_passes_pure_prose(self):
         grounded, _ = hook._ground_proposal(
-            "/Users/main/supervisor",
+            REPO_ROOT,
             "Close the calibration gap on destructive recall",
             "", timeout=10)
         self.assertTrue(grounded, "a prose proposal naming no code symbols is grounded")
@@ -1300,10 +1377,10 @@ class TestGrounding(unittest.TestCase):
         # work. A test class IS real code — it must ground.
         for sym in ("TriageEngineTests", "PathIsolationSymmetryTests"):
             self.assertTrue(
-                hook._symbol_exists_in_repo("/Users/main/supervisor", sym, 10),
+                hook._symbol_exists_in_repo(REPO_ROOT, sym, 10),
                 f"{sym} is a real test class and must ground via the tests-fallback")
         grounded, reason = hook._ground_proposal(
-            "/Users/main/supervisor",
+            REPO_ROOT,
             "Fix the 4 failing TriageEngineTests that the rm -rf catch short-circuits",
             "they assert the Haiku path", timeout=10)
         self.assertTrue(grounded, f"test-fix proposal must ground; got reason={reason!r}")
@@ -1312,7 +1389,7 @@ class TestGrounding(unittest.TestCase):
         # The tests-fallback must NOT weaken the anti-hallucination guard: a
         # CamelCase type that exists nowhere (not even in tests) stays rejected.
         self.assertFalse(
-            hook._symbol_exists_in_repo("/Users/main/supervisor", "WidgetFrobnicatorXYZ", 10))
+            hook._symbol_exists_in_repo(REPO_ROOT, "WidgetFrobnicatorXYZ", 10))
 
 
 class TestEnvironmentClaimGrounding(unittest.TestCase):
