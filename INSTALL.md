@@ -117,6 +117,14 @@ To wipe the saved key and onboarding state and re-run onboarding, open the
 **Terminal** app and paste:
 
 ```
+# One line per provider you ever entered a key for (each errors
+# harmlessly if that provider has no saved key):
+security delete-generic-password -s live.supervisor.api.anthropic
+security delete-generic-password -s live.supervisor.api.deepseek
+security delete-generic-password -s live.supervisor.api.moonshot
+security delete-generic-password -s live.supervisor.api.minimax
+security delete-generic-password -s live.supervisor.api.qwenhf
+# Pre-v0.2.0 installs stored the key here instead:
 security delete-generic-password -s live.supervisor.api
 rm -rf ~/Library/Application\ Support/Supervisor
 rm -rf ~/Library/Logs/Supervisor

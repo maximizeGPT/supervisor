@@ -66,7 +66,7 @@ Three things make it trustworthy:
 - **Bring your own key.** No server, no subscription, no per-seat pricing. Use the key you already have (Anthropic, DeepSeek, and more). Your usage is billed to you, at cost.
 - **Honest health.** A companion menu-bar process reports green, amber, or red, so you always know whether Supervisor is actually watching.
 
-The full architecture is in **[DESIGN.md](./DESIGN.md)**.
+The architecture diagram is in **[docs/architecture.svg](./docs/architecture.svg)**, and the current release plan is in **[docs/V0.3.0-PLAN.md](./docs/V0.3.0-PLAN.md)**.
 
 ## Pricing
 

@@ -17,9 +17,10 @@ swift test
 ```
 
 The first `swift build` triggers Xcode Command Line Tools install if
-they're missing. `swift test` runs 130 tests; one (`testRealHaikuLiveCall`)
-is skipped unless `ANTHROPIC_API_KEY` is exported — that one hits the
-real Anthropic API and bills against your key.
+they're missing. `swift test` runs the full unit suite (~470 tests); a
+handful self-skip unless `ANTHROPIC_API_KEY` (and, for the calibration
+sweeps, `SUPERVISOR_LIVE_API=1`) is exported — those hit the real
+provider APIs and bill against your key.
 
 For an end-to-end smoke test that builds, signs, and launches all three
 `.app` bundles with the brand icons baked in:
@@ -56,9 +57,9 @@ Swift code follows the shape of what's already there — small `struct`
 types, narrow protocol surfaces, intent verbs on view-model methods
 (`submitKey`, `recheckAX`, never `setState`). Multi-line block comments
 at the top of each file explain *why* the file exists, not what it does.
-The trace-log lines and the design doc together carry most of the
-context — when adding a new subsystem, add a trace tag and a brief
-paragraph in `DESIGN.md` for the next person.
+The trace-log lines and the file-header comments together carry most
+of the context — when adding a new subsystem, add a trace tag and a
+brief *why* block at the top of the file for the next person.
 
 There's no formatter enforced in CI yet (swift-format pending — see
 issues). Match surrounding indentation (4 spaces) and column width
