@@ -201,12 +201,20 @@ final class RedactorTests: XCTestCase {
         XCTAssertTrue(out.contains("aws_secret_access_key = <redacted:aws-credential>"))
     }
 
-    func testAWSSecretAssignmentIgnoresLongerBlob() {
-        // 41 base64 chars — the trailing lookahead pins the value at
-        // exactly 40, so a longer blob must not half-match.
+    func testAWSSecretAssignmentLongerBlobStillRedactedByGenericEnvRule() {
+        // 41 base64 chars — too long for the narrow `awsSecretAssignment`
+        // pattern (its trailing lookahead pins the value at exactly 40, so it
+        // does NOT half-match). But `aws_secret_access_key` is a
+        // `*SECRET*/*KEY*=value` assignment, so the v0.3.0 generic
+        // `envAssignmentSecret` rule catches it regardless of length —
+        // redacting a secret we would otherwise have leaked. The narrow
+        // pattern's exact-40 behavior is still covered by the positive test
+        // above (which asserts the `<redacted:aws-credential>` placeholder).
         let blob = String(repeating: "A", count: 41)
         let input = "aws_secret_access_key=\(blob)"
-        XCTAssertEqual(redactor.redact(input), input)
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains(blob), "a longer secret assignment must not leak")
+        XCTAssertTrue(out.contains("aws_secret_access_key=<redacted:env-secret>"))
     }
 
     // MARK: - JWT
