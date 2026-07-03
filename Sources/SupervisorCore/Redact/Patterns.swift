@@ -28,12 +28,17 @@ extension RedactionPattern {
         npmToken,
         googleAPIKey,
         slackToken,
+        stripeKey,           // sk_live_/sk_test_/rk_live_ — underscore-prefixed.
+        stripeWebhookSecret, // whsec_
+        sendgridKey,
+        twilioKey,
         jwt,
         genericOpenAIKey,    // After the named keys so prefix-anchored ones win.
         urlBasicAuth,
         connectionStringCredentials,
         urlCredentialedQueryParam,
         shellExport,
+        envAssignmentSecret, // Value-side .env dump shape; after shellExport (export-prefixed) catches its own.
     ]
 
     // MARK: - Provider-specific keys
@@ -114,6 +119,40 @@ extension RedactionPattern {
         name: "slack-token",
         placeholder: "<redacted:slack-token>",
         kind: .regex(re(#"\bxox[baprs]-[A-Za-z0-9\-]{10,}"#))
+    )
+
+    /// Stripe secret / restricted secret keys: `sk_live_`, `sk_test_`,
+    /// `rk_live_`, `rk_test_`. `genericOpenAIKey` only matches the hyphenated
+    /// `sk-` form, so these underscore-prefixed keys slipped through. Publishable
+    /// `pk_` keys are deliberately excluded (not secret). Body lower-bounded at
+    /// 16 so a truncated `sk_live_x` label is not redacted.
+    public static let stripeKey = RedactionPattern(
+        name: "stripe-key",
+        placeholder: "<redacted:stripe-key>",
+        kind: .regex(re(#"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"#))
+    )
+
+    /// Stripe webhook signing secret. `whsec_` prefix + body.
+    public static let stripeWebhookSecret = RedactionPattern(
+        name: "stripe-webhook-secret",
+        placeholder: "<redacted:stripe-webhook-secret>",
+        kind: .regex(re(#"\bwhsec_[A-Za-z0-9]{16,}"#))
+    )
+
+    /// SendGrid API key. `SG.` + a 22-char selector + a 43-char secret, both
+    /// base64url-ish. The two fixed-length segments make the shape unambiguous.
+    public static let sendgridKey = RedactionPattern(
+        name: "sendgrid-key",
+        placeholder: "<redacted:sendgrid-key>",
+        kind: .regex(re(#"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b"#))
+    )
+
+    /// Twilio Account SID (`AC…`) and API Key SID (`SK…`) — the `AC`/`SK`
+    /// prefix + exactly 32 lowercase-hex chars. Fixed shape, so no length slack.
+    public static let twilioKey = RedactionPattern(
+        name: "twilio-key",
+        placeholder: "<redacted:twilio-key>",
+        kind: .regex(re(#"\b(?:AC|SK)[a-f0-9]{32}\b"#))
     )
 
     /// AWS access-key ID + paired secret within 200 chars. The access-key
@@ -218,6 +257,25 @@ extension RedactionPattern {
         placeholder: "<redacted>",
         kind: .regexGroup(
             re(#"(?m)^(\s*export\s+[A-Za-z_][A-Za-z0-9_]*=)(\S+)"#),
+            group: 2
+        )
+    )
+
+    /// Generic env-assignment secret — the dominant `.env` dump shape,
+    /// `NAME=value` / `NAME: value` where the NAME contains SECRET/TOKEN/KEY/
+    /// PASSWORD/PASSWD/APIKEY. `shellExport` only catches the `export`-prefixed
+    /// form; this covers the bare assignment. Value-side only: `NAME=` stays
+    /// visible, the value is redacted. Anchored to line start (`(?m)^`) so it
+    /// cannot run across a compact JSON body, and the value class `\S+` stops
+    /// at whitespace (mirrors `shellExport`). The `(?!<redacted)` guard skips a
+    /// value a provider-specific pattern already replaced (e.g.
+    /// `OPENAI_KEY=<redacted:api-key>`), so those keep their precise label and
+    /// re-redaction stays idempotent.
+    public static let envAssignmentSecret = RedactionPattern(
+        name: "env-secret",
+        placeholder: "<redacted:env-secret>",
+        kind: .regexGroup(
+            re(#"(?im)^(\s*[A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD|PASSWD|APIKEY)[A-Z0-9_]*\s*[=:]\s*)(?!<redacted)(\S+)"#),
             group: 2
         )
     )

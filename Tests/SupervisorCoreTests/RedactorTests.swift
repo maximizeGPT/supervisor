@@ -368,6 +368,102 @@ final class RedactorTests: XCTestCase {
         XCTAssertEqual(redactor.redact(input), input)
     }
 
+    // MARK: - Generic env-assignment secret (bare NAME=value .env shape)
+
+    func testRedactsBareEnvSecretAssignment() {
+        let input = "DATABASE_PASSWORD=hunter2super"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("hunter2super"))
+        XCTAssertTrue(out.contains("DATABASE_PASSWORD=<redacted:env-secret>"))
+    }
+
+    func testRedactsColonSeparatedEnvSecretAssignment() {
+        let input = "API_TOKEN: abc123def456ghi789"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("abc123def456ghi789"))
+        XCTAssertTrue(out.contains("API_TOKEN: <redacted:env-secret>"))
+    }
+
+    func testRedactsEnvSecretOnLaterLine() {
+        let input = "loading config\nSERVICE_SECRET=s0m3-s3cr3t-value\ndone"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("s0m3-s3cr3t-value"))
+        XCTAssertTrue(out.contains("SERVICE_SECRET=<redacted:env-secret>"))
+    }
+
+    func testEnvAssignmentIgnoresNonSecretName() {
+        // No SECRET/TOKEN/KEY/PASSWORD/APIKEY substring in the name → not a
+        // secret assignment, must not redact the value.
+        let input = "username = alice"
+        XCTAssertEqual(redactor.redact(input), input)
+    }
+
+    func testEnvAssignmentDoesNotDoubleRedactProviderKey() {
+        // `OPENAI_KEY=<value>` where the value is a provider key: the specific
+        // provider pattern must win and keep its label; env-secret must not
+        // re-wrap the already-redacted placeholder.
+        let input = "OPENAI_KEY=sk-AbCdEf1234567890abcdefghijklmnop12345678"
+        let out = redactor.redact(input)
+        XCTAssertTrue(out.contains("<redacted:api-key>"))
+        XCTAssertFalse(out.contains("<redacted:env-secret>"))
+    }
+
+    // MARK: - Stripe keys (underscore-prefixed)
+
+    func testRedactsStripeSecretKeys() {
+        for prefix in ["sk_live_", "sk_test_", "rk_live_"] {
+            let key = prefix + String(repeating: "a", count: 24)
+            let out = redactor.redact("the stripe key is \(key) done")
+            XCTAssertFalse(out.contains(key), "failed to redact \(prefix)")
+            XCTAssertTrue(out.contains("<redacted:stripe-key>"))
+        }
+    }
+
+    func testShortStripeKeyNotRedacted() {
+        // Body under the 16-char lower bound — a label, not a live key.
+        let near = "sk_live_short"
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    func testRedactsStripeWebhookSecret() {
+        let secret = "whsec_" + String(repeating: "b", count: 24)
+        let out = redactor.redact("STRIPE_WEBHOOK=\(secret)")
+        XCTAssertFalse(out.contains(secret))
+        XCTAssertTrue(out.contains("<redacted:stripe-webhook-secret>"))
+    }
+
+    // MARK: - SendGrid
+
+    func testRedactsSendGridKey() {
+        let key = "SG." + String(repeating: "a", count: 22) + "." + String(repeating: "b", count: 43)
+        let out = redactor.redact("sendgrid key: \(key)")
+        XCTAssertFalse(out.contains(key))
+        XCTAssertTrue(out.contains("<redacted:sendgrid-key>"))
+    }
+
+    func testShortSendGridStringNotRedacted() {
+        // Segments too short for the fixed 22/43 shape.
+        let near = "SG." + String(repeating: "a", count: 10) + "." + String(repeating: "b", count: 10)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    // MARK: - Twilio
+
+    func testRedactsTwilioSIDs() {
+        for prefix in ["AC", "SK"] {
+            let sid = prefix + String(repeating: "a", count: 32)   // 32 lowercase hex
+            let out = redactor.redact("twilio sid \(sid) here")
+            XCTAssertFalse(out.contains(sid), "failed to redact \(prefix) SID")
+            XCTAssertTrue(out.contains("<redacted:twilio-key>"))
+        }
+    }
+
+    func testTwilioWrongLengthNotRedacted() {
+        // 31 hex chars instead of 32 — should NOT match.
+        let near = "AC" + String(repeating: "a", count: 31)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
     func testRedactsIndentedExportOnLaterLine() {
         // `(?m)^\s*export` needs a REAL newline before it. This is the
         // plaintext shape LLMClient now redacts before JSON-encoding; on
