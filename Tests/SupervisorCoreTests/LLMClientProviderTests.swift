@@ -594,6 +594,151 @@ final class LLMClientProviderTests: XCTestCase {
         XCTAssertFalse(body.contains(token), "line-leading token must never reach the wire")
         XCTAssertTrue(body.contains("<redacted:github-token>"))
     }
+
+    // MARK: - Finding 3: daily-cap reservation under concurrency
+
+    /// The reservation estimate is a conservative worst case: the whole
+    /// max_tokens budget billed at the model's OUTPUT rate, plus a ~4-chars/
+    /// token input allowance. Asserted directly because forcing true
+    /// concurrency deterministically is fragile.
+    func testReservationEstimateIsWorstCaseOutputPlusInputAllowance() {
+        let client = LLMClient(
+            provider: .anthropic,
+            apiKey: "k",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!
+        )
+        // Haiku 4.5: input 1.00/1M, output 5.00/1M.
+        // Empty message text → 0 input tokens; 100k output tokens * 5/1e6 = 0.5.
+        let req = AnthropicMessageRequest(
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 100_000,
+            system: nil,
+            messages: [.init(role: "user", content: .string(""))],
+            tools: nil, tool_choice: nil
+        )
+        XCTAssertEqual(client.reservationEstimateUSD(for: req), 0.5, accuracy: 1e-9)
+
+        // 8 input chars → 2 tokens * 1/1e6 = 2e-6 added on top of the 0.5 output.
+        let reqWithInput = AnthropicMessageRequest(
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 100_000,
+            system: nil,
+            messages: [.init(role: "user", content: .string("abcdefgh"))],
+            tools: nil, tool_choice: nil
+        )
+        XCTAssertEqual(client.reservationEstimateUSD(for: reqWithInput), 0.5 + 2e-6, accuracy: 1e-9)
+    }
+
+    /// An unknown model records as $0 (loud silence), so it must reserve $0 too
+    /// — otherwise the reservation would gate a model the store treats as free.
+    func testReservationEstimateIsZeroForUnknownModel() {
+        let client = LLMClient(
+            provider: .anthropic,
+            apiKey: "k",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!
+        )
+        let req = AnthropicMessageRequest(
+            model: "no-such-model-xyz",
+            max_tokens: 100_000,
+            system: nil,
+            messages: [.init(role: "user", content: .string("hi"))],
+            tools: nil, tool_choice: nil
+        )
+        XCTAssertEqual(client.reservationEstimateUSD(for: req), 0)
+    }
+
+    /// The race the reservation closes: with a fixed near-cap `spent`, N
+    /// concurrent createMessage calls would ALL pass the old `spent >= cap`
+    /// gate and overshoot by ~N calls. The delayed mock keeps each admitted
+    /// call in flight long enough that all N reach the atomic `admit` step
+    /// before any releases, so the in-flight reservation actually bites:
+    /// cap 1.0, estimate 0.5/call → 0+0<1 (admit), 0+0.5<1 (admit),
+    /// 0+1.0>=1 (refuse ×3). Exactly two are admitted regardless of the order
+    /// the tasks reach the actor.
+    func testConcurrentCallsNearCapAreBoundedByReservation() async throws {
+        let body = Data(#"""
+        {"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}
+        """#.utf8)
+        DelayedCapMockURLProtocol.response = (200, body)
+        // Keep admitted calls in flight long enough that all 5 tasks reach the
+        // atomic `admit` step before any releases — generous for slow CI.
+        DelayedCapMockURLProtocol.delaySeconds = 1.0
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [DelayedCapMockURLProtocol.self]
+        // Fixed cap 1.0 / spent 0.0 — recorded spend never moves during the
+        // test, so any bounding must come from the in-flight reservation.
+        let client = LLMClient(
+            provider: .anthropic,
+            apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: URLSession(configuration: cfg),
+            capCheck: { (cap: 1.0, spent: 0.0) }
+        )
+        // Estimate per call ≈ 0.5 (100k output tokens at Haiku's 5/1M).
+        let req = AnthropicMessageRequest(
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 100_000,
+            system: nil,
+            messages: [.init(role: "user", content: .string("hi"))],
+            tools: nil, tool_choice: nil
+        )
+
+        let results = await withTaskGroup(of: Bool.self) { group -> [Bool] in
+            for _ in 0..<5 {
+                group.addTask {
+                    do { _ = try await client.createMessage(req); return true }
+                    catch { return false }
+                }
+            }
+            var out: [Bool] = []
+            for await ok in group { out.append(ok) }
+            return out
+        }
+
+        let admitted = results.filter { $0 }.count
+        XCTAssertEqual(admitted, 2,
+            "reservation must bound concurrent admits to floor(cap/estimate) = 2; got \(admitted)")
+        XCTAssertEqual(results.count - admitted, 3,
+            "the other three concurrent calls must be refused by the reservation gate")
+    }
+
+    /// After an admitted call records + releases, the freed headroom is
+    /// reusable: a later (sequential) call sees reserved back at 0 and gates
+    /// on `spent` alone. Guards against the release path leaking reservations.
+    func testReservationIsReleasedSoSequentialCallsStillProceed() async throws {
+        let body = Data(#"""
+        {"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}
+        """#.utf8)
+        DelayedCapMockURLProtocol.response = (200, body)
+        DelayedCapMockURLProtocol.delaySeconds = 0.0
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [DelayedCapMockURLProtocol.self]
+        let client = LLMClient(
+            provider: .anthropic,
+            apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: URLSession(configuration: cfg),
+            capCheck: { (cap: 1.0, spent: 0.0) }  // spent stays 0 (no real recorder wired)
+        )
+        let req = AnthropicMessageRequest(
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 100_000,          // reserves 0.5 while in flight
+            system: nil,
+            messages: [.init(role: "user", content: .string("hi"))],
+            tools: nil, tool_choice: nil
+        )
+        // Three back-to-back calls. Each reserves 0.5, then releases on return.
+        // If release leaked, the third would see reserved >= 1.0 and be refused.
+        for _ in 0..<3 {
+            _ = try await client.createMessage(req)  // must not throw
+        }
+    }
 }
 
 // MARK: - URL protocol mock
@@ -644,6 +789,37 @@ final class LLMProviderMockURLProtocol: URLProtocol, @unchecked Sendable {
             headerFields: headers
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+// MARK: - Delaying URL protocol mock (Finding 3 concurrency)
+
+/// Sleeps `delaySeconds` in startLoading so multiple admitted calls stay in
+/// flight simultaneously — the condition under which the daily-cap
+/// reservation must bound concurrent admits.
+final class DelayedCapMockURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var delaySeconds: TimeInterval = 0.5
+    nonisolated(unsafe) static var response: (Int, Data) = (200, Data())
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        if Self.delaySeconds > 0 {
+            Thread.sleep(forTimeInterval: Self.delaySeconds)
+        }
+        let (status, body) = Self.response
+        let resp = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: body)
         client?.urlProtocolDidFinishLoading(self)
     }

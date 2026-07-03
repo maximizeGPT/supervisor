@@ -226,6 +226,51 @@ final class SessionTailTests: XCTestCase {
                        "above-size-threshold file must fast-forward, not replay")
     }
 
+    /// Finding 5 (2026-07-03): a fast-forward whose head scan finds NO
+    /// sessionStart-bearing line means cwd never resolves — pause/kill/inject
+    /// degrade forever, and until now, silently. The scan must emit a loud,
+    /// distinct, diagnosable trace so the failure is visible in the log.
+    func testFastForwardWithNoSessionStartInHeadEmitsTrace() async throws {
+        let file = tempDir.appendingPathComponent("session-nocwd.jsonl")
+        // History with NO cwd-bearing lead-in line — only assistant tool_use
+        // lines — so the parser derives no sessionStart from the head.
+        let history = (
+            #"{"type":"assistant","timestamp":"2026-05-21T19:36:22Z","sessionId":"session-nocwd","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo one"}}]}}"#
+            + "\n"
+            + #"{"type":"assistant","timestamp":"2026-05-21T19:36:22.1Z","sessionId":"session-nocwd","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"echo two"}}]}}"#
+            + "\n"
+        )
+        try Data(history.utf8).write(to: file)
+        // Age it past the mtime threshold so the tail fast-forwards.
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -3600)],
+            ofItemAtPath: file.path
+        )
+
+        let traceURL = tempDir.appendingPathComponent("trace-nocwd.log")
+        let trace = TraceLog(path: traceURL)
+        let bus = EventBus(trace: TraceLog(path: tempDir.appendingPathComponent("bus-nocwd.log")))
+        let tail = SessionTail(
+            sessionId: "session-nocwd",
+            path: file,
+            projectHash: "-tmp",
+            bus: bus,
+            sessionStore: nil,
+            startOffset: 0,
+            trace: trace
+        )
+        // start() runs the head scan synchronously; the trace is emitted there.
+        try tail.start()
+        defer { tail.stop() }
+
+        trace.sync()  // drain the write queue before reading the file back
+        let traceText = (try? String(contentsOf: traceURL, encoding: .utf8)) ?? ""
+        XCTAssertTrue(traceText.contains("fast_forward.no_sessionstart_in_head"),
+                      "a fast-forward with no sessionStart in the head must emit the diagnostic trace; got: \(traceText)")
+        XCTAssertTrue(traceText.contains("session=session-nocwd"),
+                      "the trace must name the affected session")
+    }
+
     /// A small fresh pre-existing file (the common brand-new session, or a
     /// tiny fixture in tests) still replays from byte 0 — the opening
     /// context must keep flowing to Triage. Default thresholds.

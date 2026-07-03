@@ -374,6 +374,122 @@ final class TriageEngineTests: XCTestCase {
                        "the fresh event must spend exactly one triage call")
     }
 
+    // MARK: - Finding 2: consume() gates loop-state mutations on staleness
+
+    /// Harness for the Finding-2 loop-state tests: an engine wired with a
+    /// LoopController and an injected clock, idle timer parked. Returns the
+    /// engine, bus, loop controller, and the trace URL for assertions.
+    private func makeLoopEngine(
+        clock: @escaping @MainActor () -> Date
+    ) -> (TriageEngine, EventBus, LoopController, TraceLog, URL) {
+        let traceURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("f2-\(UUID().uuidString).log")
+        let trace = TraceLog(path: traceURL)
+        let bus = EventBus(trace: trace)
+        let client = LLMClient(
+            provider: .anthropic, apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: mockSession(),
+            traceLog: trace
+        )
+        let lc = LoopController(trace: TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("f2-loop-\(UUID().uuidString).log")))
+        let engine = TriageEngine(
+            client: client, bus: bus, model: "claude-haiku-4-5-20251001",
+            windowSize: 30, costStore: nil,
+            loopController: lc,
+            idleCheckIntervalSeconds: 3600,   // park the idle timer
+            now: clock,
+            trace: trace
+        )
+        engine.start()
+        return (engine, bus, lc, trace, traceURL)
+    }
+
+    /// A STALE (replayed) owner prompt must NOT clear a three_consecutive_low
+    /// hard stop or re-stamp operator presence — those mutations run in
+    /// consume() BEFORE the age gate, so a months-old prompt from a
+    /// `claude --resume` copy would otherwise un-stick a stopped loop. A FRESH
+    /// owner prompt still clears it (the existing new-direction behavior).
+    func testStaleUserPromptDoesNotClearHardStopButFreshOneDoes() async throws {
+        let clock = ClockBox(initial: Date(timeIntervalSince1970: 1_700_000_000))
+        let (engine, bus, lc, trace, traceURL) = makeLoopEngine(clock: { clock.now })
+        defer { engine.stop() }
+        let session = "f2-session"
+
+        // Drive the loop into a three_consecutive_low hard stop.
+        await lc.stop(sessionId: session, reason: .threeConsecutiveLow)
+        let stopped = await lc.snapshot(sessionId: session)
+        XCTAssertEqual(stopped?.stopped, true)
+        XCTAssertEqual(stopped?.stopReason, .threeConsecutiveLow)
+
+        // Stale owner prompt (10 min old) must not reach notePause.
+        bus.publish(.userPrompt(.init(
+            sessionId: session, text: "please keep going",
+            ts: clock.now.addingTimeInterval(-600))))
+        try await Task.sleep(nanoseconds: 400_000_000)
+        let afterStale = await lc.snapshot(sessionId: session)
+        XCTAssertEqual(afterStale?.stopped, true,
+                       "a stale replayed owner prompt must not clear the three_consecutive_low stop")
+        XCTAssertEqual(afterStale?.stopReason, .threeConsecutiveLow)
+        XCTAssertNotEqual(afterStale?.paused, true,
+                          "a stale prompt must not engage/pause the loop either")
+        XCTAssertNil(afterStale?.lastOwnerMessageAt,
+                     "a stale prompt must not stamp operator presence")
+
+        trace.sync()
+        let traceText = (try? String(contentsOf: traceURL, encoding: .utf8)) ?? ""
+        XCTAssertTrue(traceText.contains("stale_event_state_skipped"),
+                      "consume() must trace the skipped state mutation")
+
+        // A fresh owner prompt (age 0) DOES clear the stop (new direction).
+        bus.publish(.userPrompt(.init(
+            sessionId: session, text: "new direction: do X",
+            ts: clock.now)))
+        try await Task.sleep(nanoseconds: 400_000_000)
+        let afterFresh = await lc.snapshot(sessionId: session)
+        XCTAssertEqual(afterFresh?.stopped, false,
+                       "a fresh owner prompt clears the three_consecutive_low stop")
+        XCTAssertEqual(afterFresh?.paused, true,
+                       "a fresh owner prompt pauses the loop (operator present)")
+        XCTAssertNotNil(afterFresh?.lastOwnerMessageAt,
+                        "a fresh owner prompt stamps operator presence")
+    }
+
+    /// A STALE bashToolCall must NOT clear a live loop pause (clearPause runs
+    /// in consume() before the age gate). A FRESH one still clears it.
+    func testStaleBashToolCallDoesNotClearPauseButFreshOneDoes() async throws {
+        let clock = ClockBox(initial: Date(timeIntervalSince1970: 1_700_000_000))
+        let (engine, bus, lc, _, _) = makeLoopEngine(clock: { clock.now })
+        defer { engine.stop() }
+        let session = "f2-bash"
+
+        // Establish a pause via a fresh owner prompt.
+        bus.publish(.userPrompt(.init(sessionId: session, text: "hold on", ts: clock.now)))
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(await lc.snapshot(sessionId: session)?.paused, true,
+                       "a fresh owner prompt must pause the loop")
+
+        // Stale tool_use (10 min old) must NOT clear the pause.
+        bus.publish(.bashToolCall(.init(
+            sessionId: session, command: "ls /tmp", description: nil,
+            toolUseId: "t-stale", turnUUID: "u-stale",
+            ts: clock.now.addingTimeInterval(-600))))
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(await lc.snapshot(sessionId: session)?.paused, true,
+                       "a stale tool_use must not clear the pause")
+
+        // Fresh tool_use clears the pause (worker resumed now).
+        bus.publish(.bashToolCall(.init(
+            sessionId: session, command: "ls /tmp", description: nil,
+            toolUseId: "t-fresh", turnUUID: "u-fresh",
+            ts: clock.now)))
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertNotEqual(await lc.snapshot(sessionId: session)?.paused, true,
+                          "a fresh tool_use clears the pause")
+    }
+
     // MARK: - v0.3.1 Issue #6: per-session cwd cache
 
     /// Helper: a record_triage response that fires user_question_pending

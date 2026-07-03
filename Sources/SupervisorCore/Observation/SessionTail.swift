@@ -252,6 +252,7 @@ public final class SessionTail: @unchecked Sendable {
         var scanned: Int64 = 0
         let chunk = 65_536
         var scratch = Data(count: chunk)
+        var foundSessionStart = false
         headScan: while scanned < scanCap {
             let n = scratch.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Int in
                 guard let base = raw.baseAddress else { return -1 }
@@ -267,6 +268,7 @@ public final class SessionTail: @unchecked Sendable {
                 for event in parser.parse(line: line) {
                     guard case .sessionStart(let info) = event else { continue }
                     bus.publish(event)
+                    foundSessionStart = true
                     // Same placeholder → real cwd transition as handleEvent.
                     if !persistedResolvedCwd,
                        info.cwd != "<resolving>", info.cwd != "<unknown>", !info.cwd.isEmpty {
@@ -277,6 +279,16 @@ public final class SessionTail: @unchecked Sendable {
                     break headScan
                 }
             }
+        }
+        // Finding 5 (2026-07-03): the head scan bounded out (or the whole file
+        // was scanned) without a sessionStart-bearing line. cwd never resolves,
+        // so pause/kill/inject degrade forever for this session — silently,
+        // until now. Emit a loud, distinct, diagnosable trace: the tag names
+        // the failure and reports how many bytes were scanned vs the cap so a
+        // "sessionStart is past the head cap" case is distinguishable from a
+        // file that genuinely has no lead-in line.
+        if !foundSessionStart {
+            trace.emit("tail", "fast_forward.no_sessionstart_in_head session=\(sessionId) scannedBytes=\(scanned) scanCap=\(scanCap) fileSize=\(fileSize) headScanCapBytes=\(Self.headScanCapBytes)")
         }
     }
 

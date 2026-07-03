@@ -353,6 +353,54 @@ final class IdleDetectionTests: XCTestCase {
                        "checkIdleStates must not dispatch any new request after tool_use cleared the stop-shape")
     }
 
+    // MARK: - Finding 2: replayed old event must not drag lastEventTs backward
+
+    /// A replayed OLD assistantText (a `claude --resume` / post-compact copy
+    /// re-delivering history) must not drag `lastEventTs` backward. If it did,
+    /// checkIdleStates would compute a huge silenceElapsed and fire a spurious
+    /// idle dispatch on a session that was active moments ago. consume() gates
+    /// updateIdleState on staleness, so the stale event is ignored and
+    /// lastEventTs stays at the recent value — no dispatch.
+    func testReplayedOldAssistantTextDoesNotDragLastEventTsBackward() async throws {
+        Self.canned["/v1/messages"] = (200, Self.haikuIdleFlagResponse(), [:])
+        let clockBox = ClockBox(initial: Date(timeIntervalSince1970: 1_700_000_000))
+        let (engine, bus, captured) = makeEngine(clock: { clockBox.now })
+        defer { engine.stop() }
+
+        publishAutonomousSessionStart(bus, at: clockBox.now)
+
+        // Fresh stop-shaped assistant turn → recent lastEventTs (= t1) and a
+        // present stop-shape, so the ONLY thing gating a fire is the silence
+        // window from t1.
+        clockBox.advance(by: 1)
+        bus.publish(.assistantText(.init(
+            sessionId: "s-idle",
+            text: "All done — ready for next.",
+            turnUUID: "u-fresh",
+            ts: clockBox.now)))
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // Replayed OLD assistant turn (10 min behind the clock). Without the
+        // monotonic guard this would set lastEventTs backward to t1-600 and
+        // blow the silence gate wide open.
+        bus.publish(.assistantText(.init(
+            sessionId: "s-idle",
+            text: "some old history line",
+            turnUUID: "u-old",
+            ts: clockBox.now.addingTimeInterval(-600))))
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // The clock hasn't advanced past t1, so real silence ≈ 0. The idle
+        // check must NOT fire off the stale event's backdated timestamp.
+        engine.checkIdleStates()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertEqual(captured.snapshot.count, 0,
+                       "a replayed old assistantText must not trigger a spurious idle dispatch")
+        XCTAssertEqual(Self.requestCount, 0,
+                       "no idle triage call may be dispatched off a stale replayed event")
+    }
+
     // MARK: - A4-5: rubric returns all-clear
 
     func testIdleDetectionRespectsRubricNoFire() async throws {

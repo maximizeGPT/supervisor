@@ -454,9 +454,35 @@ public final class TriageEngine {
         }
         perSessionWindow[sessionId] = window
 
-        // v0.4.0 Part A: maintain per-session idle state on every event,
-        // regardless of type. The timer reads this state once per tick.
-        updateIdleState(for: event)
+        // Finding 2 (2026-07-03): consume() runs the loop-presence /
+        // pause-clear / idle-state MUTATIONS below BEFORE the event-age gate
+        // that guards the model calls inside evaluate()/evaluateAssistantText()
+        // /updateIdleState. A months-old replayed event from a `claude
+        // --resume` / post-compact copy — the exact case the gate's own comment
+        // (~:172) says slips past SessionTail's fast-forward layer for a small
+        // fresh file — would otherwise UN-STICK a stopped loop (userPrompt →
+        // notePause clears a three_consecutive_low hard stop) or clear a pause
+        // (bashToolCall → clearPause) or drag idle bookkeeping backward. Gate
+        // the STATE MUTATIONS here on the same staleness threshold. We still let
+        // the window append (above) and the self-gating evaluate()/
+        // evaluateAssistantText() dispatch (below) run — evaluate()'s own gate
+        // (~:1092) still guards the destructive-catch path unchanged; only the
+        // consume() state mutations are withheld. Finding 6: clamp a negative
+        // age to 0 so a future-dated event (clock skew / tz-ahead) counts as
+        // fresh, not stale-forever.
+        let nowTs = now()
+        let eventAge = max(0, nowTs.timeIntervalSince(event.timestamp))
+        let isStale = eventAge > staleEventThresholdSeconds
+        if isStale {
+            // Distinct tag from evaluate()'s stale_event_skipped, and carries
+            // the event ts + wall-clock now (Finding 6b) so a genuinely stale
+            // backfill is distinguishable from a machine-clock skew in the log.
+            trace.emit("triage", "stale_event_state_skipped session=\(sessionId) age=\(Int(eventAge))s threshold=\(Int(staleEventThresholdSeconds))s eventTs=\(event.timestamp.timeIntervalSince1970) now=\(nowTs.timeIntervalSince1970)")
+        } else {
+            // v0.4.0 Part A: maintain per-session idle state on every FRESH
+            // event, regardless of type. The timer reads this state once per tick.
+            updateIdleState(for: event)
+        }
 
         switch event {
         case .sessionStart(let info):
@@ -481,7 +507,11 @@ public final class TriageEngine {
             // resetting its own kill switch on every injection, which is exactly
             // the thrash that drove this session. Correlate against the
             // InjectionLedger and ignore our own injected turns.
-            if let lc = loopController {
+            // Finding 2: a STALE (replayed) owner prompt must NOT reach
+            // notePause — it would clear a three_consecutive_low hard stop and
+            // re-stamp operator presence off months-old history. The
+            // injection-ledger check is preserved for fresh prompts.
+            if !isStale, let lc = loopController {
                 let selfInjected = injectionLedger?.isSupervisorInjected(
                     sessionId: info.sessionId, text: info.text, asOf: info.ts) ?? false
                 if selfInjected {
@@ -494,8 +524,11 @@ public final class TriageEngine {
             bashCalls[info.toolUseId] = info
             // v0.4.0 Part C: worker emitted a tool_use → autonomous
             // work resumed. Clear any prior loop-pause so the next
-            // idle fire can dispatch normally.
-            if let lc = loopController {
+            // idle fire can dispatch normally. Finding 2: a STALE (replayed)
+            // tool_use is not the worker resuming NOW — it must not clear a
+            // live pause. evaluate() below is still dispatched unconditionally;
+            // its own age gate (~:1092) short-circuits the replay.
+            if !isStale, let lc = loopController {
                 Task { await lc.clearPause(sessionId: info.sessionId) }
             }
             Task { await self.evaluate(call: info, prePost: .preExecution) }
@@ -524,8 +557,10 @@ public final class TriageEngine {
     // MARK: - v0.4.0 Part A: idle detection
 
     /// Mutate per-session idle state in response to an incoming event.
-    /// Called for EVERY event; the cost is a dict lookup + a few field
-    /// assignments. ED-2: state is per-session. Worker-stopped detection:
+    /// Called for every FRESH event (consume() gates this on staleness per
+    /// Finding 2, so a replayed old event never touches idle bookkeeping);
+    /// the cost is a dict lookup + a few field assignments. ED-2: state is
+    /// per-session. Worker-stopped detection:
     /// any assistantText marks the worker as stopped; any bashToolCall
     /// clears it (worker is actively working).
     private func updateIdleState(for event: SupervisorEvent) {
@@ -538,7 +573,12 @@ public final class TriageEngine {
             lastUserMsgTs: nil,
             lastIdleTriageTs: nil
         )
-        state.lastEventTs = ts
+        // Finding 2: keep lastEventTs monotonic. A fresh-but-out-of-order event
+        // (delivered slightly late, ts < the last recorded ts) must not drag
+        // lastEventTs backward — that would inflate silenceElapsed in
+        // checkIdleStates into a spurious idle dispatch. (Stale replays never
+        // reach here — consume() gates updateIdleState on staleness.)
+        state.lastEventTs = max(state.lastEventTs, ts)
         // Any new event invalidates a prior idle-triage gate: the world
         // has changed since the rubric last said "no fire," so let the
         // timer re-ask if conditions hold.
@@ -567,7 +607,10 @@ public final class TriageEngine {
             // to its old lastEventTs would read as instant idleness and
             // spend an idle-triage call on a session that was merely
             // re-discovered. Fresh events behave exactly as before.
-            if now().timeIntervalSince(ts) <= staleEventThresholdSeconds {
+            // Finding 6: clamp a negative age to 0 so a future-dated event
+            // (clock skew / tz-ahead) records its stop-shape as fresh rather
+            // than being silently dropped.
+            if max(0, now().timeIntervalSince(ts)) <= staleEventThresholdSeconds {
                 state.lastStopShapedTs = ts
                 state.lastStopShapedPhrase = "no_tool_use"
             }
@@ -1089,9 +1132,11 @@ public final class TriageEngine {
         // fire the deterministic catch (the command already ran). Sits
         // before the catch on purpose — pausing a live session over a
         // months-old rm -rf is the storm this gate exists to stop.
-        let eventAge = now().timeIntervalSince(call.ts)
+        // Finding 6: clamp a negative age to 0 so a future-dated event (clock
+        // skew / tz-ahead) is treated as fresh, not stale-forever.
+        let eventAge = max(0, now().timeIntervalSince(call.ts))
         if eventAge > staleEventThresholdSeconds {
-            trace.emit("triage", "stale_event_skipped session=\(call.sessionId) age=\(Int(eventAge))s threshold=\(Int(staleEventThresholdSeconds))s cmd=\(call.command.prefix(60))")
+            trace.emit("triage", "stale_event_skipped session=\(call.sessionId) age=\(Int(eventAge))s threshold=\(Int(staleEventThresholdSeconds))s eventTs=\(call.ts.timeIntervalSince1970) now=\(now().timeIntervalSince1970) cmd=\(call.command.prefix(60))")
             return
         }
         onActivityChange?(.triaging)
@@ -1226,9 +1271,11 @@ public final class TriageEngine {
         // Event-age gate: same backfill guard as evaluate(call:) — a
         // historical question was answered (or abandoned) long ago; a
         // model call + banner for it is pure replay noise and spend.
-        let eventAge = now().timeIntervalSince(info.ts)
+        // Finding 6: clamp a negative age to 0 so a future-dated event (clock
+        // skew / tz-ahead) is treated as fresh, not stale-forever.
+        let eventAge = max(0, now().timeIntervalSince(info.ts))
         if eventAge > staleEventThresholdSeconds {
-            trace.emit("triage", "stale_event_skipped session=\(info.sessionId) age=\(Int(eventAge))s threshold=\(Int(staleEventThresholdSeconds))s assistant_text_len=\(info.text.count)")
+            trace.emit("triage", "stale_event_skipped session=\(info.sessionId) age=\(Int(eventAge))s threshold=\(Int(staleEventThresholdSeconds))s eventTs=\(info.ts.timeIntervalSince1970) now=\(now().timeIntervalSince1970) assistant_text_len=\(info.text.count)")
             return
         }
         onActivityChange?(.triaging)
