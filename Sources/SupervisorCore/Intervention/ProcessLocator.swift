@@ -71,6 +71,18 @@ public protocol ProcessLocator: Sendable {
     /// concurrent sessions instead of safe-degrading. Default nil so the
     /// stub locators in tests opt out without implementing it.
     func locate(bySessionId sessionId: String) -> ProcessHandle?
+
+    /// TOCTOU re-check (Finding 4): confirm `pid` STILL resolves to a
+    /// Claude-shaped process, called immediately before a GROUP signal.
+    /// Between the `locate…` above and `kill(-pgid)` the pid can be reused by
+    /// an unrelated process, and a group signal would then hit a FOREIGN
+    /// process group — the `getpgrp()` self-guard in DarwinSignalSender only
+    /// protects Supervisor's OWN group, not a stranger's. The router calls
+    /// this right before `sendToGroup` and degrades to notify on false.
+    /// Default returns true so existing conformers / test stubs stay
+    /// source-compatible (they resolve the pid themselves and don't model
+    /// reuse).
+    func stillClaudeProcess(pid: pid_t) -> Bool
 }
 
 public extension ProcessLocator {
@@ -78,6 +90,7 @@ public extension ProcessLocator {
     func locate(targetCwd: String, allowDesktopFallback: Bool) -> ProcessHandle? {
         locate(targetCwd: targetCwd)
     }
+    func stillClaudeProcess(pid: pid_t) -> Bool { true }
 }
 
 /// Production implementation backed by libproc on macOS. No entitlements
@@ -262,6 +275,33 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
             trace.emit("locator", "locator.session.ambiguous sessionId=\(trimmed) pids=\(pidList)")
             return nil
         }
+    }
+
+    /// TOCTOU re-check (Finding 4): re-read `pid`'s exec path (and argv for
+    /// the interpreter case) and confirm it's still Claude-shaped. A vanished
+    /// pid (`proc_pidpath` fails) or a pid reused by an unrelated process
+    /// returns false, so the router degrades to notify instead of group-
+    /// signaling a stranger. Cheap: one `proc_pidpath`, plus one
+    /// KERN_PROCARGS2 read only for the `node …/cli.mjs` interpreter shape —
+    /// the same recognition logic `locate` uses, so a process this locator
+    /// would have matched a moment ago still passes.
+    public func stillClaudeProcess(pid: pid_t) -> Bool {
+        // Supervisor is never a legitimate signal target (it holds Claude's
+        // JSONLs open and could otherwise look Claude-shaped to a naive check).
+        if pid == supervisorPID { return false }
+        guard let execPath = Self.execPath(pid: pid) else {
+            trace.emit("locator", "locator.recheck.gone pid=\(pid) (proc_pidpath failed — process exited)")
+            return false
+        }
+        if matchesExecName(execPath) { return true }
+        let execBase = (execPath as NSString).lastPathComponent
+        if Self.interpreterBasenames.contains(execBase),
+           let argv = Self.readProcessArgv(pid: pid),
+           Self.argvContainsClaudeCodeMarker(argv) {
+            return true
+        }
+        trace.emit("locator", "locator.recheck.reused pid=\(pid) execPath=\(execPath) (pid no longer resolves to a Claude-shaped process — refusing group signal)")
+        return false
     }
 
     // MARK: - Claude.app fallback (v0.3.1)

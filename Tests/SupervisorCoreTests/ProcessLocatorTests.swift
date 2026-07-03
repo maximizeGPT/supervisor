@@ -455,4 +455,60 @@ final class ProcessLocatorTests: XCTestCase {
         // Empty id is rejected outright.
         XCTAssertNil(locator.locate(bySessionId: ""))
     }
+
+    // MARK: - TOCTOU re-check (Finding 4): stillClaudeProcess
+
+    /// A live process matching the exec patterns must re-check as still-Claude —
+    /// the happy path the router relies on to fire the group signal.
+    func testStillClaudeProcessTrueForLiveMatchingProcess() throws {
+        let binary = try fakeClaudeBinary()
+        let dir = try makeTempDir("recheck-live")
+        let pidFile = dir + "/fake.pid"
+        let proc = try spawnFakeClaude(binary: binary, cwd: dir, jsonl: dir + "/t.jsonl", pidFile: pidFile)
+        defer { cleanup(processes: [proc], dirs: [dir]) }
+        guard let fakePid = waitForPidFile(at: pidFile) else {
+            XCTFail("FakeClaudeCLI never wrote its pid file"); return
+        }
+        let locator = LiveProcessLocator(execNamePatterns: ["FakeClaudeCLI"])
+        XCTAssertTrue(locator.stillClaudeProcess(pid: fakePid),
+                      "a live process matching the exec patterns must re-check as still-Claude")
+    }
+
+    /// A live pid whose exec is NOT Claude-shaped (patterns don't match and it
+    /// isn't a JS-runtime interpreter) models the reused-pid case → false, so
+    /// the router refuses the group signal.
+    func testStillClaudeProcessFalseWhenExecNameDoesNotMatch() throws {
+        let binary = try fakeClaudeBinary()
+        let dir = try makeTempDir("recheck-nomatch")
+        let pidFile = dir + "/fake.pid"
+        let proc = try spawnFakeClaude(binary: binary, cwd: dir, jsonl: dir + "/t.jsonl", pidFile: pidFile)
+        defer { cleanup(processes: [proc], dirs: [dir]) }
+        guard let fakePid = waitForPidFile(at: pidFile) else {
+            XCTFail("FakeClaudeCLI never wrote its pid file"); return
+        }
+        let locator = LiveProcessLocator(execNamePatterns: ["claude", "claude-code"])
+        XCTAssertFalse(locator.stillClaudeProcess(pid: fakePid),
+                       "a live pid whose exec isn't Claude-shaped must re-check false (models pid reuse)")
+    }
+
+    /// An exited pid must re-check false (`proc_pidpath` fails) — the router
+    /// then degrades to notify instead of signaling a possibly-reused pid.
+    func testStillClaudeProcessFalseForExitedPid() throws {
+        let binary = try fakeClaudeBinary()
+        let dir = try makeTempDir("recheck-gone")
+        let pidFile = dir + "/fake.pid"
+        let proc = try spawnFakeClaude(binary: binary, cwd: dir, jsonl: dir + "/t.jsonl", pidFile: pidFile)
+        guard let fakePid = waitForPidFile(at: pidFile) else {
+            cleanup(processes: [proc], dirs: [dir])
+            XCTFail("FakeClaudeCLI never wrote its pid file"); return
+        }
+        // Terminate and reap, so the pid no longer resolves to any exec path.
+        proc.terminate()
+        proc.waitUntilExit()
+        usleep(200_000)
+        try? FileManager.default.removeItem(atPath: dir)
+        let locator = LiveProcessLocator(execNamePatterns: ["FakeClaudeCLI"])
+        XCTAssertFalse(locator.stillClaudeProcess(pid: fakePid),
+                       "an exited pid must re-check false")
+    }
 }

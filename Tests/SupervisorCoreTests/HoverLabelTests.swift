@@ -188,4 +188,74 @@ final class HoverLabelTests: XCTestCase {
             return XCTFail("paused must not overwrite a live flag; got \(vm.activity)")
         }
     }
+
+    // MARK: - Resume threads the session id (Finding 1)
+
+    /// The hover must pass the PAUSED session's id (tracked from `.sessionStart`)
+    /// to the resume handler, so the process is resolved session-id-FIRST — a
+    /// cwd-only resume can't find a CLI/multi-session worker Pause stopped.
+    func testResumePassesTrackedSessionIdAndCwdToHandler() {
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("hover-resume-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(bus: bus, trace: trace)
+
+        bus.publish(.sessionStart(SessionStartInfo(
+            sessionId: "sess-abc", cwd: "/Users/dev/proj",
+            gitBranch: "main", projectHash: "hash",
+            jsonlPath: "/tmp/x.jsonl", ts: Date()
+        )))
+        let exp1 = expectation(description: "session start processed")
+        Task { @MainActor in try? await Task.sleep(nanoseconds: 50_000_000); exp1.fulfill() }
+        wait(for: [exp1], timeout: 1.0)
+
+        vm.flagRaised(severity: .high, action: .pause, reasoningPlain: "danger")
+        XCTAssertTrue(vm.isPaused)
+
+        var gotSession: String?
+        var gotCwd: String?
+        vm.resumeSessionHandler = { sessionId, cwd in
+            gotSession = sessionId
+            gotCwd = cwd
+            return true
+        }
+        vm.resumePausedSession()
+        let exp2 = expectation(description: "resume completes")
+        Task { @MainActor in try? await Task.sleep(nanoseconds: 100_000_000); exp2.fulfill() }
+        wait(for: [exp2], timeout: 1.0)
+
+        XCTAssertEqual(gotSession, "sess-abc",
+                       "resume must pass the session id tracked from .sessionStart, not just the cwd")
+        XCTAssertEqual(gotCwd, "/Users/dev/proj")
+        XCTAssertFalse(vm.isPaused, "a successful resume acknowledges the flag")
+    }
+
+    /// The session-aware handler wins when both are wired; the legacy cwd-only
+    /// handler must NOT be called (it can't resolve a CLI/multi-session worker).
+    func testSessionAwareResumeHandlerTakesPrecedenceOverLegacy() {
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("hover-resume-prec-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(bus: bus, trace: trace)
+        bus.publish(.sessionStart(SessionStartInfo(
+            sessionId: "s1", cwd: "/p",
+            gitBranch: nil, projectHash: "h", jsonlPath: "/tmp/y.jsonl", ts: Date()
+        )))
+        let exp1 = expectation(description: "session start processed")
+        Task { @MainActor in try? await Task.sleep(nanoseconds: 50_000_000); exp1.fulfill() }
+        wait(for: [exp1], timeout: 1.0)
+        vm.flagRaised(severity: .high, action: .pause, reasoningPlain: "danger")
+
+        var legacyCalled = false
+        var sessionAwareCalled = false
+        vm.resumeHandler = { _ in legacyCalled = true; return true }
+        vm.resumeSessionHandler = { _, _ in sessionAwareCalled = true; return true }
+        vm.resumePausedSession()
+        let exp2 = expectation(description: "resume completes")
+        Task { @MainActor in try? await Task.sleep(nanoseconds: 100_000_000); exp2.fulfill() }
+        wait(for: [exp2], timeout: 1.0)
+
+        XCTAssertTrue(sessionAwareCalled, "the session-aware handler must be used when set")
+        XCTAssertFalse(legacyCalled, "the legacy cwd-only handler must not fire when the session-aware one is set")
+    }
 }

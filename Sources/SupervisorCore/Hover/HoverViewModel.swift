@@ -82,6 +82,12 @@ public final class HoverViewModel: ObservableObject {
     /// The full cwd path for the expanded panel header.
     @Published public private(set) var sessionCwd: String = ""
 
+    /// The id of the session currently reflected in the hover, paired with
+    /// `sessionCwd` and set from the same `.sessionStart` event. Resume passes
+    /// it so the paused process is resolved session-id-FIRST (Finding 1) — the
+    /// cwd walk alone can't pin a CLI session (the `claude` proc cwd is $HOME).
+    public private(set) var sessionId: String = ""
+
     /// Whether a resume from pause is in progress.
     @Published public private(set) var isResuming: Bool = false
 
@@ -125,9 +131,20 @@ public final class HoverViewModel: ObservableObject {
     /// Resets on each new flag.
     public let acknowledgeDebounceDuration: TimeInterval
 
-    /// Callback to resume a paused session. Takes cwd, returns true on
-    /// success. Wired in main.swift with ProcessLocator + SignalSender.
+    /// Legacy callback to resume a paused session by cwd only. Returns true on
+    /// success. Retained for source compatibility with older callers/tests;
+    /// production wires `resumeSessionHandler` instead. When both are set the
+    /// session-aware handler wins (see `resumePausedSession`).
     public var resumeHandler: ((String) async -> Bool)?
+
+    /// Session-aware resume callback (Finding 1). Carries BOTH the paused
+    /// session's id and its cwd so the process is resolved session-id-FIRST
+    /// (the reliable primitive) with a cwd fallback — the cwd walk alone
+    /// "always degrades" for CLI sessions because the `claude` proc cwd is the
+    /// user's HOME dir, not the project dir, so a Pause that stopped the worker
+    /// by session-id could never be un-paused by a cwd-only resume. Wired in
+    /// main.swift with ProcessLocator + SignalSender.
+    public var resumeSessionHandler: ((_ sessionId: String, _ cwd: String) async -> Bool)?
 
     public init(
         bus: EventBus,
@@ -378,21 +395,33 @@ public final class HoverViewModel: ObservableObject {
     /// Resume a paused session by sending SIGCONT to the process.
     /// Called from the expanded panel's Resume button.
     public func resumePausedSession() {
-        guard isPaused, !sessionCwd.isEmpty, let handler = resumeHandler else {
-            trace.emit("hover", "resume: precondition failed (isPaused=\(isPaused) cwd=\(sessionCwd.isEmpty ? "empty" : "set") handler=\(resumeHandler == nil ? "nil" : "set"))")
+        // Finding 1: prefer the session-aware handler (session-id-FIRST
+        // resolution); fall back to the legacy cwd-only handler for older
+        // callers/tests that only wire that one.
+        let haveHandler = resumeSessionHandler != nil || resumeHandler != nil
+        guard isPaused, !sessionCwd.isEmpty, haveHandler else {
+            trace.emit("hover", "resume: precondition failed (isPaused=\(isPaused) cwd=\(sessionCwd.isEmpty ? "empty" : "set") handler=\(haveHandler ? "set" : "nil"))")
             return
         }
         isResuming = true
         let cwd = sessionCwd
+        let sid = sessionId
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let ok = await handler(cwd)
+            let ok: Bool
+            if let sessionAware = self.resumeSessionHandler {
+                ok = await sessionAware(sid, cwd)
+            } else if let legacy = self.resumeHandler {
+                ok = await legacy(cwd)
+            } else {
+                ok = false
+            }
             self.isResuming = false
             if ok {
-                self.trace.emit("hover", "resume: SIGCONT sent successfully cwd=\(cwd)")
+                self.trace.emit("hover", "resume: SIGCONT sent successfully session=\(sid) cwd=\(cwd)")
                 self.acknowledgeFlag()
             } else {
-                self.trace.emit("hover", "resume: SIGCONT failed cwd=\(cwd)")
+                self.trace.emit("hover", "resume: SIGCONT failed session=\(sid) cwd=\(cwd)")
             }
         }
     }
@@ -620,6 +649,9 @@ public final class HoverViewModel: ObservableObject {
             let basename = (info.cwd as NSString).lastPathComponent
             projectName = basename.isEmpty ? "" : basename
             sessionCwd = info.cwd
+            // Track the session id alongside its cwd (Finding 1): Resume passes
+            // it so the paused process is resolved session-id-FIRST.
+            sessionId = info.sessionId
             // Reset per-session metrics on new session.
             turnCount = 0
             toolCallCount = 0

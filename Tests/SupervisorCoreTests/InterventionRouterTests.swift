@@ -61,6 +61,10 @@ final class InterventionRouterTests: XCTestCase {
         /// What `locate(bySessionId:)` returns — nil (the default) models
         /// a session whose id isn't visible in any argv.
         var sessionHandle: ProcessHandle? = nil
+        /// What `stillClaudeProcess(pid:)` returns — true (the default) models a
+        /// pid that's unchanged between locate and signal. Set false to model
+        /// the Finding 4 TOCTOU race (pid reused/vanished before the send).
+        var stillClaude: Bool = true
         func locate(targetCwd: String) -> ProcessHandle? { handle }
         func locate(targetCwd: String, allowDesktopFallback: Bool) -> ProcessHandle? {
             // Mirror LiveProcessLocator's gate: with the fallback disallowed
@@ -74,6 +78,7 @@ final class InterventionRouterTests: XCTestCase {
             return handle
         }
         func locate(bySessionId sessionId: String) -> ProcessHandle? { sessionHandle }
+        func stillClaudeProcess(pid: pid_t) -> Bool { stillClaude }
     }
 
     final class CapturingSignalSender: SignalSender, @unchecked Sendable {
@@ -155,6 +160,7 @@ final class InterventionRouterTests: XCTestCase {
     private func makeRouter(
         handle: ProcessHandle? = ProcessHandle(pid: 4242, execPath: "/path/claude", cwd: "/tmp/test-cwd"),
         sessionHandle: ProcessHandle? = nil,
+        stillClaude: Bool = true,
         sender: CapturingSignalSender = CapturingSignalSender(),
         injector: MockInjector = MockInjector(),
         activeSessionCount: @escaping () -> Int = { 1 },
@@ -170,7 +176,7 @@ final class InterventionRouterTests: XCTestCase {
         let notifier = MockNotifier()
         let router = InterventionRouter(
             notifier: notifier,
-            locator: StubLocator(handle: handle, sessionHandle: sessionHandle),
+            locator: StubLocator(handle: handle, sessionHandle: sessionHandle, stillClaude: stillClaude),
             signalSender: sender,
             injector: injector,
             activeSessionCount: activeSessionCount,
@@ -359,6 +365,128 @@ final class InterventionRouterTests: XCTestCase {
     /// the own-group fallback guard) without side effects.
     func testDarwinSignalSenderGroupSendSignalZeroDoesNotThrow() throws {
         XCTAssertNoThrow(try DarwinSignalSender().sendToGroup(0, of: getpid()))
+    }
+
+    // MARK: - Group-signal TOCTOU re-check (Finding 4)
+
+    private func tmpTrace() -> TraceLog {
+        TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("resume-test-\(UUID().uuidString).log"))
+    }
+
+    /// The TOCTOU race: between locate and `kill(-pgid)` the pid was reused by
+    /// an unrelated process. The re-check (`stillClaudeProcess` → false) must
+    /// make the router degrade to notify and send NO signal — a group signal
+    /// would otherwise hit a FOREIGN process group.
+    func testPauseDegradesToNotifyWhenPidRecheckFails() async {
+        let (router, notifier, sender, _) = makeRouter(stillClaude: false)
+        await router.dispatch(decision: makeDecision(action: .pause))
+        XCTAssertTrue(sender.sent.isEmpty,
+                      "a failed TOCTOU re-check must send no signal (the pid may be a foreign process now)")
+        XCTAssertEqual(notifier.calls.count, 1)
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly,
+                       "re-check failure degrades to a plain notify, never a misleading pauseSucceeded")
+    }
+
+    /// The same guard on the session-id-confirmed path: even a pid pinned by
+    /// the reliable session-id match is re-checked, and a reuse degrades.
+    func testKillDegradesToNotifyWhenSessionConfirmedPidRecheckFails() async {
+        let cli = ProcessHandle(pid: 777, execPath: "/usr/local/bin/claude", cwd: "/Users/dev")
+        let (router, notifier, sender, _) = makeRouter(
+            handle: nil, sessionHandle: cli, stillClaude: false)
+        await router.dispatch(decision: makeDecision(action: .kill))
+        XCTAssertTrue(sender.sent.isEmpty)
+        XCTAssertEqual(notifier.calls.first?.outcome, .notifyOnly)
+    }
+
+    /// The happy path is unchanged: when the re-check confirms the pid, the
+    /// group signal still fires. (Pairs with the degrade test above so the
+    /// guard can't be satisfied by simply never signaling.)
+    func testPauseStillSignalsWhenPidRecheckConfirms() async {
+        let (router, _, sender, _) = makeRouter(stillClaude: true)
+        await router.dispatch(decision: makeDecision(action: .pause))
+        XCTAssertEqual(sender.sent, [.init(signal: SIGSTOP, pid: 4242, group: true)],
+                       "a confirmed re-check must still signal the process group")
+    }
+
+    // MARK: - Resume resolution (Finding 1): session-id-FIRST, mirroring pause
+
+    /// The core Finding 1 fix: Pause stops a CLI/multi-session worker by
+    /// session-id (cwd=$HOME, which the cwd walk can't pin), so Resume MUST
+    /// resolve by session-id too. Here the cwd walk returns nil (would degrade)
+    /// but the session-id match pins pid 777 — SIGCONT must reach 777's group.
+    func testResumeResolvesBySessionIdWhenCwdWalkDegrades() {
+        let cli = ProcessHandle(pid: 777, execPath: "/usr/local/bin/claude", cwd: "/Users/dev")
+        let locator = StubLocator(handle: nil, sessionHandle: cli)
+        let sender = CapturingSignalSender()
+        let ok = InterventionRouter.resumeResolveAndSignal(
+            sessionId: "s1", cwd: "/some/project",
+            locator: locator, signalSender: sender, trace: tmpTrace())
+        XCTAssertTrue(ok, "resume must succeed via the session-id primitive when the cwd walk degrades")
+        XCTAssertEqual(sender.sent, [.init(signal: SIGCONT, pid: 777, group: true)],
+                       "SIGCONT must reach the session-id-confirmed pid's process GROUP (mirror of pause)")
+    }
+
+    /// With no session id, resume falls back to the cwd walk (desktop fallback
+    /// OFF) — the legacy behavior, preserved.
+    func testResumeFallsBackToCwdWalkWhenNoSessionId() {
+        let cli = ProcessHandle(pid: 555, execPath: "/usr/local/bin/claude", cwd: "/tmp/proj")
+        let locator = StubLocator(handle: cli, sessionHandle: nil)
+        let sender = CapturingSignalSender()
+        let ok = InterventionRouter.resumeResolveAndSignal(
+            sessionId: "", cwd: "/tmp/proj",
+            locator: locator, signalSender: sender, trace: tmpTrace())
+        XCTAssertTrue(ok)
+        XCTAssertEqual(sender.sent, [.init(signal: SIGCONT, pid: 555, group: true)])
+    }
+
+    /// Resume must NEVER POSIX-signal the shared Claude Desktop process, even
+    /// when the session-id match itself resolves to it.
+    func testResumeRefusesDesktopHostResolvedBySessionId() {
+        let desktop = ProcessHandle(pid: 94716, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+        let locator = StubLocator(handle: nil, sessionHandle: desktop)
+        let sender = CapturingSignalSender()
+        let ok = InterventionRouter.resumeResolveAndSignal(
+            sessionId: "s1", cwd: "/x",
+            locator: locator, signalSender: sender, trace: tmpTrace())
+        XCTAssertFalse(ok, "a desktop-host resolve must not be signaled")
+        XCTAssertTrue(sender.sent.isEmpty,
+                      "the shared Claude Desktop PID must never receive a SIGCONT")
+    }
+
+    /// Neither primitive resolves → resume degrades (returns false), no signal.
+    func testResumeReturnsFalseWhenNothingResolves() {
+        let locator = StubLocator(handle: nil, sessionHandle: nil)
+        let sender = CapturingSignalSender()
+        let ok = InterventionRouter.resumeResolveAndSignal(
+            sessionId: "s1", cwd: "/x",
+            locator: locator, signalSender: sender, trace: tmpTrace())
+        XCTAssertFalse(ok)
+        XCTAssertTrue(sender.sent.isEmpty)
+    }
+
+    /// Regression: pause-then-resume round-trips for a session whose cwd does
+    /// NOT match (the `claude` proc cwd is $HOME). Pause stops pid 777 by
+    /// session-id; resume resolves the SAME pid by session-id and CONTs it —
+    /// the pre-fix cwd-only resume would have left it frozen forever.
+    func testPauseThenResumeRoundTripsWhenCwdDoesNotMatch() async {
+        let cli = ProcessHandle(pid: 777, execPath: "/usr/local/bin/claude", cwd: "/Users/dev")
+        let desktop = ProcessHandle(pid: 94716, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
+        let sender = CapturingSignalSender()
+        // Pause: cwd walk would fall back to the desktop host, but the session-id
+        // match pins the CLI process (pid 777) — SIGSTOP lands on 777's group.
+        let (router, _, _, _) = makeRouter(handle: desktop, sessionHandle: cli, sender: sender)
+        await router.dispatch(decision: makeDecision(action: .pause, cwd: "/Users/dev"))
+        // Resume: the SAME environment, resolved session-id-FIRST → SIGCONT 777.
+        let resumeLocator = StubLocator(handle: desktop, sessionHandle: cli)
+        let ok = InterventionRouter.resumeResolveAndSignal(
+            sessionId: "s1", cwd: "/Users/dev",
+            locator: resumeLocator, signalSender: sender, trace: tmpTrace())
+        XCTAssertTrue(ok)
+        XCTAssertEqual(sender.sent, [
+            .init(signal: SIGSTOP, pid: 777, group: true),
+            .init(signal: SIGCONT, pid: 777, group: true),
+        ], "pause then resume must both target pid 777's group — never the desktop host")
     }
 
     // MARK: - Inject tests (v0.3.0)

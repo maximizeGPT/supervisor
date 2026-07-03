@@ -672,6 +672,18 @@ public final class InterventionRouter {
             await postNotify(decision)
             return
         }
+        // TOCTOU re-check (Finding 4, 2026-07-03): between the locate above and
+        // the `kill(-pgid)` below, this pid could have been reused by an
+        // unrelated process — and a GROUP signal would then freeze/terminate a
+        // stranger's whole process group. The `getpgrp()` self-guard in
+        // DarwinSignalSender only protects Supervisor's OWN group, not a foreign
+        // one. Re-confirm the pid still resolves to a Claude-shaped process; if
+        // it vanished or was reused, degrade to notify rather than signal it.
+        guard locator.stillClaudeProcess(pid: handle.pid) else {
+            trace.emit("router", "intervention.\(opName).degraded reason=toctou_pid_recheck_failed pid=\(handle.pid) cwd=\(cwd)")
+            await postNotify(decision)
+            return
+        }
         // v0.1.6: write the recovery doc BEFORE the signal lands. For
         // kill especially, the assistant process is gone post-SIGTERM
         // and we'd lose the ability to surface state. Write first; signal
@@ -711,6 +723,77 @@ public final class InterventionRouter {
         } catch {
             trace.emit("router", "intervention.\(opName).degraded reason=unexpected_throw=\(error) pid=\(handle.pid) cwd=\(cwd)")
             await postNotify(decision)
+        }
+    }
+
+    // MARK: - Resume (SIGCONT) resolution — shared by hover + notification (Finding 1)
+
+    /// Resolve the paused session's process and send it a GROUP SIGCONT.
+    /// Shared verbatim by the hover Resume button and the Notification Center
+    /// Resume action so a tap and a click do exactly the same safe thing.
+    ///
+    /// Resolution mirrors `signalOrDegrade`'s targeting EXACTLY: try the
+    /// session-id argv match FIRST (the reliable primitive — the cwd walk
+    /// "always degrades" for CLI sessions because the `claude` proc cwd is the
+    /// user's HOME dir, not the project dir, and returns nil on 2+ matches),
+    /// then fall back to the cwd walk with the Claude.app desktop fallback OFF
+    /// (a SIGCONT must never land on the shared desktop Electron PID — it
+    /// multiplexes every conversation). This is the Finding 1 fix: the old
+    /// resume paths resolved by cwd ONLY, so a CLI/multi-session worker that
+    /// Pause had stopped by session-id could never be un-paused.
+    ///
+    /// Traces which path resolved (session-id / cwd / nil). Returns true iff a
+    /// SIGCONT was delivered. Pure w.r.t. app state (touches only the injected
+    /// locator / sender / trace), so it's unit-testable without the app
+    /// executable — which is where the two resume call sites actually live.
+    nonisolated public static func resumeResolveAndSignal(
+        sessionId: String,
+        cwd: String,
+        locator: any ProcessLocator,
+        signalSender: any SignalSender,
+        trace: TraceLog,
+        logTag: String = "resume"
+    ) -> Bool {
+        let resolved: ProcessHandle?
+        let via: String
+        if !sessionId.isEmpty, let byId = locator.locate(bySessionId: sessionId) {
+            resolved = byId
+            via = "session_id"
+            trace.emit("resume", "\(logTag).resume.target_by_session_id pid=\(byId.pid) session=\(sessionId) exec=\(byId.execPath)")
+        } else if let byCwd = locator.locate(targetCwd: cwd, allowDesktopFallback: false) {
+            resolved = byCwd
+            via = "cwd"
+            trace.emit("resume", "\(logTag).resume.target_by_cwd pid=\(byCwd.pid) cwd=\(cwd)")
+        } else {
+            resolved = nil
+            via = "nil"
+        }
+        guard let handle = resolved else {
+            trace.emit("resume", "\(logTag).resume.degraded reason=locator_nil session=\(sessionId) cwd=\(cwd)")
+            return false
+        }
+        // SAFETY (mirror of the pause path): never POSIX-signal the shared Claude
+        // Desktop process. A desktop-hosted session was paused via the per-
+        // conversation Stop-click, not SIGSTOP, so there's no stopped group to
+        // CONT; and a signal to the shared Electron PID would touch every
+        // conversation. The cwd fallback already suppresses it
+        // (allowDesktopFallback:false), but a session-id match could still
+        // resolve it — guard here too.
+        if handle.execPath.contains("Claude.app/Contents/MacOS/Claude") {
+            trace.emit("resume", "\(logTag).resume.degraded reason=refused_desktop_host pid=\(handle.pid) via=\(via)")
+            return false
+        }
+        do {
+            // GROUP CONT: the pause sent SIGSTOP to the whole group (so a forked
+            // `bash -c` child stopped too); a single-pid SIGCONT would resume the
+            // parent while leaving those children stopped — the parent then hangs
+            // waiting on a frozen child. Resume the group.
+            try signalSender.sendToGroup(SIGCONT, of: handle.pid)
+            trace.emit("resume", "\(logTag).resume.fired pid=\(handle.pid) signal=SIGCONT target=process_group via=\(via)")
+            return true
+        } catch {
+            trace.emit("resume", "\(logTag).resume.degraded reason=signal_failed pid=\(handle.pid) error=\(error)")
+            return false
         }
     }
 

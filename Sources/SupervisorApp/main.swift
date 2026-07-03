@@ -406,20 +406,20 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // parent resumes, then hangs waiting on a frozen child. Desktop
         // fallback is off for the same reason it's off on the pause path:
         // a resume signal must never land on Claude Desktop's PID.
-        hoverVM.resumeHandler = { [weak self] cwd in
+        // Finding 1: resolve session-id-FIRST (fall back to the cwd walk),
+        // mirroring the pause path — a cwd-only resume can't find a CLI/multi-
+        // session worker Pause stopped by session-id. The shared resolver is
+        // the single source of truth for both this and the notification path.
+        hoverVM.resumeSessionHandler = { [weak self] sessionId, cwd in
             guard let self else { return false }
-            guard let handle = locator.locate(targetCwd: cwd, allowDesktopFallback: false) else {
-                self.trace.emit("hover", "resume: locator returned nil for cwd=\(cwd)")
-                return false
-            }
-            do {
-                try signalSender.sendToGroup(SIGCONT, of: handle.pid)
-                self.trace.emit("hover", "resume: SIGCONT sent to group of pid=\(handle.pid) cwd=\(cwd)")
-                return true
-            } catch {
-                self.trace.emit("hover", "resume: SIGCONT failed pid=\(handle.pid) error=\(error)")
-                return false
-            }
+            return InterventionRouter.resumeResolveAndSignal(
+                sessionId: sessionId,
+                cwd: cwd,
+                locator: locator,
+                signalSender: signalSender,
+                trace: self.trace,
+                logTag: "hover"
+            )
         }
 
         // 4b. Actionable notifications (F8). Register the categories (Resume /
@@ -429,18 +429,19 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // click in the panel do exactly the same safe thing.
         notifier.registerCategories()
         let actionRouter = NotificationActionRouter(trace: trace)
-        actionRouter.onResume = { [weak self] cwd in
+        actionRouter.onResume = { [weak self] sessionId, cwd in
             guard let self else { return }
-            guard let handle = locator.locate(targetCwd: cwd, allowDesktopFallback: false) else {
-                self.trace.emit("app", "notif resume: locator returned nil for cwd=\(cwd)")
-                return
-            }
-            do {
-                try signalSender.sendToGroup(SIGCONT, of: handle.pid)
-                self.trace.emit("app", "notif resume: SIGCONT sent to group of pid=\(handle.pid) cwd=\(cwd)")
-            } catch {
-                self.trace.emit("app", "notif resume: SIGCONT failed pid=\(handle.pid) error=\(error)")
-            }
+            // Finding 1: same session-id-FIRST resolution as the hover button —
+            // the userInfo payload already carries the session id right beside
+            // the cwd (Notifier.userInfo), so the tap resolves the exact process.
+            _ = InterventionRouter.resumeResolveAndSignal(
+                sessionId: sessionId,
+                cwd: cwd,
+                locator: locator,
+                signalSender: signalSender,
+                trace: self.trace,
+                logTag: "notif"
+            )
         }
         UNUserNotificationCenter.current().delegate = actionRouter
         self.notificationActionRouter = actionRouter
@@ -927,9 +928,10 @@ final class NotificationActionRouter: NSObject, UNUserNotificationCenterDelegate
 
     private let trace: TraceLog
 
-    /// Resume the paused session at `cwd` (group SIGCONT). Wired in main to the
-    /// same locator + signal path the hover's Resume button uses.
-    var onResume: ((String) -> Void)?
+    /// Resume the paused session (group SIGCONT). Carries BOTH the session id
+    /// and the cwd so resolution is session-id-FIRST (Finding 1). Wired in main
+    /// to the same shared resolver the hover's Resume button uses.
+    var onResume: ((_ sessionId: String, _ cwd: String) -> Void)?
 
     init(trace: TraceLog) {
         self.trace = trace
@@ -954,11 +956,17 @@ final class NotificationActionRouter: NSObject, UNUserNotificationCenterDelegate
         let info = response.notification.request.content.userInfo
         switch response.actionIdentifier {
         case Notifier.actionResume:
-            if let cwd = info[Notifier.userInfoCwd] as? String {
-                trace.emit("notifier", "action tap: Resume cwd=\(cwd)")
-                onResume?(cwd)
+            // Finding 1: read BOTH the session id and the cwd. The session id is
+            // the reliable primitive (resolves a CLI/multi-session worker the cwd
+            // walk can't), so a resume can proceed on the id alone even if the
+            // cwd is absent.
+            let sid = info[Notifier.userInfoSessionId] as? String ?? ""
+            let cwd = info[Notifier.userInfoCwd] as? String ?? ""
+            if !sid.isEmpty || !cwd.isEmpty {
+                trace.emit("notifier", "action tap: Resume session=\(sid) cwd=\(cwd)")
+                onResume?(sid, cwd)
             } else {
-                trace.emit("notifier", "action tap: Resume — no cwd in userInfo, cannot resume")
+                trace.emit("notifier", "action tap: Resume — no session/cwd in userInfo, cannot resume")
             }
         case Notifier.actionCopyAnswer:
             if let text = info[Notifier.userInfoAnswer] as? String {

@@ -69,6 +69,13 @@ public struct DarwinSignalSender: SignalSender {
         // shares Supervisor's own process group (never signal ourselves):
         // fall back to the single-pid send so the primary target is still
         // hit and the error taxonomy stays the same.
+        //
+        // SCOPE (Finding 4): the `getpgrp()` guard below only protects
+        // Supervisor's OWN process group — it cannot detect a pid that was
+        // reused by an unrelated FOREIGN process between locate and here, whose
+        // group we'd then signal. That residual TOCTOU is bounded one level up:
+        // the router re-verifies the pid is still Claude-shaped
+        // (`ProcessLocator.stillClaudeProcess`) immediately before calling this.
         guard pgid > 0, pgid != getpgrp() else {
             try send(signal, to: pid)
             return
