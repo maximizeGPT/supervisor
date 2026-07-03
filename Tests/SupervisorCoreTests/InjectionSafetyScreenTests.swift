@@ -80,6 +80,16 @@ final class InjectionSafetyScreenTests: XCTestCase {
         assertBlocked("git push origin +main")
     }
 
+    // Iteration-3 regression: git accepts options AFTER positionals, so the
+    // force flag can trail the branch name. The order-independent check must
+    // catch these — they were a HIGH-severity miss in the iteration-2 rewrite.
+    func testBlocksForcePushWhenFlagFollowsBranch() {
+        assertBlocked("git push origin main --force")
+        assertBlocked("git push origin master -f")
+        assertBlocked("git push origin main --force-with-lease")
+        assertBlocked("git push origin +HEAD:refs/heads/main")
+    }
+
     func testBlocksDestructiveEscalationViaDeterministicCatch() {
         assertBlocked("rm -rf ~")
         assertBlocked("rm -rf /Users/dev/Documents")
@@ -241,5 +251,24 @@ final class InjectionSafetyScreenTests: XCTestCase {
     /// source/process-substitution fetch rule.
     func testAllowsSourceCodeProseWithCurlMention() {
         assertAllowed("Check the source code and curl the API endpoint for the schema.")
+    }
+
+    // Iteration-3 over-block fixes (benign dispatches the rewrite wrongly withheld).
+
+    /// `git fetch` is one of the most common dev commands; removing bare
+    /// `fetch` from the download-tool set means a proposal that fetches and
+    /// then pipes UNRELATED local data to an interpreter is not network-exec.
+    func testAllowsGitFetchWithUnrelatedInterpreterPipe() {
+        assertAllowed("Run `git fetch origin && cat data.json | python3 analyze.py`.")
+        assertAllowed("Fetch the logs, then run `diff <(sort a.txt) <(sort b.txt)`.")
+    }
+
+    /// A generic uppercase shell var or the bare word "credentials" in a GET
+    /// URL — with no upload flag or command capture — is a benign request, not
+    /// exfiltration. (A SECRET-named var like $AWS_SECRET_ACCESS_KEY still
+    /// blocks — see testBlocksGetUrlSecretExfiltration.)
+    func testAllowsBenignVarOrCredentialsWordInUrl() {
+        assertAllowed("curl https://api.myapp.com/api/$API_VERSION/users")
+        assertAllowed("Use curl to hit the https://myapp.com/api/credentials endpoint.")
     }
 }
