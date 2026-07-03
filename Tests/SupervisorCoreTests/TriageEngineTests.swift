@@ -468,7 +468,8 @@ final class TriageEngineTests: XCTestCase {
         // Establish a pause via a fresh owner prompt.
         bus.publish(.userPrompt(.init(sessionId: session, text: "hold on", ts: clock.now)))
         try await Task.sleep(nanoseconds: 400_000_000)
-        XCTAssertEqual(await lc.snapshot(sessionId: session)?.paused, true,
+        let pausedAfterPrompt = await lc.snapshot(sessionId: session)?.paused
+        XCTAssertEqual(pausedAfterPrompt, true,
                        "a fresh owner prompt must pause the loop")
 
         // Stale tool_use (10 min old) must NOT clear the pause.
@@ -477,7 +478,10 @@ final class TriageEngineTests: XCTestCase {
             toolUseId: "t-stale", turnUUID: "u-stale",
             ts: clock.now.addingTimeInterval(-600))))
         try await Task.sleep(nanoseconds: 400_000_000)
-        XCTAssertEqual(await lc.snapshot(sessionId: session)?.paused, true,
+        // Hoist the async read out of the XCTAssert autoclosure (autoclosures
+        // don't support `await`).
+        let pausedAfterStale = await lc.snapshot(sessionId: session)?.paused
+        XCTAssertEqual(pausedAfterStale, true,
                        "a stale tool_use must not clear the pause")
 
         // Fresh tool_use clears the pause (worker resumed now).
@@ -486,7 +490,8 @@ final class TriageEngineTests: XCTestCase {
             toolUseId: "t-fresh", turnUUID: "u-fresh",
             ts: clock.now)))
         try await Task.sleep(nanoseconds: 400_000_000)
-        XCTAssertNotEqual(await lc.snapshot(sessionId: session)?.paused, true,
+        let pausedAfterFresh = await lc.snapshot(sessionId: session)?.paused
+        XCTAssertNotEqual(pausedAfterFresh, true,
                           "a fresh tool_use clears the pause")
     }
 
