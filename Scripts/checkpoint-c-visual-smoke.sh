@@ -44,15 +44,14 @@ echo "==> 2. Seed session offsets to EOF (so historical sessions don't replay)"
 echo "==> 3. Inject API key from env (key never appears in argv)"
 "$DEVTOOLS" inject-key-from-env
 
-echo "==> 4. Launch Supervisor + status-bar companion"
+echo "==> 4. Launch Supervisor (owns the menu-bar status item in-process)"
 open ./build/Supervisor.app
-open ./build/SupervisorStatusBar.app
 echo
 echo "Within the next ~10 seconds, watch for:"
 echo "  • macOS prompt: 'Supervisor would like to send you notifications'"
 echo "    → Click ALLOW.   [closes visual gap Q1 — prompt]"
 echo "  • Hover window: 240x40, top-right of screen, green dot, label '(no session)'"
-echo "  • Menu bar status icon: green checkmark.circle.fill"
+echo "  • Menu bar status icon: the Supervisor V1 glyph"
 echo "    [closes baseline for Q2]"
 echo
 read -p "Press ENTER when you have observed the above (or anything is wrong)..."
@@ -76,7 +75,7 @@ echo "  • Orange persists until another bash command runs"
 echo
 read -p "Press ENTER after you've observed the banner + orange dot..."
 
-echo "==> 6. Verify the §11.4 SIGTERM-orphan limit (Q2 part 1)"
+echo "==> 6. Verify the menu-bar icon tracks the main app's lifetime (Q2)"
 APP_PID=$(pgrep -f "Supervisor.app/Contents/MacOS/Supervisor$" | head -1)
 if [[ -n "$APP_PID" ]]; then
     echo "[smoke] killing main app PID $APP_PID with SIGKILL"
@@ -85,26 +84,15 @@ else
     echo "[smoke] WARN: couldn't find Supervisor.app main PID"
 fi
 echo
-echo "Watch the menu bar for ~30 seconds. Expected behavior in v0.1.0:"
-echo "  • Status bar icon STAYS GREEN"
-echo "  • This is the documented §11.4 limitation — orphaned heartbeat"
-echo "    keeps writing because macOS reparented it to launchd."
-echo "  • v0.1.1's mach-port liveness check is the targeted fix."
+echo "Watch the menu bar. Expected now that the status item is in-process:"
+echo "  • The Supervisor menu-bar icon DISAPPEARS as soon as the app dies"
+echo "    (the NSStatusItem is owned by the main app, not a companion)."
+echo "  • The heartbeat companion may be orphaned to launchd — that is the"
+echo "    crash-detector's concern, separate from the menu-bar icon."
 echo
-read -p "Press ENTER after confirming status bar stays green for 30+ seconds..."
+read -p "Press ENTER after confirming the menu-bar icon disappeared..."
 
-echo "==> 7. Verify the heartbeat-direct-death path (Q2 part 2)"
-echo "[smoke] killing heartbeat companion"
-pkill -f SupervisorHeartbeat 2>/dev/null || true
-echo
-echo "Watch the menu bar for ~30 seconds. Expected:"
-echo "  • Status bar transitions through amber (~10s after kill)"
-echo "  • Then to RED (~30s after kill)"
-echo "  • This is the Phase A.6-verified path — heartbeat absence -> red."
-echo
-read -p "Press ENTER after confirming red transition..."
-
-echo "==> 8. Cleanup"
+echo "==> 7. Cleanup"
 "$DEVTOOLS" delete-key 2>&1 | head -1
 echo
 echo "✓ Checkpoint C visual smoke complete."

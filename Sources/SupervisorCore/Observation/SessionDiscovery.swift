@@ -42,17 +42,55 @@ public final class SessionDiscovery: @unchecked Sendable {
     private var rescanTimer: DispatchSourceTimer?
     private let rescanInterval: TimeInterval
 
+    /// Recency-filtered discovery (audit H4): only start a tail for a
+    /// transcript whose mtime is within this window at discovery time. A
+    /// heavy user accrues hundreds/thousands of historical JSONLs; tailing
+    /// every one holds an fd + DispatchSource + offset timer per file forever
+    /// and, past the process fd limit, it is the NEWEST live session whose
+    /// open() fails. A file written to later (a `claude --resume` bumps its
+    /// mtime) is adopted on a subsequent scan — the scan re-checks mtime for
+    /// every not-yet-tailed file each time it runs. Overridable via init for
+    /// tests.
+    static let defaultDiscoveryRecencyWindowSeconds: TimeInterval = 172_800  // 48h
+    private let discoveryRecencyWindow: TimeInterval
+
+    /// Stale-skip announcements already emitted, by sessionId (launch-audit
+    /// fix, 2026-07). The rescan timer re-walks every JSONL every few seconds,
+    /// and announcing every stale skip on every pass was ~4,600 lines/min with
+    /// a couple hundred historical transcripts — 99.7% of log volume, rotating
+    /// real history out of the trace in ~30 minutes. Each stale transcript is
+    /// announced ONCE per process lifetime; the aggregate stays visible via a
+    /// throttled per-scan summary line (`emitStaleSummaryIfDue`). Queue-
+    /// confined like `tails` — every scan runs on `queue`.
+    private var announcedStaleSkips: Set<String> = []
+    private var lastStaleSummaryAt: Date?
+
+    /// Minimum gap between "skipped N stale transcripts" summary lines.
+    static let staleSummaryInterval: TimeInterval = 300
+
+    /// Injected into every SessionTail this discovery spawns. `nil` uses the
+    /// tail's own defaults; tests pass small values to exercise the
+    /// inactivity close cheaply.
+    private let tailInactivityTimeout: TimeInterval?
+    private let tailOffsetPersistInterval: TimeInterval
+
     public init(
         claudeProjectsDir: URL,
         bus: EventBus,
         sessionStore: SessionStore?,
         rescanInterval: TimeInterval = 3.0,
+        discoveryRecencyWindow: TimeInterval? = nil,
+        tailInactivityTimeout: TimeInterval? = nil,
+        tailOffsetPersistInterval: TimeInterval = 30,
         trace: TraceLog = .shared
     ) {
         self.claudeProjectsDir = claudeProjectsDir
         self.bus = bus
         self.sessionStore = sessionStore
         self.rescanInterval = rescanInterval
+        self.discoveryRecencyWindow = discoveryRecencyWindow ?? SessionDiscovery.defaultDiscoveryRecencyWindowSeconds
+        self.tailInactivityTimeout = tailInactivityTimeout
+        self.tailOffsetPersistInterval = tailOffsetPersistInterval
         self.trace = trace
     }
 
@@ -124,22 +162,60 @@ public final class SessionDiscovery: @unchecked Sendable {
             trace.emit("discovery", "no projects dir at \(claudeProjectsDir.path) — supervisor will idle until it exists")
             return
         }
+        var staleSkips = 0
         for dir in projectDirs {
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { continue }
-            scanProjectHashDir(dir)
+            staleSkips += scanProjectHashDir(dir)
             watchProjectHashDir(dir)
         }
+        emitStaleSummaryIfDue(skipped: staleSkips)
     }
 
-    private func scanProjectHashDir(_ dir: URL) {
+    /// Returns the number of stale transcripts skipped this pass so the
+    /// full-scan caller can emit the throttled summary. The per-dir kqueue
+    /// handler discards the count — a single-dir wake is not a full picture.
+    @discardableResult
+    private func scanProjectHashDir(_ dir: URL) -> Int {
         let projectHash = dir.lastPathComponent
-        guard let entries = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey]) else { return }
+        guard let entries = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        var staleSkips = 0
         for entry in entries where entry.pathExtension == "jsonl" {
             let sessionId = entry.deletingPathExtension().lastPathComponent
             if tails[sessionId] != nil { continue }
+            // Recency filter: skip transcripts not written to within the
+            // window. This is re-evaluated on every scan, so a previously
+            // skipped file that later gets a write (mtime bumps into the
+            // window) is adopted on the next scan. A deleted-then-recreated
+            // same-id session is no longer blocked here either: its tail's
+            // delete handler pruned the tails[id] entry, and the fresh file
+            // has a current mtime.
+            if let mtime = (try? FileManager.default.attributesOfItem(atPath: entry.path))?[.modificationDate] as? Date {
+                let age = Date().timeIntervalSince(mtime)
+                if age > discoveryRecencyWindow {
+                    staleSkips += 1
+                    // Announce each stale transcript once, not once per
+                    // rescan — the 3s timer made this line 99.7% of the log.
+                    if announcedStaleSkips.insert(sessionId).inserted {
+                        trace.emit("discovery", "skipping stale transcript session=\(sessionId) age=\(Int(age))s > window=\(Int(discoveryRecencyWindow))s — not tailed (will adopt if it is written to; announced once)")
+                    }
+                    continue
+                }
+            }
             startTail(sessionId: sessionId, projectHash: projectHash, path: entry)
         }
+        return staleSkips
+    }
+
+    /// One aggregate "skipped N stale transcripts" line, at most every
+    /// `staleSummaryInterval`, so the steady-state count stays observable
+    /// without the per-file spam.
+    private func emitStaleSummaryIfDue(skipped: Int) {
+        guard skipped > 0 else { return }
+        let now = Date()
+        if let last = lastStaleSummaryAt, now.timeIntervalSince(last) < Self.staleSummaryInterval { return }
+        lastStaleSummaryAt = now
+        trace.emit("discovery", "skipped \(skipped) stale transcript(s) this scan (window=\(Int(discoveryRecencyWindow))s; each announced once, adopted on write)")
     }
 
     private func startTail(sessionId: String, projectHash: String, path: URL) {
@@ -151,8 +227,26 @@ public final class SessionDiscovery: @unchecked Sendable {
             bus: bus,
             sessionStore: sessionStore,
             startOffset: savedOffset,
+            offsetPersistInterval: tailOffsetPersistInterval,
+            inactivityTimeout: tailInactivityTimeout,
             trace: trace
         )
+        // When the tail self-terminates (inactivity close or delete/rename),
+        // drop its entry so the fd is freed and the session can be re-adopted
+        // on a later scan (an inactive-then-re-opened tail resumes at the
+        // saved offset). Identity-guarded by ObjectIdentifier so we never
+        // remove a NEWER tail that a recreated same-id file installed under
+        // this key. Captures only a value + weak self — no retain cycle.
+        let tailIdentity = ObjectIdentifier(tail)
+        tail.onTerminated = { [weak self] sid in
+            self?.queue.async {
+                guard let self else { return }
+                if let current = self.tails[sid], ObjectIdentifier(current) == tailIdentity {
+                    self.tails.removeValue(forKey: sid)
+                    self.trace.emit("discovery", "pruned tail entry session=\(sid) after self-termination — re-tailable on next scan")
+                }
+            }
+        }
         do {
             try tail.start()
             tails[sessionId] = tail

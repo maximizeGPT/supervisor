@@ -6,10 +6,40 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet. The entries that previously sat here (the Context Wiki auditor,
+Context Health, and the code-review dimension) merged to the release branch
+and now live under [0.3.0] below.
+
+## [0.3.0] — 2026-06-29 (planner + evaluator + generator harness, observability, and hardening)
+
+*Updated 2026-07-10: this entry folds in the work merged to `release/v0.3.0-rc`
+after the original 2026-06-29 draft (PRs #30 through #50, including #42, the
+Agent Skill packaging).*
+
+*Version note: this file's numbering is not monotonic. Early development in
+May 2026 ran the version line up through [0.9.3] before the numbering was
+reset ahead of the 2026-06-26 public launch; the public line restarted low and
+continues to this [0.3.0]. Everything from [0.9.3] downward belongs to the
+pre-reset line, including the older [0.3.0] dated 2026-05-24. Below this
+entry, go by dates, not version numbers.*
+
+This release builds on the multi-provider 0.2.0 (Anthropic, DeepSeek,
+Moonshot, MiniMax, Qwen) and adds the opt-in planner / evaluator / generator
+harness, per-session observability and report export, a new branded plan and
+status UI, a Decision Sensitivity dial, two new onboarding steps, and a large
+hardening pass. The post-draft merges add the Context Wiki auditor and its
+Context Health surface, the opt-in code-review dimension, OpenAI Codex session
+support, and the multi-model second-opinion panel.
+
+The harness is INERT by default. Nothing below changes the shipped 0.2.0
+behavior unless the owner opts in (a `planner-enabled.marker`); when off, the
+idle path is the untouched Dispatcher path and the new plan types are never
+entered.
+
 Safety (the impersonation gap): Supervisor no longer mistakes its own injected
 messages for the owner. It used to read the answers and tasks it typed into a
 session back as "the user's most recent prompt" and could treat them as owner
-authorization for a destructive action — green-lighting irreversible work on
+authorization for a destructive action, green-lighting irreversible work on
 words it wrote itself. Injected turns are now tagged and can never authorize.
 
 Delivery reliability (the inject path): land on the first try by focusing the
@@ -18,6 +48,282 @@ dispatch honestly in the hover instead of going silent.
 
 Desktop conversation targeting: deliver answers to the correct conversation
 across multiple open windows, and reach conversations scrolled off-screen.
+
+### Added
+- Context Health, surfaced in the panel (`SupervisorCore/ContextHealthMonitor`,
+  a `Context Health` section in `ExpandedPanelView`): the Context Wiki audit is
+  no longer buried in a menu-bar item. A quiet, self-effacing line in the
+  expanded panel shows the one-glance verdict (mute when the context is lean, a
+  single static amber cue + count only at notable), on its own axis so it never
+  fights the Status/Activity/Review tabs, and opens the full window on tap. A
+  cheap deterministic audit runs in the background (never in the triage loop) and
+  re-checks on panel appear only when a context file changed, so the line never
+  asserts a stale "lean". `ContextHealthPresenter` moves to SupervisorUI and is
+  shared by the panel line, the menu item, and the one earned notification, so
+  all doors open one window. The notification (#45) fires at most once ever per
+  project, the first time a background audit finds notable drift; the once-ever
+  guarantee is persisted, so it survives relaunches. Placement + states shaped
+  by a Jobs/Wispr/Plaid critique panel.
+- Context Wiki auditor (`SupervisorCore/ContextWiki`): perpetually audits the
+  Claude memory/skill/context setup of any project Supervisor is pointed at —
+  CLAUDE.md files, `.claude/skills/*/SKILL.md`, `.claude/commands/*.md`,
+  AGENTS.md — and recommends cleanups that optimize memory/skill/context use.
+  Applies Karpathy's LLM Wiki pattern: raw sources (read-only) -> a consolidated,
+  cross-referenced **wiki** -> a **schema** conventions doc that prevents
+  re-bloat. GENERAL, not hardcoded to any setup.
+  - `ContextSourceScanner` — read-only, deterministic enumeration + classification
+    of a project's context surfaces (skips `.git`/`node_modules`/build trees).
+  - `ContextMetrics` — model-free cross-file duplicate-block detection + size/weight
+    totals, scoped to PROSE (the surface a session actually loads; a skill's
+    executed scripts are inventoried as weight, not context).
+  - `SourceSurveyor` — OPTIONAL cheap-model (Haiku-tier) fan-out that surveys each
+    source semantically; enrichment only, the deterministic report stands without it.
+  - `WikiConsolidator` — main-session synthesis: the cross-reference wiki, ranked
+    non-destructive recommendations, and the generated schema conventions.
+  - `WikiRenderer` — writes `CONTEXT-WIKI.md` / `CONTEXT-SCHEMA.md` /
+    `RECOMMENDATIONS.md` + `audit-report.json` into a caller-chosen output dir only.
+  - `ContextWikiSteward` — pure classifier for WHEN to re-audit (mirrors
+    `ContextSteward`'s stance); never scans or spends on its own.
+  - Persistence: migration `v6_context_audits` + `ContextAuditStore` (one row per
+    run; keeps the full report for re-rendering + a bloat-over-time trail).
+  - `SupervisorDevTools context-wiki <root> [--survey] [--out DIR] [--persist]`
+    runs it end-to-end.
+  - NON-DESTRUCTIVE: never edits/deletes a source. Every file-changing
+    recommendation carries `requiresSignoff`; applying it is a separate,
+    human-gated step. INERT in the running app — invoked explicitly (DevTools
+    today), so 0.3.0-rc runtime behavior is unchanged unless someone asks for an audit.
+- Context Health window (`SupervisorUI/ContextWiki`): a native SwiftUI surface for
+  the audit, on the brand vocabulary — a one-glance verdict hero, a Recommendations
+  / Wiki / Schema view, and a deliberate, non-destructive sign-off. Approving
+  records a sign-off (it never edits a file) and yields a copy-as-task-list
+  destination; only the top unresolved item shows the primary action ("one lit
+  path"). `ContextWikiViewModel` + `ContextWikiWindowController`, plus a
+  `ContextWikiPreview` dev harness that opens the window against a live audit.
+  Live in the app: a "Context Health…" item in the menu-bar (status bar) menu
+  opens it on demand — SwiftUI is only constructed when asked, so the always-on
+  status icon stays light and the auditor stays out of the running triage loop.
+  Design shaped by a multi-lens critique pass; 9 view-model tests.
+
+**Code REVIEW dimension — opt-in, inert by default**
+(`Sources/SupervisorCore/Review/ReviewEngine.swift`, `ReviewPrompt.swift`,
+`Sources/SupervisorCore/Storage/ReviewFindingStore.swift`)
+A second observer alongside the safety triage. Where the triage watches for
+danger (destructive / unauthorized / injection), the review dimension watches
+for code QUALITY: as a supervised worker writes code (Edit / Write / MultiEdit),
+Supervisor reviews the changes on the fly and surfaces SUBSTANTIVE issues — a
+wrong assumption baked into the code, an edge case the change overlooks, a line
+that misses something important, logic that contradicts an earlier decision in
+the session.
+
+- **Additive to the observation pipeline, not a change to it.** The parser now
+  emits a new `.fileEdit` event for Edit / Write / MultiEdit tool calls
+  (previously only Bash tool calls were surfaced). The safety `TriageEngine`
+  IGNORES this event (it is guarded out of its window before any state
+  mutation), so the destructive-action path is byte-for-byte unchanged. The new
+  event, the new engine, the new store, and the new UI kind are all purely
+  additive — nothing about the shipped safety behavior changes whether the
+  feature is on or off.
+- **Trigger: debounced per-turn.** A worker's edits arrive in bursts (a turn);
+  the engine reviews a burst once the edits go quiet, with a floor between
+  reviews so rapid turns can't fire one each, and a ceiling so a long continuous
+  edit streak still gets reviewed. Batching a coherent change (with the worker's
+  reasoning attached) is cheaper and less noisy than reviewing each edit.
+- **Surface: pull, not push.** Findings land in a dedicated **Review tab** in the
+  hover panel (and, as a `review` audit kind, in the Activity timeline + the
+  exported session report) — never a banner. Safety flags push (they interrupt);
+  quality reviews pull (the owner reads them when they open the panel). No
+  notification fatigue.
+- **Conservatism (an ignorable nitpick is worse than silence).** A high-bar
+  prompt that treats an empty result as correct; the owner's existing Decision
+  Sensitivity dial as the confidence gate (Cautious surfaces only high-confidence
+  findings; Balanced / Decisive surface medium+; low confidence never surfaces);
+  per-finding dedup via a UNIQUE fingerprint so the same issue on the same file
+  surfaces once, not every turn; a per-review surfacing cap; and the shared daily
+  cost cap (review calls ride the same cost-gated `LLMClient` as triage).
+- **Opt-in, inert by default.** Gated behind a `review-enabled.marker`
+  (`RuntimeToggles.reviewEnabled`, default OFF), mirroring the planner harness:
+  with the marker off the engine subscribes but short-circuits on every event and
+  spends nothing. The global `supervisor-paused.marker` also suppresses it. New
+  storage: migration `v6_review_findings` (dedup ledger); new audit kind
+  `.review`.
+- **Apple-grade Review UI** (`Sources/SupervisorUI/Review/ReviewView.swift`,
+  `ReviewFindingRow.swift`). A calm, in-brand surface: warm-paper finding cards
+  (the finding sentence reads first, in ink; file + a severity dot that defers to
+  the canonical `SeverityBadge` tone + confidence are quiet metadata; tap to
+  reveal the "why" and the exact changed line as a mono code sliver), a confident
+  empty state ("no news is good news"), and a quiet, self-clearing unseen-count
+  whisper on the always-on band (the mute tone, never the amber safety accent)
+  that clears the moment the Review tab is opened. Passed a three-lens design
+  review (Apple restraint / motion discipline / product seamlessness).
+- **Validated live against a real model + a QA loop.** Run end-to-end against
+  DeepSeek (`deepseek-chat`) over a 43-scenario adversarial battery designed and
+  graded by a planner→generate→evaluator agent loop: **100% recall on
+  genuinely-introduced bugs (zero missed)** across security, edge-case,
+  contradiction, resource-leak, and multi-hunk cases, with strong silence on
+  clean refactors / renames / reformats / pre-existing flaws. The evaluator pass
+  drove two surgical, recall-safe prompt hardenings now in `ReviewPrompt`: a
+  GROUNDING rule (every finding must quote a real changed line + enumerate each
+  new control-flow branch — closes a "confident hallucination" failure mode and
+  recovered a missed `switch`-case bug) and a calibration rule (stay silent when a
+  change is safe as written given only the diff, with an explicit carve-out that
+  never suppresses real security / secret-exposure / data-loss / authz issues).
+  The env-gated `LiveReviewQATests` harness + the committed
+  `Tests/SupervisorCoreTests/Fixtures/review-qa-battery.json` make the run
+  reproducible (skipped in CI, which has no key).
+
+**Agent-agnostic: Supervisor watches OpenAI Codex sessions too** (#32, #35, #36)
+- The `SupervisorEvent` + `EventBus` contract turned out to already be the
+  agent-agnostic spine: everything downstream (triage, rubric, injection
+  ledger, idle/loop detection, intervention routing) consumes typed events and
+  never branches on "Claude". A Codex observation adapter (Stage 1, #32) feeds
+  Codex CLI rollouts through that same pipeline with no changes to existing
+  files.
+- Intervention parity (#35): `ProcessLocator` now recognizes the `codex`
+  executable, so a Codex CLI session resolves cwd → PID exactly like a Claude
+  one and all four verbs (notify / inject / pause / kill) work with zero
+  router changes.
+- The hover band floats over the Codex desktop app (#36): `com.openai.codex`
+  joins the recognized host apps, so a supervised Codex desktop session shows
+  the band, not just terminal sessions.
+
+**Multi-model "Second opinion" panel, opt-in and OFF by default** (#31, #38)
+- The owner can put a panel of models on a flagged decision: a DIY
+  cross-provider fan-out (N members + a judge that fuses consensus /
+  contradictions / blind spots / unique insights) over the existing
+  `LLMClient`, or an OpenRouter Fusion one-call backend behind a new
+  `.openrouter` provider. Results render inline in the hover panel. Roughly
+  4-5x the cost of a single call, which is why it is opt-in.
+- An "Add a provider key" mini-form in the panel settings (#38) writes through
+  the same per-provider Keychain store onboarding uses, so a normal user can
+  add the second key the panel needs without re-running onboarding.
+
+### Fixed
+
+**RC hardening pass from the adversarial audit** (#30)
+- Injection safety: a harm screen now fronts the command-typing (inject) path,
+  which the RC previously lacked.
+- Honest health: Restart force-terminates a hung app; the status surface can
+  no longer report a lying green; the idle loop can't orphan-lie and is
+  deterministic; the flagged session stays pinned. Plus resume correctness.
+  The single-instance guard and stub-PRINCIPLES rejection documented below
+  landed in the same pass.
+
+**Dispatcher grounding honesty + PR-state awareness** (#37)
+- The drive-loop dispatcher fabricated "the PR was never opened" because it
+  had no pull-request visibility, and re-proposed finished work. It must now
+  check whether an objective is already done before re-proposing, never assert
+  "was never done / is missing" without evidence, and return
+  `low_confidence_no_action` rather than invent a gap. A new `GitHubPRFetcher`
+  (mirror of `GitHubIssueFetcher`) gives it real PR state. Also removes a
+  duplicated Decision Sensitivity heading in the panel.
+
+**Honest flags badge, cosmetic-finding filter, better block receipts** (#39)
+- The "N flags this run" panel badge shows the live work-window count instead
+  of a drifting process-lifetime counter; the review prompt no longer surfaces
+  documentation-typo / date-string / formatting cosmetics; block audit
+  receipts always carry a `risk_reason` and cap the summary with a truncation
+  marker (the full command stays in the command field).
+
+**Inject degrades to notify when the desktop targeter is not confident** (#40)
+- Closes the misroute where a dispatch pasted into the wrong conversation
+  among many open ones: the targeter accepted the matcher's self-confidence
+  plus a margin over runners-up but never checked the winner's own identity
+  overlap with the target. An identity floor now requires the winner's local
+  score to clear a threshold, else the router degrades to the existing notify
+  banner. Worst case is a banner, never a wrong-chat paste.
+
+**Expanded panel scrolls instead of clipping** (#44)
+- Expanding several collapsible footer groups at once overflowed the fixed
+  480x360 panel and clipped everything past the edge with no way to scroll.
+  The status strip (top) and flag count (bottom) stay pinned; the whole middle
+  (flags list + sections) scrolls.
+
+**The un-typed answer goes to the clipboard, not a truncated banner** (#46)
+- When Supervisor can't type its answer into a session it degrades to a
+  "here's what to paste" fallback, but the answer was embedded in the
+  notification body, which macOS truncates and makes unselectable. The full
+  answer is now copied to the clipboard and the banner says so.
+
+### CI
+
+**CI runs on macos-15 (Swift 6.x) to match the shipped compiler** (#41)
+- CI ran macos-14 (Swift 5.10) while the app is developed, tested, and
+  deployed on Swift 6.2, causing recurring local-green / CI-red divergence.
+  CI now tests what actually ships.
+
+### Added
+
+**Planner / Evaluator / Generator harness, opt-in and inert by default**
+(`Sources/SupervisorCore/Triage/Planner.swift`, `Evaluator.swift`,
+`Plan.swift`, `PlanLoop.swift`, `PlanOrchestrator.swift`, `ContextSteward.swift`,
+`StallWatchdog.swift`, `StallClassifier.swift`, `Storage/PlanStore.swift`)
+- The whole unit is GATED behind `RuntimeToggles.plannerEnabled` (set by a
+  `planner-enabled.marker`). Off, the engine's idle path is the untouched
+  Dispatcher path and `PlanLoop` is never entered, so the default install keeps
+  the shipped 0.2.0 behavior unchanged.
+- The Planner drafts a grounded multi-step plan from the session's real state
+  (objective, recent turns, repo context), not a generic template. The plan
+  stays a proposal until the owner approves it (a panel button or an
+  `approve-plan.marker`); only then does Supervisor start driving the steps.
+- The Evaluator is the skeptic: it grades each step against the session's REAL
+  output (build/test verdicts, the live error) via a forced-tool `record_verdict`
+  call and either advances to the next step, redirects the worker, or escalates,
+  rather than trusting the worker's self-report. The verdict persists through
+  `PlanStore.updateStep` (passed/failed + feedback + attempt count).
+- `StallWatchdog` (with `StallClassifier`) nudges a routine that has gone quiet
+  with bounded, escalating nudges; `ContextSteward` writes checkpoints so a long
+  plan survives a context reset; `PlanOrchestrator` sequences steps with attempt
+  caps.
+- Every plan injection rides the EXISTING marked + ledgered injection path:
+  `PlanLoop` never types directly. It hands the engine a `.continue` / `.notify`
+  decision that the router records in the `InjectionLedger` before delivery, so a
+  plan injection can never be read back as owner authorization.
+
+**Observability: per-session audit log + Activity tab**
+(`Sources/SupervisorCore/Storage/AuditStore.swift`,
+`Sources/SupervisorUI/Audit/AuditLogView.swift`, `AuditEntryRow.swift`,
+`FlagTimelineRow.swift`)
+- Supervisor now keeps a per-session audit trail of every quiet action it took
+  on the owner's behalf (auto-answer, block, nudge, evaluator verdict), not just
+  the loud flags. The new Activity tab merges that audit trail with the
+  significant flags into one timeline, so the owner can see what Supervisor did
+  while they were away, in order, with reasoning.
+
+**Session report export (JSON + Markdown)**
+(`Sources/SupervisorCore/Storage/SessionReportExporter.swift`, `SupervisorApp/main.swift`)
+- A session can be exported as a machine-readable JSON report and a
+  human-readable Markdown report, written as a pair into
+  `~/Downloads/Supervisor Reports/`. The exporter creates the directory if
+  needed and names the files from a stable stem.
+
+**New branded plan and status UI**
+(`Sources/SupervisorUI/Plan/PlanView.swift`, `StatusChip.swift`,
+`PlanStepRow.swift`, `StepStateIcon.swift`, `PulseDot.swift`,
+`PlanDetailView.swift`)
+- The Plan view is the panel centerpiece: a live `StatusChip`, the step list
+  with per-step state icons, each step's done-criteria, and the evaluator's
+  verdict. A distilled objective title (a tested
+  `PlanView.displayTitle(for:)` helper that humanizes a routine name and strips
+  XML/markdown wrapper noise) replaces the old wall of raw prompt text; the
+  verbatim objective and full routine prompt move behind a disclosure in the
+  dark `PlanDetailView`.
+
+**Decision Sensitivity dial**
+(`Sources/SupervisorCore/Config/DecisionSensitivity.swift`,
+`Sources/SupervisorUI/Audit/SensitivityControl.swift`)
+- A user-facing dial that tunes how readily Supervisor intervenes, surfaced as a
+  collapsible control in the status panel and backed by a tested core type.
+
+**Onboarding: customization step + Screen Recording step**
+(`Sources/SupervisorUI/Onboarding/CustomizationStep.swift`,
+`OnboardingScene.swift`, `OnboardingViewModel.swift`)
+- A customization step shows where the editable rules files live, with a Reveal
+  in Finder affordance, and where exports go (`~/Downloads/Supervisor Reports/`).
+- A first-class Screen Recording permission step, modeled on the Accessibility
+  step (preflight + request, an Open-Settings deep link, skip/continue),
+  sequenced into onboarding so the desktop inject path (which screenshots and
+  OCRs the sidebar to target the right conversation) is granted up front rather
+  than failing silently later.
 
 ### Security
 
@@ -128,6 +434,186 @@ self-authorization / impersonation gap** (`Sources/SupervisorCore/Intervention/I
   intended target ai-title only; a mismatch degrades to a notify banner instead
   of typing. Worst case across all of the above is scroll, find nothing, banner,
   never a wrong-chat paste.
+
+**CRITICAL: never SIGSTOP/SIGTERM the shared Claude.app desktop host**
+(`Sources/SupervisorCore/Intervention/InterventionRouter.swift`)
+- A `git checkout -- <pathspec>` in a watched session correctly matched the
+  DeterministicCatch (irreversible local change) with action=pause. The pause
+  EXECUTOR then resolved the target via the locator's `claude_app_fallback` to
+  the SHARED Claude.app desktop host PID and sent SIGSTOP to it, freezing the
+  entire Electron app and every session inside it, the operator's live session
+  included.
+- `signalOrDegrade` now guards before signaling: if the resolved handle is the
+  Claude.app desktop host (a shared `isClaudeDesktopHost` helper, also used by
+  the inject path) or an unconfirmed multi-session target, it degrades to a
+  notify banner instead of sending SIGSTOP/SIGTERM. A single real CLI process is
+  still signaled as before. The catch classification was correct and is
+  unchanged; only the unsafe delivery is fixed. Regression tests assert a
+  pause/kill into a desktop-host handle sends ZERO signals.
+
+**Pause/kill resolves the target by session id, not just cwd**
+(`InterventionRouter.swift`)
+- A high-severity pause whose decision carried no cwd degraded straight to a
+  no-op notify (`reason=no_cwd_on_decision`), even when the session id could
+  resolve the process. `signalOrDegrade` now resolves the target like the inject
+  path via a shared `resolveTarget` (locate by session id first when set, then by
+  cwd), so a pause with no cwd but a resolvable session FIRES instead of being
+  silently downgraded. The desktop-host guard above is preserved, and the degrade
+  reason is now discriminating (`unresolvable_no_session_no_cwd` vs
+  `locator_nil`).
+
+**Inject dedup + bounded delivery retries (opt-in)** (`InterventionRouter.swift`)
+- The dispatcher re-detected the same idle+objective each tick and re-sent the
+  IDENTICAL dispatch, stealing window focus every time. The router now keeps a
+  per-(session, normalized-text) delivery ledger: a confirmed-delivered identical
+  text is never re-sent within a 30-min window, and a never-landed inject retries
+  at most `maxDeliveryAttempts` (2) before it stops. The gate is OPT-IN: only the
+  dispatcher's high-confidence auto-dispatch (the unbounded spam source) sets it.
+  Self-governed injections keep their own cadence and are never router-deduped
+  (the stall watchdog's escalating nudges, plan steps, steward checkpoints,
+  answers). An injectable clock keeps the window deterministic in tests.
+
+**Drop the user-visible injection banner; rely on the InjectionLedger**
+(`Sources/SupervisorCore/Intervention/SupervisorInjectionMarker.swift`)
+- Injected turns now read clean (no `⟦ SUPERVISOR · automated ⟧` banner +
+  notice prefix). Own-injection recognition was never banner-based: triage
+  filters its own turns via `InjectionLedger` correlation (session id + normalized
+  text within a recency window), so removing the banner changes nothing on the
+  safety side. `SupervisorInjectionMarker.wrap()` is now a clean passthrough that
+  also strips any legacy banner from a re-queued pre-decision dispatch.
+
+**Ground injected dispatch proposals in the live conversation**
+(`Sources/SupervisorCore/Triage/Dispatcher.swift`)
+- The dispatcher injected generic, section-ref-heavy boilerplate (PRINCIPLES
+  sections cited by number, a mandated hard-stop reminder, a rigid opener voice)
+  that did not match where the target chat actually was. The
+  `record_dispatch` schema and the dispatcher system prompt now require a proposal
+  grounded in THAT conversation's actual recent state (the worker's latest
+  output, the files/commits/errors in play, the concrete next step), like a
+  senior collaborator who just read the chat. The section-by-number recitation
+  and boilerplate are dropped; a constraint is cited only when it genuinely bears.
+  The most-recent turns get more room in the prompt (~600 vs 240 chars). All
+  anti-fabrication, objective-grounding, and honor-worker-rejection backstops are
+  intact.
+
+**Dormant gate: do not auto-drive a session abandoned past 6h**
+(`Sources/SupervisorCore/Triage/TriageEngine.swift`)
+- Supervisor auto-dispatched into a chat idle for days. The targeter was already
+  hardened; the remaining bug was the DECISION to drive a stale session at all.
+  Root cause: `canDispatch`'s fresh-session reset keyed on `lastSeenAt`, which is
+  refreshed every loop-eval tick, so it never reflected real silence. A dormant
+  gate now sits at `checkIdleStates` (the single chokepoint feeding idle-dispatch,
+  plan-step drive, and watchdog nudge): a session silent past
+  `dormantSessionSilenceSeconds` (default 6h, past the task cap and 4h loop
+  window, under the 24h eviction) is skipped, keyed on real activity
+  (`lastEventTs`), with a discriminating `reason=session_dormant` trace. A
+  long-running but active session is never dormant; a fresh event clears dormancy.
+
+**Multi-session-aware hover band** (`Sources/SupervisorCore/Hover/HoverViewModel.swift`)
+- Watching several sessions, the single hover band showed "Watching <one
+  project>. All clear" for whichever session last emitted an event, flipping
+  between names, and the panel targeted an ambiguous session. The band now
+  aggregates ("Watching N sessions. All clear" at 2+, the exact prior wording at
+  0/1) via a new `setWatchedSessionCount` fed by `SessionDiscovery.activeSessions().count`,
+  and never stomps a flag/triage/flash label. This also stabilizes which session
+  the expanded panel targets.
+
+**Hard single-instance guard + reject stub PRINCIPLES**
+(`Sources/SupervisorCore/Config/SingleInstanceGuard.swift`,
+`Config/PrinciplesResolver.swift`, `SupervisorApp/main.swift`)
+- Two app bundles sharing bundle id `live.supervisor.app` (the dev app + a backup
+  bundle) ping-ponged: the old logic killed the other on launch, a relauncher
+  restarted it, and it killed back (5 launches in 14 min, two stacked hover
+  bands). A new `SingleInstanceGuard` (pure decider backed by a pidfile with
+  `kill(pid,0)` liveness) makes a duplicate QUIT itself with a loud trace instead
+  of killing the incumbent, ending the thrash; the lock releases on terminate.
+- Separately, the backup bundle embedded a 3,838-char STUB PRINCIPLES.md that won
+  the loader's bundle-first candidate walk, so a tick serviced by that instance
+  reasoned from a near-empty operating manual (the real file is ~35k chars). A new
+  `PrinciplesResolver` (stub threshold 8,000 chars) skips below-threshold
+  candidates with a loud trace and degrades rather than silently loading a stub,
+  applied to all three loaders and the per-tick re-reads.
+
+**Watchdog: log short-idle suppression once per episode, not every tick**
+(`TriageEngine.swift`)
+- The watchdog re-logged "short-idle drive SUPPRESSED ... async work outstanding"
+  every ~1s while a background task ran (1,024x in 90 min). A new
+  `shortIdleSuppressionLogged` gate logs the trace only on the transition into
+  suppression and resets on the async-work true→false transition (with a single
+  "RESUMED" line), so a fresh episode logs once more. Suppression behavior is
+  unchanged: it still never drives over outstanding async work.
+
+**Desktop targeter: exclude Supervisor's own banner; keep the composer click in
+the verified column** (`Sources/SupervisorCore/Intervention/DesktopConversationTargeter.swift`)
+- The OCR/LLM matcher repeatedly scored Supervisor's own injected banner
+  ("SUPERVISOR ... automated ... NOT from your operator") as the best candidate,
+  wasting scroll attempts and risking self-targeting. A new
+  `isSupervisorBannerText` predicate (tolerant of OCR glyph/separator variants)
+  filters those rows out of candidates, still needed because old on-screen turns
+  keep showing the legacy banner. And after a verified switch at one column,
+  `composerPoint` with `nearX` could return a far-off neighbor pane's composer and
+  focus the wrong pane; it now only accepts a placeholder within a pane-column
+  tolerance of `nearX`, falling back to clicking the verified title column, never
+  a different pane. Single-window behavior is unchanged.
+
+**Dispatch fetchers: resolve gh/git via absolute paths, negative-cache failures,
+guard non-repo cwds** (`Sources/SupervisorCore/Triage/DispatchFetchers.swift`)
+- A GUI app's minimal PATH omits Homebrew, so `env gh` returned exit 127 every
+  tick (proposals computed blind, issues=0), and git on a non-repo cwd returned
+  exit 128 every tick, both re-shelling and re-logging endlessly. `resolveTool`
+  now probes `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` and runs
+  the absolute binary; all three fetchers (issues, commits, diff-stat)
+  negative-cache a failure for the TTL and log it ONCE, returning empty on later
+  ticks with no re-shell; and a one-shot "is inside git work tree" probe
+  short-circuits non-repo cwds. This ends the per-tick failure flood.
+
+### Changed
+
+**Menu-bar status item: an auto-launched companion process, supervised by the
+main app** (`Sources/SupervisorApp/main.swift`, `Sources/SupervisorStatusBar/`,
+`Scripts/build-app.sh`)
+- The menu-bar health icon used to be a separate `SupervisorStatusBar`
+  executable that the main app never launched, so the icon never appeared.
+  Mid-cycle the status item was folded into `SupervisorApp` itself; the final
+  0.3.0 state restores the separate companion, because an in-process icon dies
+  with the app and can't report a crash or hang. The main app now spawns
+  `SupervisorStatusBar` at startup, tears it down on quit, and respawns it on
+  unexpected exit under a bounded respawn budget, so a companion that crashes
+  on every boot can't respawn-loop. The companion polls the heartbeat, so the
+  icon reflects real liveness instead of freezing green.
+- `build-app.sh` embeds the companion binary in
+  `Supervisor.app/Contents/MacOS/` and its branded-icon resource bundle in
+  `Contents/Resources/`. The `SupervisorHeartbeat` crash detector is unchanged.
+
+**A generic default PRINCIPLES.md ships in the app, and customization wins**
+(`branding/PRINCIPLES.default.md` (new), `Sources/SupervisorApp/main.swift`,
+`Scripts/build-app.sh`, `Scripts/make-dmg.sh` (new))
+- The triage, dispatcher, and answerer read PRINCIPLES.md to decide how to act.
+  A fresh install previously bundled none, so the answer and dispatch features
+  silently disabled. The build now bundles a provider-neutral, universal default
+  (`branding/PRINCIPLES.default.md`, about 39k chars) into
+  `Supervisor.app/Contents/Resources/PRINCIPLES.md` as the safety-net fallback.
+- The PRINCIPLES resolver now checks the user's Application Support copy FIRST
+  (the file onboarding's customization step points at), then the in-place repo
+  file, then the bundled default. Previously the bundle was checked first, which
+  would have overridden a user's edits and the loader did not read Application
+  Support at all, so the customization step was a no-op. The shared
+  `principlesCandidateURLs()` helper backs all three loaders; the hard-coded
+  personal dev path is gone. A user's edits always win; the bundled default is
+  only the out-of-the-box safety net.
+- `Scripts/make-dmg.sh` builds the notarized, stapled `.dmg` distribution
+  (single app + Applications symlink) the public download uses.
+
+### Tests
+
+- The harness ships with a deterministic scenario-replay test harness and an LLM
+  eval set alongside the new plan-harness engine tests (`PlannerTests`,
+  `EvaluatorTests`, `PlanLoopWiringTests`, `PlanOrchestratorTests`,
+  `PlanHarnessEngineTests`, `StallWatchdog*Tests`, `ContextStewardTests`,
+  `ApprovePlanMarkerTests`, `DecisionSensitivityTests`,
+  `SessionReportExporterTests`, and the UI `PlanViewTests` / `AuditLogViewTests`).
+- The full suite is ~775 tests, 0 failures, across the harness baseline and the
+  hardening pass.
 
 ## [0.9.3] — 2026-06-03
 

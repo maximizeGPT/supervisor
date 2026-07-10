@@ -44,7 +44,11 @@ public final class HoverWindowController {
     /// Pixel inset from the right edge and top edge of visibleFrame.
     private static let edgeInset: CGFloat = 12
 
-    /// Default apps that host a tailable Claude Code session.
+    /// Default apps that host a tailable coding-agent session — a terminal, or a
+    /// coding agent's own desktop app (Claude Code's, and Codex's). The band's
+    /// visibility gate floats over these; without an agent's app here, the band
+    /// never appears when that app is frontmost even though its sessions are
+    /// being supervised.
     public static let defaultHostApps: Set<String> = [
         "com.apple.Terminal",
         "com.googlecode.iterm2",
@@ -52,6 +56,7 @@ public final class HoverWindowController {
         "dev.warp.Warp-Stable",
         "org.alacritty",
         "com.anthropic.claudefordesktop",
+        "com.openai.codex",             // Codex desktop app — so the band hovers over Codex too
     ]
 
     /// Live set: defaults + user config. Updated by `mergeUserConfig`.
@@ -61,6 +66,13 @@ public final class HoverWindowController {
     private let panel: HoverPanel
     private let expandedPanel: HoverPanel
     private let isAnySessionActive: () -> Bool
+
+    /// Live count of sessions Supervisor is watching, from SessionDiscovery
+    /// (the single authority on which sessions are active). Pushed to the VM on
+    /// every visibility pass so the one band can read "Watching N sessions" when
+    /// Supervisor is busy. Defaults to deriving 0/1 from `isAnySessionActive`,
+    /// so existing callers (and tests) that only wire the boolean keep working.
+    private let activeSessionCount: () -> Int
 
     private var workspaceObserver: NSObjectProtocol?
     private var pollTimer: Timer?
@@ -82,10 +94,15 @@ public final class HoverWindowController {
     public init(
         vm: HoverViewModel,
         isAnySessionActive: @escaping () -> Bool = { true },
+        activeSessionCount: (() -> Int)? = nil,
         additionalHostApps: [String] = []
     ) {
         self.vm = vm
         self.isAnySessionActive = isAnySessionActive
+        // If no explicit count provider is wired, fall back to 0/1 derived from
+        // the activity boolean, preserving the prior single-band wording for
+        // callers (and tests) that only pass `isAnySessionActive`.
+        self.activeSessionCount = activeSessionCount ?? { isAnySessionActive() ? 1 : 0 }
         self.claudeCodeHostApps = Self.defaultHostApps.union(additionalHostApps)
 
         // -- Hover panel (240x40) --
@@ -255,7 +272,12 @@ public final class HoverWindowController {
 
         let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontmostHostsClaudeCode = frontmostBundleID.map(claudeCodeHostApps.contains) ?? false
-        let sessionActive = isAnySessionActive()
+        // One read of the live count drives both the show/hide gate and the
+        // band's "N sessions" label, so the band always reflects the same
+        // session set the visibility gate just saw.
+        let sessionCount = activeSessionCount()
+        vm.setWatchedSessionCount(sessionCount)
+        let sessionActive = sessionCount > 0
         let shouldShow = frontmostHostsClaudeCode && sessionActive
 
         if shouldShow && !currentlyVisible {

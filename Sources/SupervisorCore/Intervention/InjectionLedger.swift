@@ -126,6 +126,16 @@ public final class InjectionLedger: @unchecked Sendable {
         return bySession[sessionId]?.count ?? 0
     }
 
+    /// The timestamp of the MOST RECENT injection recorded for this session, or
+    /// nil if none. v0.2.0 M2d-2 uses this as the anchor for a plan step's
+    /// observation window: the events at/after the last injection (the step we
+    /// just typed) are the activity to grade. Best-effort - a pruned-away ancient
+    /// injection simply isn't counted, which is correct (it is not the live step).
+    public func lastInjectionTime(sessionId: String) -> Date? {
+        lock.lock(); defer { lock.unlock() }
+        return bySession[sessionId]?.last?.ts
+    }
+
     // MARK: - Matching
 
     /// Collapse runs of whitespace and trim. The injected text and the JSONL

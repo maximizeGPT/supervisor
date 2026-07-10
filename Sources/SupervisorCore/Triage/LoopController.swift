@@ -90,13 +90,6 @@ public enum LoopStopReason: String, Sendable, Equatable {
 public enum LoopPauseReason: String, Sendable, Equatable {
     case userMessage = "user_message"
     case userQuestionPending = "user_question_pending"
-    /// Supervisor fired a pause intervention (a risky action was flagged). The
-    /// worker is being interrupted, so the drive loop must HOLD for this session
-    /// — otherwise the worker goes idle post-interrupt and the loop immediately
-    /// re-drives it (the 2026-06-16 "it stopped and then Supervisor injected
-    /// something else" case). Unlike .userMessage this is NOT operator presence,
-    /// so it never stamps lastOwnerMessageAt and never clears a hard stop.
-    case safetyPause = "safety_pause"
 }
 
 // MARK: - The controller
@@ -136,6 +129,13 @@ public actor LoopController {
     /// 2026-06-15).
     public static let defaultOwnerPresenceBackoff: TimeInterval = 10 * 60
 
+    /// v0.2.0 M5: how many advanced steps must pass after a context checkpoint
+    /// injection before another is allowed for the SAME plan. The cooldown stops a
+    /// long-running session from re-injecting a "write a progress checkpoint"
+    /// instruction at every step boundary once it crosses a steward threshold.
+    /// Default 3: checkpoint, then skip the next three boundaries.
+    public static let defaultCheckpointCooldownSteps = 3
+
     private struct SessionState {
         var loopStartedAt: Date
         var lastSeenAt: Date
@@ -150,6 +150,26 @@ public actor LoopController {
         /// the first genuine operator turn. Defaulted so the existing
         /// SessionState(...) construction sites need no change.
         var lastOwnerMessageAt: Date? = nil
+        /// v0.2.0 M2d-1: per-step attempt counts for the active plan, keyed by
+        /// PlanStep.id. Incremented each time a step is graded (decideAndRecord).
+        /// The orchestrator reads the count to apply the max-attempts guardrail;
+        /// the count is also the source for the persisted PlanStep.attempts.
+        /// Defaulted empty so the existing SessionState(...) sites need no change.
+        var stepAttempts: [String: Int] = [:]
+        /// v0.2.0 M2d-1: the per-step score history for the active plan, keyed by
+        /// PlanStep.id, oldest first. Feeds the orchestrator's no-progress
+        /// detector (scoreStalled). Defaulted empty.
+        var stepScores: [String: [Double]] = [:]
+        /// v0.2.0 M5: the plan step index at which the context steward last
+        /// injected a non-destructive handoff checkpoint, keyed by plan id. Used
+        /// to enforce the checkpoint COOLDOWN: a fresh checkpoint is suppressed
+        /// until at least `checkpointCooldownSteps` steps have advanced past it,
+        /// so a long run cannot spam checkpoint injections at every boundary. nil
+        /// (absent) until the first checkpoint for a plan. In-memory like the idle
+        /// counters (a checkpoint is a within-run nudge; a Supervisor restart
+        /// re-arming it is harmless). Defaulted empty so existing SessionState(...)
+        /// construction sites need no change.
+        var lastCheckpointStepIndexByPlan: [String: Int] = [:]
     }
 
     private var sessions: [String: SessionState] = [:]
@@ -158,37 +178,54 @@ public actor LoopController {
     private let sessionResetIdle: TimeInterval
     private let ownerPresenceBackoff: TimeInterval
     private let consecutiveLowThreshold: Int
+    /// v0.2.0 M5: how many advanced steps must pass after a context checkpoint
+    /// before another is allowed for the same plan (the cooldown). Injectable so
+    /// tests can shorten it; defaults to the standard value.
+    private let checkpointCooldownSteps: Int
     private let trace: TraceLog
     private let now: @Sendable () -> Date
     private let seedCount: ((String) -> Int)?
+    /// v0.2.0 M2a: read-only access to the persisted plan for a session.
+    /// Injected like `loopStore` (optional, off by default) so M2a wires
+    /// the type in without changing any existing call site. M2d-1 adds the
+    /// plan-orchestration decision methods (decideAndRecord) that read +
+    /// write through this store; the live execution of a decision (inject,
+    /// notify, replan) is M2d-2. nil when no PlanStore is wired.
+    private let planStore: PlanStore?
+    /// v0.2.0 M2d-1: the pure plan-orchestration decision brain. The
+    /// controller OWNS one orchestrator + the per-step attempt counters and
+    /// asks it for a `PlanDecision` on every graded step. Injectable so its
+    /// guardrails (max attempts/step) are tunable; defaults to the standard
+    /// PlanOrchestrator.
+    private let orchestrator: PlanOrchestrator
     /// Owner toggle: is the 4-hour wall-clock cap turned off? Defaults to the
     /// live RuntimeToggles marker; injectable so tests exercise the gate without
     /// writing the real marker (which the running app would pick up).
     private let loopCapDisabled: @Sendable () -> Bool
-    /// Owner toggle (demo): when true, canDispatch skips the owner-presence backoff
-    /// so the loop drives the moment a session goes idle, even though the operator
-    /// just messaged. Injectable so tests exercise it without a real marker.
-    private let ownerPresenceBackoffDisabled: @Sendable () -> Bool
 
     public init(
         maxLoopDuration: TimeInterval = LoopController.defaultMaxLoopDuration,
         sessionResetIdle: TimeInterval = LoopController.defaultSessionResetIdle,
         ownerPresenceBackoff: TimeInterval = LoopController.defaultOwnerPresenceBackoff,
         consecutiveLowThreshold: Int = LoopController.defaultConsecutiveLowThreshold,
+        checkpointCooldownSteps: Int = LoopController.defaultCheckpointCooldownSteps,
         now: @escaping @Sendable () -> Date = { Date() },
         loopCapDisabled: @escaping @Sendable () -> Bool = { RuntimeToggles.loopCapDisabled },
-        ownerPresenceBackoffDisabled: @escaping @Sendable () -> Bool = { RuntimeToggles.ownerPresenceBackoffDisabled },
         trace: TraceLog = .shared,
-        loopStore: LoopDispatchStore? = nil
+        loopStore: LoopDispatchStore? = nil,
+        planStore: PlanStore? = nil,
+        orchestrator: PlanOrchestrator = PlanOrchestrator()
     ) {
         self.maxLoopDuration = maxLoopDuration
         self.sessionResetIdle = sessionResetIdle
         self.ownerPresenceBackoff = ownerPresenceBackoff
         self.consecutiveLowThreshold = consecutiveLowThreshold
+        self.checkpointCooldownSteps = checkpointCooldownSteps
         self.trace = trace
         self.now = now
         self.loopCapDisabled = loopCapDisabled
-        self.ownerPresenceBackoffDisabled = ownerPresenceBackoffDisabled
+        self.planStore = planStore
+        self.orchestrator = orchestrator
         if let store = loopStore {
             self.seedCount = { sessionId in
                 (try? store.count(sessionId: sessionId)) ?? 0
@@ -292,8 +329,7 @@ public actor LoopController {
         // as .paused, which the engine treats as SILENT — no banner spam. Resumes
         // once the operator has been quiet for the window (they've stepped away —
         // the condition the drive feature is for).
-        if !ownerPresenceBackoffDisabled(),
-           let lastOwner = state.lastOwnerMessageAt,
+        if let lastOwner = state.lastOwnerMessageAt,
            nowTs.timeIntervalSince(lastOwner) < ownerPresenceBackoff {
             sessions[sessionId] = state
             return .paused(reason: "operator active \(Int(nowTs.timeIntervalSince(lastOwner)))s ago (presence backoff)")
@@ -379,11 +415,7 @@ public actor LoopController {
         // that) stop so the loop re-engages after the human's input. Kill and
         // 4-hour stops are terminal and stay.
         if state.stopped {
-            // New owner DIRECTION (a real user message / pending question) clears a
-            // "ran out of grounded work" stop so the loop re-engages. A SAFETY pause
-            // must NOT — it's holding a risky session, not giving new direction — so
-            // it leaves a stopped session stopped (already held) and returns.
-            guard reason != .safetyPause, state.stopReason == .threeConsecutiveLow else { return }
+            guard state.stopReason == .threeConsecutiveLow else { return }
             state.stopped = false
             state.stopReason = nil
             state.consecutiveLowCount = 0
@@ -450,6 +482,340 @@ public actor LoopController {
         state.stopReason = reason
         sessions[sessionId] = state
         trace.emit("loop", "STOPPED session=\(sessionId) reason=\(reason.rawValue)")
+    }
+
+    // MARK: - Plan state (v0.2.0 M2a — read-only accessor)
+
+    /// The current (latest) persisted plan for a session, or nil if no
+    /// PlanStore is wired or the session has no plan yet. M2a exposes
+    /// only this read accessor; producing a plan (M2b) and driving its
+    /// steps (M2d) come later. A store read error degrades to nil
+    /// (best-effort, like the rest of the loop's reads).
+    public func currentPlan(sessionId: String) -> Plan? {
+        guard let planStore else { return nil }
+        return (try? planStore.currentPlan(sessionId: sessionId)) ?? nil
+    }
+
+    // MARK: - Plan orchestration (v0.2.0 M2d-1 - decide + record the transition)
+
+    /// The outcome of grading a step and running the orchestrator: the pure
+    /// `decision` plus the plan/step state that was PERSISTED as a result. The
+    /// caller (M2d-2's live wiring) reads `decision` to know what to do next
+    /// (inject feedback, advance, pause + notify, replan, stop) - but those
+    /// LIVE actions are M2d-2; M2d-1 only computes the decision and records the
+    /// resulting plan/step state transition.
+    public struct OrchestrationOutcome: Sendable, Equatable {
+        /// What the orchestrator decided (advance / complete / redirect /
+        /// replan / escalate / abort).
+        public let decision: PlanDecision
+        /// The step status written for the graded step (e.g. passed, retrying,
+        /// failed). nil if no plan/step state was persisted (no store wired).
+        public let recordedStepStatus: PlanStep.Status?
+        /// The plan status written (e.g. running, completed, aborted), or nil if
+        /// nothing was persisted.
+        public let recordedPlanStatus: Plan.Status?
+        /// The plan's current-step index written (advanced on `.advance`, held
+        /// otherwise), or nil if nothing was persisted.
+        public let recordedCurrentStepIndex: Int?
+        /// The attempt count written for the graded step (the per-step counter
+        /// after this grade), or nil if nothing was persisted.
+        public let recordedAttempts: Int?
+
+        public init(
+            decision: PlanDecision,
+            recordedStepStatus: PlanStep.Status? = nil,
+            recordedPlanStatus: Plan.Status? = nil,
+            recordedCurrentStepIndex: Int? = nil,
+            recordedAttempts: Int? = nil
+        ) {
+            self.decision = decision
+            self.recordedStepStatus = recordedStepStatus
+            self.recordedPlanStatus = recordedPlanStatus
+            self.recordedCurrentStepIndex = recordedCurrentStepIndex
+            self.recordedAttempts = recordedAttempts
+        }
+    }
+
+    /// Grade-time entry point: given the Evaluator's `verdict` for `step` of the
+    /// session's current plan, bump the per-step attempt counter + score
+    /// history, ask the owned PlanOrchestrator for a `PlanDecision`, then PERSIST
+    /// the resulting plan/step state transition via PlanStore. Returns the
+    /// decision plus what was written.
+    ///
+    /// This does NOT execute the decision on the live path: it does NOT call
+    /// TriageEngine, the Injector, the Notifier, or any LLM (Planner.replan).
+    /// Executing a decision live - injecting the redirect feedback, advancing
+    /// the Generator to the next step, pausing + notifying on escalate, invoking
+    /// Planner.replan - is M2d-2. The persisted state is the durable record the
+    /// live wiring will act on.
+    ///
+    /// - `sessionId`: the session whose loop + plan this is.
+    /// - `plan`: the current plan (the caller passes the plan it graded against;
+    ///   typically `currentPlan(sessionId:)`). Its `steps`/`currentStepIndex`
+    ///   are used for advance/complete decisions.
+    /// - `step`: the step that was graded.
+    /// - `verdict`: the Evaluator's verdict for that step.
+    /// - `extraSignals`: optional human-insight / budget flags to fold into the
+    ///   decision (offPlan, needsHumanInput, destructiveActionObserved,
+    ///   safetyConcern, budgetExhausted, newInfoWarrantsReplan + replanReason).
+    ///   The attempt count and score history are filled by the controller from
+    ///   its own per-step state; any values on the passed-in signals for those
+    ///   two fields are overridden. Defaults to "no extra flags".
+    /// - `now`: timestamp for the persisted `updated_at` columns (injectable for
+    ///   deterministic tests).
+    @discardableResult
+    public func decideAndRecord(
+        sessionId: String,
+        plan: Plan,
+        step: PlanStep,
+        verdict: PlanStep.Verdict,
+        extraSignals: OrchestrationSignals? = nil,
+        now: Date? = nil
+    ) -> OrchestrationOutcome {
+        let nowTs = now ?? self.now()
+        var state = sessions[sessionId] ?? SessionState(
+            loopStartedAt: nowTs,
+            lastSeenAt: nowTs,
+            consecutiveLowCount: 0,
+            totalDispatches: seedCount?(sessionId) ?? 0,
+            paused: false,
+            pauseReason: nil,
+            stopped: false,
+            stopReason: nil
+        )
+
+        // Bump the per-step attempt counter (this grade IS an attempt) and append
+        // this verdict's score to the step's history. These are the controller's
+        // source of truth for the orchestrator's guardrail inputs; they override
+        // whatever the caller put on `extraSignals` for those two fields.
+        let attempts = (state.stepAttempts[step.id] ?? 0) + 1
+        state.stepAttempts[step.id] = attempts
+        var scores = state.stepScores[step.id] ?? []
+        scores.append(verdict.score)
+        state.stepScores[step.id] = scores
+        sessions[sessionId] = state
+
+        // Assemble the signals: controller-owned counters + the caller's flags.
+        let base = extraSignals ?? OrchestrationSignals(attemptsOnStep: attempts)
+        let signals = OrchestrationSignals(
+            attemptsOnStep: attempts,
+            scoreHistoryForStep: scores,
+            budgetExhausted: base.budgetExhausted,
+            needsHumanInput: base.needsHumanInput,
+            offPlan: base.offPlan,
+            destructiveActionObserved: base.destructiveActionObserved,
+            safetyConcern: base.safetyConcern,
+            newInfoWarrantsReplan: base.newInfoWarrantsReplan,
+            replanReason: base.replanReason
+        )
+
+        let decision = orchestrator.decide(
+            plan: plan, currentStep: step, verdict: verdict, signals: signals
+        )
+
+        trace.emit("loop", "orchestrate session=\(sessionId) plan=\(plan.id) step=\(step.index) attempts=\(attempts) verdict_passed=\(verdict.passed) score=\(String(format: "%.2f", verdict.score)) decision=\(Self.decisionTag(decision))")
+
+        // Map the decision to the persisted plan/step transition, then write it.
+        // No live action is taken here (no inject/notify/replan/LLM) - that is
+        // M2d-2. Each branch leaves a // M2d-2: TODO at the live-action seam.
+        return record(
+            decision: decision,
+            sessionId: sessionId,
+            plan: plan,
+            step: step,
+            verdict: verdict,
+            attempts: attempts,
+            now: nowTs
+        )
+    }
+
+    /// Persist the plan/step state implied by a decision, and return the
+    /// outcome. Private - the only caller is `decideAndRecord`. Degrades to a
+    /// "decision only, nothing persisted" outcome when no PlanStore is wired (so
+    /// the pure decision is still usable without storage, as the tests need).
+    private func record(
+        decision: PlanDecision,
+        sessionId: String,
+        plan: Plan,
+        step: PlanStep,
+        verdict: PlanStep.Verdict,
+        attempts: Int,
+        now: Date
+    ) -> OrchestrationOutcome {
+        guard let planStore else {
+            // No store: the orchestrator's decision still stands; we just have
+            // nowhere to record the transition. The caller gets the decision.
+            return OrchestrationOutcome(decision: decision)
+        }
+
+        // Helper to write the graded step's status/attempts/verdict.
+        func writeStep(_ status: PlanStep.Status) {
+            try? planStore.updateStep(
+                stepId: step.id, status: status, attempts: attempts,
+                verdict: verdict, now: now
+            )
+        }
+        // Helper to write the plan's status + current-step index.
+        func writePlan(_ status: Plan.Status, currentStepIndex: Int) {
+            try? planStore.updatePlan(
+                planId: plan.id, status: status,
+                currentStepIndex: currentStepIndex, now: now
+            )
+        }
+
+        switch decision {
+        case .advance:
+            // Step passed; mark it passed and move the plan's cursor to the next
+            // step (the plan stays running).
+            writeStep(.passed)
+            let nextIndex = step.index + 1
+            writePlan(.running, currentStepIndex: nextIndex)
+            // M2d-2: inject the next step's spec into the Generator and observe.
+            return OrchestrationOutcome(
+                decision: decision,
+                recordedStepStatus: .passed,
+                recordedPlanStatus: .running,
+                recordedCurrentStepIndex: nextIndex,
+                recordedAttempts: attempts
+            )
+
+        case .complete:
+            // Last step passed; mark it passed and the plan completed. The
+            // current-step index holds at the last step.
+            writeStep(.passed)
+            writePlan(.completed, currentStepIndex: step.index)
+            // M2d-2: stop the loop with a "plan complete" terminal reason and
+            // notify the human the objective is built.
+            return OrchestrationOutcome(
+                decision: decision,
+                recordedStepStatus: .passed,
+                recordedPlanStatus: .completed,
+                recordedCurrentStepIndex: step.index,
+                recordedAttempts: attempts
+            )
+
+        case .redirect:
+            // Step failed but is being re-attempted: status retrying, plan holds
+            // on the same step.
+            writeStep(.retrying)
+            writePlan(.running, currentStepIndex: step.index)
+            // M2d-2: inject the verdict feedback as a redirect and re-run the
+            // same step.
+            return OrchestrationOutcome(
+                decision: decision,
+                recordedStepStatus: .retrying,
+                recordedPlanStatus: .running,
+                recordedCurrentStepIndex: step.index,
+                recordedAttempts: attempts
+            )
+
+        case .replan:
+            // The remaining plan looks wrong. Record the graded step's verdict
+            // (status reflects the verdict: passed-but-replan keeps passed, else
+            // failed) and hold the plan running; the actual re-plan is M2d-2.
+            let stepStatus: PlanStep.Status = verdict.passed ? .passed : .failed
+            writeStep(stepStatus)
+            writePlan(.running, currentStepIndex: step.index)
+            // M2d-2: call Planner.replan(existing:observation:cwd:) with the
+            // decision's reason and swap in the revised plan.
+            return OrchestrationOutcome(
+                decision: decision,
+                recordedStepStatus: stepStatus,
+                recordedPlanStatus: .running,
+                recordedCurrentStepIndex: step.index,
+                recordedAttempts: attempts
+            )
+
+        case .escalate:
+            // A human-insight trigger fired. Persist the step's verdict-derived
+            // status; the plan stays running (the human decides next). The PAUSE
+            // + NOTIFY are M2d-2 - M2d-1 only records the state.
+            let stepStatus: PlanStep.Status = verdict.passed ? .passed : .failed
+            writeStep(stepStatus)
+            writePlan(.running, currentStepIndex: step.index)
+            // M2d-2: pause the loop (stop/notePause) and notify the human with
+            // the escalation trigger + reason.
+            return OrchestrationOutcome(
+                decision: decision,
+                recordedStepStatus: stepStatus,
+                recordedPlanStatus: .running,
+                recordedCurrentStepIndex: step.index,
+                recordedAttempts: attempts
+            )
+
+        case .abort:
+            // A hard guardrail tripped. Mark the step's verdict-derived status
+            // and the plan aborted (terminal).
+            let stepStatus: PlanStep.Status = verdict.passed ? .passed : .failed
+            writeStep(stepStatus)
+            writePlan(.aborted, currentStepIndex: step.index)
+            // M2d-2: stop the loop (stop(reason:)) and notify the human the run
+            // was aborted on a guardrail.
+            return OrchestrationOutcome(
+                decision: decision,
+                recordedStepStatus: stepStatus,
+                recordedPlanStatus: .aborted,
+                recordedCurrentStepIndex: step.index,
+                recordedAttempts: attempts
+            )
+        }
+    }
+
+    // MARK: - Context steward state (v0.2.0 M5 - checkpoint cooldown + signals)
+
+    /// How many times the given step has been attempted so far for this session,
+    /// from the controller's per-step counter (the same counter decideAndRecord
+    /// bumps). 0 if the session/step is unknown. The context steward reads this as
+    /// one of its long-horizon-risk signals (repeated attempts on one step). Pure
+    /// read - no state change.
+    public func attemptsOnStep(sessionId: String, stepId: String) -> Int {
+        sessions[sessionId]?.stepAttempts[stepId] ?? 0
+    }
+
+    /// Is a context checkpoint currently SUPPRESSED for `planId` by the cooldown?
+    /// True when a checkpoint was injected within the last `checkpointCooldownSteps`
+    /// advanced steps (i.e. `atStepIndex` is still within the cooldown window after
+    /// the last checkpoint's step index). False when no checkpoint has fired for the
+    /// plan yet, or enough steps have advanced past it. The context steward consults
+    /// this at a SAFE boundary so it cannot re-fire a checkpoint every step. Pure
+    /// read - no state change.
+    public func checkpointCooldownActive(sessionId: String, planId: String, atStepIndex: Int) -> Bool {
+        guard let last = sessions[sessionId]?.lastCheckpointStepIndexByPlan[planId] else { return false }
+        return atStepIndex - last < checkpointCooldownSteps
+    }
+
+    /// Record that the context steward injected a non-destructive checkpoint for
+    /// `planId` at `atStepIndex`, arming the cooldown. Lazily initializes the
+    /// session state (like the other record* methods) so a checkpoint can be the
+    /// first thing recorded for a session. In-memory only (a checkpoint is a
+    /// within-run nudge).
+    public func recordCheckpoint(sessionId: String, planId: String, atStepIndex: Int) {
+        let nowTs = now()
+        var state = sessions[sessionId] ?? SessionState(
+            loopStartedAt: nowTs,
+            lastSeenAt: nowTs,
+            consecutiveLowCount: 0,
+            totalDispatches: seedCount?(sessionId) ?? 0,
+            paused: false,
+            pauseReason: nil,
+            stopped: false,
+            stopReason: nil
+        )
+        state.lastCheckpointStepIndexByPlan[planId] = atStepIndex
+        sessions[sessionId] = state
+        trace.emit("loop", "context checkpoint recorded session=\(sessionId) plan=\(planId) at_step_index=\(atStepIndex) (cooldown \(checkpointCooldownSteps) steps)")
+    }
+
+    /// Short stable tag for a decision, for the trace line. Not user-facing.
+    private static func decisionTag(_ decision: PlanDecision) -> String {
+        switch decision {
+        case .advance: return "advance"
+        case .complete: return "complete"
+        case .redirect: return "redirect"
+        case .replan: return "replan"
+        case let .escalate(trigger, _): return "escalate:\(trigger.rawValue)"
+        case .abort: return "abort"
+        }
     }
 
     /// Inspect — used by tests and post-mortems. Returns nil if the

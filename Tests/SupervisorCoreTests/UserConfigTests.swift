@@ -115,4 +115,57 @@ final class UserConfigTests: XCTestCase {
         XCTAssertEqual(config.additionalHostApps, ["com.microsoft.VSCode"],
                        "empty list entries must be skipped")
     }
+
+    // MARK: - cost.daily_cap_usd (v0.3.0)
+
+    func testParseDailyCapUnderCostKey() {
+        let yaml = """
+        cost:
+          daily_cap_usd: 5.0
+        """
+        let config = UserConfig.parse(yaml)
+        XCTAssertEqual(config.dailyCostCapUSD, 5.0)
+    }
+
+    func testParseDailyCapAbsentIsNil() {
+        let yaml = """
+        hover:
+          known_terminals:
+            - com.microsoft.VSCode
+        """
+        XCTAssertNil(UserConfig.parse(yaml).dailyCostCapUSD)
+        XCTAssertNil(UserConfig.parse(nil).dailyCostCapUSD)
+        XCTAssertNil(UserConfig.parse("").dailyCostCapUSD)
+    }
+
+    func testParseDailyCapGarbageIsNilAndDoesNotCrash() {
+        for bad in ["daily_cap_usd: lots", "daily_cap_usd:", "daily_cap_usd: $5", "daily_cap_usd: 5,00"] {
+            let config = UserConfig.parse("cost:\n  \(bad)")
+            XCTAssertNil(config.dailyCostCapUSD, "'\(bad)' must degrade to nil, not crash")
+        }
+    }
+
+    func testParseDailyCapNonPositiveIsNil() {
+        XCTAssertNil(UserConfig.parse("cost:\n  daily_cap_usd: 0").dailyCostCapUSD,
+                     "a zero cap would block every call — treated as unset")
+        XCTAssertNil(UserConfig.parse("cost:\n  daily_cap_usd: -3.5").dailyCostCapUSD)
+    }
+
+    func testParseDailyCapWithInlineComment() {
+        let config = UserConfig.parse("cost:\n  daily_cap_usd: 2.50  # two fifty a day")
+        XCTAssertEqual(config.dailyCostCapUSD, 2.5)
+    }
+
+    func testParseDailyCapCoexistsWithKnownTerminals() {
+        let yaml = """
+        hover:
+          known_terminals:
+            - com.microsoft.VSCode
+        cost:
+          daily_cap_usd: 10
+        """
+        let config = UserConfig.parse(yaml)
+        XCTAssertEqual(config.additionalHostApps, ["com.microsoft.VSCode"])
+        XCTAssertEqual(config.dailyCostCapUSD, 10.0)
+    }
 }

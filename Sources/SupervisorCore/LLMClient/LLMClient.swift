@@ -51,6 +51,39 @@ public final class LLMClient: Sendable {
     /// Anthropic-version header. Only sent when talking to Anthropic.
     private let anthropicVersion: String
 
+    /// v0.3.0 cost hook (P0-4). Called once per successful `createMessage`
+    /// with the requested model id and the usage block the provider
+    /// returned — createMessage is the single choke point every network
+    /// call flows through, so wiring this records ALL spend (triage,
+    /// QuestionAnswerer, Dispatcher, LLMConversationMatcher) with no
+    /// per-call-site plumbing. nil (the default) = no recording, i.e.
+    /// exactly the pre-v0.3.0 behavior.
+    ///
+    /// Wired in exactly ONE place in production: SupervisorApp's
+    /// enterRunningState hands the shared running-state client a recorder
+    /// backed by the same CostStore the panel reads. TriageEngine's old
+    /// per-call-site recordHaiku calls were removed at the same time —
+    /// recording lives here and ONLY here, or spend double-counts.
+    private let costRecorder: (@Sendable (_ model: String, _ usage: AnthropicUsage) -> Void)?
+
+    /// v0.3.0 daily-cap gate (P0-4). Consulted at the top of every
+    /// `createMessage`; when it returns a (cap, spent) pair with
+    /// spent >= cap, the call throws `DailyCapExceededError` WITHOUT
+    /// making a network request. Return nil for "no cap configured /
+    /// don't gate". nil closure (the default) = no gating at all.
+    ///
+    /// Wired next to `costRecorder` in SupervisorApp's enterRunningState:
+    /// reads UserConfig.dailyCostCapUSD (re-loaded per call, so cap edits
+    /// apply live) against CostStore.todayTotalUSD().
+    private let capCheck: (@Sendable () -> (cap: Double, spent: Double)?)?
+
+    /// Finding 3 (2026-07-03): in-flight spend reservation, so the daily-cap
+    /// gate holds under concurrent bursts. Guards a single `reserved` Double
+    /// (the sum of estimates for calls that have passed the gate but not yet
+    /// recorded). An actor because `createMessage` is `async` and the client
+    /// is `Sendable` — many Tasks can be inside `createMessage` at once.
+    private let spendReserve = SpendReserve()
+
     public init(
         provider: LLMProvider,
         apiKey: String,
@@ -58,7 +91,9 @@ public final class LLMClient: Sendable {
         baseURL: URL? = nil,
         session: URLSession = .shared,
         traceLog: TraceLog = .shared,
-        anthropicVersion: String = "2023-06-01"
+        anthropicVersion: String = "2023-06-01",
+        costRecorder: (@Sendable (_ model: String, _ usage: AnthropicUsage) -> Void)? = nil,
+        capCheck: (@Sendable () -> (cap: Double, spent: Double)?)? = nil
     ) {
         self.provider = provider
         self.apiKey = apiKey
@@ -67,6 +102,8 @@ public final class LLMClient: Sendable {
         self.session = session
         self.traceLog = traceLog
         self.anthropicVersion = anthropicVersion
+        self.costRecorder = costRecorder
+        self.capCheck = capCheck
     }
 
     // MARK: - Public surface
@@ -104,11 +141,109 @@ public final class LLMClient: Sendable {
     /// of the wire shape so call sites don't branch.
     @discardableResult
     public func createMessage(_ request: AnthropicMessageRequest) async throws -> AnthropicMessageResponse {
-        switch provider.apiShape {
-        case .anthropic:
-            return try await postAnthropic(request)
-        case .openAICompat:
-            return try await postOpenAICompat(request)
+        // v0.3.0 daily-cap gate: refuse BEFORE any network work. The
+        // check sits ahead of encoding/redaction on purpose — a capped
+        // call should cost nothing, not even CPU.
+        //
+        // Finding 3 (2026-07-03): the gate compares against RECORDED spend,
+        // which only updates AFTER a call's network round-trip completes. Under
+        // a concurrent burst, N Tasks all read the same pre-spend `spent`, all
+        // pass `spent >= cap`, and actual spend overshoots the cap by ~N calls.
+        // Fix: reserve an estimate of this call's cost in an in-flight
+        // accumulator (the `spendReserve` actor) and gate on
+        // `spent + reserved >= cap` ATOMICALLY. Because the reserve-and-check
+        // runs inside the actor, a second concurrent call sees the first's
+        // reservation and is refused once the in-flight total would blow the
+        // cap — bounding overshoot to about one reservation's granularity. A
+        // single (non-concurrent) call still gates on `spent` alone: the
+        // in-flight total is 0 at that point, so `admit` reduces to the exact
+        // pre-Finding-3 boundary (`spent >= cap`).
+        var reservation: Double? = nil
+        if let capCheck, let limit = capCheck() {
+            let estimate = reservationEstimateUSD(for: request)
+            if let blocking = await spendReserve.admit(estimate: estimate, spent: limit.spent, cap: limit.cap) {
+                traceLog.emit(
+                    "api",
+                    "daily cap reached: spent=\(limit.spent) reserved=\(blocking) cap=\(limit.cap) provider=\(provider.rawValue) — call refused"
+                )
+                throw DailyCapExceededError(capUSD: limit.cap, spentUSD: limit.spent)
+            }
+            reservation = estimate
+        }
+
+        do {
+            // First redaction pass, over the PLAINTEXT. JSONEncoder writes a
+            // newline as the two characters `\n`, so on the encoded body the
+            // `(?m)^` line anchors and the `\b` boundaries at line starts never
+            // fire — an `export FOO=...` line or a line-leading `ghp_`/`AKIA`
+            // token would sail through an encoded-body pass alone. Redacting
+            // here, before any encoding, gives every pattern the real newlines
+            // it was written against. The encoded-body pass inside each POST
+            // path stays as a second layer.
+            let redactedRequest = plaintextRedacted(request)
+            let response: AnthropicMessageResponse
+            switch provider.apiShape {
+            case .anthropic:
+                response = try await postAnthropic(redactedRequest)
+            case .openAICompat:
+                response = try await postOpenAICompat(redactedRequest)
+            }
+
+            // v0.3.0 cost hook: record the spend of every successful call at
+            // the choke point. Passes the REQUESTED model id (the pricing
+            // table is keyed on the ids we configure, e.g. "deepseek-chat"),
+            // not the wire-echoed one. See the `costRecorder` doc comment for
+            // the double-counting handoff with TriageEngine.
+            costRecorder?(request.model, response.usage)
+            // Finding 3: the real cost is now recorded (visible to the next
+            // capCheck), so release the estimate from the in-flight total.
+            if let reservation { await spendReserve.release(reservation) }
+            return response
+        } catch {
+            // Finding 3: nothing was recorded — release the reservation so a
+            // failed call doesn't permanently occupy in-flight headroom.
+            if let reservation { await spendReserve.release(reservation) }
+            throw error
+        }
+    }
+
+    // MARK: - Plaintext redaction (first pass, pre-encoding)
+
+    /// Returns a copy of `request` with every human-content string — the
+    /// system prompt and each message's content — run through the redactor
+    /// while it is still plaintext. Fail-closed the same way the
+    /// encoded-body pass is: the redacted copy is built before any request
+    /// body exists and is the only value handed to the POST paths, so no
+    /// code path can encode or send the original strings.
+    private func plaintextRedacted(_ request: AnthropicMessageRequest) -> AnthropicMessageRequest {
+        AnthropicMessageRequest(
+            model: request.model,
+            max_tokens: request.max_tokens,
+            system: request.system.map { redactor.redact($0) },
+            messages: request.messages.map { message in
+                AnthropicMessage(role: message.role, content: plaintextRedacted(message.content))
+            },
+            tools: request.tools,
+            tool_choice: request.tool_choice
+        )
+    }
+
+    private func plaintextRedacted(_ content: AnthropicContent) -> AnthropicContent {
+        switch content {
+        case .string(let s):
+            return .string(redactor.redact(s))
+        case .blocks(let blocks):
+            return .blocks(blocks.map { block in
+                AnthropicContentBlock(
+                    type: block.type,
+                    text: block.text.map { redactor.redact($0) },
+                    id: block.id,
+                    name: block.name,
+                    input: block.input,
+                    tool_use_id: block.tool_use_id,
+                    content: block.content
+                )
+            })
         }
     }
 
@@ -123,6 +258,9 @@ public final class LLMClient: Sendable {
         } catch {
             throw AnthropicClientError.decodingFailed(reason: "request encode: \(error)")
         }
+        // Second-layer pass over the encoded body. The plaintext pass in
+        // createMessage() already ran; this catches anything assembled by
+        // the encoder itself.
         let redacted = redactor.redact(String(decoding: bodyData, as: UTF8.self))
         let outgoing = Data(redacted.utf8)
 
@@ -162,6 +300,9 @@ public final class LLMClient: Sendable {
         } catch {
             throw AnthropicClientError.decodingFailed(reason: "request encode: \(error)")
         }
+        // Second-layer pass over the encoded body. The plaintext pass in
+        // createMessage() already ran; this catches anything assembled by
+        // the encoder itself.
         let redacted = redactor.redact(String(decoding: bodyData, as: UTF8.self))
         let outgoing = Data(redacted.utf8)
 
@@ -443,5 +584,65 @@ public final class LLMClient: Sendable {
             }
         }
         return nil
+    }
+
+    // MARK: - Daily-cap reservation (Finding 3)
+
+    /// A conservative worst-case cost for ONE call, in USD. Used only to
+    /// reserve in-flight spend so a concurrent burst can't blow the daily cap
+    /// between the pre-call `spent` read and the post-call record.
+    ///
+    /// Estimate basis: the ENTIRE `max_tokens` budget billed at the model's
+    /// OUTPUT rate (output is the pricier side, and the reply length is the one
+    /// unknown at gate time), plus a rough input allowance from the request
+    /// text at ~4 chars/token. Overestimating is safe — it only makes the gate
+    /// slightly more conservative under concurrency; a single call still gates
+    /// on recorded `spent` alone (in-flight total is 0). An unknown model
+    /// records as $0 (loud silence per TokenAccounting), so it reserves $0 too
+    /// — the reservation never gates a model whose spend the store treats as
+    /// free.
+    func reservationEstimateUSD(for request: AnthropicMessageRequest) -> Double {
+        guard let price = TokenAccounting.prices[request.model] else { return 0 }
+        let inputChars = (request.system?.count ?? 0) + request.messages.reduce(0) { acc, message in
+            switch message.content {
+            case .string(let s):
+                return acc + s.count
+            case .blocks(let blocks):
+                return acc + blocks.reduce(0) { $0 + ($1.text?.count ?? 0) }
+            }
+        }
+        let inputTokens = Double(inputChars) / 4.0
+        let outputTokens = Double(request.max_tokens)
+        return inputTokens * (price.inputPer1M / 1_000_000)
+             + outputTokens * (price.outputPer1M / 1_000_000)
+    }
+
+    /// Serializes the in-flight reservation accounting for the daily-cap gate.
+    /// `admit` is the atomic "gate + reserve" step: two concurrent calls can't
+    /// both read the same pre-reservation total and both pass, because the
+    /// second runs after the first has committed its reservation.
+    private actor SpendReserve {
+        /// Sum of estimates for calls admitted but not yet recorded/released.
+        private(set) var reserved: Double = 0
+
+        /// Atomic gate. If `spent` plus what is ALREADY in flight (reserved by
+        /// other concurrent calls, NOT this one) would meet or exceed `cap`,
+        /// refuse: return the blocking in-flight total and reserve nothing.
+        /// Otherwise reserve `estimate` for this call and return nil (admitted).
+        /// A single, non-concurrent call sees `reserved == 0`, so the test
+        /// reduces to `spent >= cap` — the exact pre-Finding-3 boundary.
+        func admit(estimate: Double, spent: Double, cap: Double) -> Double? {
+            if spent + reserved >= cap {
+                return reserved
+            }
+            reserved += estimate
+            return nil
+        }
+
+        /// Drop a prior reservation once its call has recorded (or failed).
+        /// `max(0, …)` guards against any double-release drifting negative.
+        func release(_ estimate: Double) {
+            reserved = max(0, reserved - estimate)
+        }
     }
 }

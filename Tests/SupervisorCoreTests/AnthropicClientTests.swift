@@ -220,6 +220,37 @@ final class AnthropicClientTests: XCTestCase {
         XCTAssertEqual(TokenAccounting.costUSD(model: "made-up-model", usage: usage), 0)
     }
 
+    // v0.3.0: every provider's default triage model must be priced —
+    // otherwise that provider's users record $0.00 forever (audit A1).
+    func testTokenAccountingKnowsEveryProviderDefaultTriageModel() {
+        let usage = AnthropicUsage(input_tokens: 1_000_000, output_tokens: 1_000_000,
+                                   cache_creation_input_tokens: nil,
+                                   cache_read_input_tokens: nil)
+        for p in LLMProvider.allCases {
+            let model = p.defaultTriageModel
+            XCTAssertTrue(TokenAccounting.isKnownModel(model),
+                          "\(p.rawValue) default triage model '\(model)' has no price entry")
+            XCTAssertGreaterThan(TokenAccounting.costUSD(model: model, usage: usage), 0,
+                                 "\(p.rawValue) default triage model '\(model)' must cost > 0")
+        }
+    }
+
+    func testTokenAccountingDeepSeekCost() {
+        // 1M input @ $0.28/1M + 1M output @ $0.42/1M = $0.70.
+        let usage = AnthropicUsage(input_tokens: 1_000_000, output_tokens: 1_000_000,
+                                   cache_creation_input_tokens: nil,
+                                   cache_read_input_tokens: nil)
+        XCTAssertEqual(TokenAccounting.costUSD(model: "deepseek-chat", usage: usage),
+                       0.70, accuracy: 0.0001)
+    }
+
+    func testIsKnownModelDistinguishesUnknownFromFree() {
+        XCTAssertFalse(TokenAccounting.isKnownModel("made-up-model"),
+                       "unknown model must be distinguishable from a $0 cost")
+        XCTAssertTrue(TokenAccounting.isKnownModel("claude-haiku-4-5-20251001"))
+        XCTAssertTrue(TokenAccounting.isKnownModel("deepseek-chat"))
+    }
+
     // MARK: - Live API (gated)
 
     /// Runs only if ANTHROPIC_API_KEY is set in the env. I run this

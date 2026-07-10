@@ -92,6 +92,36 @@ final class TraceLogTests: XCTestCase {
         XCTAssertTrue(rolledExists, "rolled .1 file should be present")
     }
 
+    // MARK: - defaultPath resolution (launch-audit fix: test log bleed)
+
+    func testDefaultPathHonorsSupervisorLogDirOverride() throws {
+        setenv("SUPERVISOR_LOG_DIR", tempDir.path, 1)
+        defer { unsetenv("SUPERVISOR_LOG_DIR") }
+
+        XCTAssertEqual(
+            TraceLog.defaultPath.path,
+            tempDir.appendingPathComponent("supervisor.log").path,
+            "$SUPERVISOR_LOG_DIR must fully determine the default log location"
+        )
+    }
+
+    /// The bleed this guards against: components that fall back to
+    /// `TraceLog.shared` during `swift test` were writing synthetic sessions
+    /// into the REAL ~/Library/Logs/Supervisor/supervisor.log
+    /// (`homeDirectoryForCurrentUser` ignores a stubbed $HOME, so temp-home
+    /// isolation never covered this path).
+    func testDefaultPathUnderXCTestNeverTargetsRealUserLogs() throws {
+        unsetenv("SUPERVISOR_LOG_DIR")
+
+        XCTAssertTrue(TraceLog.isRunningUnderXCTest,
+                      "this test IS an XCTest run; the probe must say so")
+
+        let realLogsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/Supervisor").path
+        XCTAssertFalse(TraceLog.defaultPath.path.hasPrefix(realLogsDir),
+                       "under XCTest the default trace path must never resolve into the user's real Logs dir, got: \(TraceLog.defaultPath.path)")
+    }
+
     func testConcurrentEmitsDoNotCorrupt() throws {
         let log = TraceLog(path: logPath)
         let group = DispatchGroup()

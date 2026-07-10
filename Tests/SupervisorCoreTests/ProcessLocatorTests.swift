@@ -146,6 +146,12 @@ final class ProcessLocatorTests: XCTestCase {
         XCTAssertEqual(handle?.cwd, dir)
         XCTAssertTrue(handle?.execPath.contains("FakeClaudeCLI") ?? false,
                       "execPath should contain FakeClaudeCLI; got \(handle?.execPath ?? "(nil)")")
+
+        // The desktop-fallback gate (signal paths) must not affect a REAL
+        // cwd match — it only suppresses the 0-match Claude.app fallback.
+        let strict = locator.locate(targetCwd: dir, allowDesktopFallback: false)
+        XCTAssertEqual(strict?.pid, fakePid,
+                       "a real cwd match must be returned even with the desktop fallback disallowed")
     }
 
     // MARK: - Filter by cwd (--multi-instance: parent in dir A, child in /tmp)
@@ -224,6 +230,25 @@ final class ProcessLocatorTests: XCTestCase {
             XCTAssertTrue(h.execPath.contains("Claude") || h.execPath.contains("claude"),
                           "if any handle returns from a not-found cwd, it must be the Claude.app fallback (v0.3.1); got \(h.execPath)")
         }
+    }
+
+    // MARK: - Desktop fallback gate (signal paths, 2026-07-02)
+
+    /// A locate for the SIGNAL path (`allowDesktopFallback: false`) must
+    /// return nil at 0 cwd matches instead of the Claude.app fallback PID —
+    /// a POSIX SIGSTOP/SIGTERM to the shared desktop process would freeze or
+    /// quit every conversation in it. Unlike `locate(targetCwd:)` (whose
+    /// result is environment-dependent, see
+    /// testLocatorReturnsNilWhenNoMatchingProcess), this holds whether or
+    /// not Claude.app is running on the test machine.
+    func testLocateWithDesktopFallbackDisallowedReturnsNilInsteadOfDesktopPID() {
+        let locator = LiveProcessLocator(execNamePatterns: ["FakeClaudeCLI"])
+        let handle = locator.locate(
+            targetCwd: "/var/folders/no/such/path/exists-\(UUID().uuidString)",
+            allowDesktopFallback: false
+        )
+        XCTAssertNil(handle,
+                     "with the desktop fallback disallowed, 0 cwd matches must yield nil — never Claude.app's PID")
     }
 
     // MARK: - Exec-name filter
@@ -349,6 +374,29 @@ final class ProcessLocatorTests: XCTestCase {
             return
         }
 
+        // ENVIRONMENT PROBE (CI flake guard): the exec_unrecognized tag can
+        // only fire if this process can read ANOTHER process's cwd/argv at
+        // all. GitHub macos runners intermittently deny cross-process
+        // KERN_PROCARGS2 / libproc reads (the same primitives the locator
+        // uses), which makes the spawned FakeClaudeCLI invisible here even
+        // though it's running — that's an environment limitation, not a
+        // locator regression. Probe both primitives against the KNOWN pid:
+        //   1. argv via the same KERN_PROCARGS2 read the locator uses;
+        //   2. cwd via a happy-path locate with MATCHING patterns (exercises
+        //      the PROC_PIDVNODEPATHINFO cwd read end-to-end).
+        // If either probe can't see the spawned process, skip loudly. When
+        // the probes pass, the full assertions below run unweakened.
+        if LiveProcessLocator.readProcessArgv(pid: fakePid) == nil {
+            throw XCTSkip("environment cannot read another process's argv via KERN_PROCARGS2 (pid \(fakePid)) — cross-process sysctl reads are denied on this runner, so the exec_unrecognized path is untestable here")
+        }
+        let probeLocator = LiveProcessLocator(
+            execNamePatterns: ["FakeClaudeCLI"],
+            trace: TraceLog(path: FileManager.default.temporaryDirectory
+                .appendingPathComponent("locator-probe-\(UUID().uuidString).log")))
+        if probeLocator.locate(targetCwd: dir)?.pid != fakePid {
+            throw XCTSkip("environment cannot resolve another process's cwd via libproc (pid \(fakePid)) — cross-process proc_pidinfo reads are denied on this runner, so the exec_unrecognized path is untestable here")
+        }
+
         // Custom trace log we can inspect.
         let traceURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("locator-trace-\(UUID().uuidString).log")
@@ -429,5 +477,61 @@ final class ProcessLocatorTests: XCTestCase {
                      "an unused session id must not match any process")
         // Empty id is rejected outright.
         XCTAssertNil(locator.locate(bySessionId: ""))
+    }
+
+    // MARK: - TOCTOU re-check (Finding 4): stillClaudeProcess
+
+    /// A live process matching the exec patterns must re-check as still-Claude —
+    /// the happy path the router relies on to fire the group signal.
+    func testStillClaudeProcessTrueForLiveMatchingProcess() throws {
+        let binary = try fakeClaudeBinary()
+        let dir = try makeTempDir("recheck-live")
+        let pidFile = dir + "/fake.pid"
+        let proc = try spawnFakeClaude(binary: binary, cwd: dir, jsonl: dir + "/t.jsonl", pidFile: pidFile)
+        defer { cleanup(processes: [proc], dirs: [dir]) }
+        guard let fakePid = waitForPidFile(at: pidFile) else {
+            XCTFail("FakeClaudeCLI never wrote its pid file"); return
+        }
+        let locator = LiveProcessLocator(execNamePatterns: ["FakeClaudeCLI"])
+        XCTAssertTrue(locator.stillClaudeProcess(pid: fakePid),
+                      "a live process matching the exec patterns must re-check as still-Claude")
+    }
+
+    /// A live pid whose exec is NOT Claude-shaped (patterns don't match and it
+    /// isn't a JS-runtime interpreter) models the reused-pid case → false, so
+    /// the router refuses the group signal.
+    func testStillClaudeProcessFalseWhenExecNameDoesNotMatch() throws {
+        let binary = try fakeClaudeBinary()
+        let dir = try makeTempDir("recheck-nomatch")
+        let pidFile = dir + "/fake.pid"
+        let proc = try spawnFakeClaude(binary: binary, cwd: dir, jsonl: dir + "/t.jsonl", pidFile: pidFile)
+        defer { cleanup(processes: [proc], dirs: [dir]) }
+        guard let fakePid = waitForPidFile(at: pidFile) else {
+            XCTFail("FakeClaudeCLI never wrote its pid file"); return
+        }
+        let locator = LiveProcessLocator(execNamePatterns: ["claude", "claude-code"])
+        XCTAssertFalse(locator.stillClaudeProcess(pid: fakePid),
+                       "a live pid whose exec isn't Claude-shaped must re-check false (models pid reuse)")
+    }
+
+    /// An exited pid must re-check false (`proc_pidpath` fails) — the router
+    /// then degrades to notify instead of signaling a possibly-reused pid.
+    func testStillClaudeProcessFalseForExitedPid() throws {
+        let binary = try fakeClaudeBinary()
+        let dir = try makeTempDir("recheck-gone")
+        let pidFile = dir + "/fake.pid"
+        let proc = try spawnFakeClaude(binary: binary, cwd: dir, jsonl: dir + "/t.jsonl", pidFile: pidFile)
+        guard let fakePid = waitForPidFile(at: pidFile) else {
+            cleanup(processes: [proc], dirs: [dir])
+            XCTFail("FakeClaudeCLI never wrote its pid file"); return
+        }
+        // Terminate and reap, so the pid no longer resolves to any exec path.
+        proc.terminate()
+        proc.waitUntilExit()
+        usleep(200_000)
+        try? FileManager.default.removeItem(atPath: dir)
+        let locator = LiveProcessLocator(execNamePatterns: ["FakeClaudeCLI"])
+        XCTAssertFalse(locator.stillClaudeProcess(pid: fakePid),
+                       "an exited pid must re-check false")
     }
 }

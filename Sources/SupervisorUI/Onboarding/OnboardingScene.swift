@@ -1,11 +1,11 @@
 // OnboardingScene.swift
 //
-// v0.1.6.3 layout — a 480×420 window split into three explicit bands:
+// v0.1.6.3 layout: a 480x420 window split into three explicit bands.
 //
-//   Header (80pt, Paper-warm bg)     — wordmark centered at 24pt
-//   Content (fill = 284pt, default)   — step indicator + title + step body
-//   Footer (56pt, Paper bg)           — primary button right-aligned;
-//                                       Skip left-aligned on the AX step
+//   Header (80pt, Paper-warm bg):   wordmark centered at 24pt
+//   Content (fill = 284pt, default): step indicator + title + step body
+//   Footer (56pt, Paper bg):        primary button right-aligned;
+//                                    Skip left-aligned on the AX step
 //
 // Window grew from 360→420pt in v0.1.6.3: at 360pt the AX step body
 // and the Notif-denied state body both overflowed the 224pt content
@@ -13,12 +13,12 @@
 // for the longer note.
 //
 // Step views (KeyEntryStep, AXCheckStep, NotifCheckStep) shed their
-// primary buttons — those moved into the footer here. KeyEntryStep's
+// primary buttons, those moved into the footer here. KeyEntryStep's
 // `key` state lifts up via a Binding<String> so the footer's primary
 // button can gate its disabled state on emptiness. AXCheckStep's
 // "Re-check now" is gone entirely (vm.tick() polls every 1.5s);
-// NotifCheckStep's "Skip" is removed per the spec ("Skip only on AX")
-// — in `.denied` the secondary "Open System Settings" still lives
+// NotifCheckStep's "Skip" is removed per the spec ("Skip only on AX").
+// In `.denied` the secondary "Open System Settings" still lives
 // inside the content area as a non-primary action.
 
 import AppKit
@@ -70,20 +70,36 @@ public struct OnboardingScene: View {
         ZStack {
             BrandColor.paperWarm.color
             wordmark
-                .frame(height: 24)
+                .frame(height: BrandMetrics.iconLarge)
                 .accessibilityLabel("Supervisor")
         }
         .frame(height: 80)
         .frame(maxWidth: .infinity)
+        // The header band closes on a hairline rule, the same quiet 1px
+        // separator the Plan card uses between surfaces, so the wizard
+        // reads as the same instrument, not a stack of differently-edged
+        // panes.
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(BrandColor.mute.color.opacity(0.15))
+                .frame(height: BrandMetrics.hairline)
+        }
     }
 
     /// SVG resource → NSImage → SwiftUI Image, with a text fallback. The
-    /// fallback prevents an empty header band if Bundle.module misses the
-    /// asset (resource-stripped build, name typo, etc.) — same defensive
-    /// shape as SupervisorStatusBar's branded glyph.
+    /// fallback prevents an empty header band if the resource bundle misses
+    /// the asset (resource-stripped build, name typo, etc.), same defensive
+    /// shape as the menu-bar status item's branded glyph.
+    ///
+    /// Deliberately NOT `Bundle.module`: the synthesized accessor fatalErrors
+    /// when `Supervisor_SupervisorUI.bundle` itself is absent — exactly the
+    /// packaged-app case if the build script ever fails to copy it into
+    /// Contents/Resources — which would crash the app on the FIRST onboarding
+    /// render. `Self.resourceBundle` probes the same locations and returns nil
+    /// instead, so a missing bundle degrades to the text fallback below.
     @ViewBuilder
     private var wordmark: some View {
-        if let ns = Bundle.module.image(forResource: "OnboardingWordmark") {
+        if let ns = Self.resourceBundle?.image(forResource: "OnboardingWordmark") {
             Image(nsImage: ns)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
@@ -94,6 +110,37 @@ public struct OnboardingScene: View {
         }
     }
 
+    /// Non-trapping stand-in for `Bundle.module`. Probes the candidate
+    /// directories the synthesized accessor searches — the main bundle's
+    /// Resources dir and bundle root, the class-context bundle (dev / xctest
+    /// layouts, where SwiftPM drops the resource bundle next to the binary),
+    /// and the executable's own directory — and returns nil when the bundle
+    /// is genuinely absent rather than crashing.
+    /// Class token for `Bundle(for:)` — resolves to the binary this library is
+    /// statically linked into (the app in production, the xctest bundle in tests).
+    private final class SupervisorUIBundleToken {}
+
+    private static let resourceBundle: Bundle? = {
+        let name = "Supervisor_SupervisorUI.bundle"
+        var candidates: [URL] = []
+        if let u = Bundle.main.resourceURL { candidates.append(u) }
+        candidates.append(Bundle.main.bundleURL)
+        let classBundle = Bundle(for: SupervisorUIBundleToken.self)
+        if let u = classBundle.resourceURL { candidates.append(u) }
+        candidates.append(classBundle.bundleURL.deletingLastPathComponent())
+        if let exe = Bundle.main.executableURL?.deletingLastPathComponent() {
+            candidates.append(exe)
+            candidates.append(exe.deletingLastPathComponent().appendingPathComponent("Resources"))
+        }
+        for dir in candidates {
+            let url = dir.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: url.path), let b = Bundle(url: url) {
+                return b
+            }
+        }
+        return nil
+    }()
+
     // MARK: - Content
 
     @ViewBuilder
@@ -101,7 +148,7 @@ public struct OnboardingScene: View {
         // Wrap in a ZStack with an explicit Paper background so the
         // content band doesn't fall through to the window's default
         // background (belt + suspenders with .preferredColorScheme(.light)
-        // on the parent — works even if a future SwiftUI build ignores
+        // on the parent, works even if a future SwiftUI build ignores
         // the colorScheme hint on borderless-content-view windows).
         ZStack {
             BrandColor.paper.color
@@ -114,7 +161,7 @@ public struct OnboardingScene: View {
                 CompleteStep()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             default:
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: BrandSpacing.sm) {
                     Text(stepIndicatorText)
                         .font(BrandFont.indicator)
                         .tracking(1)
@@ -124,22 +171,30 @@ public struct OnboardingScene: View {
                         .font(BrandFont.title)
                         .foregroundStyle(BrandColor.ink.color)
                     stepBody
-                        .padding(.top, 4)
+                        .padding(.top, BrandSpacing.xs)
                 }
-                .padding(.horizontal, 24)
-                .padding(.top, 16)
-                .padding(.bottom, 12)
+                .padding(.horizontal, BrandSpacing.xl)
+                .padding(.top, BrandSpacing.lg)
+                .padding(.bottom, BrandSpacing.md)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // The one calm beat as a step lands: content crossfades on the
+        // standard motion (the same curve the panel uses when its contents
+        // reflow), so advancing a step reads as a deliberate transition,
+        // never a jump. Keyed on the step identity so substate changes
+        // within a step (an inline error appearing) don't re-trigger it.
+        .animation(BrandMotion.standard, value: stepIndicatorText)
     }
 
     private var stepIndicatorText: String {
         switch vm.state {
-        case .keyEntry, .keyValidating: return "Step 1 of 3"
-        case .axCheck:                  return "Step 2 of 3"
-        case .notifCheck:               return "Step 3 of 3"
+        case .keyEntry, .keyValidating: return "Step 1 of 5"
+        case .axCheck:                  return "Step 2 of 5"
+        case .screenRecordingCheck:     return "Step 3 of 5"
+        case .notifCheck:               return "Step 4 of 5"
+        case .customization:            return "Step 5 of 5"
         case .complete:                 return ""
         }
     }
@@ -152,7 +207,9 @@ public struct OnboardingScene: View {
             // / Moonshot / etc. picked.
             return "\(vm.selectedProvider.displayName) API key"
         case .axCheck:                  return "Accessibility access"
+        case .screenRecordingCheck:     return "Screen Recording access"
         case .notifCheck:               return "Notifications"
+        case .customization:            return "Make it yours"
         case .complete:                 return "All set"
         }
     }
@@ -163,11 +220,15 @@ public struct OnboardingScene: View {
         case .keyEntry(let err):
             KeyEntryStep(vm: vm, error: err, key: $keyDraft)
         case .keyValidating:
-            KeyValidatingStep(provider: vm.selectedProvider)
+            KeyValidatingStep(providerName: vm.selectedProvider.displayName)
         case .axCheck(let prompted):
             AXCheckStep(vm: vm, prompted: prompted)
+        case .screenRecordingCheck(let prompted):
+            ScreenRecordingCheckStep(vm: vm, prompted: prompted)
         case .notifCheck(let status):
             NotifCheckStep(vm: vm, status: status)
+        case .customization:
+            CustomizationStep()
         case .complete:
             EmptyView()   // handled by the `.complete` branch in `content`
         }
@@ -178,14 +239,14 @@ public struct OnboardingScene: View {
     private var footer: some View {
         VStack(spacing: 0) {
             Rectangle()
-                .fill(BrandColor.paperWarm.color)
-                .frame(height: 1)
-            HStack(spacing: 10) {
+                .fill(BrandColor.mute.color.opacity(0.15))
+                .frame(height: BrandMetrics.hairline)
+            HStack(spacing: BrandSpacing.sm) {
                 skipButton
                 Spacer()
                 primaryButton
             }
-            .padding(.horizontal, 24)
+            .padding(.horizontal, BrandSpacing.xl)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(BrandColor.paper.color)
         }
@@ -197,6 +258,13 @@ public struct OnboardingScene: View {
         if case .axCheck = vm.state {
             Button("Skip for now") {
                 Task { await vm.skipAX() }
+            }
+            .buttonStyle(.plain)
+            .font(BrandFont.button)
+            .foregroundStyle(BrandColor.mute.color)
+        } else if case .screenRecordingCheck = vm.state {
+            Button("Skip for now") {
+                Task { await vm.skipScreenRecording() }
             }
             .buttonStyle(.plain)
             .font(BrandFont.button)
@@ -215,7 +283,9 @@ public struct OnboardingScene: View {
             .disabled(keyDraft.trimmingCharacters(in: .whitespaces).isEmpty)
 
         case .keyValidating:
-            ProgressView().controlSize(.small)
+            ProgressView()
+                .controlSize(.small)
+                .tint(BrandColor.signal.color)
 
         case .axCheck(let prompted):
             // Before the user has been sent to Settings, the primary
@@ -238,6 +308,26 @@ public struct OnboardingScene: View {
                 .keyboardShortcut(.defaultAction)
             }
 
+        case .screenRecordingCheck(let prompted):
+            // Mirrors the AX step: before the user has been sent to Settings,
+            // the primary action opens System Settings (and fires the macOS
+            // request once). After that it becomes "Continue" so a user who
+            // enabled the grant is never stuck on "Skip" when macOS fails to
+            // report the grant back. The 1.5s poll still auto-advances when
+            // macOS does report it.
+            if prompted {
+                BrandPrimaryButton("Continue") {
+                    Task { await vm.confirmScreenRecording() }
+                }
+                .keyboardShortcut(.defaultAction)
+            } else {
+                BrandPrimaryButton("Open System Settings") {
+                    NSWorkspace.shared.open(PermissionSettingsURL.screenRecording)
+                    vm.promptForScreenRecording()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+
         case .notifCheck(.notDetermined):
             BrandPrimaryButton("Request permission") {
                 Task { await vm.requestNotifications() }
@@ -253,6 +343,12 @@ public struct OnboardingScene: View {
         case .notifCheck(.denied):
             BrandPrimaryButton("Continue anyway") {
                 vm.finishNotificationStep()
+            }
+            .keyboardShortcut(.defaultAction)
+
+        case .customization:
+            BrandPrimaryButton("Done") {
+                vm.finishCustomizationStep()
             }
             .keyboardShortcut(.defaultAction)
 

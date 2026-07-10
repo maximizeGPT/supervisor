@@ -17,7 +17,6 @@
 //                               through Haiku on first start.
 
 import AppKit
-import CoreGraphics
 import Foundation
 import SupervisorCore
 
@@ -201,70 +200,6 @@ case "desktop-ocr-dump":
     }
     print("sidebarCandidates (\(cands.count)):")
     for c in cands.prefix(24) { print("  x=\(Int(c.point.x)) y=\(Int(c.point.y)) \"\(c.text)\"") }
-    if args.count >= 3, args[2] == "--all" {
-        print("ALL rows (x,y,text), sorted by y:")
-        for r in rows.sorted(by: { $0.point.y < $1.point.y }) {
-            print("  x=\(Int(r.point.x)) y=\(Int(r.point.y)) \"\(r.text.prefix(48))\"")
-        }
-    }
-case "desktop-click":
-    // Re-OCR live and click the screen label matching <needle>, confined to an
-    // optional x-column. The reusable "find a control and click it" primitive —
-    // for the MCQ Submit, the Stop button, etc. Usage: desktop-click <label> [minX] [maxX]
-    guard args.count >= 3 else { print("usage: desktop-click <label> [minX] [maxX]"); exit(2) }
-    let cNeedle = args[2]
-    let cMinX = args.count >= 4 ? (Double(args[3]) ?? 0) : 0
-    let cMaxX = args.count >= 5 ? (Double(args[4]) ?? 99999) : 99999
-    let ct = DesktopConversationTargeter()
-    guard let cimg = ct.captureMainDisplay() else { print("capture_failed"); exit(1) }
-    let crows = ct.recognizeRows(in: cimg).filter { Double($0.point.x) >= cMinX && Double($0.point.x) <= cMaxX }
-    guard let cpt = crows.first(where: { $0.text.localizedCaseInsensitiveContains(cNeedle) })?.point else {
-        print("'\(cNeedle)' not found in x=[\(Int(cMinX)),\(Int(cMaxX))].")
-        print("rows: " + crows.sorted { $0.point.y < $1.point.y }.prefix(24).map { "(\(Int($0.point.x)),\(Int($0.point.y)))\($0.text.prefix(14))" }.joined(separator: " | "))
-        exit(1)
-    }
-    for app in NSWorkspace.shared.runningApplications
-    where app.bundleIdentifier == "com.anthropic.claudefordesktop" { app.activate(options: []); break }
-    usleep(400_000)
-    print("clicking '\(cNeedle)' at (\(Int(cpt.x)),\(Int(cpt.y)))")
-    ct.click(at: cpt)
-case "desktop-mcq-answer":
-    // Answer an on-screen AskUserQuestion (MCQ) widget by the universal "Other"
-    // path: click Other → focus the text field → paste the answer → click Submit.
-    // Re-OCRs live (robust to layout). Optional minX/maxX confine it to ONE
-    // pane's column. Usage: desktop-mcq-answer "<answer>" [minX] [maxX]
-    guard args.count >= 3 else { print("usage: desktop-mcq-answer <answer> [minX] [maxX]"); exit(2) }
-    let mcqAnswer = args[2]
-    let mcqMinX = args.count >= 4 ? (Double(args[3]) ?? 0) : 0
-    let mcqMaxX = args.count >= 5 ? (Double(args[4]) ?? 99999) : 99999
-    let mt = DesktopConversationTargeter()
-    guard let mimg = mt.captureMainDisplay() else { print("capture_failed"); exit(1) }
-    let mrows = mt.recognizeRows(in: mimg).filter {
-        Double($0.point.x) >= mcqMinX && Double($0.point.x) <= mcqMaxX
-    }
-    func mfind(_ needle: String) -> CGPoint? {
-        mrows.first { $0.text.localizedCaseInsensitiveContains(needle) }?.point
-    }
-    guard let fieldPt = mfind("Type your own") ?? mfind("Other"),
-          let submitPt = mfind("Submit") else {
-        print("MCQ controls not found in x=[\(Int(mcqMinX)),\(Int(mcqMaxX))].")
-        print("rows: " + mrows.prefix(16).map { "(\(Int($0.point.x)),\(Int($0.point.y)))\($0.text.prefix(14))" }.joined(separator: " | "))
-        exit(1)
-    }
-    let otherPt = mfind("Other") ?? fieldPt
-    for app in NSWorkspace.shared.runningApplications
-    where app.bundleIdentifier == "com.anthropic.claudefordesktop" { app.activate(options: []); break }
-    usleep(500_000)
-    print("Other@(\(Int(otherPt.x)),\(Int(otherPt.y))) field@(\(Int(fieldPt.x)),\(Int(fieldPt.y))) Submit@(\(Int(submitPt.x)),\(Int(submitPt.y)))")
-    mt.click(at: otherPt); usleep(350_000)
-    mt.click(at: fieldPt); usleep(350_000)
-    let mpb = NSPasteboard.general; mpb.clearContents(); mpb.setString(mcqAnswer, forType: .string)
-    let mcsrc = CGEventSource(stateID: .hidSystemState)
-    if let dn = CGEvent(keyboardEventSource: mcsrc, virtualKey: 9, keyDown: true) { dn.flags = .maskCommand; dn.post(tap: .cghidEventTap) }
-    if let up = CGEvent(keyboardEventSource: mcsrc, virtualKey: 9, keyDown: false) { up.flags = .maskCommand; up.post(tap: .cghidEventTap) }
-    usleep(450_000)
-    mt.click(at: submitPt)
-    print("submitted answer to MCQ: \(mcqAnswer.prefix(60))")
 case "match-test":
     // Verify the Path B LLM conversation matcher against real titles, using
     // the user's CONFIGURED provider + key (same path the app uses), so the
@@ -433,7 +368,95 @@ case "desktop-title":
     print("aiTitle (JSONL, frozen): \(frozen.map { "\"\($0)\"" } ?? "nil")")
     print("desktop title (live):    \(live.map { "\"\($0)\"" } ?? "nil")")
     print(frozen == live ? "  -> MATCH (no drift)" : "  -> DIVERGED: targeting must use the live title (this fix)")
+case "context-wiki":
+    // Run the Context Wiki auditor end-to-end against a project root and write
+    // the artifacts (CONTEXT-WIKI.md / CONTEXT-SCHEMA.md / RECOMMENDATIONS.md +
+    // audit-report.json). This is the runnable proof of the general capability —
+    // point it at ANY directory with CLAUDE.md / SKILL.md / commands.
+    //
+    //   context-wiki <root> [--survey] [--out DIR] [--persist]
+    //     --survey   also run the cheap-model per-source semantic pass (needs a
+    //                configured provider + key). Off by default (deterministic-only).
+    //     --out DIR  where to write artifacts (default: appSupport/context-wiki/<name>).
+    //     --persist  record a summary row in the Supervisor DB (context_audits).
+    guard args.count >= 3 else {
+        print("usage: SupervisorDevTools context-wiki <root> [--survey] [--out DIR] [--persist]")
+        exit(2)
+    }
+    let root = URL(fileURLWithPath: args[2], isDirectory: true)
+    let runSurvey = args.contains("--survey")
+    let persist = args.contains("--persist")
+    let outDir: URL = {
+        if let i = args.firstIndex(of: "--out"), i + 1 < args.count {
+            return URL(fileURLWithPath: args[i + 1], isDirectory: true)
+        }
+        let name = root.lastPathComponent.isEmpty ? "root" : root.lastPathComponent
+        return ConfigPaths().appSupportDir
+            .appendingPathComponent("context-wiki", isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
+    }()
+
+    // Optional survey: build a client from the configured provider + key, exactly
+    // like the app does. Absent key -> deterministic-only (never a hard failure).
+    // A `let` (built once here) so it can be captured by the audit Task below;
+    // a captured `var` is rejected under strict concurrency.
+    let surveyor: SourceSurveyor? = {
+        guard runSurvey else { return nil }
+        let paths = ConfigPaths()
+        let provider = (try? FileActiveProviderStore(path: paths.activeProviderPath).read()) ?? .anthropic
+        guard let key = ((try? KeychainProviderKeyStore().read(provider)) ?? nil), !key.isEmpty else {
+            print("survey: requested but no API key for active provider — running deterministic-only")
+            return nil
+        }
+        let client = LLMClient(provider: provider, apiKey: key, redactor: DefaultRedactor(), traceLog: .shared)
+        print("survey: ON (provider=\(provider.rawValue), model=\(provider.defaultTriageModel))")
+        return SourceSurveyor(client: client)
+    }()
+
+    let auditor = ContextAuditor()
+    let renderer = WikiRenderer()
+    let box = ResultBox2()
+    let sem = DispatchSemaphore(value: 0)
+    Task {
+        let report = await auditor.audit(root: root, surveyor: surveyor)
+        box.report = report
+        sem.signal()
+    }
+    sem.wait()
+    guard let report = box.report else { print("ERROR: audit produced no report"); exit(1) }
+
+    do {
+        let written = try renderer.writeArtifacts(report, to: outDir)
+        print("")
+        print(renderer.consoleSummary(report))
+        print("")
+        print("artifacts written to \(outDir.path):")
+        print("  \(written.wikiPath.lastPathComponent)")
+        print("  \(written.schemaPath.lastPathComponent)")
+        print("  \(written.recommendationsPath.lastPathComponent)")
+        print("  \(written.reportJSONPath.lastPathComponent)")
+    } catch {
+        print("ERROR writing artifacts: \(error)")
+        exit(1)
+    }
+
+    if persist {
+        let paths = ConfigPaths()
+        do {
+            try paths.ensureDirectoriesExist()
+            let db = try SupervisorDatabase(path: paths.databasePath)
+            let row = try ContextAuditStore(database: db).record(report)
+            print("persisted audit row id=\(row.id) (context_audits)")
+        } catch {
+            print("WARN: could not persist audit: \(error)")
+        }
+    }
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)
 }
+
+/// Small reference box so the detached audit Task can hand its result back across
+/// the semaphore without mutating a captured `var` (Swift 6 strict concurrency).
+/// Named `…2` to avoid colliding with the `ResultBox` in the inject-test case.
+final class ResultBox2: @unchecked Sendable { var report: AuditReport? = nil }

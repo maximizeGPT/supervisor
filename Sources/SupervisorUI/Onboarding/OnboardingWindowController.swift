@@ -1,7 +1,7 @@
 // OnboardingWindowController.swift
 //
 // NSWindowController hosting the SwiftUI `OnboardingScene`. Sized at
-// 480x420 with no resize, no minimize, no zoom — Wispr-Flow/Clicky-style
+// 480x420 with no resize, no minimize, no zoom, Wispr-Flow/Clicky-style
 // fixed onboarding window. Height was 360pt in v0.1.3 but at that size
 // the AX step body + Notif-denied state body BOTH overflowed the 224pt
 // content band, eating into the 56pt footer and clipping the
@@ -35,7 +35,7 @@ public final class OnboardingWindowController: NSWindowController {
         // traffic-light controls and the drag-by-titlebar region.
         // Literally dropping `.titled` (Mohammed's first-pass instruction)
         // would also remove the close button and make the window
-        // un-draggable — `.titled + .fullSizeContentView` with a
+        // un-draggable, `.titled + .fullSizeContentView` with a
         // transparent + hidden title bar gives the cleaner result:
         // traffic lights float over the branded 80pt header's top-left
         // corner, and the window stays draggable through the (now

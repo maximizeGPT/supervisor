@@ -41,7 +41,14 @@ final class TriageEngineTests: XCTestCase {
             bus: bus,
             model: "claude-haiku-4-5-20251001",
             windowSize: 30,
-            costStore: nil
+            costStore: nil,
+            supervisorPausedRead: { false },  // hermetic: ignore the REAL pause marker
+            // Honest-health: this harness runs the REAL 1s background idle loop
+            // (default interval + start()). A no-op recorder keeps that loop's
+            // behavior identical while guaranteeing the test run never stamps the
+            // real global engine-progress.txt liveness token (which would flip a
+            // production status bar to lying GREEN over a hung engine).
+            recordEngineProgress: {}
         )
         let captured = CapturedDecisions()
         engine.onDecision = { d in captured.append(d) }
@@ -91,8 +98,10 @@ final class TriageEngineTests: XCTestCase {
             client: client, bus: bus, model: "claude-haiku-4-5-20251001",
             windowSize: 30, costStore: nil,
             loopController: lc,
+            supervisorPausedRead: { false },  // hermetic: ignore the REAL pause marker
             idleCheckIntervalSeconds: 3600,   // park the idle timer; we test only the userPrompt path
-            injectionLedger: ledger
+            injectionLedger: ledger,
+            recordEngineProgress: {}          // honest-health: never stamp the real liveness token
         )
         engine.start()
 
@@ -119,6 +128,68 @@ final class TriageEngineTests: XCTestCase {
             "a real operator message must pause the loop")
         XCTAssertNotNil(afterReal?.lastOwnerMessageAt,
             "a real operator message must stamp operator presence (drives the backoff)")
+    }
+
+    // Conflict-fix (2026-07-03): consume() gates the loop-STATE mutations on event
+    // age. A months-old replayed event (a `claude --resume` / post-compact copy)
+    // must NOT un-stick a stopped loop (stale userPrompt -> notePause) or clear a
+    // live pause (stale bashToolCall -> clearPause). Fresh events still mutate.
+    func testStaleReplayedEventsDoNotMutateLoopState() async throws {
+        let bus = EventBus(trace: TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("stale-\(UUID().uuidString).log")))
+        let client = LLMClient(provider: .anthropic, apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: mockSession(),
+            traceLog: TraceLog(path: FileManager.default.temporaryDirectory
+                .appendingPathComponent("stale-client-\(UUID().uuidString).log")))
+        let lc = LoopController(trace: TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("stale-loop-\(UUID().uuidString).log")))
+        let engine = TriageEngine(
+            client: client, bus: bus, model: "claude-haiku-4-5-20251001",
+            windowSize: 30, costStore: nil,
+            loopController: lc,
+            supervisorPausedRead: { false },  // hermetic: ignore the REAL pause marker
+            idleCheckIntervalSeconds: 3600,   // park the idle timer
+            injectionLedger: InjectionLedger(),
+            recordEngineProgress: {})         // honest-health: never stamp the real liveness token
+        engine.start()
+        defer { engine.stop() }
+
+        let session = "stale-session"
+        let stale = Date().addingTimeInterval(-3600)  // 1h old > 120s threshold
+        let fresh = Date()
+
+        // 1. Loop hard-stopped on three-consecutive-low.
+        await lc.stop(sessionId: session, reason: .threeConsecutiveLow)
+
+        // 2. A STALE replayed operator prompt must NOT clear that stop.
+        bus.publish(.userPrompt(.init(sessionId: session, text: "old direction", ts: stale)))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        var snap = await lc.snapshot(sessionId: session)
+        XCTAssertEqual(snap?.stopped, true, "a stale userPrompt must NOT clear a hard stop")
+        XCTAssertEqual(snap?.stopReason, .threeConsecutiveLow)
+
+        // 3. A FRESH operator prompt DOES clear the three-low stop and pauses.
+        bus.publish(.userPrompt(.init(sessionId: session, text: "new direction", ts: fresh)))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        snap = await lc.snapshot(sessionId: session)
+        XCTAssertNotEqual(snap?.stopped, true, "a fresh userPrompt clears the three-low stop")
+        XCTAssertEqual(snap?.paused, true, "a fresh operator prompt pauses the loop")
+
+        // 4. A STALE bashToolCall must NOT clear the live pause.
+        bus.publish(.bashToolCall(.init(sessionId: session, command: "echo hi", description: nil,
+                                        toolUseId: "stale-tc", turnUUID: "u", ts: stale)))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        snap = await lc.snapshot(sessionId: session)
+        XCTAssertEqual(snap?.paused, true, "a stale bashToolCall must NOT clear a live pause")
+
+        // 5. A FRESH bashToolCall clears the pause (the worker resumed now).
+        bus.publish(.bashToolCall(.init(sessionId: session, command: "echo hi2", description: nil,
+                                        toolUseId: "fresh-tc", turnUUID: "u", ts: Date())))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        snap = await lc.snapshot(sessionId: session)
+        XCTAssertNotEqual(snap?.paused, true, "a fresh bashToolCall clears the pause")
     }
 
     // Helper: a record_triage response that returns one flag.
@@ -399,6 +470,10 @@ final class TriageEngineTests: XCTestCase {
             model: "claude-haiku-4-5-20251001",
             windowSize: 30,
             costStore: nil,
+            supervisorPausedRead: { false },  // hermetic: ignore the REAL pause marker
+            // Honest-health: default 1s background loop runs here — no-op the
+            // engine-progress recorder so the test never touches the real token.
+            recordEngineProgress: {},
             trace: trace
         )
         let captured = CapturedDecisions()
@@ -458,6 +533,74 @@ final class TriageEngineTests: XCTestCase {
     }
 
     // MARK: - Capture helper
+
+    // MARK: - Deterministic-catch restart-replay dedupe (launch-audit fix)
+
+    /// A SessionTail resumes from the last PERSISTED offset, so an engine
+    /// restart replays the trailing transcript events. The deterministic catch
+    /// used to re-fire on the replayed tool_use and post a second identical
+    /// destructive-action banner. With the sqlite dedupe ledger: the first
+    /// engine fires + notifies; a second engine (the restart) sees the SAME
+    /// toolUseId and stays silent; a genuinely NEW destructive event on the
+    /// second engine still fires.
+    func testDeterministicCatchDoesNotReNotifyReplayedEventAfterRestart() async throws {
+        let tmpDb = FileManager.default.temporaryDirectory
+            .appendingPathComponent("triage-catch-dedupe-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tmpDb) }
+        let db = try SupervisorDatabase(path: tmpDb)
+        let auditStore = AuditStore(database: db)
+
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("triage-catch-dedupe-\(UUID().uuidString).log"))
+        let bus = EventBus(trace: trace)
+
+        func makeEngineWithLedger() -> (TriageEngine, CapturedDecisions) {
+            let client = LLMClient(provider: .anthropic,
+                apiKey: "sk-ant-test",
+                redactor: DefaultRedactor(),
+                baseURL: URL(string: "https://mock.anthropic.test")!,
+                session: mockSession(),
+                traceLog: trace
+            )
+            let engine = TriageEngine(
+                client: client, bus: bus, model: "claude-haiku-4-5-20251001",
+                windowSize: 30, costStore: nil,
+                auditStore: auditStore,
+                supervisorPausedRead: { false },  // hermetic: ignore the REAL pause marker
+                idleCheckIntervalSeconds: 3600,   // park the idle timer
+                recordEngineProgress: {},         // never stamp the real liveness token
+                trace: trace
+            )
+            let captured = CapturedDecisions()
+            engine.onDecision = { d in captured.append(d) }
+            return (engine, captured)
+        }
+
+        // Engine 1 (pre-restart): the catch fires and notifies once. No canned
+        // HTTP response exists — the catch must short-circuit the model.
+        let (engine1, captured1) = makeEngineWithLedger()
+        engine1.start()
+        publishBashCall(bus, command: "git reset --hard", sessionId: "s-replay", toolUseId: "toolu-replayed")
+        try await captured1.waitFor(count: 1, within: 4.0)
+        XCTAssertEqual(captured1.snapshot.first?.candidate.category, "destructive_action_pending")
+        engine1.stop()
+
+        // Engine 2 (the restart): the tail re-delivers the SAME event from the
+        // persisted offset. It must NOT produce a second decision.
+        let (engine2, captured2) = makeEngineWithLedger()
+        engine2.start()
+        publishBashCall(bus, command: "git reset --hard", sessionId: "s-replay", toolUseId: "toolu-replayed")
+        try await Task.sleep(nanoseconds: 800_000_000)
+        XCTAssertEqual(captured2.snapshot.count, 0,
+                       "a replayed catch (same toolUseId) must not re-notify after a restart")
+
+        // A NEVER-seen destructive event must still fire on the restarted
+        // engine — dedupe is keyed on identity, not age or command text.
+        publishBashCall(bus, command: "git reset --hard", sessionId: "s-replay", toolUseId: "toolu-genuinely-new")
+        try await captured2.waitFor(count: 1, within: 4.0)
+        XCTAssertEqual(captured2.snapshot.first?.candidate.category, "destructive_action_pending")
+        engine2.stop()
+    }
 
     final class CapturedDecisions: @unchecked Sendable {
         private let lock = NSLock()
@@ -582,4 +725,5 @@ final class CwdExclusivityGateTests: XCTestCase {
             "/Users/main/supervisor"
         )
     }
+
 }

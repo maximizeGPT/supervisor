@@ -29,16 +29,18 @@ public enum LLMProvider: String, Codable, CaseIterable, Sendable {
     case moonshot
     case minimax
     case qwenHF       // Qwen via Hugging Face router
+    case openrouter   // OpenRouter aggregator — the deliberation-panel / Fusion backend
 
     /// User-facing label for the onboarding picker and the
     /// status-bar "active provider" tooltip.
     public var displayName: String {
         switch self {
-        case .anthropic: return "Anthropic"
-        case .deepseek:  return "DeepSeek"
-        case .moonshot:  return "Moonshot (Kimi)"
-        case .minimax:   return "MiniMax"
-        case .qwenHF:    return "Qwen (via Hugging Face)"
+        case .anthropic:  return "Anthropic"
+        case .deepseek:   return "DeepSeek"
+        case .moonshot:   return "Moonshot (Kimi)"
+        case .minimax:    return "MiniMax"
+        case .qwenHF:     return "Qwen (via Hugging Face)"
+        case .openrouter: return "OpenRouter"
         }
     }
 
@@ -52,6 +54,10 @@ public enum LLMProvider: String, Codable, CaseIterable, Sendable {
         case .moonshot:  return URL(string: "https://api.moonshot.ai")!
         case .minimax:   return URL(string: "https://api.minimax.chat")!
         case .qwenHF:    return URL(string: "https://router.huggingface.co")!
+        // Full endpoint is https://openrouter.ai/api/v1/chat/completions; the
+        // client appends `/v1/chat/completions` (openAICompat), so the base
+        // stops at `/api`.
+        case .openrouter: return URL(string: "https://openrouter.ai/api")!
         }
     }
 
@@ -83,6 +89,11 @@ public enum LLMProvider: String, Codable, CaseIterable, Sendable {
         case .moonshot:  return "kimi-k2-0905-preview"      // Kimi K2, function-call capable
         case .minimax:   return "MiniMax-M1"                // MiniMax M1 reasoner
         case .qwenHF:    return "Qwen/Qwen2.5-72B-Instruct" // HF router shape
+        // OpenRouter is primarily the panel/Fusion backend, not a triage
+        // provider; if selected as the main provider, route triage through a
+        // cheap tool-calling model. NOT `openrouter/fusion` — triage must stay
+        // a single fast call, never a 4-5x panel.
+        case .openrouter: return "openai/gpt-4o-mini"
         }
     }
 
@@ -101,6 +112,7 @@ public enum LLMProvider: String, Codable, CaseIterable, Sendable {
         case .moonshot:  return nil                          // verify Kimi vision model before enabling
         case .minimax:   return nil                          // verify MiniMax vision model before enabling
         case .qwenHF:    return nil                          // verify Qwen-VL HF router id before enabling
+        case .openrouter: return nil                         // verify an OpenRouter vision slug before enabling
         }
     }
 
@@ -114,6 +126,7 @@ public enum LLMProvider: String, Codable, CaseIterable, Sendable {
         case .moonshot:  return "sk-..."
         case .minimax:   return "eyJh... (JWT) or sk-..."
         case .qwenHF:    return "hf_..."
+        case .openrouter: return "sk-or-..."
         }
     }
 
@@ -127,6 +140,7 @@ public enum LLMProvider: String, Codable, CaseIterable, Sendable {
         case .moonshot:  return "live.supervisor.api.moonshot"
         case .minimax:   return "live.supervisor.api.minimax"
         case .qwenHF:    return "live.supervisor.api.qwenhf"
+        case .openrouter: return "live.supervisor.api.openrouter"
         }
     }
 

@@ -43,7 +43,60 @@ public enum TokenAccounting {
             cacheReadPer1M: 0.30,
             cacheWritePer1M: 3.75
         ),
+
+        // v0.3.0: default triage models of the non-Anthropic providers
+        // (see LLMProvider.defaultTriageModel). Without these, every
+        // DeepSeek/Moonshot/MiniMax/Qwen call recorded $0.00 forever.
+
+        // DeepSeek V3 — approximate list price, 2026-07.
+        "deepseek-chat": .init(
+            inputPer1M: 0.28,
+            outputPer1M: 0.42,
+            cacheReadPer1M: 0.028,
+            cacheWritePer1M: nil
+        ),
+        // Moonshot Kimi K2 — approximate list price, 2026-07.
+        "kimi-k2-0905-preview": .init(
+            inputPer1M: 0.60,
+            outputPer1M: 2.50,
+            cacheReadPer1M: 0.15,
+            cacheWritePer1M: nil
+        ),
+        // MiniMax M1 — approximate list price, 2026-07.
+        "MiniMax-M1": .init(
+            inputPer1M: 0.40,
+            outputPer1M: 2.20,
+            cacheReadPer1M: nil,
+            cacheWritePer1M: nil
+        ),
+        // Qwen2.5-72B via the Hugging Face router — provider-dependent;
+        // conservative approximate list price, 2026-07.
+        "Qwen/Qwen2.5-72B-Instruct": .init(
+            inputPer1M: 1.20,
+            outputPer1M: 1.20,
+            cacheReadPer1M: nil,
+            cacheWritePer1M: nil
+        ),
+        // OpenRouter's default triage model (LLMProvider.openrouter). OpenRouter
+        // is primarily the multi-model panel / Fusion backend, but if selected as
+        // the main provider its triage routes through a cheap tool-calling model.
+        // gpt-4o-mini list price via OpenRouter — approximate, 2026-07. (The
+        // `openrouter/fusion` slug itself is billed server-side as the sum of its
+        // panel + judge calls, so it stays unpriced here and records $0 locally.)
+        "openai/gpt-4o-mini": .init(
+            inputPer1M: 0.15,
+            outputPer1M: 0.60,
+            cacheReadPer1M: nil,
+            cacheWritePer1M: nil
+        ),
     ]
+
+    /// True when a rate exists for `model`. Lets callers distinguish
+    /// "genuinely free / unknown model" from "priced at zero" — the
+    /// costUSD-returns-0 fallback is otherwise ambiguous.
+    public static func isKnownModel(_ model: String) -> Bool {
+        prices[model] != nil
+    }
 
     /// Compute cost in USD for a usage block. Returns 0 for unknown models
     /// (loud silence — UI shows $0.00 cost, which signals stale pricing).

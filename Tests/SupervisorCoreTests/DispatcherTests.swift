@@ -274,11 +274,15 @@ final class DispatcherTests: XCTestCase {
                       "must define PATH 2")
         XCTAssertTrue(prompt.contains("low_confidence_no_action"),
                       "must define the low-confidence path")
-        // Voice / shape constraints (v0.8.1: operator voice rewrite)
+        // Voice / shape constraints (v0.8.1: operator voice rewrite;
+        // fix-queue #8: the proposal must ground in the live conversation,
+        // not generic PRINCIPLES-section boilerplate).
         XCTAssertTrue(prompt.contains("first-principles operator"),
                       "must teach the operator voice")
-        XCTAssertTrue(prompt.contains("75 min"),
-                      "must reference the hard stop in the proposal-shape rule")
+        XCTAssertTrue(prompt.contains("where this conversation actually is RIGHT NOW"),
+                      "must instruct grounding the proposal in the live conversation state")
+        XCTAssertTrue(prompt.contains("not in PRINCIPLES section numbers"),
+                      "must drop the mandatory PRINCIPLES-section-by-number boilerplate")
         XCTAssertTrue(prompt.contains("record_dispatch"),
                       "must reference the forced tool call")
         XCTAssertTrue(prompt.contains("DO NOT cite specific function names"),
@@ -354,6 +358,40 @@ final class DispatcherTests: XCTestCase {
                       "user message must include diff stat section")
         XCTAssertTrue(msg.contains("Sources/Foo.swift | 10"),
                       "user message must include diff stat content")
+    }
+
+    /// Fix-queue #8: the dispatch prompt must bias the proposal toward
+    /// THIS conversation's live state — it must both render the recent
+    /// turns and instruct the model to make the proposal specifically
+    /// relevant to them, not generic boilerplate.
+    func testUserMessageGroundsProposalInRecentTurns() {
+        let now = Date()
+        let ctx = SessionContext(
+            sessionUUID: "sess-grounded",
+            cwd: "/Users/test/supervisor",
+            gitBranch: "autonomous-test",
+            lastNTurns: [
+                .userPrompt(.init(sessionId: "sess-grounded",
+                                  text: "the notarization step keeps failing", ts: now)),
+                .assistantText(.init(sessionId: "sess-grounded",
+                                     text: "I re-ran notarize.sh and the staple succeeded on Supervisor.dmg.",
+                                     turnUUID: "u1", ts: now)),
+            ],
+            openIssues: [],
+            currentBranchCommits: []
+        )
+        let msg = Dispatcher.userMessage(context: ctx, principles: "(stub)")
+        // The recent-turns content must reach the prompt.
+        XCTAssertTrue(msg.contains("Session's last turns"),
+                      "prompt must include the recent-turns section")
+        XCTAssertTrue(msg.contains("notarize.sh and the staple succeeded"),
+                      "prompt must render the worker's actual recent output")
+        // The Task instruction must explicitly bias the proposal toward
+        // those recent turns rather than generic work.
+        XCTAssertTrue(msg.contains("SPECIFICALLY RELEVANT to the recent turns"),
+                      "Task instruction must tie the proposal to the recent turns")
+        XCTAssertTrue(msg.contains("not generic boilerplate"),
+                      "Task instruction must reject generic boilerplate")
     }
 
     /// The user message must surface `prior_dispatches_considered` so

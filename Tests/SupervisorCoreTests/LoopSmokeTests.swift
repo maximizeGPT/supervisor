@@ -275,11 +275,13 @@ final class LoopSmokeTests: XCTestCase {
 
         XCTAssertEqual(injector.calls.count, 3,
                        "three high-confidence dispatches must each invoke the injector")
-        // Each inject now carries the provenance marker (Fix A, 2026-06-15) as
-        // its prefix AND the Nth dispatcher proposal after it — verified through
-        // the REAL router → injector path, so this is the end-to-end proof that a
-        // drive proposal can never reach the worker unmarked.
+        // Each inject reads CLEAN (no-stamp decision) and carries exactly the Nth
+        // dispatcher proposal — verified through the REAL router → injector path,
+        // so this is the end-to-end proof that a drive proposal reaches the worker
+        // with no in-text provenance banner. Provenance lives in the ledger.
         for (i, step) in ["Step 1:", "Step 2:", "Step 3:"].enumerated() {
+            XCTAssertFalse(injector.calls[i].text.contains("SUPERVISOR"),
+                           "inject \(i) must read clean — no banner")
             XCTAssertTrue(injector.calls[i].text.contains(step),
                           "inject \(i) must carry dispatcher proposal '\(step)'")
         }

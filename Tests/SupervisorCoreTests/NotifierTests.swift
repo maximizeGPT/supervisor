@@ -69,6 +69,57 @@ final class NotifierTests: XCTestCase {
                        "technical-style text should not appear in banner; got: \(str)")
     }
 
+    // MARK: - Clipboard-claim honesty (the setString-can-fail bug)
+
+    func testDegradedInjectBodyClaimsClipboardOnlyWhenCopySucceeded() {
+        let d = decision()
+        let answer = "the full answer text to paste"
+
+        let copied = Notifier.composeBody(
+            for: d, outcome: .injectDegraded(intendedText: answer, reason: "locator_nil", copiedToClipboard: true))
+        XCTAssertTrue(copied.contains("copied it to your clipboard"),
+                      "a successful copy earns the clipboard claim: \(copied)")
+
+        let failed = Notifier.composeBody(
+            for: d, outcome: .injectDegraded(intendedText: answer, reason: "locator_nil", copiedToClipboard: false))
+        XCTAssertFalse(failed.contains("copied it to your clipboard"),
+                       "a FAILED setString must not claim the clipboard: \(failed)")
+        XCTAssertTrue(failed.contains(answer),
+                      "when the clipboard failed, the banner must carry the answer itself: \(failed)")
+    }
+
+    func testScreenRecordingDeniedBodyClaimsClipboardOnlyWhenCopySucceeded() {
+        let d = decision()
+        let answer = "paste-this proposal"
+
+        let copied = Notifier.composeBody(
+            for: d, outcome: .screenRecordingDenied(intendedText: answer, copiedToClipboard: true))
+        XCTAssertTrue(copied.contains("on your clipboard"), "got: \(copied)")
+
+        let failed = Notifier.composeBody(
+            for: d, outcome: .screenRecordingDenied(intendedText: answer, copiedToClipboard: false))
+        XCTAssertFalse(failed.contains("on your clipboard"),
+                       "must not point at a clipboard it never wrote: \(failed)")
+        XCTAssertTrue(failed.contains(answer), "the text must still reach the owner: \(failed)")
+        XCTAssertTrue(failed.contains("Screen Recording"),
+                      "the actionable permission callout survives the clipboard fallback: \(failed)")
+    }
+
+    func testContinueProposedMediumBodyMentionsClipboardOnlyWhenCopied() {
+        let d = decision()
+        let proposal = "Run the release checklist next."
+
+        let degraded = Notifier.composeBody(
+            for: d, outcome: .continueProposedMedium(proposal: proposal, justification: "j", copiedToClipboard: true))
+        XCTAssertTrue(degraded.contains("on your clipboard"), "got: \(degraded)")
+
+        let genuine = Notifier.composeBody(
+            for: d, outcome: .continueProposedMedium(proposal: proposal, justification: "j", copiedToClipboard: false))
+        XCTAssertFalse(genuine.contains("clipboard"),
+                       "a proposal that never touched the clipboard must not mention it: \(genuine)")
+        XCTAssertTrue(genuine.contains(proposal))
+    }
+
     func testBodyUsesMalformedFallbackWhenReasoningPlainIsTheFixedString() {
         // When Haiku's verdict is malformed, the engine populates
         // reasoning_plain with TriagePrompt.malformedVerdictBannerText.

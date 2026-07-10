@@ -1,6 +1,6 @@
 // KeyEntryStep.swift
 //
-// Step 1 content body — API key entry. The step indicator and title now
+// Step 1 content body, API key entry. The step indicator and title now
 // live on OnboardingScene; the primary "Validate & Save" button is in
 // the footer. KeyEntryStep owns the provider picker (v0.2.0+), the
 // description copy, the SecureField, and the inline error display.
@@ -24,7 +24,7 @@ struct KeyEntryStep: View {
     @Binding var key: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: BrandSpacing.md) {
             // Cost / provenance copy. Cost line is provider-specific so
             // the user understands what they're committing to before
             // pasting a key.
@@ -36,11 +36,12 @@ struct KeyEntryStep: View {
 
             // Provider picker. .menu style keeps the row compact so the
             // SecureField sits at roughly the same vertical position as
-            // before, and we don't push the footer out.
-            HStack(spacing: 8) {
-                Text("Provider:")
-                    .font(BrandFont.note)
-                    .foregroundStyle(BrandColor.mute.color)
+            // before, and we don't push the footer out. The "Provider"
+            // label uses the same caps/tracked overline treatment as the
+            // panel's section headers, so the field reads as a labeled
+            // control on the instrument panel rather than an ad-hoc row.
+            VStack(alignment: .leading, spacing: BrandSpacing.xs) {
+                BrandSectionHeader("Provider")
                 Picker("", selection: $vm.selectedProvider) {
                     ForEach(LLMProvider.allCases, id: \.self) { p in
                         Text(p.displayName).tag(p)
@@ -48,8 +49,9 @@ struct KeyEntryStep: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
+                .font(BrandFont.body)
+                .tint(BrandColor.signal.color)
                 .frame(maxWidth: 200, alignment: .leading)
-                Spacer()
             }
             // Re-rendering on provider change is automatic because vm is
             // @ObservedObject and selectedProvider is @Published.
@@ -60,18 +62,33 @@ struct KeyEntryStep: View {
                 vm.clearKeyError()
             }
 
-            SecureField(vm.selectedProvider.keyPlaceholder, text: $key, onCommit: submit)
-                .textFieldStyle(.roundedBorder)
-                .font(BrandFont.body)
-                .onChange(of: key) { _ in vm.clearKeyError() }
+            VStack(alignment: .leading, spacing: BrandSpacing.xs) {
+                BrandSectionHeader("API key")
+                SecureField(vm.selectedProvider.keyPlaceholder, text: $key, onCommit: submit)
+                    .textFieldStyle(.roundedBorder)
+                    .font(BrandFont.body)
+                    .onChange(of: key) { _ in vm.clearKeyError() }
 
-            if let error {
-                Text(errorMessage(error))
-                    .font(BrandFont.note)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+                if let error {
+                    // A failed validation is an attention state, not an alarm:
+                    // the one calm amber tone the rest of the app uses for
+                    // "needs a look" (SeverityBadge, a failed plan step), never
+                    // a raw system red. A leading warning glyph matches the
+                    // severity-badge vocabulary.
+                    HStack(alignment: .firstTextBaseline, spacing: BrandSpacing.xs) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text(errorMessage(error))
+                            .font(BrandFont.note)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .foregroundStyle(BrandColor.attention.color)
+                    .transition(.opacity)
+                }
             }
         }
+        // The inline error appears on the calm "content reflow" curve.
+        .animation(BrandMotion.standard, value: error != nil)
     }
 
     /// Per-provider intro copy. Anthropic keeps the v0.1.x cost line;
@@ -90,6 +107,8 @@ struct KeyEntryStep: View {
             return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. MiniMax pricing varies by model. Review their dashboard for current rates."
         case .qwenHF:
             return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. Routed through the Hugging Face Inference router; pricing depends on the upstream provider selected. Expect higher latency than direct providers."
+        case .openrouter:
+            return "Stored in macOS Keychain. OpenRouter routes to many models under one key and powers the multi-model deliberation panel. Cost depends on the models you pick; a panel bills every member plus the judge, so use it deliberately."
         }
     }
 
@@ -99,24 +118,30 @@ struct KeyEntryStep: View {
     }
 
     private func errorMessage(_ err: KeyEntryError) -> String {
-        let name = vm.selectedProvider.displayName
+        let provider = vm.selectedProvider.displayName
         switch err {
         case .invalidKey(let m):       return "Key invalid: \(m)"
-        case .rateLimit(let r?):       return "\(name) is rate-limiting validation. Try again in ~\(Int(r))s."
-        case .rateLimit(nil):          return "\(name) is rate-limiting validation. Try again in a moment."
-        case .network(let m):          return "Couldn't reach \(name): \(m)"
-        case .server(let s, let m):    return "\(name) returned \(s): \(m)"
+        case .rateLimit(let r?):       return "\(provider) is rate-limiting validation. Try again in ~\(Int(r))s."
+        case .rateLimit(nil):          return "\(provider) is rate-limiting validation. Try again in a moment."
+        case .network(let m):          return "Couldn't reach \(provider): \(m)"
+        case .server(let s, let m):    return "\(provider) returned \(s): \(m)"
         case .unexpected(let m):       return "Unexpected error: \(m)"
         }
     }
 }
 
 struct KeyValidatingStep: View {
-    let provider: LLMProvider
+    /// The provider whose key is being validated, so the spinner copy
+    /// names the provider the user actually picked (DeepSeek by default)
+    /// rather than always saying "Anthropic".
+    var providerName: String = "your provider"
+
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: BrandSpacing.md) {
             ProgressView()
-            Text("Validating with \(provider.displayName)…")
+                .controlSize(.small)
+                .tint(BrandColor.signal.color)
+            Text("Validating your API key with \(providerName)…")
                 .font(BrandFont.body)
                 .foregroundStyle(BrandColor.mute.color)
         }

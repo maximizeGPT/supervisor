@@ -111,6 +111,75 @@ final class ExpandedPanelTests: XCTestCase {
         XCTAssertFalse(vm.isExpanded)
     }
 
+    // MARK: - Multi-session band (one band, aggregated label)
+
+    /// The fix for the stacked "Watching... All clear" bands: when Supervisor
+    /// watches several sessions, the ONE band aggregates the count rather than
+    /// flipping between project names. 2+ sessions reads "Watching N sessions".
+    func testMultipleSessionsAggregateIdleLabel() {
+        let (vm, _) = makeVM()
+        vm.setWatchedSessionCount(3)
+        XCTAssertEqual(vm.watchedSessionCount, 3)
+        XCTAssertEqual(vm.plainLabel, "Watching 3 sessions. All clear")
+    }
+
+    /// One session keeps the exact prior wording (no project name yet -> the
+    /// bare "Watching. All clear"); the single-session behavior is unchanged.
+    func testSingleSessionKeepsPriorIdleLabel() {
+        let (vm, _) = makeVM()
+        vm.setWatchedSessionCount(1)
+        XCTAssertEqual(vm.plainLabel, "Watching. All clear")
+    }
+
+    /// Zero sessions also keeps the bare "Watching. All clear" (the resting
+    /// label before any session is seen).
+    func testZeroSessionsKeepsBareIdleLabel() {
+        let (vm, _) = makeVM()
+        vm.setWatchedSessionCount(0)
+        XCTAssertEqual(vm.plainLabel, "Watching. All clear")
+    }
+
+    /// With a known project AND multiple sessions, the count wins over the
+    /// single project name: the band tells the user how many it's watching.
+    func testMultiSessionLabelOverridesProjectName() {
+        let (vm, bus) = makeVM()
+        bus.publish(.sessionStart(SessionStartInfo(
+            sessionId: "s1", cwd: "/Users/main/alpha",
+            gitBranch: "main", projectHash: "h", jsonlPath: "/tmp/a.jsonl", ts: Date()
+        )))
+        let exp = expectation(description: "session start processed")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 1.0)
+        XCTAssertEqual(vm.plainLabel, "Watching alpha. All clear")
+
+        vm.setWatchedSessionCount(2)
+        XCTAssertEqual(vm.plainLabel, "Watching 2 sessions. All clear")
+    }
+
+    /// The count never stomps a flag headline: a pause label survives a
+    /// session-count update (the count only colors the calm idle state).
+    func testSessionCountDoesNotStompFlagLabel() {
+        let (vm, _) = makeVM()
+        vm.flagRaised(severity: .high, action: .pause, reasoningPlain: nil)
+        let flagged = vm.plainLabel
+        vm.setWatchedSessionCount(4)
+        XCTAssertEqual(vm.plainLabel, flagged,
+                       "a session-count update must not overwrite an active flag label")
+    }
+
+    /// Setting the same count is a no-op and does not disturb the label.
+    func testSettingUnchangedCountIsNoOp() {
+        let (vm, _) = makeVM()
+        vm.setWatchedSessionCount(2)
+        vm.flagRaised(severity: .medium, action: .notify, reasoningPlain: nil)
+        let labelBefore = vm.plainLabel
+        vm.setWatchedSessionCount(2)   // unchanged -> no-op
+        XCTAssertEqual(vm.plainLabel, labelBefore)
+    }
+
     // MARK: - Model name
 
     func testModelNameSetAtInit() {
@@ -378,6 +447,158 @@ final class ExpandedPanelTests: XCTestCase {
 
         let flags = try store.recent(limit: 10)
         XCTAssertEqual(flags.first?.userResponse, .rejected)
+    }
+
+    // MARK: - Session-scoped flags (RC fix #4)
+
+    /// `recentFlags` must return ONLY the watched session's flags. Before the
+    /// fix it called the store with no sessionId, so a concurrent session's
+    /// flags bled into the Status tab's list.
+    func testRecentFlagsIsSessionScoped() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let sessionStore = SessionStore(database: db)
+        try sessionStore.upsert(StoredSession(
+            id: "s1", projectHash: "h", cwd: "/x",
+            startedAt: Date(), lastSeenAt: Date(), jsonlPath: "/x"))
+        try sessionStore.upsert(StoredSession(
+            id: "s2", projectHash: "h", cwd: "/y",
+            startedAt: Date(), lastSeenAt: Date(), jsonlPath: "/y"))
+        let store = FlagStore(database: db)
+        try store.insert(StoredFlag(
+            id: "f1", sessionId: "s1", category: "c",
+            severity: .high, action: .notify,
+            reasoningPlain: "one", reasoningTechnical: "t"))
+        try store.insert(StoredFlag(
+            id: "f2", sessionId: "s2", category: "c",
+            severity: .high, action: .notify,
+            reasoningPlain: "two", reasoningTechnical: "t"))
+
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("panel-test-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(bus: bus, trace: trace, flagStore: store)
+
+        // Watch session s1.
+        bus.publish(.sessionStart(SessionStartInfo(
+            sessionId: "s1", cwd: "/x", gitBranch: nil,
+            projectHash: "h", jsonlPath: "/x", ts: Date())))
+        let exp = expectation(description: "session start processed")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 1.0)
+
+        let flags = vm.recentFlags()
+        XCTAssertEqual(flags.map(\.id), ["f1"],
+            "recentFlags must return only the watched session's flags")
+    }
+
+    // MARK: - Store-write re-render (RC fix #1)
+
+    /// A store-write action must bump `storeRevision` so the panel's SwiftUI
+    /// body re-invokes and re-reads the store (otherwise the Approve / flag
+    /// actions show stale state).
+    func testRespondToFlagBumpsStoreRevision() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let sessionStore = SessionStore(database: db)
+        try sessionStore.upsert(StoredSession(
+            id: "s1", projectHash: "h", cwd: "/x",
+            startedAt: Date(), lastSeenAt: Date(), jsonlPath: "/x"))
+        let store = FlagStore(database: db)
+        try store.insert(StoredFlag(
+            id: "flag1", sessionId: "s1", category: "c",
+            severity: .high, action: .notify,
+            reasoningPlain: "r", reasoningTechnical: "t"))
+
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("panel-test-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(bus: bus, trace: trace, flagStore: store)
+
+        let before = vm.storeRevision
+        vm.respondToFlag(flagId: "flag1", response: .dismissed)
+        XCTAssertEqual(vm.storeRevision, before + 1,
+            "a store write must bump storeRevision to force a re-render")
+    }
+
+    /// Approving a plan from the panel bumps the revision AND records the plan
+    /// as optimistically approved (so the Approve button disables immediately,
+    /// before the async handler round-trips through the store).
+    func testApprovePlanBumpsRevisionAndMarksOptimistic() {
+        let (vm, _) = makeVM()
+        var handlerPlanId: String?
+        vm.approvePlanHandler = { planId in handlerPlanId = planId }
+
+        let before = vm.storeRevision
+        vm.approvePlan(planId: "plan-1")
+
+        XCTAssertEqual(vm.storeRevision, before + 1)
+        XCTAssertTrue(vm.approvedPlanIds.contains("plan-1"),
+            "the plan must be marked optimistically approved so Approve disables now")
+        _ = handlerPlanId  // handler dispatch is async; the optimistic state is synchronous
+    }
+
+    /// With no handler wired, approvePlan is a no-op: it must NOT mark the plan
+    /// optimistically approved or bump the revision (nothing was written).
+    func testApprovePlanWithoutHandlerIsNoOp() {
+        let (vm, _) = makeVM()
+        let before = vm.storeRevision
+        vm.approvePlan(planId: "plan-1")
+        XCTAssertEqual(vm.storeRevision, before)
+        XCTAssertFalse(vm.approvedPlanIds.contains("plan-1"))
+    }
+
+    // MARK: - Back-to-plan control (fix-item #4b cross-over)
+    //
+    // The status surface shows a "Back to plan" control ONLY when a plan exists
+    // (so the cross-over to the plan surface is meaningful). With no plan the
+    // status surface is unchanged. showsBackToPlanControl is the testable seam
+    // for that rule, so we assert it without rendering layout.
+
+    func testShowsBackToPlanControlFalseWithoutPlan() {
+        let (vm, _) = makeVM()
+        let panel = ExpandedPanelView(vm: vm)
+        XCTAssertFalse(panel.showsBackToPlanControl)
+    }
+
+    func testShowsBackToPlanControlTrueWhenPlanExists() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let sessionStore = SessionStore(database: db)
+        try sessionStore.upsert(StoredSession(
+            id: "sess-1", projectHash: "h", cwd: "/Users/main/project",
+            startedAt: Date(), lastSeenAt: Date(), jsonlPath: "/x"
+        ))
+        let planStore = PlanStore(database: db)
+        try planStore.create(Plan(
+            id: "plan-1", sessionId: "sess-1", objective: "Ship auth.",
+            steps: [PlanStep(
+                id: "step-0", index: 0, title: "Step 0",
+                objective: "Do step 0.", doneCriteria: "Done.",
+                status: .active
+            )],
+            status: .running, currentStepIndex: 0
+        ))
+
+        let trace = TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("panel-test-\(UUID()).log"))
+        let bus = EventBus(trace: trace)
+        let vm = HoverViewModel(bus: bus, trace: trace, planStore: planStore)
+        // Seed the watched session so currentPlan() resolves to plan-1.
+        bus.publish(.sessionStart(SessionStartInfo(
+            sessionId: "sess-1", cwd: "/Users/main/project",
+            gitBranch: "main", projectHash: "hash",
+            jsonlPath: "/tmp/test.jsonl", ts: Date()
+        )))
+        let exp = expectation(description: "session start processed")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 1.0)
+
+        let panel = ExpandedPanelView(vm: vm)
+        XCTAssertTrue(panel.showsBackToPlanControl)
     }
 
     // MARK: - Expanded panel visibility (guard fix)

@@ -4,9 +4,7 @@
 // consumes:
 //   - sessionStart  (first parsed line per session)
 //   - userPrompt    (user.message.content as string)
-//   - assistantText (assistant.message.content[*].type == "text"; PLUS a
-//                    synthesized one rendering an AskUserQuestion tool_use, so the
-//                    structured question reaches the user_question_pending triage)
+//   - assistantText (assistant.message.content[*].type == "text")
 //   - bashToolCall  (assistant.message.content[*].type == "tool_use" + name == "Bash")
 //   - bashToolResult (user.message.content[*].type == "tool_result" matching a known Bash tool_use_id)
 //   - systemSignal  (type == "system" with preventedContinuation set)
@@ -15,6 +13,17 @@
 // thinking blocks, non-Bash tool calls) parses successfully but emits
 // nothing. The verbose-line discipline keeps the EventBus traffic
 // proportional to what the rest of the system actually needs.
+//
+// Provenance guard (2026-07-02): not every line is main-session,
+// owner-authored content. Sidechain lines (`isSidechain: true` — a
+// subagent's transcript interleaved into the same JSONL, whose opening
+// user-role turn is really the ASSISTANT's Task prompt) emit nothing past
+// sessionStart. Machine-generated user-role turns (`isMeta: true` caveats,
+// <command-*>/<local-command-stdout> slash-command echoes, and
+// compact-continuation summaries) never become userPrompt. Any of these
+// would otherwise read downstream as the owner's words — the
+// destructive-action authorization anchor (TriageEngine.lastOwnerPrompt)
+// and the session objective.
 
 import Foundation
 
@@ -84,6 +93,15 @@ public final class EventParser: Sendable {
             emittedSessionStart = true
         }
 
+        // Sidechain lines are a subagent's transcript, not the main session:
+        // nothing on them may interleave into the main-session window. The
+        // sidechain's opening user-role turn is assistant-authored (the Task
+        // tool prompt) and would otherwise become lastOwnerPrompt; its
+        // assistant/tool events aren't the observed session's work either.
+        // sessionStart above still fires — the line carries the real cwd even
+        // when its content is skippable.
+        if (obj["isSidechain"] as? Bool) == true { return emitted }
+
         switch type {
         case "user":
             emitted.append(contentsOf: parseUserMessage(obj))
@@ -107,10 +125,18 @@ public final class EventParser: Sendable {
 
         var out: [SupervisorEvent] = []
 
+        // A user-role turn the human didn't type must never become userPrompt
+        // (it would be `.owner` downstream). isMeta covers CLI-generated
+        // caveat turns; the text-shape check covers slash-command echoes and
+        // compact-continuation summaries.
+        let isMeta = (obj["isMeta"] as? Bool) == true
+
         // content may be a String (a plain user prompt) or an array of
         // blocks (containing tool_result entries).
         if let str = message["content"] as? String, !str.isEmpty {
-            out.append(.userPrompt(.init(sessionId: sessionId, text: str, ts: ts)))
+            if !isMeta, !Self.isMachineGeneratedUserText(str) {
+                out.append(.userPrompt(.init(sessionId: sessionId, text: str, ts: ts)))
+            }
             return out
         }
         guard let blocks = message["content"] as? [[String: Any]] else { return [] }
@@ -131,7 +157,8 @@ public final class EventParser: Sendable {
                     )))
                 }
             case "text":
-                if let str = block["text"] as? String, !str.isEmpty {
+                if let str = block["text"] as? String, !str.isEmpty,
+                   !isMeta, !Self.isMachineGeneratedUserText(str) {
                     out.append(.userPrompt(.init(sessionId: sessionId, text: str, ts: ts)))
                 }
             default:
@@ -164,44 +191,37 @@ public final class EventParser: Sendable {
                     )))
                 }
             case "tool_use":
-                let toolName = block["name"] as? String
-                // AskUserQuestion: the worker is asking the user a STRUCTURED
-                // question (the multiple-choice widget modern Claude reaches for).
-                // The parser otherwise only surfaces Bash, so without this
-                // Supervisor is blind to how Claude actually asks — and never
-                // answers. Render the question + options into a synthesized
-                // assistantText so the existing user_question_pending triage sees
-                // it and can respond (2026-06-16).
-                if toolName == "AskUserQuestion",
-                   let input = block["input"] as? [String: Any] {
-                    let rendered = Self.renderAskUserQuestion(input)
-                    if !rendered.isEmpty {
-                        out.append(.assistantText(.init(
-                            sessionId: sessionId,
-                            text: rendered,
-                            turnUUID: turnUUID,
-                            ts: ts
-                        )))
-                    }
-                    continue
-                }
-                guard toolName == "Bash",
+                guard let name = block["name"] as? String,
                       let toolUseId = block["id"] as? String,
                       let input = block["input"] as? [String: Any] else {
-                    // Other non-Bash tools (Edit/Write/Read/etc.): not surfaced.
                     continue
                 }
-                let command = (input["command"] as? String) ?? ""
-                let description = input["description"] as? String
-                registry.registerBash(toolUseId)
-                out.append(.bashToolCall(.init(
-                    sessionId: sessionId,
-                    command: command,
-                    description: description,
-                    toolUseId: toolUseId,
-                    turnUUID: turnUUID,
-                    ts: ts
-                )))
+                switch name {
+                case "Bash":
+                    let command = (input["command"] as? String) ?? ""
+                    let description = input["description"] as? String
+                    registry.registerBash(toolUseId)
+                    out.append(.bashToolCall(.init(
+                        sessionId: sessionId,
+                        command: command,
+                        description: description,
+                        toolUseId: toolUseId,
+                        turnUUID: turnUUID,
+                        ts: ts
+                    )))
+                case "Edit", "Write", "MultiEdit":
+                    // The REVIEW dimension consumes fileEdit; the safety triage
+                    // ignores it. Non-applying/empty edits parse to nil and emit
+                    // nothing (a Write with no content, an Edit with no strings).
+                    if let info = Self.parseFileEdit(
+                        name: name, input: input, sessionId: sessionId,
+                        toolUseId: toolUseId, turnUUID: turnUUID, ts: ts
+                    ) {
+                        out.append(.fileEdit(info))
+                    }
+                default:
+                    break  // Read, Grep, Glob, MCP tools, etc. — not consumed
+                }
             default:
                 break  // thinking, etc.
             }
@@ -242,38 +262,91 @@ public final class EventParser: Sendable {
         return Self.isoFormatter.date(from: str) ?? Self.isoFormatterNoFrac.date(from: str)
     }
 
-    /// Render an AskUserQuestion tool input into plain text the
-    /// user_question_pending triage can read: each question plus its option
-    /// labels. The framing line carries a prefilter-guaranteed phrase
-    /// ("let me know") so a question whose own text lacks a "?" still routes to
-    /// the question triage. Returns "" when there's nothing to surface.
-    static func renderAskUserQuestion(_ input: [String: Any]) -> String {
-        guard let questions = input["questions"] as? [[String: Any]] else { return "" }
-        var lines: [String] = []
-        for q in questions {
-            guard let qtext = (q["question"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !qtext.isEmpty else { continue }
-            lines.append("Question: \(qtext)")
-            let labels = optionLabels(q["options"])
-            if !labels.isEmpty {
-                lines.append("Options: \(labels.joined(separator: " | "))")
-            }
-        }
-        guard !lines.isEmpty else { return "" }
-        return (["The worker paused on a multiple-choice prompt and is waiting on your answer before it continues — let me know which option you want:"] + lines)
-            .joined(separator: "\n")
+    /// True when a user-role message's text is machine-generated, not typed
+    /// by the owner: slash-command echoes (the CLI records the expansion as a
+    /// user turn wrapped in <command-name>/<command-message>/
+    /// <local-command-stdout> tags) and compact-continuation summaries (a
+    /// resumed session opens with a generated recap that can DESCRIBE
+    /// destructive work and would otherwise read as authorizing it). Shared
+    /// with SessionObjective so the objective reader skips the same shapes.
+    static func isMachineGeneratedUserText(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let machinePrefixes = [
+            "<command-name>",
+            "<command-message>",
+            "<local-command-stdout>",
+            "This session is being continued from a previous conversation",
+        ]
+        return machinePrefixes.contains { trimmed.hasPrefix($0) }
     }
 
-    /// Labels from an AskUserQuestion `options` value, which may be an array of
-    /// strings or of objects keyed label/name/description.
-    private static func optionLabels(_ raw: Any?) -> [String] {
-        if let arr = raw as? [String] { return arr.filter { !$0.isEmpty } }
-        if let arr = raw as? [[String: Any]] {
-            return arr.compactMap { obj in
-                (obj["label"] as? String) ?? (obj["name"] as? String) ?? (obj["description"] as? String)
-            }.filter { !$0.isEmpty }
+    /// Per-hunk cap on edit text carried in the event. A `Write` can hand us a
+    /// whole large file; keeping the event lean bounds EventBus + review-window
+    /// memory. The review prompt truncates further; this is the outer guard.
+    /// Mirrors `stringifyToolResultContent`'s truncation posture.
+    static let fileEditHunkCap = 16_384
+
+    private static func capText(_ s: String) -> String {
+        guard s.utf8.count > fileEditHunkCap else { return s }
+        return String(s.prefix(fileEditHunkCap)) + " …[truncated]"
+    }
+
+    /// Parse an `Edit` / `Write` / `MultiEdit` tool_use `input` into a
+    /// `FileEditInfo`. Returns nil when the call carries nothing reviewable (no
+    /// `file_path`, or no usable hunk) — the caller then emits nothing.
+    ///
+    ///   - Edit:      { file_path, old_string, new_string }              → 1 hunk
+    ///   - Write:     { file_path, content }                             → 1 hunk (oldString nil)
+    ///   - MultiEdit: { file_path, edits: [{ old_string, new_string }] } → 1 hunk / edit
+    static func parseFileEdit(
+        name: String,
+        input: [String: Any],
+        sessionId: String,
+        toolUseId: String,
+        turnUUID: String,
+        ts: Date
+    ) -> FileEditInfo? {
+        guard let filePath = input["file_path"] as? String, !filePath.isEmpty else { return nil }
+
+        var hunks: [FileEditHunk] = []
+        switch name {
+        case "Write":
+            guard let content = input["content"] as? String else { return nil }
+            hunks.append(.init(oldString: nil, newString: capText(content)))
+        case "Edit":
+            let newString = input["new_string"] as? String
+            let oldString = input["old_string"] as? String
+            // An Edit with neither side is not reviewable.
+            guard newString != nil || oldString != nil else { return nil }
+            hunks.append(.init(
+                oldString: oldString.map(capText),
+                newString: capText(newString ?? "")
+            ))
+        case "MultiEdit":
+            guard let edits = input["edits"] as? [[String: Any]] else { return nil }
+            for edit in edits {
+                let newString = edit["new_string"] as? String
+                let oldString = edit["old_string"] as? String
+                guard newString != nil || oldString != nil else { continue }
+                hunks.append(.init(
+                    oldString: oldString.map(capText),
+                    newString: capText(newString ?? "")
+                ))
+            }
+        default:
+            return nil
         }
-        return []
+
+        guard !hunks.isEmpty else { return nil }
+        return FileEditInfo(
+            sessionId: sessionId,
+            toolName: name,
+            filePath: filePath,
+            hunks: hunks,
+            toolUseId: toolUseId,
+            turnUUID: turnUUID,
+            ts: ts
+        )
     }
 
     /// `tool_result.content` is variable shape — string for simple results,

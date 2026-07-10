@@ -20,8 +20,13 @@ public enum SessionObjective {
     /// found. A "plain user prompt" is a `type == "user"` line whose
     /// `message.content` is a non-empty String — the opening instruction. Lines
     /// whose content is an array (tool_result user messages) are skipped; they
-    /// aren't the objective. Reads only the head of the file because the opening
-    /// prompt sits at the top, so it stays cheap on multi-MB transcripts.
+    /// aren't the objective. Also skipped: user-role lines the human didn't
+    /// type — sidechain (subagent) turns, isMeta caveats, slash-command echoes,
+    /// and compact-continuation summaries. A resumed/compacted transcript opens
+    /// with a caveat + generated recap; the objective must be the first REAL
+    /// owner prompt, not machinery (same shapes EventParser suppresses). Reads
+    /// only the head of the file because the opening prompt sits at the top, so
+    /// it stays cheap on multi-MB transcripts.
     public static func read(
         sessionId: String,
         projectsDir: URL? = nil,
@@ -47,8 +52,14 @@ public enum SessionObjective {
                   obj["type"] as? String == "user",
                   let message = obj["message"] as? [String: Any],
                   let content = message["content"] as? String else { continue }
+            // Not owner-authored: subagent turns and CLI-generated caveats.
+            if (obj["isSidechain"] as? Bool) == true { continue }
+            if (obj["isMeta"] as? Bool) == true { continue }
             let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return trimmed }
+            if trimmed.isEmpty { continue }
+            // Command echoes / compact summaries: machinery, not the ask.
+            if EventParser.isMachineGeneratedUserText(trimmed) { continue }
+            return trimmed
         }
         return nil
     }

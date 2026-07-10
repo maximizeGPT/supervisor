@@ -88,6 +88,62 @@ final class RedactorTests: XCTestCase {
         XCTAssertEqual(redactor.redact(near), near)
     }
 
+    func testRedactsGitHubServerSideTokens() {
+        for prefix in ["ghs_", "ghr_", "ghu_"] {
+            let token = prefix + String(repeating: "C", count: 36)
+            let out = redactor.redact("token: \(token)")
+            XCTAssertFalse(out.contains(token), "failed to redact \(prefix) token")
+            XCTAssertTrue(out.contains("<redacted:github-token>"))
+        }
+    }
+
+    func testGitHubUnknownPrefixNotRedacted() {
+        // ghx_ is not a GitHub token family.
+        let near = "ghx_" + String(repeating: "C", count: 36)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    // MARK: - GitLab / npm / Google tokens
+
+    func testRedactsGitLabToken() {
+        let token = "glpat-" + String(repeating: "x", count: 20)
+        let out = redactor.redact("clone with \(token)")
+        XCTAssertFalse(out.contains(token))
+        XCTAssertTrue(out.contains("<redacted:gitlab-token>"))
+    }
+
+    func testShortGitLabTokenNotRedacted() {
+        // 19 chars after the prefix — under the 20 lower bound.
+        let near = "glpat-" + String(repeating: "x", count: 19)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    func testRedactsNpmToken() {
+        let token = "npm_" + String(repeating: "a", count: 36)
+        let out = redactor.redact("//registry.npmjs.org/:_authToken=\(token)")
+        XCTAssertFalse(out.contains(token))
+        XCTAssertTrue(out.contains("<redacted:npm-token>"))
+    }
+
+    func testNpmTokenWrongLengthNotRedacted() {
+        // 35 chars instead of 36 — should NOT match.
+        let near = "npm_" + String(repeating: "a", count: 35)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    func testRedactsGoogleAPIKey() {
+        let key = "AIzaSy" + String(repeating: "D", count: 33)   // AIza + 35-char body
+        let out = redactor.redact("maps key is \(key)")
+        XCTAssertFalse(out.contains(key))
+        XCTAssertTrue(out.contains("<redacted:google-api-key>"))
+    }
+
+    func testShortAIzaStringNotRedacted() {
+        // Body under the fixed 35-char shape — not a Google key.
+        let near = "AIzaSy" + String(repeating: "D", count: 20)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
     // MARK: - Slack tokens
 
     func testRedactsSlackBotToken() {
@@ -133,6 +189,34 @@ final class RedactorTests: XCTestCase {
         XCTAssertEqual(redactor.redact(input), input)
     }
 
+    // MARK: - AWS credentials (standalone secret assignment)
+
+    func testRedactsStandaloneAWSSecretAssignment() {
+        // ~/.aws/credentials shape: the secret line with no AKIA id nearby,
+        // so the pair pattern can't fire.
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        let input = "aws_secret_access_key = \(secret)"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains(secret))
+        XCTAssertTrue(out.contains("aws_secret_access_key = <redacted:aws-credential>"))
+    }
+
+    func testAWSSecretAssignmentLongerBlobStillRedactedByGenericEnvRule() {
+        // 41 base64 chars — too long for the narrow `awsSecretAssignment`
+        // pattern (its trailing lookahead pins the value at exactly 40, so it
+        // does NOT half-match). But `aws_secret_access_key` is a
+        // `*SECRET*/*KEY*=value` assignment, so the v0.3.0 generic
+        // `envAssignmentSecret` rule catches it regardless of length —
+        // redacting a secret we would otherwise have leaked. The narrow
+        // pattern's exact-40 behavior is still covered by the positive test
+        // above (which asserts the `<redacted:aws-credential>` placeholder).
+        let blob = String(repeating: "A", count: 41)
+        let input = "aws_secret_access_key=\(blob)"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains(blob), "a longer secret assignment must not leak")
+        XCTAssertTrue(out.contains("aws_secret_access_key=<redacted:env-secret>"))
+    }
+
     // MARK: - JWT
 
     func testRedactsJWT() {
@@ -145,6 +229,36 @@ final class RedactorTests: XCTestCase {
     func testShortJWTLikeStringNotRedacted() {
         // Three short segments; below the 20-char minimum per segment.
         let input = "eyJ.eyJ.eyJ"
+        XCTAssertEqual(redactor.redact(input), input)
+    }
+
+    // MARK: - PEM private keys
+
+    func testRedactsPEMPrivateKeyBlock() {
+        // Whole multiline block goes, surrounding output stays.
+        let input = """
+        writing key to disk
+        -----BEGIN RSA PRIVATE KEY-----
+        MIIEpAIBAAKCAQEAfakebody0123456789
+        moreFakeBody/lines+here==
+        -----END RSA PRIVATE KEY-----
+        done
+        """
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("MIIEpAIBAAKCAQEA"))
+        XCTAssertFalse(out.contains("BEGIN RSA PRIVATE KEY"))
+        XCTAssertTrue(out.contains("<redacted:private-key>"))
+        XCTAssertTrue(out.contains("writing key to disk"))
+        XCTAssertTrue(out.contains("done"))
+    }
+
+    func testDoesNotRedactPEMPublicKeyBlock() {
+        // No "PRIVATE KEY" in the header — public keys are fine to send.
+        let input = """
+        -----BEGIN PUBLIC KEY-----
+        MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJ
+        -----END PUBLIC KEY-----
+        """
         XCTAssertEqual(redactor.redact(input), input)
     }
 
@@ -195,6 +309,42 @@ final class RedactorTests: XCTestCase {
         XCTAssertEqual(redactor.redact(input), input)
     }
 
+    func testQueryParamRedactionStopsAtJSONQuote() {
+        // Regression for the encoded-body second pass: the value class
+        // excludes `"` and `\`, so redaction must stop at the JSON closing
+        // quote instead of eating `","next":"..."` and corrupting the body.
+        let encoded = #"{"url":"https://x.test/?token=abc123","next":"keep-me"}"#
+        let out = redactor.redact(encoded)
+        XCTAssertFalse(out.contains("abc123"))
+        XCTAssertTrue(
+            out.contains(#"token=<redacted:url-credentials>","next":"keep-me""#),
+            "redaction consumed across the JSON string boundary: \(out)"
+        )
+    }
+
+    // MARK: - Connection strings
+
+    func testRedactsPostgresConnectionStringPassword() {
+        let input = "psql postgres://admin:hunter2@db.internal:5432/prod"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("hunter2"))
+        // Username and host survive for triage context.
+        XCTAssertTrue(out.contains("postgres://admin:<redacted:url-credentials>@db.internal:5432/prod"))
+    }
+
+    func testRedactsMongoDBSRVConnectionStringPassword() {
+        let input = "mongodb+srv://app:s3cr3tpw@cluster0.mongodb.net/db"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("s3cr3tpw"))
+        XCTAssertTrue(out.contains("mongodb+srv://app:<redacted:url-credentials>@cluster0.mongodb.net/db"))
+    }
+
+    func testConnectionStringWithoutCredentialsUnchanged() {
+        // Host:port but no `user:pass@` — nothing to redact.
+        let input = "postgres://db.example.com:5432/mydb"
+        XCTAssertEqual(redactor.redact(input), input)
+    }
+
     // MARK: - Shell export
 
     func testRedactsExportValue() {
@@ -224,6 +374,127 @@ final class RedactorTests: XCTestCase {
         // — no value to leak.
         let input = "export FOO"
         XCTAssertEqual(redactor.redact(input), input)
+    }
+
+    // MARK: - Generic env-assignment secret (bare NAME=value .env shape)
+
+    func testRedactsBareEnvSecretAssignment() {
+        let input = "DATABASE_PASSWORD=hunter2super"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("hunter2super"))
+        XCTAssertTrue(out.contains("DATABASE_PASSWORD=<redacted:env-secret>"))
+    }
+
+    func testRedactsColonSeparatedEnvSecretAssignment() {
+        let input = "API_TOKEN: abc123def456ghi789"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("abc123def456ghi789"))
+        XCTAssertTrue(out.contains("API_TOKEN: <redacted:env-secret>"))
+    }
+
+    func testRedactsEnvSecretOnLaterLine() {
+        let input = "loading config\nSERVICE_SECRET=s0m3-s3cr3t-value\ndone"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("s0m3-s3cr3t-value"))
+        XCTAssertTrue(out.contains("SERVICE_SECRET=<redacted:env-secret>"))
+    }
+
+    func testEnvAssignmentIgnoresNonSecretName() {
+        // No SECRET/TOKEN/KEY/PASSWORD/APIKEY substring in the name → not a
+        // secret assignment, must not redact the value.
+        let input = "username = alice"
+        XCTAssertEqual(redactor.redact(input), input)
+    }
+
+    func testEnvAssignmentDoesNotDoubleRedactProviderKey() {
+        // `OPENAI_KEY=<value>` where the value is a provider key: the specific
+        // provider pattern must win and keep its label; env-secret must not
+        // re-wrap the already-redacted placeholder.
+        let input = "OPENAI_KEY=sk-AbCdEf1234567890abcdefghijklmnop12345678"
+        let out = redactor.redact(input)
+        XCTAssertTrue(out.contains("<redacted:api-key>"))
+        XCTAssertFalse(out.contains("<redacted:env-secret>"))
+    }
+
+    // MARK: - Stripe keys (underscore-prefixed)
+
+    func testRedactsStripeSecretKeys() {
+        for prefix in ["sk_live_", "sk_test_", "rk_live_"] {
+            let key = prefix + String(repeating: "a", count: 24)
+            let out = redactor.redact("the stripe key is \(key) done")
+            XCTAssertFalse(out.contains(key), "failed to redact \(prefix)")
+            XCTAssertTrue(out.contains("<redacted:stripe-key>"))
+        }
+    }
+
+    func testShortStripeKeyNotRedacted() {
+        // Body under the 16-char lower bound — a label, not a live key.
+        let near = "sk_live_short"
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    func testRedactsStripeWebhookSecret() {
+        let secret = "whsec_" + String(repeating: "b", count: 24)
+        let out = redactor.redact("STRIPE_WEBHOOK=\(secret)")
+        XCTAssertFalse(out.contains(secret))
+        XCTAssertTrue(out.contains("<redacted:stripe-webhook-secret>"))
+    }
+
+    // MARK: - SendGrid
+
+    func testRedactsSendGridKey() {
+        let key = "SG." + String(repeating: "a", count: 22) + "." + String(repeating: "b", count: 43)
+        let out = redactor.redact("sendgrid key: \(key)")
+        XCTAssertFalse(out.contains(key))
+        XCTAssertTrue(out.contains("<redacted:sendgrid-key>"))
+    }
+
+    func testShortSendGridStringNotRedacted() {
+        // Segments too short for the fixed 22/43 shape.
+        let near = "SG." + String(repeating: "a", count: 10) + "." + String(repeating: "b", count: 10)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    // MARK: - Twilio
+
+    func testRedactsTwilioSIDs() {
+        for prefix in ["AC", "SK"] {
+            let sid = prefix + String(repeating: "a", count: 32)   // 32 lowercase hex
+            let out = redactor.redact("twilio sid \(sid) here")
+            XCTAssertFalse(out.contains(sid), "failed to redact \(prefix) SID")
+            XCTAssertTrue(out.contains("<redacted:twilio-key>"))
+        }
+    }
+
+    func testTwilioWrongLengthNotRedacted() {
+        // 31 hex chars instead of 32 — should NOT match.
+        let near = "AC" + String(repeating: "a", count: 31)
+        XCTAssertEqual(redactor.redact(near), near)
+    }
+
+    func testRedactsIndentedExportOnLaterLine() {
+        // `(?m)^\s*export` needs a REAL newline before it. This is the
+        // plaintext shape LLMClient now redacts before JSON-encoding; on
+        // the encoded body (`\n` as two chars) this line anchor can never
+        // fire.
+        let input = "setting up environment\n  export SECRET_TOKEN=hunter2abc\ndone"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains("hunter2abc"))
+        XCTAssertTrue(out.contains("export SECRET_TOKEN=<redacted>"))
+    }
+
+    // MARK: - Line-start regressions (plaintext-before-encoding)
+
+    func testRedactsLineLeadingGitHubToken() {
+        // A token at the start of a line: its leading `\b` sits right after
+        // a newline. In plaintext that's a boundary; in a JSON-encoded body
+        // the preceding char is the `n` of the `\n` escape and the boundary
+        // vanishes. The redactor must see this shape as plaintext.
+        let token = "ghp_" + String(repeating: "Z", count: 36)
+        let input = "output\n\(token)"
+        let out = redactor.redact(input)
+        XCTAssertFalse(out.contains(token))
+        XCTAssertTrue(out.contains("<redacted:github-token>"))
     }
 
     // MARK: - Idempotence

@@ -46,11 +46,42 @@ public final class TraceLog: @unchecked Sendable {
         }
     }
 
-    /// Default location. Honors `$HOME` so test runs in temp homes don't
-    /// pollute the user's real Logs directory.
+    /// Default location, used by `TraceLog.shared` (the fallback every
+    /// component reaches for when no explicit trace is injected).
+    ///
+    /// Resolution order (launch-audit fix, 2026-07):
+    ///   1. `$SUPERVISOR_LOG_DIR` — explicit override; the file is
+    ///      `supervisor.log` inside that directory.
+    ///   2. Under XCTest — a per-user temp directory. `swift test` runs were
+    ///      writing synthetic sessions (sess-longrun, s-idle, …) into the REAL
+    ///      ~/Library/Logs/Supervisor/supervisor.log whenever a component fell
+    ///      back to `.shared`; `homeDirectoryForCurrentUser` resolves the true
+    ///      home regardless of a stubbed `$HOME`, so temp-home isolation never
+    ///      covered this path.
+    ///   3. Production — `~/Library/Logs/Supervisor/supervisor.log`.
     public static var defaultPath: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        let env = ProcessInfo.processInfo.environment
+        if let dir = env["SUPERVISOR_LOG_DIR"], !dir.isEmpty {
+            return URL(fileURLWithPath: dir, isDirectory: true)
+                .appendingPathComponent("supervisor.log")
+        }
+        if isRunningUnderXCTest {
+            return FileManager.default.temporaryDirectory
+                .appendingPathComponent("SupervisorTests/Logs", isDirectory: true)
+                .appendingPathComponent("supervisor.log")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/Supervisor/supervisor.log")
+    }
+
+    /// True when the process is an XCTest run. The env var is what Xcode /
+    /// `swift test` set for the test host; the class probe is the
+    /// belt-and-suspenders for runners that don't (the test bundle links
+    /// XCTest, production binaries never do).
+    static var isRunningUnderXCTest: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
     }
 
     /// Emit one line. Returns immediately; write happens on the trace queue.

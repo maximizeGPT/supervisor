@@ -219,7 +219,12 @@ final class PathIsolationSymmetryTests: XCTestCase {
             costStore: nil,
             idleThresholdSeconds: 9999,
             idleReTriageIntervalSeconds: 9999,
-            idleCheckIntervalSeconds: 3600
+            idleCheckIntervalSeconds: 3600,
+            // Honest-health, belt-and-braces: the 3600s interval already parks the
+            // background loop (sleep-first, so it never ticks within a test), but
+            // no-op the engine-progress recorder too so no future interval tweak
+            // can silently start stamping the REAL global liveness token.
+            recordEngineProgress: {}
         )
         let captured = TriageEngineTests.CapturedDecisions()
         engine.onDecision = { d in captured.append(d) }

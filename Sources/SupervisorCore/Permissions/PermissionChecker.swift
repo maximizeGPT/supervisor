@@ -70,6 +70,13 @@ public protocol PermissionChecker: AnyObject, Sendable {
     /// Current Screen Recording state. Does not prompt.
     func isScreenRecordingGranted() -> Bool
 
+    /// Prompt the user for Screen Recording permission. Like AX, macOS routes
+    /// the user to System Settings; there is no in-app grant. Returns the
+    /// resulting state (typically still false on first call, until the user
+    /// enables it and Supervisor polls again). The screen-recording analogue
+    /// of `requestAX`.
+    func requestScreenRecording() -> Bool
+
     /// Prompt the user for AX permission. macOS routes them to System
     /// Settings — there is no in-app permission grant for AX. Returns
     /// the resulting state (likely still false until they actually grant
@@ -125,6 +132,10 @@ public final class LivePermissionChecker: PermissionChecker, @unchecked Sendable
 
     public func isScreenRecordingGranted() -> Bool {
         CGPreflightScreenCaptureAccess()
+    }
+
+    public func requestScreenRecording() -> Bool {
+        CGRequestScreenCaptureAccess()
     }
 
     public func requestAX(prompt: Bool) -> Bool {

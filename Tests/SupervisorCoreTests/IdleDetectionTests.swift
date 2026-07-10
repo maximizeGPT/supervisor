@@ -392,6 +392,105 @@ final class IdleDetectionTests: XCTestCase {
                        "but the engine MUST have asked the rubric — branch-name is a rubric-body responsibility, not an engine gate (ED-4)")
     }
 
+    // MARK: - Background idle-loop liveness (honest-health engine-progress seam)
+
+    /// The ONE test that intentionally runs the real `startIdleCheckLoop`
+    /// background Task end-to-end (every other suite parks the interval at
+    /// 3600s, passes runIdleLoop:false, or no-ops the recorder). It drives the
+    /// loop with a SHORT interval and an injected recorder that (1) bumps an
+    /// in-memory counter and (2) exercises the REAL EngineProgress writer
+    /// against a TEMP-dir ConfigPaths — never the global token. Asserts:
+    ///   (a) sleep-first: no tick fires at start — the count is 0 synchronously
+    ///       after start() (the @MainActor loop Task cannot have run before we
+    ///       suspend), and the FIRST observed tick lands at least ~one interval
+    ///       after start (Task.sleep never undersleeps, so a slow CI runner can
+    ///       only widen this gap, never shrink it below the interval).
+    ///   (b) alive + recording: within a generous 5s deadline (expected
+    ///       ~0.15-0.25s at a 50ms interval) the counter reaches >= 3 and the
+    ///       temp engine-progress token exists and parses.
+    ///   (c) stop() cancels: after engine.stop() the counter never advances
+    ///       again (asserted across a 300ms wait, >= 6 intervals).
+    func testBackgroundLoopSleepsFirstTicksWhileRunningAndStopsOnStop() async throws {
+        // Temp-dir ConfigPaths: the injected recorder points the REAL writer
+        // here, proving the seam composes with EngineProgress.recordTick(paths:)
+        // without ever touching ~/Library/Application Support/Supervisor.
+        let tempHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("idle-loop-home-\(UUID().uuidString)", isDirectory: true)
+        let tempPaths = ConfigPaths(home: tempHome)
+        defer { try? FileManager.default.removeItem(at: tempHome) }
+
+        let ticks = TickBox()
+        let bus = EventBus(trace: TraceLog(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("idle-loop-tests-\(UUID().uuidString).log")))
+        let client = LLMClient(
+            provider: .anthropic,
+            apiKey: "sk-ant-test",
+            redactor: DefaultRedactor(),
+            baseURL: URL(string: "https://mock.anthropic.test")!,
+            session: mockSession(),
+            traceLog: TraceLog(path: FileManager.default.temporaryDirectory
+                .appendingPathComponent("idle-loop-client-\(UUID().uuidString).log"))
+        )
+        let interval: TimeInterval = 0.05
+        let engine = TriageEngine(
+            client: client,
+            bus: bus,
+            model: "claude-haiku-4-5-20251001",
+            windowSize: 30,
+            costStore: nil,
+            // No sessions are ever published, so each loop cycle's
+            // checkIdleStates() walks an empty map and dispatches nothing —
+            // the cycles under test are pure timer ticks.
+            idleThresholdSeconds: 9999,
+            idleReTriageIntervalSeconds: 9999,
+            idleCheckIntervalSeconds: interval,
+            recordEngineProgress: {
+                ticks.record(at: Date())
+                _ = EngineProgress.recordTick(paths: tempPaths)
+            }
+        )
+
+        let startedAt = Date()
+        engine.start()
+
+        // (a) sleep-first, part 1: no synchronous tick at start. We have not
+        // suspended since start(), and the loop Task is @MainActor, so it
+        // cannot have run yet — deterministic, cannot flake.
+        XCTAssertEqual(ticks.count, 0,
+                       "sleep-first: start() must not fire an immediate tick")
+
+        // (b) loop alive: poll (generously — expected ~0.2s) until >= 3 ticks.
+        let deadline = Date().addingTimeInterval(5.0)
+        while ticks.count < 3 && Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(ticks.count, 3,
+                                    "background loop must tick repeatedly (~every \(interval)s); got \(ticks.count) within 5s")
+
+        // (a) sleep-first, part 2: the FIRST tick landed at least ~one interval
+        // after start. Task.sleep(nanoseconds:) never returns early, so a slow
+        // runner only increases this gap; 0.8x margin absorbs clock granularity.
+        let firstTickAt = try XCTUnwrap(ticks.firstTickAt, "at least one tick was recorded above")
+        XCTAssertGreaterThanOrEqual(firstTickAt.timeIntervalSince(startedAt), interval * 0.8,
+                                    "sleep-first: the first tick must come AFTER one full interval of sleep, not immediately at start")
+
+        // (b) recording: the injected recorder drove the REAL writer against the
+        // temp paths — the token exists there and parses.
+        let token = try HeartbeatFile(path: tempPaths.engineProgressPath).read()
+        XCTAssertNotNil(token,
+                        "the injected recorder must have stamped the TEMP engine-progress token via EngineProgress.recordTick(paths:)")
+
+        // (c) stop() cancels the loop: no tick may land after stop(). stop()
+        // runs on the MainActor the loop is isolated to, so no cycle can be
+        // mid-flight while we snapshot; the loop's post-sleep cancellation
+        // guards ensure the next wakeup breaks instead of ticking.
+        engine.stop()
+        let countAtStop = ticks.count
+        try await Task.sleep(nanoseconds: 300_000_000)  // >= 6 intervals of headroom
+        XCTAssertEqual(ticks.count, countAtStop,
+                       "no tick may fire after stop() — cancellation must silence the loop")
+    }
+
     // MARK: - detectWorkerStopped unit coverage
 
     func testDetectWorkerStoppedReturnsTrueForTextOnlyAssistant() {
@@ -412,6 +511,22 @@ final class IdleDetectionTests: XCTestCase {
 
     func testDetectWorkerStoppedReturnsFalseForEmptyWindow() {
         XCTAssertFalse(TriageEngine.detectWorkerStopped(in: []))
+    }
+}
+
+// MARK: - Tick-counter helper (background-loop liveness test)
+
+/// MainActor-isolated tick counter for the injected engine-progress recorder —
+/// the recorder closure is `@MainActor () -> Void`, so accesses are serialized
+/// on the main actor (no locking needed). Records the first tick's wall-clock
+/// time so the sleep-first property can be asserted as a latency lower bound.
+@MainActor
+final class TickBox {
+    private(set) var count = 0
+    private(set) var firstTickAt: Date?
+    func record(at time: Date) {
+        if count == 0 { firstTickAt = time }
+        count += 1
     }
 }
 

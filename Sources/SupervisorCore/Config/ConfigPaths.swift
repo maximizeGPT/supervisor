@@ -35,6 +35,15 @@ public struct ConfigPaths: Sendable {
         appSupportDir.appendingPathComponent("heartbeat.txt", isDirectory: false)
     }
 
+    /// `~/Library/Application Support/Supervisor/supervisor.pid`
+    /// Single-instance lock: the running app writes its pid here on a
+    /// successful start and removes it on normal termination. A newcomer
+    /// reads it and quits if the recorded pid is a live incumbent (see
+    /// SingleInstanceGuard).
+    public var pidfilePath: URL {
+        appSupportDir.appendingPathComponent("supervisor.pid", isDirectory: false)
+    }
+
     /// `~/Library/Application Support/Supervisor/recovery/` — one markdown file
     /// per pause/kill intervention, written by the router immediately before
     /// it signals the Claude Code process. Read by the user (or the resumed /

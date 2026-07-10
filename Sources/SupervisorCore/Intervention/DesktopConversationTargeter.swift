@@ -56,27 +56,6 @@ public enum DesktopTargetingOutcome: Sendable, Equatable {
     case screenRecordingDenied
 }
 
-/// Result of trying to answer an on-screen AskUserQuestion (MCQ) widget.
-public enum MCQAnswerOutcome: Sendable, Equatable {
-    /// The widget was operated (answer typed into "Other" + Submit clicked).
-    case answered(matchedTitle: String)
-    /// The target pane shows NO MCQ controls — it's a free-text question. The
-    /// caller should fall back to a normal composer paste.
-    case notMCQ
-    /// It IS an MCQ but the controls couldn't be located/operated. The caller
-    /// must degrade to a notify — never blind-paste into a widget that won't take it.
-    case unplaceable(reason: String)
-    case targetingFailed(reason: String)
-    case screenRecordingDenied
-}
-
-/// The three OCR-located controls of an AskUserQuestion widget (desktop).
-public struct MCQControls: Sendable, Equatable {
-    public let other: CGPoint   // the "Other" affordance to reveal the free-text field
-    public let field: CGPoint   // the text field to focus before typing
-    public let submit: CGPoint  // the Submit button (its PRE-paste position; re-OCR after typing)
-}
-
 public struct DesktopConversationTargeter: @unchecked Sendable {
 
     private let trace: TraceLog
@@ -89,47 +68,12 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         CGPreflightScreenCaptureAccess()
     }
 
-    /// Capture the conversation surface for OCR. Prefers capturing ONLY Claude's
-    /// window — which composites OUT Supervisor's own hover/panel. That overlay
-    /// floats top-right (≈1656,129), dead over the rightmost pane's title strip,
-    /// and was occluding it in the whole-display screenshot — Supervisor blinding
-    /// itself, the 2026-06-16 `windows=1` drop that broke targeting mid-demo.
-    ///
-    /// Single-window capture is used ONLY when Claude's window covers the display
-    /// from the origin (the maximized / full-screen case), so the image's coords
-    /// still map 1:1 to global screen points (what clicking expects). Otherwise —
-    /// or on any failure — we fall back to the whole display (may include the
-    /// overlay, i.e. today's behavior, never worse).
+    /// Capture the full main display as a CGImage. We capture the whole display
+    /// (not just the Claude window) so OCR'd coordinates are already global
+    /// screen points — the scale is 1:1 on the verified setup, and clicking
+    /// expects global points. Returns nil if capture fails (no permission, etc.).
     public func captureMainDisplay() -> CGImage? {
-        let screen = CGDisplayBounds(CGMainDisplayID())
-        if let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] {
-            let claude = infos.filter {
-                (($0[kCGWindowOwnerName as String] as? String) ?? "")
-                    .localizedCaseInsensitiveContains("claude")
-            }
-            if let main = claude.max(by: { Self.windowArea($0) < Self.windowArea($1) }),
-               let winID = main[kCGWindowNumber as String] as? CGWindowID,
-               let b = main[kCGWindowBounds as String] as? [String: Any],
-               let ox = (b["X"] as? NSNumber)?.doubleValue,
-               let oy = (b["Y"] as? NSNumber)?.doubleValue,
-               let w = (b["Width"] as? NSNumber)?.doubleValue,
-               let h = (b["Height"] as? NSNumber)?.doubleValue,
-               abs(ox) < 4, abs(oy) < 4,
-               w >= Double(screen.width) - 4, h >= Double(screen.height) - 4,
-               let img = CGWindowListCreateImage(
-                    .null, .optionIncludingWindow, winID, [.boundsIgnoreFraming, .nominalResolution]) {
-                return img
-            }
-        }
-        return CGDisplayCreateImage(CGMainDisplayID())
-    }
-
-    /// Screen area of a CGWindowList info dict (Width×Height), 0 if unreadable.
-    static func windowArea(_ info: [String: Any]) -> Double {
-        guard let b = info[kCGWindowBounds as String] as? [String: Any],
-              let w = (b["Width"] as? NSNumber)?.doubleValue,
-              let h = (b["Height"] as? NSNumber)?.doubleValue else { return 0 }
-        return w * h
+        CGDisplayCreateImage(CGMainDisplayID())
     }
 
     // MARK: - OCR (Path B transcription)
@@ -190,6 +134,7 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
             $0.point.x < screen.width * 0.40
                 && $0.point.y >= recentsY
                 && !$0.text.localizedCaseInsensitiveContains("Recent")
+                && !Self.isSupervisorBannerText($0.text)  // never our own stamp
                 && Self.cleanTitle($0.text).count >= 3
         }
         guard !region.isEmpty else { return [] }
@@ -247,11 +192,9 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         screen: CGRect = CGDisplayBounds(CGMainDisplayID())
     ) -> [(title: String, point: CGPoint)] {
         let decorations = CharacterSet(charactersIn: " ~›•-")
-        let topStrip = rows.filter { $0.point.y < screen.height * 0.055 }
-
-        // Primary: the "prefix / title" title-strip format (e.g. "icon / ai-title").
-        let slashed = topStrip
-            .filter { $0.text.contains(" / ") }
+        return rows
+            .filter { $0.point.y < screen.height * 0.055 && $0.text.contains(" / ") }
+            .filter { !Self.isSupervisorBannerText($0.text) }  // never our own stamp
             .compactMap { row -> (title: String, point: CGPoint)? in
                 let tail = row.text
                     .components(separatedBy: " / ")
@@ -261,37 +204,7 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
                 let cleaned = Self.cleanTitle(tail)
                 return cleaned.count >= 3 ? (cleaned, row.point) : nil
             }
-        if !slashed.isEmpty {
-            return slashed.sorted { $0.title.count > $1.title.count }
-        }
-
-        // Fallback (2026-06-19): Claude **Code** panes title their strip with the
-        // worktree/folder name and NO " / " separator — "• sv-demo-pause
-        // sv-demo-pause", "sv-demo-answer C". The slash filter missed those
-        // entirely, returning windows=0 → the misrouting single-window path (the
-        // bug that broke every demo take). Detect any surviving top-strip row,
-        // excluding the macOS menu bar and 1-glyph window controls, de-duped per
-        // column (the strip repeats the name as a worktree badge).
-        var seen = Set<String>()
-        return topStrip
-            .compactMap { row -> (title: String, point: CGPoint)? in
-                let cleaned = Self.cleanTitle(row.text)
-                guard cleaned.count >= 4, !Self.isMenuBarItem(cleaned) else { return nil }
-                let key = "\(Int(row.point.x / 80))|\(cleaned)"
-                guard seen.insert(key).inserted else { return nil }
-                return (cleaned, row.point)
-            }
             .sorted { $0.title.count > $1.title.count }
-    }
-
-    /// macOS menu-bar / app-menu words, excluded from the fallback pane-title
-    /// detection so a captured menu bar can never be read as conversations.
-    static func isMenuBarItem(_ s: String) -> Bool {
-        let menu: Set<String> = [
-            "claude", "file", "edit", "view", "window", "help", "history",
-            "format", "tools", "develop", "bookmarks", "people", "go"
-        ]
-        return menu.contains(s.lowercased())
     }
 
     /// Strip leading bullets / icon glyphs and trailing ellipses OCR picks up.
@@ -315,6 +228,26 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         // only ever window chrome after an ellipsis, already handled above).
         while let last = s.last, "•·~-–—✗⏵<>…. ".contains(last) { s.removeLast() }
         return s.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// True if an OCR'd row is Supervisor's OWN injected banner/stamp, not a real
+    /// conversation. The matcher kept picking the stamp text as the best
+    /// candidate (conf=0.95 title="[ SUPERVISOR • automated - NOT from your
+    /// operator ]"), wasting scroll attempts and risking self-targeting. The
+    /// in-text banner was removed from NEW injections (see
+    /// SupervisorInjectionMarker), but OLD turns still on screen keep showing it,
+    /// so the targeter must filter it regardless.
+    ///
+    /// Matches on the three distinctive tokens that survive OCR ("supervisor",
+    /// "automated", and the phrase "not from your operator"), case-insensitive
+    /// and independent of the bracket glyphs (separators the OCR renders
+    /// variably). Requiring all three together keeps it specific enough to never
+    /// match a real conversation title.
+    static func isSupervisorBannerText(_ s: String) -> Bool {
+        let lower = s.lowercased()
+        return lower.contains("supervisor")
+            && lower.contains("automated")
+            && lower.contains("not from your operator")
     }
 
     // MARK: - Click
@@ -393,18 +326,32 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         let hints = ["type /", "for commands", "reply to claude",
                      "message claude", "ask claude", "how can i help"]
         let placeholders = bottom.filter { r in hints.contains { r.text.lowercased().contains($0) } }
+        // Column tolerance for "same pane as nearX". A composer must sit within
+        // the verified pane's column to be that pane's composer; anything farther
+        // belongs to a NEIGHBOR pane. Bound it to a pane half-width so a
+        // composer in the target column is accepted but a different pane's (e.g.
+        // x=953 when nearX=407, the 2026-06-14 cross-pane mispick) is rejected.
+        let columnTolerance = screen.width * 0.22
         if !placeholders.isEmpty {
-            // Multi-window: pick the composer in the TARGET window's column
-            // (closest x to the matched title bar). Single-window: topmost.
             if let nearX {
-                return placeholders.min { abs($0.point.x - nearX) < abs($1.point.x - nearX) }!.point
+                // Multi-window/pane: pick the composer in the TARGET pane's
+                // column. Only accept a placeholder within the column tolerance of
+                // nearX; if the target pane's own placeholder wasn't OCR'd, do NOT
+                // grab a far-off neighbor's. Fall through to the nearX-column
+                // click below (the verified title column at the composer band y).
+                let inColumn = placeholders.filter { abs($0.point.x - nearX) <= columnTolerance }
+                if let p = inColumn.min(by: { abs($0.point.x - nearX) < abs($1.point.x - nearX) }) {
+                    return p.point
+                }
+            } else {
+                // Single-window: original topmost-placeholder behavior.
+                return placeholders.min { $0.point.y < $1.point.y }!.point
             }
-            return placeholders.min { $0.point.y < $1.point.y }!.point
         }
 
-        // No placeholder: composer likely holds text. Click a touch above the
-        // lowest row (the footer). Prefer the target column when known, else the
-        // pane center.
+        // No placeholder (composer holds text), or none fell in the target
+        // column. Click a touch above the lowest row (the footer). Prefer the
+        // target column when known, else the pane center.
         let footY = bottom.map(\.point.y).max() ?? (screen.height * 0.95)
         let y = max(footY - screen.height * 0.04, bandTop)
         if let nearX { return CGPoint(x: nearX, y: y) }
@@ -482,25 +429,17 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         let panes = visiblePaneTitles(from: rows)
         if panes.count > 1 {
             let paneCandidates = panes.map { DesktopConversationCandidate(text: $0.title, point: $0.point) }
-            if let (c, conf) = matcherFn(paneCandidates, targetTitle), conf >= confidenceThreshold {
-                trace.emit("desktop", "targeting pane_match panes=\(panes.count) match=\"\(c.text.prefix(30))\" conf=\(String(format: "%.2f", conf)) x=\(Int(c.point.x))")
-                // Focus the TARGET pane's composer from THIS SAME OCR pass — no
-                // second screenshot (which can drift from the title match), and a
-                // real settle BEFORE the caller's Cmd-V — so the paste lands in
-                // THIS pane's textbox and never bleeds into a neighbor (the
-                // 2026-06-16 cross-session bleed: the paste fired before the focus
-                // click took). The re-capture focusComposer is the fallback.
-                if let composerPt = composerPoint(from: rows, nearX: c.point.x) {
-                    trace.emit("desktop", "pane_compose_focus click=(\(Int(composerPt.x)),\(Int(composerPt.y))) nearX=\(Int(c.point.x))")
-                    click(at: composerPt)
-                    usleep(450_000)   // let Electron move keyboard focus to this textbox
-                } else {
-                    focusComposer(nearX: c.point.x)
-                }
-                return .focused(matchedTitle: c.text)
+            // Ambiguity guard: require an EXACT-unique title, or a clear-margin
+            // winner. Two near-identical pane titles (the M8 collision) yield no
+            // unique winner -> nil -> degrade to notify, instead of a guess.
+            if let m = Self.resolveUniqueMatch(target: targetTitle, candidates: paneCandidates, threshold: confidenceThreshold, matcher: matcherFn, trace: trace) {
+                trace.emit("desktop", "targeting pane_match panes=\(panes.count) match=\"\(m.candidate.text.prefix(30))\" conf=\(String(format: "%.2f", m.confidence)) exact=\(m.exact) x=\(Int(m.candidate.point.x))")
+                focusComposer(nearX: m.candidate.point.x)
+                return .focused(matchedTitle: m.candidate.text)
             }
-            trace.emit("desktop", "targeting pane_no_match panes=\(panes.count) target=\"\(targetTitle.prefix(40))\"")
-            return .targetingFailed(reason: "no_confident_pane_match panes=\(panes.count) target=\"\(targetTitle.prefix(40))\"")
+            let considered = paneCandidates.map { "\"\($0.text.prefix(30))\"" }.joined(separator: ", ")
+            trace.emit("desktop", "targeting pane_ambiguous_or_no_match panes=\(panes.count) target=\"\(targetTitle.prefix(40))\" candidates=[\(considered)]")
+            return .targetingFailed(reason: "no_unique_pane_match panes=\(panes.count) target=\"\(targetTitle.prefix(40))\"")
         }
 
         // Already-active shortcut, but ONLY with exactly one visible window.
@@ -517,9 +456,12 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
             return .focused(matchedTitle: titles[0])
         }
 
+        // Ambiguity guard (see resolveUniqueMatch): an exact-unique title, or a
+        // clear-margin winner, otherwise nil, so two colliding sidebar titles
+        // degrade to notify instead of a wrong-chat paste.
         var matched: (cand: DesktopConversationCandidate, conf: Double)?
-        if let (c, conf) = matcherFn(candidates, targetTitle), conf >= confidenceThreshold {
-            matched = (c, conf)
+        if let m = Self.resolveUniqueMatch(target: targetTitle, candidates: candidates, threshold: confidenceThreshold, matcher: matcherFn, trace: trace) {
+            matched = (m.candidate, m.confidence)
         }
 
         // Pass 2 (scroll-to-find): the target wasn't confidently in the visible
@@ -536,9 +478,9 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
                 usleep(350_000)
                 guard let v = captureMainDisplay() else { break }
                 let scrolled = sidebarCandidates(from: recognizeRows(in: v))
-                if let (c, conf) = matcherFn(scrolled, targetTitle), conf >= confidenceThreshold {
-                    trace.emit("desktop", "targeting found_after_scroll attempt=\(attempt) match=\"\(c.text.prefix(30))\" conf=\(String(format: "%.2f", conf))")
-                    matched = (c, conf); break
+                if let m = Self.resolveUniqueMatch(target: targetTitle, candidates: scrolled, threshold: confidenceThreshold, matcher: matcherFn, trace: trace) {
+                    trace.emit("desktop", "targeting found_after_scroll attempt=\(attempt) match=\"\(m.candidate.text.prefix(30))\" conf=\(String(format: "%.2f", m.confidence)) exact=\(m.exact)")
+                    matched = (m.candidate, m.confidence); break
                 }
                 let fresh = scrolled.map(\.text).filter { !seen.contains($0) }
                 if fresh.isEmpty {
@@ -612,174 +554,107 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         return best
     }
 
-    /// PAUSE/KILL on desktop is a UI interrupt, NOT a process signal: Claude
-    /// Desktop runs every conversation in ONE process, so SIGSTOP/SIGTERM would
-    /// freeze/kill them all. Instead, match the target pane and click its Stop
-    /// button (the □ Claude shows while the agent runs) at the composer's right
-    /// edge — per-conversation, and a click can't bleed text. Returns .focused on
-    /// a confident match + click, else .targetingFailed / .screenRecordingDenied
-    /// for the caller to degrade to a notify. Mirrors focusConversation's OCR +
-    /// pane-match path (same SAME-OCR discipline that killed the paste bleed).
-    public func interruptPane(targetTitle: String, confidenceThreshold: Double = 0.6) -> DesktopTargetingOutcome {
-        guard Self.hasScreenRecordingPermission() else {
-            trace.emit("desktop", "interrupt screen_recording_denied")
-            return .screenRecordingDenied
-        }
-        activateClaudeApp()
-        usleep(500_000)
-        guard let img = captureMainDisplay() else {
-            return .targetingFailed(reason: "capture_failed")
-        }
-        let rows = recognizeRows(in: img)
-        let panes = visiblePaneTitles(from: rows)
-        let paneCandidates = panes.map { DesktopConversationCandidate(text: $0.title, point: $0.point) }
-        guard let (c, conf) = bestMatch(target: targetTitle, candidates: paneCandidates), conf >= confidenceThreshold else {
-            trace.emit("desktop", "interrupt pane_no_match panes=\(panes.count) target=\"\(targetTitle.prefix(40))\"")
-            return .targetingFailed(reason: "no_confident_pane_match panes=\(panes.count)")
-        }
-        guard let composerPt = composerPoint(from: rows, nearX: c.point.x) else {
-            trace.emit("desktop", "interrupt composer_not_found pane=\"\(c.text.prefix(30))\"")
-            return .targetingFailed(reason: "composer_not_found")
-        }
-        // The Stop/Send button sits at the composer's right edge — a fixed offset
-        // right of the placeholder's OCR center. Calibrated to the dense
-        // side-by-side layout (verified live: composer 1225 -> Stop 1450 in a 4-up).
-        // Sparse 1-2 pane layouts put the button farther right; revisit if needed.
-        let stopPt = CGPoint(x: composerPt.x + Self.stopButtonOffset, y: composerPt.y)
-        trace.emit("desktop", "interrupt pane=\"\(c.text.prefix(30))\" conf=\(String(format: "%.2f", conf)) stop_click=(\(Int(stopPt.x)),\(Int(stopPt.y)))")
-        click(at: stopPt)
-        return .focused(matchedTitle: c.text)
-    }
+    /// Resolve the ONE candidate that uniquely IS the target, or return nil so
+    /// the caller degrades to a notify. This is the ambiguity guard that stops a
+    /// wrong-conversation inject when two titles collide (the M8 failure: an
+    /// auto-dispatch for "Supervisor Product Launch Readiness" landed in
+    /// "Supervisor Launch Readiness" because the fuzzy matcher just took the top
+    /// score with no check that a second, structurally-different conversation
+    /// also cleared the gate).
+    ///
+    /// Resolution order (most-specific identity first):
+    ///   1. EXACT, UNIQUE title equality (normalized). If exactly one candidate's
+    ///      title equals the target, that's the answer (no fuzzy guessing). If
+    ///      TWO OR MORE candidates equal the target (genuine duplicates on
+    ///      screen), it is ambiguous -> nil.
+    ///   2. Otherwise fall to the scoring `matcher`, but apply a UNIQUENESS /
+    ///      MARGIN guard: the top score must clear `threshold` AND beat the
+    ///      runner-up by at least `margin`. A near-tie means two candidates are
+    ///      both plausibly the target (exactly the collision case), so we refuse
+    ///      to guess and return nil. Zero candidates -> nil.
+    ///   3. IDENTITY FLOOR (the 2026-07-08 misroute fix): the WINNER'S OWN local
+    ///      identity score must itself clear the threshold. The margin guard only
+    ///      proves the winner beat the OTHER candidates — it does NOT prove the
+    ///      winner actually resembles the target. When the matcher is the LLM
+    ///      (Path A/B), `winnerScore` is the model's self-reported confidence,
+    ///      which can be high for a candidate whose text bears NO real
+    ///      relationship to the target (the live misroute: a dispatch for
+    ///      "discussion" pasted into "memory/skill audit" — an overconfident LLM
+    ///      pick whose local token/prefix overlap with the target is ~0). A wide
+    ///      margin over unrelated runners-up let that slip the margin guard. So we
+    ///      additionally require the winner's LOCAL score (its literal
+    ///      cwd/title/session-identity overlap with the target) to clear
+    ///      `threshold`. For the fuzzy default this is a no-op — its reported
+    ///      confidence IS the local score, so `winnerScore >= threshold` already
+    ///      implies `winnerLocal >= threshold`, and the confident path is
+    ///      unchanged. It only bites the LLM path, degrading a confidently-picked
+    ///      but textually-unrelated winner to notify instead of pasting it.
+    ///
+    /// nil is the safe outcome: the caller (focusConversation) turns it into a
+    /// `.targetingFailed` that the injector degrades to a logged notify, never a
+    /// blind paste into the wrong chat.
+    ///
+    /// `trace` (optional) logs the SPECIFIC degrade reason on a nil return so the
+    /// recorded outcome is honest ("ambiguous margin" vs "winner identity below
+    /// floor"). nil by default keeps existing callers/tests source-compatible.
+    static func resolveUniqueMatch(
+        target: String,
+        candidates: [DesktopConversationCandidate],
+        threshold: Double,
+        margin: Double = 0.10,
+        matcher: ([DesktopConversationCandidate], String) -> (DesktopConversationCandidate, Double)?,
+        trace: TraceLog? = nil
+    ) -> (candidate: DesktopConversationCandidate, confidence: Double, exact: Bool)? {
+        guard !candidates.isEmpty else { return nil }
 
-    /// Horizontal offset from the composer placeholder (its OCR center) to the
-    /// Stop/Send button at the composer's right edge, in the dense side-by-side
-    /// layout. Verified live in a 4-up (composer 1225 -> Stop 1450).
-    static let stopButtonOffset: CGFloat = 225
-
-    // MARK: - MCQ (AskUserQuestion widget) answering
-
-    /// Answer an on-screen AskUserQuestion (MCQ) for the target conversation via
-    /// the universal "Other" path: focus the target pane, click "Other", type the
-    /// answer into its field, then click Submit — RE-OCR'ing for Submit AFTER the
-    /// text lands, because typing grows the field and shifts the button (the
-    /// finicky-submit bug the devtools hit). Returns .notMCQ when no MCQ controls
-    /// are visible (caller falls back to a composer paste) and .unplaceable when it
-    /// IS an MCQ but the controls can't be operated (caller degrades to a notify —
-    /// never a blind paste into a widget that won't accept it).
-    public func answerMCQ(targetTitle: String, answer: String, confidenceThreshold: Double = 0.6) -> MCQAnswerOutcome {
-        guard Self.hasScreenRecordingPermission() else { return .screenRecordingDenied }
-        activateClaudeApp()
-        usleep(500_000)
-        guard let img = captureMainDisplay() else { return .targetingFailed(reason: "capture_failed") }
-        let rows = recognizeRows(in: img)
-        let panes = visiblePaneTitles(from: rows)
-        let paneCandidates = panes.map { DesktopConversationCandidate(text: $0.title, point: $0.point) }
-        guard let (c, conf) = bestMatch(target: targetTitle, candidates: paneCandidates), conf >= confidenceThreshold else {
-            return .targetingFailed(reason: "no_confident_pane_match panes=\(panes.count)")
+        // 1. Exact, UNIQUE normalized-title equality wins outright. Prefer the
+        //    strongest identity available (full-title equality) over any
+        //    substring/fuzzy score, per the safety rule.
+        let t = normalize(target)
+        let exactMatches = candidates.filter { normalize($0.text) == t }
+        if exactMatches.count == 1 {
+            return (exactMatches[0], 1.0, true)
         }
-        // Confine detection to the matched pane's column so a neighbor pane's MCQ
-        // controls can't be mistaken for this one's.
-        let col = Self.columnBounds(panes: panes, at: c.point.x)
-        let colRows = rows.filter { $0.point.x >= col.minX && $0.point.x <= col.maxX }
-        guard let controls = Self.detectMCQControls(in: colRows) else {
-            return .notMCQ
-        }
-        trace.emit("desktop", "mcq detected pane=\"\(c.text.prefix(30))\" other=(\(Int(controls.other.x)),\(Int(controls.other.y))) submit_pre=(\(Int(controls.submit.x)),\(Int(controls.submit.y)))")
-        // Reveal the free-text field ("Other" / "Type your own").
-        click(at: controls.other); usleep(400_000)
-
-        func col2(_ image: CGImage) -> [(text: String, point: CGPoint)] {
-            recognizeRows(in: image).filter { $0.point.x >= col.minX && $0.point.x <= col.maxX }
+        if exactMatches.count > 1 {
+            // Two on-screen conversations share the exact target title: we
+            // cannot tell them apart, so do NOT inject.
+            return nil
         }
 
-        // Focus → paste → VERIFY the answer actually landed, THEN Submit. The old
-        // path clicked Submit unconditionally. On 2026-06-19 two MCQs came up at
-        // once, the paste missed the pause pane's field, and it submitted a BLANK
-        // "Other" → mcq_no_turn_landed and a confused worker. So: never submit an
-        // unverified field, and retry the focus+paste once before giving up.
-        for attempt in 0..<2 {
-            // Re-find the field each try — it shifts when "Other" expands, and a
-            // fresh focus click is what recovers a missed paste.
-            var fieldRows: [(text: String, point: CGPoint)] = []
-            if let fimg = captureMainDisplay() { fieldRows = col2(fimg) }
-            let fieldPt = Self.mcqFieldPoint(in: fieldRows) ?? controls.field
-            click(at: fieldPt); usleep(350_000)
-            pasteViaClipboard(answer); usleep(500_000)
+        // 2. No exact match: fall to the scoring matcher, but never accept a top
+        //    score that a runner-up sits right beside. Score EVERY candidate so
+        //    we can measure the margin between the best and second-best (the
+        //    matcher itself only hands back its single pick).
+        guard let (winner, winnerScore) = matcher(candidates, target),
+              winnerScore >= threshold else { return nil }
 
-            guard let img2 = captureMainDisplay() else { return .unplaceable(reason: "recapture_failed") }
-            let after = col2(img2)
-            if Self.answerLanded(answer, in: after),
-               let submit = after.first(where: { $0.text.localizedCaseInsensitiveContains("submit") })?.point {
-                trace.emit("desktop", "mcq submit pane=\"\(c.text.prefix(30))\" attempt=\(attempt) verified click=(\(Int(submit.x)),\(Int(submit.y)))")
-                click(at: submit)
-                return .answered(matchedTitle: c.text)
-            }
-            trace.emit("desktop", "mcq other_unverified attempt=\(attempt) pane=\"\(c.text.prefix(30))\" — retrying focus+paste")
+        // The runner-up is the highest-scoring OTHER candidate under the same
+        // local scoring the matcher's confidence is comparable to. (We score all
+        // candidates locally to get a stable, matcher-independent margin; the
+        // winner's reported confidence still has to clear the threshold above.)
+        let nt = t
+        var runnerUp = 0.0
+        for c in candidates where c != winner {
+            runnerUp = max(runnerUp, score(normalize(c.text), nt))
         }
-        // Two tries and the answer never showed in the field → don't submit blank;
-        // degrade to a notify so the owner places it.
-        return .unplaceable(reason: "other_field_unverified_after_paste")
-    }
-
-    /// The free-text field in a revealed AskUserQuestion widget — the "Type your
-    /// own" placeholder, falling back to the "Other" row — within OCR'd column rows.
-    static func mcqFieldPoint(in rows: [(text: String, point: CGPoint)]) -> CGPoint? {
-        rows.first { $0.text.localizedCaseInsensitiveContains("Type your own") }?.point
-            ?? rows.first { $0.text.localizedCaseInsensitiveContains("Other") }?.point
-    }
-
-    /// True when a distinctive leading slice of `answer` is visible in the OCR'd
-    /// column — i.e. the paste reached the Other field. This is the guard against
-    /// the blank-Submit bug: if focus/paste missed, the answer won't be on screen
-    /// and we must NOT commit. Very short answers can't be verified, so they pass
-    /// (don't block). Pure + static for unit tests.
-    static func answerLanded(_ answer: String, in rows: [(text: String, point: CGPoint)]) -> Bool {
-        func squash(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
-        let probe = squash(String(answer.prefix(20)))
-        guard probe.count >= 6 else { return true }
-        let head = String(probe.prefix(12))
-        return squash(rows.map(\.text).joined(separator: " ")).contains(head)
-    }
-
-    /// Locate the "Other" affordance, its text field, and the Submit button in a
-    /// set of OCR rows (already confined to one pane's column). nil when the rows
-    /// show no MCQ controls — i.e. a free-text question, not a widget. Pure + static
-    /// so it's unit-testable with synthetic rows.
-    public static func detectMCQControls(in rows: [(text: String, point: CGPoint)]) -> MCQControls? {
-        func find(_ needle: String) -> CGPoint? {
-            rows.first { $0.text.localizedCaseInsensitiveContains(needle) }?.point
+        let winnerLocal = score(normalize(winner.text), nt)
+        if winnerLocal - runnerUp < margin {
+            // Near-tie: a second conversation is just as plausibly the target.
+            // The collision case -> refuse to guess.
+            trace?.emit("desktop", "targeting degrade_to_notify reason=ambiguous_margin candidates=\(candidates.count) winnerLocal=\(String(format: "%.2f", winnerLocal)) runnerUp=\(String(format: "%.2f", runnerUp)) margin<\(String(format: "%.2f", margin)) target=\"\(target.prefix(40))\"")
+            return nil
         }
-        guard let field = find("Type your own") ?? find("Other"),
-              let submit = find("Submit") else { return nil }
-        let other = find("Other") ?? field
-        return MCQControls(other: other, field: field, submit: submit)
-    }
-
-    /// The x-range of the column containing the pane at `x`, as the midpoints to the
-    /// nearest neighbor panes (whole width when only one pane is visible). Confines
-    /// MCQ-control detection to the target pane. Pure + static for tests.
-    public static func columnBounds(panes: [(title: String, point: CGPoint)], at x: CGFloat) -> (minX: CGFloat, maxX: CGFloat) {
-        let xs = panes.map { $0.point.x }.sorted()
-        guard xs.count > 1 else { return (0, 99_999) }
-        let left = xs.last { $0 < x }
-        let right = xs.first { $0 > x }
-        return (left.map { ($0 + x) / 2 } ?? 0, right.map { ($0 + x) / 2 } ?? 99_999)
-    }
-
-    /// Set the clipboard to `text` and post Cmd-V to the frontmost app. The caller
-    /// activates Claude and clicks the destination field first, so the paste lands
-    /// in that field.
-    public func pasteViaClipboard(_ text: String) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-        let src = CGEventSource(stateID: .hidSystemState)
-        if let dn = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: true) {
-            dn.flags = .maskCommand; dn.post(tap: .cghidEventTap)
+        // Identity floor (2026-07-08 misroute fix): the winner must itself
+        // resemble the target, not merely beat unrelated runners-up. A high
+        // matcher confidence (an overconfident LLM pick) whose LOCAL identity
+        // overlap with the target is below the gate is exactly the wrong-chat
+        // paste we must never produce -> degrade to notify. No-op for the fuzzy
+        // default (winnerLocal == winnerScore there).
+        if winnerLocal < threshold {
+            trace?.emit("desktop", "targeting degrade_to_notify reason=winner_identity_below_floor candidates=\(candidates.count) winner=\"\(winner.text.prefix(30))\" winnerScore=\(String(format: "%.2f", winnerScore)) winnerLocal=\(String(format: "%.2f", winnerLocal)) floor=\(String(format: "%.2f", threshold)) target=\"\(target.prefix(40))\"")
+            return nil
         }
-        if let up = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: false) {
-            up.flags = .maskCommand; up.post(tap: .cghidEventTap)
-        }
+        return (winner, winnerScore, false)
     }
 
     private func activateClaudeApp() {

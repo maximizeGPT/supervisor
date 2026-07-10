@@ -56,4 +56,46 @@ final class SessionObjectiveTests: XCTestCase {
             .appendingPathComponent("empty-\(UUID().uuidString)", isDirectory: true)
         XCTAssertNil(SessionObjective.read(sessionId: "any", projectsDir: empty))
     }
+
+    // MARK: - Provenance skips (objective must be the first REAL owner prompt)
+
+    func testSkipsLeadingMetaCaveat() throws {
+        let sid = "obj-meta"
+        let base = try makeTranscript(sid: sid, lines: [
+            #"{"type":"user","isMeta":true,"message":{"role":"user","content":"Caveat: messages below were generated while running local commands."}}"#,
+            #"{"type":"user","message":{"role":"user","content":"The real objective"}}"#,
+        ])
+        defer { try? FileManager.default.removeItem(at: base) }
+        XCTAssertEqual(SessionObjective.read(sessionId: sid, projectsDir: base), "The real objective")
+    }
+
+    func testSkipsLeadingSlashCommandEcho() throws {
+        let sid = "obj-cmd"
+        let base = try makeTranscript(sid: sid, lines: [
+            #"{"type":"user","message":{"role":"user","content":"<command-name>/deploy</command-name>"}}"#,
+            #"{"type":"user","message":{"role":"user","content":"The real objective"}}"#,
+        ])
+        defer { try? FileManager.default.removeItem(at: base) }
+        XCTAssertEqual(SessionObjective.read(sessionId: sid, projectsDir: base), "The real objective")
+    }
+
+    func testSkipsLeadingCompactContinuationRecap() throws {
+        let sid = "obj-recap"
+        let base = try makeTranscript(sid: sid, lines: [
+            #"{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}"#,
+            #"{"type":"user","message":{"role":"user","content":"The real objective"}}"#,
+        ])
+        defer { try? FileManager.default.removeItem(at: base) }
+        XCTAssertEqual(SessionObjective.read(sessionId: sid, projectsDir: base), "The real objective")
+    }
+
+    func testSkipsLeadingSidechainTurn() throws {
+        let sid = "obj-sidechain"
+        let base = try makeTranscript(sid: sid, lines: [
+            #"{"type":"user","isSidechain":true,"message":{"role":"user","content":"You are a subagent. Do the task."}}"#,
+            #"{"type":"user","message":{"role":"user","content":"The real objective"}}"#,
+        ])
+        defer { try? FileManager.default.removeItem(at: base) }
+        XCTAssertEqual(SessionObjective.read(sessionId: sid, projectsDir: base), "The real objective")
+    }
 }

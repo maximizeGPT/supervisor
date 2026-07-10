@@ -493,6 +493,8 @@ public enum TriagePrompt {
             return "[\(ts)] bashToolCall id=\(i.toolUseId): \(i.command.prefix(160))"
         case .bashToolResult(let i):
             return "[\(ts)] bashToolResult id=\(i.toolUseId) error=\(i.isError) bytes=\(i.output.utf8.count)"
+        case .fileEdit(let i):
+            return "[\(ts)] fileEdit \(i.toolName) \(i.filePath) (\(i.hunks.count) change(s))"
         case .systemSignal(let i):
             return "[\(ts)] systemSignal \(i.subtype) preventedContinuation=\(i.preventedContinuation)"
         }
@@ -535,6 +537,15 @@ public struct TriageCandidate: Sendable, Equatable {
     /// high → continue (auto-dispatch); medium → notify (propose-and-wait);
     /// low → notify (surface idle state, no dispatch).
     public let confidence: String?
+    /// Fix #12: opt this injection into the InterventionRouter's
+    /// delivered-dedup + bounded-retry gate. Default false because most
+    /// injections self-govern their own repetition (the watchdog nudge stamps
+    /// nudgeCount + lastNudgeTime, the orchestrator counts step attempts) or
+    /// carry distinct text per dispatch. Only the dispatcher's unbounded HIGH-
+    /// confidence auto-dispatch needs router-level dedup: it re-detects
+    /// idle+objective every tick and would otherwise re-send the IDENTICAL
+    /// proposal (and re-steal focus) forever.
+    public let dedupDelivery: Bool
 
     public init(
         category: String,
@@ -547,7 +558,8 @@ public struct TriageCandidate: Sendable, Equatable {
         suggestedInjectText: String? = nil,
         questionType: String? = nil,
         nextTaskProposal: String? = nil,
-        confidence: String? = nil
+        confidence: String? = nil,
+        dedupDelivery: Bool = false
     ) {
         self.category = category
         self.severity = severity
@@ -560,5 +572,6 @@ public struct TriageCandidate: Sendable, Equatable {
         self.questionType = questionType
         self.nextTaskProposal = nextTaskProposal
         self.confidence = confidence
+        self.dedupDelivery = dedupDelivery
     }
 }

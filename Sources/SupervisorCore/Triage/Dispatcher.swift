@@ -25,11 +25,12 @@
 //   - It returns confidence based on how clear the next task is,
 //     not how plausible. PRINCIPLES §3a: write the asymmetry note
 //     in the justification.
-//   - It writes the next_task_proposal in the autonomous opener's
-//     voice (§5 engineering-decisions-are-yours; §11 voice/tone).
-//     The proposal IS the prompt that gets injected — it reads
-//     like a session-opener written by Mohammed, not like LLM
-//     output addressed to a user.
+//   - It writes the next_task_proposal grounded in THIS session's
+//     actual recent state: the worker's last messages and output,
+//     the files/commits/errors in play, and the concrete next step
+//     that follows. The proposal IS the prompt that gets injected,
+//     so it reads like a senior collaborator who just read the
+//     conversation, not generic boilerplate addressed to a user.
 //
 // Cost envelope (PRINCIPLES §9e): one dispatch is ~4-6k input + ~500
 // output tokens against Haiku 4.5 → ~$0.005-0.008 per fire. With the
@@ -153,6 +154,11 @@ public struct SessionContext: Sendable {
     /// Commits on this branch since it diverged from main. Empty on
     /// fetch failure or non-repo.
     public let currentBranchCommits: [DispatchCommit]
+    /// Recent pull requests (open + merged/closed) for the session's repo,
+    /// from `gh pr list --state all`. Empty array on fetch failure or gh not
+    /// installed. Lets the dispatcher SEE PR state (e.g. a MERGED PR) so it
+    /// verifies instead of hallucinating "the PR was never opened".
+    public let recentPullRequests: [DispatchPullRequest]
     /// How many dispatches the loop has already issued in this run.
     public let priorDispatchesConsidered: Int
     /// PRODUCT-DIRECTION.md content — the project's north star.
@@ -183,6 +189,7 @@ public struct SessionContext: Sendable {
         lastNTurns: [SupervisorEvent],
         openIssues: [DispatchIssue],
         currentBranchCommits: [DispatchCommit],
+        recentPullRequests: [DispatchPullRequest] = [],
         priorDispatchesConsidered: Int = 0,
         productDirection: String = "",
         objective: String? = nil,
@@ -197,6 +204,7 @@ public struct SessionContext: Sendable {
         self.lastNTurns = lastNTurns
         self.openIssues = openIssues
         self.currentBranchCommits = currentBranchCommits
+        self.recentPullRequests = recentPullRequests
         self.priorDispatchesConsidered = priorDispatchesConsidered
         self.productDirection = productDirection
         self.objective = objective
@@ -266,6 +274,62 @@ public struct DispatchCommit: Sendable, Equatable {
     }
 }
 
+/// One pull request (open or merged/closed) for the session's repo. Mirrors
+/// the JSON shape returned by `gh pr list --json
+/// number,title,state,headRefName,mergedAt,updatedAt`. The Dispatcher uses
+/// these to SEE PR state so it verifies instead of hallucinating — e.g. a PR
+/// that is MERGED must not be re-proposed as "never opened". `gh` reports
+/// `state` as OPEN/CLOSED plus a separate `mergedAt`; the fetcher normalizes a
+/// non-null `mergedAt` to state MERGED at decode time so the prompt sees a
+/// single tri-state (OPEN/MERGED/CLOSED).
+public struct DispatchPullRequest: Sendable, Equatable, Codable {
+    public let number: Int
+    public let title: String
+    public let state: String
+    public let headRefName: String
+    public let updatedAt: String
+
+    public init(number: Int, title: String, state: String, headRefName: String, updatedAt: String) {
+        self.number = number
+        self.title = title
+        self.state = state
+        self.headRefName = headRefName
+        self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case number, title, state, headRefName, mergedAt, updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.number = try c.decode(Int.self, forKey: .number)
+        self.title = (try? c.decode(String.self, forKey: .title)) ?? ""
+        self.headRefName = (try? c.decode(String.self, forKey: .headRefName)) ?? ""
+        self.updatedAt = (try? c.decode(String.self, forKey: .updatedAt)) ?? ""
+        // gh returns state OPEN/CLOSED and a separate mergedAt timestamp. A
+        // non-null mergedAt means the PR landed — normalize to MERGED so the
+        // prompt sees a single tri-state instead of a CLOSED that was actually
+        // merged. `mergedAt` decodes to nil when JSON null or absent.
+        let rawState = (try? c.decode(String.self, forKey: .state)) ?? ""
+        let mergedAt = (try? c.decode(String?.self, forKey: .mergedAt)) ?? nil
+        if let mergedAt, !mergedAt.isEmpty {
+            self.state = "MERGED"
+        } else {
+            self.state = rawState
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(number, forKey: .number)
+        try c.encode(title, forKey: .title)
+        try c.encode(state, forKey: .state)
+        try c.encode(headRefName, forKey: .headRefName)
+        try c.encode(updatedAt, forKey: .updatedAt)
+    }
+}
+
 // MARK: - The Dispatcher
 
 /// Protocol for the engine-facing Dispatcher surface. Concrete impl
@@ -316,6 +380,7 @@ public final class Dispatcher: Dispatching, Sendable {
     private let principlesPath: URL?
     private let issueFetcher: (any IssueFetching)?
     private let commitFetcher: (any BranchCommitFetching)?
+    private let prFetcher: (any PRFetching)?
     private let dispatchHistory: (any DispatchHistoryReading)?
     private let grounder: (any ProposalGrounding)?
     private let trace: TraceLog
@@ -334,6 +399,7 @@ public final class Dispatcher: Dispatching, Sendable {
         principlesPath: URL? = nil,
         issueFetcher: (any IssueFetching)? = nil,
         commitFetcher: (any BranchCommitFetching)? = nil,
+        prFetcher: (any PRFetching)? = nil,
         dispatchHistory: (any DispatchHistoryReading)? = nil,
         grounder: (any ProposalGrounding)? = nil,
         trace: TraceLog = .shared
@@ -343,6 +409,7 @@ public final class Dispatcher: Dispatching, Sendable {
         self.principlesPath = principlesPath
         self.issueFetcher = issueFetcher
         self.commitFetcher = commitFetcher
+        self.prFetcher = prFetcher
         self.dispatchHistory = dispatchHistory
         self.grounder = grounder
         self.trace = trace
@@ -350,11 +417,18 @@ public final class Dispatcher: Dispatching, Sendable {
 
     /// Read PRINCIPLES.md from disk if a path is set, falling back to
     /// the constructor-provided text. Re-reads on every dispatch so
-    /// long-running loops pick up edits.
+    /// long-running loops pick up edits. A re-read that comes back below
+    /// the stub threshold (a stale bundle's near-empty PRINCIPLES.md) is
+    /// rejected in favor of the constructor text so a mid-loop swap to a
+    /// stub bundle can't degrade the dispatch contract.
     private var principlesText: String {
         guard let path = principlesPath,
               let fresh = try? String(contentsOf: path, encoding: .utf8),
               !fresh.isEmpty else {
+            return fallbackPrinciplesText
+        }
+        if fresh.count < PrinciplesResolver.stubThreshold {
+            trace.emit("dispatch", "PRINCIPLES re-read at \(path.path) is only \(fresh.count) chars (looks like a stub); using fallback text")
             return fallbackPrinciplesText
         }
         return fresh
@@ -371,73 +445,22 @@ public final class Dispatcher: Dispatching, Sendable {
         lastNTurns: [SupervisorEvent],
         priorDispatchesConsidered: Int
     ) async -> DispatchResult {
-        // Concurrent fetches. Both swallow errors into empty arrays so
-        // the dispatch proceeds even when gh / git misbehave; trace
-        // tags from the fetchers already discriminate the reason.
-        async let issuesFut: [DispatchIssue] = {
-            guard let fetcher = self.issueFetcher, let cwd = cwd else { return [] }
-            do {
-                return try await fetcher.fetchOpenIssues(cwd: cwd)
-            } catch {
-                self.trace.emit("dispatch", "gh fetch threw, proceeding with empty issues: \(error)")
-                return []
-            }
-        }()
-        async let commitsFut: [DispatchCommit] = {
-            guard let fetcher = self.commitFetcher,
-                  let cwd = cwd,
-                  let branch = gitBranch else { return [] }
-            do {
-                return try await fetcher.fetchBranchCommits(
-                    cwd: cwd, branch: branch, baseBranch: "main"
-                )
-            } catch {
-                self.trace.emit("dispatch", "git log threw, proceeding with empty commits: \(error)")
-                return []
-            }
-        }()
-        let issues = await issuesFut
-        let commits = await commitsFut
-        // Recent proposals this loop already produced for THIS session, so the
-        // model (and the deterministic backstop) can avoid re-proposing them.
-        // Synchronous + best-effort: a nil reader or a read error yields [].
-        let recentProposals = dispatchHistory?.recentProposalHeads(
-            sessionId: sessionUUID, limit: 6
-        ) ?? []
-        // Read the session's standing work record so the loop proposes the REAL
-        // backlog instead of fabricating a task when issues/commits give no
-        // clear move. Without this the in-app dispatcher's knownGaps was always
-        // empty (only the Python hook read it).
-        let knownGaps = cwd.flatMap { $0.isEmpty ? nil : readKnownGaps(cwd: $0) } ?? ""
-
-        // The session's objective (its opening prompt) — the through-line the
-        // dispatcher drives toward, so it proposes the next step toward what the
-        // user actually asked for, not merely a local follow-on.
-        let objective = SessionObjective.read(sessionId: sessionUUID)
-        if let objective {
-            trace.emit("dispatch", "objective session=\(sessionUUID) bytes=\(objective.utf8.count)")
-        }
-        // Fold-in fix (§1c): the in-app dispatcher never populated
-        // productDirection, so it never read PRODUCT-DIRECTION.md (only the
-        // Python hook did). Read it from the cwd repo root, like knownGaps, so
-        // the in-app dispatcher reasons against the project's north star too.
-        let productDirection = cwd.flatMap { c -> String? in
-            guard !c.isEmpty else { return nil }
-            return try? String(contentsOf: URL(fileURLWithPath: c)
-                .appendingPathComponent("PRODUCT-DIRECTION.md"), encoding: .utf8)
-        } ?? ""
-        let context = SessionContext(
+        // Context assembly (issues + commits + objective + known gaps +
+        // product direction + recent proposals) is factored into
+        // SessionContextBuilder so the Planner builds the SAME bundle from
+        // the SAME sources rather than duplicating the fetch/read logic.
+        let context = await SessionContextBuilder.build(
             sessionUUID: sessionUUID,
             cwd: cwd,
             gitBranch: gitBranch,
             lastNTurns: lastNTurns,
-            openIssues: issues,
-            currentBranchCommits: commits,
             priorDispatchesConsidered: priorDispatchesConsidered,
-            productDirection: productDirection,
-            objective: objective,
-            knownGaps: knownGaps,
-            recentDispatchProposals: recentProposals
+            issueFetcher: issueFetcher,
+            commitFetcher: commitFetcher,
+            prFetcher: prFetcher,
+            dispatchHistory: dispatchHistory,
+            trace: trace,
+            traceTag: "dispatch"
         )
         return await dispatch(context: context)
     }
@@ -732,6 +755,21 @@ public final class Dispatcher: Dispatching, Sendable {
             }
         }
 
+        // Recent pull requests — open + merged. This is the PR state that lets
+        // the dispatcher VERIFY whether the objective's deliverable already
+        // landed (e.g. a MERGED PR) instead of hallucinating "the PR was never
+        // opened". A MERGED PR whose title matches the objective is the strongest
+        // signal the work shipped — do not re-propose it.
+        lines.append("# Recent pull requests (open + merged)")
+        if context.recentPullRequests.isEmpty {
+            lines.append("(none found — either no PRs, or gh fetch failed; absence here does NOT prove a PR was never opened)")
+        } else {
+            for pr in context.recentPullRequests {
+                lines.append("## PR #\(pr.number) [\(pr.state)] \(pr.title) (branch \(pr.headRefName))")
+            }
+        }
+        lines.append("")
+
         // Source-level markers
         lines.append("# Source markers (TODO/FIXME in recently-touched files)")
         if !context.sourceMarkers.isEmpty {
@@ -749,9 +787,15 @@ public final class Dispatcher: Dispatching, Sendable {
         } else {
             let fmt = ISO8601DateFormatter()
             fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            for event in context.lastNTurns.suffix(10) {
+            // The most-recent turns ARE the current state the proposal must
+            // respond to, so give the last 3 more room (~600 chars) and keep
+            // older turns compact (~240) to stay inside the token budget.
+            let window = Array(context.lastNTurns.suffix(10))
+            let recentCutoff = max(0, window.count - 3)
+            for (idx, event) in window.enumerated() {
                 let ts = fmt.string(from: event.timestamp)
-                lines.append(turnLine(event, ts: ts))
+                let maxLen = idx >= recentCutoff ? 600 : 240
+                lines.append(turnLine(event, ts: ts, maxLen: maxLen))
             }
         }
         lines.append("")
@@ -762,7 +806,8 @@ public final class Dispatcher: Dispatching, Sendable {
         lines.append("")
 
         lines.append("# Task")
-        lines.append("Call `record_dispatch` exactly once. Choose the single most useful next move that advances the project direction, grounded in the real state of the work. The next_task_proposal you write IS the prompt that gets typed into Claude Code — write it like a senior collaborator giving specific, actionable direction.")
+        lines.append("Call `record_dispatch` exactly once. Choose the single most useful next move that advances the project direction, grounded in the real state of the work. Write the next_task_proposal so it is SPECIFICALLY RELEVANT to the recent turns above: respond to what the worker just did and where this conversation actually is, naming the concrete files, commits, errors, or output in play. The next_task_proposal you write IS the prompt that gets typed into Claude Code, so write it like a senior collaborator who just read this exact conversation and is giving the specific next step, not generic boilerplate.")
+        lines.append("Grounding honesty: before proposing anything the SESSION OBJECTIVE asks for, check the recent turns and the state above for whether it is ALREADY DONE. Autonomous sessions routinely finish the objective and land the deliverable somewhere only partly visible here (a merged PR, a different branch or repo, a deploy). If the recent turns show it was accomplished (a PR opened or merged, work shipped), do NOT re-propose it, and NEVER claim something \"was never done\" or \"is missing\" unless the context here actually shows its absence. The state shown to you is PARTIAL. When you cannot point to concrete present evidence that work is genuinely unfinished, return low_confidence_no_action instead of inventing a gap.")
 
         return lines.joined(separator: "\n")
     }
@@ -770,18 +815,25 @@ public final class Dispatcher: Dispatching, Sendable {
     /// Compact one-liner for a single event in the recent-turns section.
     /// Mirrors TriagePrompt.eventSummaryLine so the Dispatcher and the
     /// triage paths surface session history in the same shape.
-    private static func turnLine(_ event: SupervisorEvent, ts: String) -> String {
+    /// `maxLen` is the per-turn text budget. The recent-turns window passes a
+    /// larger value for the last few turns so the model sees the actual current
+    /// state, not a stub; older turns stay compact. Commands get a slightly
+    /// tighter slice (maxLen-40) as they did before, kept proportional.
+    private static func turnLine(_ event: SupervisorEvent, ts: String, maxLen: Int = 240) -> String {
+        let cmdLen = max(0, maxLen - 40)
         switch event {
         case .sessionStart(let i):
             return "[\(ts)] sessionStart branch=\(i.gitBranch ?? "?")"
         case .userPrompt(let i):
-            return "[\(ts)] userPrompt: \(i.text.prefix(240))"
+            return "[\(ts)] userPrompt: \(i.text.prefix(maxLen))"
         case .assistantText(let i):
-            return "[\(ts)] assistantText: \(i.text.prefix(240))"
+            return "[\(ts)] assistantText: \(i.text.prefix(maxLen))"
         case .bashToolCall(let i):
-            return "[\(ts)] bashToolCall: \(i.command.prefix(200))"
+            return "[\(ts)] bashToolCall: \(i.command.prefix(cmdLen))"
         case .bashToolResult(let i):
             return "[\(ts)] bashToolResult error=\(i.isError) bytes=\(i.output.utf8.count)"
+        case .fileEdit(let i):
+            return "[\(ts)] fileEdit \(i.toolName) \(i.filePath) (\(i.hunks.count) change(s))"
         case .systemSignal(let i):
             return "[\(ts)] systemSignal \(i.subtype)"
         }
@@ -803,7 +855,7 @@ public final class Dispatcher: Dispatching, Sendable {
                 "properties": .object([
                     "next_task_proposal": .object([
                         "type": .string("string"),
-                        "description": .string("The actual prompt to type into Claude Code's input. 150-300 words, written in the autonomous opener's voice — first-person, direct, references PRINCIPLES sections by number, names acceptance criteria, includes a hard-stop reminder. Empty string when selected_path=low_confidence_no_action.")
+                        "description": .string("The actual prompt to type into Claude Code's input. Ground it in where THIS conversation actually is right now: respond to the worker's most recent messages and output, the specific files, commits, and errors in play (see the 'Session's last turns' section), and the concrete next step that follows from them. Write like a senior collaborator who has just read the conversation: name a clear next action and how to know it is done. Be concrete and actionable; a tight, specific paragraph beats a long generic one. Do NOT emit generic boilerplate, and do NOT reference PRINCIPLES sections by number. Empty string when selected_path=low_confidence_no_action.")
                     ]),
                     "justification": .object([
                         "type": .string("string"),
@@ -849,163 +901,47 @@ public final class Dispatcher: Dispatching, Sendable {
 
     // MARK: - Parser
 
-    /// Root-cause premise verification. Returns a rejection reason if the
-    /// proposal's premise is false in the current tree, else nil.
-    ///
-    /// The recurring runaway: the dispatcher proposing to BUILD / WIRE the
-    /// dispatch loop, the Dispatcher, the triage engine, the inject path — all
-    /// of which already exist — i.e. the loop describing itself as work. This
-    /// is the discipline the worker applies by hand ("verify the premise: is
-    /// this already done?"), now enforced deterministically so the in-app loop
-    /// can never type already-done, self-referential work.
-    ///
-    /// PRECISE by construction (phrase-anchored, not bag-of-words) so it
-    /// rejects "build the Dispatcher" but NEVER "add a test for the
-    /// dispatcher" or "fix the dispatcher's grounding" — only a build/wire verb
-    /// applied directly to an existing component, or a false "X is not
-    /// wired/built/missing" claim about one.
+    // The string-only anti-fabrication backstops now live in
+    // ProposalBackstops.swift so the Dispatcher and the Planner share ONE
+    // copy. These thin forwarders preserve the Dispatcher's existing static
+    // surface (and its tests) verbatim — observable behavior is unchanged.
+
+    /// Forwards to `ProposalBackstops.premiseRejection`. See there for the
+    /// full contract (rejects build/wire of already-existing machinery and
+    /// false "X is missing" claims; never blocks genuine work ON a component).
     static func premiseRejection(proposal: String, justification: String) -> String? {
-        let text = (proposal + " ⋄ " + justification).lowercased()
-
-        // Core machinery that ALREADY EXISTS in this repo. Proposing to build
-        // or wire any of these is a false premise (and the loop's CLOSED rule:
-        // it dispatches PRODUCT work, never builds itself).
-        let existing = [
-            "dispatch loop", "dispatcher", "loopcontroller", "loop controller", "loopconfig",
-            "triage engine", "triageengine", "inject path", "injector", "interventionrouter",
-            "intervention router", "dispatch engine", "dispatch queue", "self-extender",
-            "selfextender", "dispatch hook", "deterministic catch", "deterministiccatch",
-            "questionanswerer", "question answerer", "hardcodedrubric",
-        ]
-        // Build-from-scratch verbs (NOT fix/improve/add-test/review/close — those
-        // are legitimate work ON existing code).
-        let buildVerbs = ["build ", "implement ", "wire up ", "wire the ", "stand up ",
-                          "introduce ", "create the ", "create a ", "write the ", "design the "]
-        // Prepositions that, between a build verb and a component, make the
-        // component a MODIFIER, not the thing being built ("a test FOR the
-        // dispatcher"). Bias toward allowing when one is present.
-        let prepositions = [" for ", " of ", " to ", " about ", " on ", " with ", " in ", " into "]
-        // False "it's not there" claims directly after a component.
-        let missingSuffixes = [" is not wired", " is not built", " is missing", " does not exist",
-                              " doesn't exist", " isn't wired", " is not implemented",
-                              " is not yet wired", " is not yet built", " needs to be built",
-                              " needs to be wired"]
-
-        for comp in existing {
-            guard let r = text.range(of: comp) else { continue }
-            // Window just BEFORE the component: a build verb here (and no
-            // intervening preposition) means the component is the build object.
-            // Catches "build the CGEventPost-based Dispatcher" (adjectives in
-            // between) but not "build a test for the dispatcher".
-            let winStart = text.index(r.lowerBound, offsetBy: -40, limitedBy: text.startIndex) ?? text.startIndex
-            let before = String(text[winStart..<r.lowerBound])
-            if buildVerbs.contains(where: { before.contains($0) }),
-               !prepositions.contains(where: { before.contains($0) }) {
-                return "build_existing(\(comp.replacingOccurrences(of: " ", with: "_")))"
-            }
-            // Window just AFTER the component: a false "not there" claim.
-            let winEnd = text.index(r.upperBound, offsetBy: 18, limitedBy: text.endIndex) ?? text.endIndex
-            let after = String(text[r.upperBound..<winEnd])
-            if missingSuffixes.contains(where: { after.contains($0) }) {
-                return "false_missing(\(comp.replacingOccurrences(of: " ", with: "_")))"
-            }
-        }
-        return nil
+        ProposalBackstops.premiseRejection(proposal: proposal, justification: justification)
     }
 
-    /// Deterministic backstop against the stale-loop failure: the dispatcher
-    /// re-proposing work it already dispatched this run. Returns a reason if
-    /// `proposal` substantially repeats any entry in `recent` (recent
-    /// ready-proposal heads), else nil. A hit degrades the dispatch to
-    /// low-confidence — same shape as `premiseRejection` — which idles the
-    /// cycle and feeds the consecutive-low hard stop.
-    ///
-    /// Similarity = Jaccard over prefix-stemmed significant tokens. Threshold
-    /// 0.85 — deliberately HIGH, so this is a narrow backstop for near-verbatim
-    /// repeats only. The PRIMARY fix is the prompt grounding (it sees the recent
-    /// proposals and can tell "do bucket 2" from "re-do bucket 1"); this catches
-    /// the case where the model ignores that and re-types essentially the same
-    /// proposal. Numbers are kept as identity-bearing tokens, so sequential
-    /// numbered work ("bucket 1" vs "bucket 2") stays well under threshold and
-    /// is NOT blocked. Both sides need ≥4 significant tokens — too-short heads
-    /// are not judged.
+    /// Forwards to `ProposalBackstops.stalenessRejection` — Jaccard-0.85
+    /// near-verbatim repeat guard against re-dispatching this run's work.
     static func stalenessRejection(proposal: String, against recent: [String]) -> String? {
-        let target = significantTokens(proposal)
-        guard target.count >= 4 else { return nil }
-        for prior in recent {
-            let priorTokens = significantTokens(prior)
-            guard priorTokens.count >= 4 else { continue }
-            let overlap = target.intersection(priorTokens).count
-            let union = target.union(priorTokens).count
-            guard union > 0 else { continue }
-            let jaccard = Double(overlap) / Double(union)
-            if jaccard >= 0.85 {
-                let pct = Int((jaccard * 100).rounded())
-                return "\(pct)% overlap with recent dispatch \"\(prior.prefix(56))\""
-            }
-        }
-        return nil
+        ProposalBackstops.stalenessRejection(proposal: proposal, against: recent)
     }
 
-    /// Lowercased, prefix-6 stemmed significant tokens for similarity. Strips
-    /// punctuation/markdown and generic stopwords, and collapses morphological
-    /// variants crudely via a 6-char prefix so "calibrate"/"calibration" both
-    /// stem to "calibr". Numbers are KEPT regardless of length — "12", "2", "7"
-    /// carry task identity (Issue #12, bucket 2, step 7), and keeping them is
-    /// what lets sequential numbered work stay distinct. Deterministic; no model.
+    /// Forwards to `ProposalBackstops.significantTokens` — prefix-6 stemmed,
+    /// stopword-stripped, number-preserving token set used for similarity.
     static func significantTokens(_ s: String) -> Set<String> {
-        let cleaned = s.lowercased().map { ($0.isLetter || $0.isNumber) ? $0 : " " }
-        let words = String(cleaned).split(separator: " ").map(String.init)
-        // Generic loop/instruction filler that carries no task identity.
-        let stop: Set<String> = [
-            "the", "and", "for", "with", "this", "that", "into", "its", "you",
-            "next", "task", "direction", "please", "lets", "let", "then", "run",
-            "now", "your", "from", "have", "has", "will", "should", "make", "via",
-            "per", "all", "any", "out", "use", "using", "still", "just", "not",
-        ]
-        return Set(
-            words
-                .filter { ($0.count >= 3 || $0.allSatisfy(\.isNumber)) && !stop.contains($0) }
-                .map { String($0.prefix(6)) }
-        )
+        ProposalBackstops.significantTokens(s)
     }
 
-    /// Deterministic guard against the dispatcher fabricating an UNBLOCKING
-    /// PRECONDITION to justify blocked work — the live failure on 2026-06-04:
-    /// "The ANTHROPIC_API_KEY is set; calibration sweeps are unblocked" when the
-    /// key was absent and the sweep had been blocked all session. Mirror of the
-    /// Python hook's `_ground_environment_claims`. Returns a reason if the
-    /// proposal asserts the key/sweep is AVAILABLE but `anthropicKey` is empty.
-    ///
-    /// `anthropicKey` defaults to this process's env, but CAVEAT: Supervisor.app
-    /// may launch without the worker's shell env, so absence here isn't proof
-    /// the sweep would lack a key. We still reject — the asymmetry favors it: a
-    /// false-reject merely declines to AUTO-dispatch an expensive sweep (the
-    /// owner can trigger it), while a miss dispatches fabricated-premise work.
-    /// The Python hook (worker-env-accurate) is the authoritative check; this is
-    /// Supervisor.app's conservative backstop. The param is injectable for tests.
+    /// Forwards to `ProposalBackstops.environmentClaimRejection` — rejects a
+    /// fabricated unblocking precondition ("the API key is set; sweeps are
+    /// unblocked") when the key is actually absent.
     static func environmentClaimRejection(
         proposal: String,
         justification: String,
         anthropicKey: String? = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"]
     ) -> String? {
-        guard assertsEnvironmentAvailability(proposal + " " + justification) else { return nil }
-        if (anthropicKey ?? "").trimmingCharacters(in: .whitespaces).isEmpty {
-            return "key/sweep asserted available but ANTHROPIC_API_KEY absent"
-        }
-        return nil
+        ProposalBackstops.environmentClaimRejection(
+            proposal: proposal, justification: justification, anthropicKey: anthropicKey
+        )
     }
 
-    /// True if `text` POSITIVELY asserts the API key / live sweep is available.
-    /// The required adjacency (subject + is/are/'s + optional adverb + positive
-    /// predicate) means the honest negated inverse — "the key is NOT set",
-    /// "sweeps are still blocked" — does NOT match, so the guard never fires on
-    /// a truthful "it's blocked" statement. Mirrors the Python `_ENV_AVAILABILITY_RE`.
+    /// Forwards to `ProposalBackstops.assertsEnvironmentAvailability` — the
+    /// positive-availability adjacency check (honest "it's blocked" passes).
     static func assertsEnvironmentAvailability(_ text: String) -> Bool {
-        let pattern = #"(?i)\b(anthropic[_ ]?api[_ ]?key|api[_ ]?key|the key|keys|sweep|sweeps|calibration|live[ -]?api)\b\s+(?:is|are|'s|was|were)\s+(?:now\s+|finally\s+|already\s+)?(set|present|available|configured|enabled|unblocked)\b"#
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return false }
-        let range = NSRange(text.startIndex..., in: text)
-        return re.firstMatch(in: text, range: range) != nil
+        ProposalBackstops.assertsEnvironmentAvailability(text)
     }
 
     /// Decode the record_dispatch tool call into a DispatchResult.

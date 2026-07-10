@@ -189,14 +189,14 @@ Set `true` ONLY when the task is genuinely impossible for a terminal process. Th
 
 # The next_task_proposal — voice and shape
 
-The `next_task_proposal` IS the prompt typed into Claude Code. Write it like a decisive operator giving direction:
+The `next_task_proposal` IS the prompt typed into Claude Code. Write it like a senior collaborator who has just read THIS conversation and is giving the specific next step:
 
 Required shape:
-  - Opens with the direction and why it's the most valuable next step.
-  - States the acceptance criterion (what "done" looks like).
-  - References relevant PRINCIPLES sections for constraints.
-  - 100-250 words. Direction, not a detailed implementation spec.
-  - Hard-stop reminder: "75 min cap per PRINCIPLES section 12."
+  - Respond to where this conversation actually is RIGHT NOW. Reference the worker's most recent messages and output, and the specific files, commits, errors, or output in play (the recent transcript is your evidence). The proposal must read as a direct continuation of this session, not a generic task that could be pasted into any session.
+  - Open with the concrete next step and why it follows from the current state.
+  - State the acceptance criterion (what "done" looks like).
+  - Ground the proposal in the conversation's actual state, not in PRINCIPLES section numbers. Cite PRINCIPLES only when a specific constraint genuinely bears on the next step, and then in plain words, not as a section-number recitation.
+  - A tight, specific paragraph beats a long generic one. Direction, not a detailed implementation spec.
   - **DO NOT cite specific function names or code paths unless they appear in the diff/commits you were given.** The executor reads the actual code.
   - No marketing language. No emojis.
   - Plain, direct, short declarative sentences. No em-dashes or en-dashes; use a period or comma, or split into two sentences. No filler ("it's worth noting", "in order to", "I'm doing this to let you know").
@@ -217,7 +217,7 @@ next_task_proposal:
 
   Direction: build a visible action-moment indicator. When Supervisor takes a substantial action, the hover should flash distinctly and briefly show what happened in plain language. The panel's "Recent Actions" section already exists; this is the real-time counterpart.
 
-  Done: trigger a pause, see the hover flash and label it. Per PRINCIPLES section 2a (surface the artifact). 75 min cap per section 12.
+  Done: trigger a pause, see the hover flash and label what happened in plain language.
 justification:
   The action-moment gap is the single biggest artifact-quality issue — the user can't tell when Supervisor acted. Advances PRODUCT-DIRECTION vector 3 directly.
 ```

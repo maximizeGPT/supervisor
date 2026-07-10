@@ -41,6 +41,16 @@ public final class OnboardingViewModel: ObservableObject {
     /// after upgrading.
     @Published public var selectedProvider: LLMProvider = .anthropic
 
+    /// Set true once Screen Recording has been granted during onboarding. macOS
+    /// requires the app to be QUIT AND RELAUNCHED before a freshly-granted Screen
+    /// Recording permission actually takes effect for capture — until then the
+    /// grant reads as "on" in System Settings but `CGDisplayStream`/screenshots
+    /// still fail. The UI surfaces a "Quit & relaunch Supervisor" affordance off
+    /// this so the user is not left with a granted-but-not-effective permission
+    /// (RC fix #6). Latches true; a relaunch clears it (a fresh process starts
+    /// with this false).
+    @Published public private(set) var screenRecordingNeedsRelaunch: Bool = false
+
     // MARK: - Dependencies
 
     private let permissions: any PermissionChecker
@@ -146,13 +156,12 @@ public final class OnboardingViewModel: ObservableObject {
         }
     }
 
-    /// Re-probe AX. If granted, advance to notification step.
+    /// Re-probe AX. If granted, advance to the screen-recording step.
     public func recheckAX() async {
         guard case .axCheck = state else { return }
         if permissions.isAXGranted() {
-            let status = await permissions.notificationStatus()
-            trace.emit("onboarding", "AX granted; advancing to notif step (notif=\(status))")
-            state = .notifCheck(status: status)
+            trace.emit("onboarding", "AX granted; advancing to screen-recording step")
+            state = .screenRecordingCheck()
         }
     }
 
@@ -173,9 +182,8 @@ public final class OnboardingViewModel: ObservableObject {
     public func confirmAX() async {
         guard case .axCheck = state else { return }
         let detected = permissions.isAXGranted()
-        let status = await permissions.notificationStatus()
-        trace.emit("onboarding", "AX confirmed by user (macOS reported granted=\(detected)); advancing to notif step (notif=\(status))")
-        state = .notifCheck(status: status)
+        trace.emit("onboarding", "AX confirmed by user (macOS reported granted=\(detected)); advancing to screen-recording step")
+        state = .screenRecordingCheck()
     }
 
     /// User clicked "Skip for now" on the AX step. Matches the §6.6
@@ -186,8 +194,70 @@ public final class OnboardingViewModel: ObservableObject {
     /// triggers an action that needs AX.
     public func skipAX() async {
         guard case .axCheck = state else { return }
+        trace.emit("onboarding", "AX skipped by user; advancing to screen-recording step")
+        state = .screenRecordingCheck()
+    }
+
+    // MARK: - Screen Recording step
+
+    /// Prompt for Screen Recording (triggers the macOS request on first call)
+    /// and mark the step as prompted. Called by the screen-recording step's
+    /// "Open System Settings" CTA. Mirrors `promptForAX`: it fires the request
+    /// once per onboarding session so Supervisor appears in the Screen
+    /// Recording list for the user to enable.
+    public func promptForScreenRecording() {
+        guard case .screenRecordingCheck(let prompted) = state else { return }
+        if !prompted {
+            _ = permissions.requestScreenRecording()
+            trace.emit("onboarding", "screen recording request fired")
+            state = .screenRecordingCheck(prompted: true)
+        }
+    }
+
+    /// Re-probe Screen Recording. If granted, advance to the notification
+    /// step. Mirrors `recheckAX`; called by the periodic tick so an
+    /// out-of-band grant in System Settings advances the flow.
+    public func recheckScreenRecording() async {
+        guard case .screenRecordingCheck = state else { return }
+        if permissions.isScreenRecordingGranted() {
+            // Granted-but-not-effective until relaunch (RC fix #6): latch the
+            // relaunch-needed flag so the UI can prompt a quit & relaunch.
+            screenRecordingNeedsRelaunch = true
+            let status = await permissions.notificationStatus()
+            trace.emit("onboarding", "screen recording granted; advancing to notif step (notif=\(status)); relaunch required for capture")
+            state = .notifCheck(status: status)
+        }
+    }
+
+    /// User clicked the active "Continue" button on the screen-recording step
+    /// after being sent to System Settings. The affirmative "I enabled it"
+    /// path, mirroring `confirmAX`: the 1.5s poll already auto-advances when
+    /// macOS reports the grant, but for self built apps macOS can fail to
+    /// report it back, so Continue advances either way and trusts the user.
+    /// The runtime re-checks Screen Recording when a desktop inject actually
+    /// needs it, so nothing is lost if the grant resolves later.
+    public func confirmScreenRecording() async {
+        guard case .screenRecordingCheck = state else { return }
+        let detected = permissions.isScreenRecordingGranted()
+        // If macOS reports the grant, capture still needs a relaunch to take
+        // effect (RC fix #6): latch the relaunch-needed flag so the UI prompts a
+        // quit & relaunch. When NOT detected we can't assert the grant, so we
+        // don't claim a relaunch is needed — Continue still advances, trusting
+        // the user, and the runtime re-checks when a desktop inject needs it.
+        if detected { screenRecordingNeedsRelaunch = true }
         let status = await permissions.notificationStatus()
-        trace.emit("onboarding", "AX skipped by user; advancing to notif step (notif=\(status))")
+        trace.emit("onboarding", "screen recording confirmed by user (macOS reported granted=\(detected)); advancing to notif step (notif=\(status)); relaunchNeeded=\(screenRecordingNeedsRelaunch)")
+        state = .notifCheck(status: status)
+    }
+
+    /// User clicked "Skip for now" on the screen-recording step. Same
+    /// proceed-with-degradation shape as `skipAX`: desktop driving and
+    /// answering degrade to a notify without it, but the user can proceed and
+    /// is told. Advances to the notification step.
+    public func skipScreenRecording() async {
+        guard case .screenRecordingCheck = state else { return }
+        let status = await permissions.notificationStatus()
+        trace.emit("onboarding", "screen recording skipped by user; advancing to notif step (notif=\(status))")
         state = .notifCheck(status: status)
     }
 
@@ -210,11 +280,20 @@ public final class OnboardingViewModel: ObservableObject {
 
     /// User clicked Continue on the notification step. Lock in whatever
     /// state they're in — `authorized` / `provisional` proceed cleanly,
-    /// `denied` proceeds with the degradation banner flag set.
+    /// `denied` carries the degradation flag forward to the customization
+    /// step (and ultimately to `.complete`).
     public func finishNotificationStep() {
         guard case .notifCheck(let status) = state else { return }
         let degraded: Bool = (status == .denied)
-        trace.emit("onboarding", "complete notifDegraded=\(degraded) status=\(status)")
+        trace.emit("onboarding", "notif step done notifDegraded=\(degraded) status=\(status); advancing to customization")
+        state = .customization(notifDegraded: degraded)
+    }
+
+    /// User clicked Done on the customization explanation step. Advances
+    /// to `.complete`, preserving the notification-degradation flag.
+    public func finishCustomizationStep() {
+        guard case .customization(let degraded) = state else { return }
+        trace.emit("onboarding", "complete notifDegraded=\(degraded)")
         state = .complete(notifDegraded: degraded)
     }
 
@@ -225,6 +304,8 @@ public final class OnboardingViewModel: ObservableObject {
         switch state {
         case .axCheck:
             await recheckAX()
+        case .screenRecordingCheck:
+            await recheckScreenRecording()
         case .notifCheck:
             let after = await permissions.notificationStatus()
             if case .notifCheck(let prev) = state, prev != after {

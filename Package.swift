@@ -3,15 +3,16 @@
 // Supervisor — a native macOS app that watches Claude Code sessions and
 // intervenes when the user would have wanted to intervene.
 //
-// Five targets:
+// Targets:
 //   - SupervisorCore        : non-UI library; observation, triage, escalation,
 //                             intervention, storage, AnthropicClient, redaction,
 //                             permission probes, onboarding state machine.
 //   - SupervisorUI          : SwiftUI/AppKit presentation layer. Depends on Core;
 //                             Core never depends on UI.
 //   - SupervisorApp         : the main @main executable. Wires Core + UI,
-//                             spawns the heartbeat companion, hosts the
-//                             PermissionMonitor and PermissionLostPopover.
+//                             spawns the heartbeat + status-bar companions,
+//                             hosts the PermissionMonitor and
+//                             PermissionLostPopover.
 //   - SupervisorHeartbeat   : tiny companion that writes a heartbeat file
 //                             every 5s while the main app is alive.
 //   - SupervisorStatusBar   : tiny menu-bar-only companion that reads the
@@ -19,9 +20,16 @@
 //                             health. Survives crashes of the main app.
 //   - SupervisorCoreTests   : unit tests for SupervisorCore.
 //
+// The menu-bar status item is a SEPARATE process on purpose. A v0.3.0 RC
+// briefly folded it into SupervisorApp, but an in-process NSStatusItem dies
+// with the app: a crash makes the icon vanish (instead of turning red) and a
+// hung engine keeps a static green icon forever. Out-of-process +
+// heartbeat-driven is the only design where a dead/hung supervisor honestly
+// shows red/amber, so the companion was restored.
+//
 // Build-graph enforcement: Heartbeat and StatusBar depend on SupervisorCore
 // but the AnthropicClient module is only invoked from SupervisorApp + the
-// (future) Triage engine. Network calls cannot originate from the companions.
+// Triage engine. Network calls cannot originate from the companions.
 
 import PackageDescription
 
@@ -36,6 +44,10 @@ let package = Package(
         .executable(name: "Supervisor", targets: ["SupervisorApp"]),
         .executable(name: "SupervisorHeartbeat", targets: ["SupervisorHeartbeat"]),
         .executable(name: "SupervisorStatusBar", targets: ["SupervisorStatusBar"]),
+        // Dev/preview harness for the Context Health window (Context Wiki UI).
+        // Opens the real SwiftUI window against a live audit so the view can be
+        // rendered + screenshotted without launching the whole app. Not shipped.
+        .executable(name: "ContextWikiPreview", targets: ["ContextWikiPreview"]),
     ],
     dependencies: [
         // Only two external deps in v0.1.0. Yams (YAML) lands in v0.1.4 with
@@ -58,8 +70,7 @@ let package = Package(
             dependencies: ["SupervisorCore"],
             path: "Sources/SupervisorUI",
             // v0.1.3: onboarding wordmark + future brand assets ship
-            // through Bundle.module the same way SupervisorStatusBar's
-            // brand glyph does (see the StatusBar target below).
+            // through Bundle.module's Resources/ processing.
             resources: [.process("Resources")]
         ),
         .executableTarget(
@@ -74,15 +85,17 @@ let package = Package(
         ),
         .executableTarget(
             name: "SupervisorStatusBar",
-            dependencies: ["SupervisorCore"],
+            // SupervisorUI added in the Context Wiki feature: the status-bar menu
+            // hosts the on-demand "Context Health" window. SwiftUI is constructed
+            // only when the user opens it, so the always-present icon stays light.
+            dependencies: ["SupervisorCore", "SupervisorUI"],
             path: "Sources/SupervisorStatusBar",
-            // Brand assets: the V1 symbol ships as both raw SVG and
-            // pre-rendered @1x/@2x PNG fallbacks. Asset Catalogs would
-            // be cleaner but SPM does not always invoke actool depending
-            // on toolchain — copying plain files into Resources/ makes
-            // Bundle.module.image(forResource:) work reliably on every
-            // supported macOS target. The button code marks the loaded
-            // image as a template so menu-bar light/dark theming kicks in.
+            // Brand assets: the V1 symbol ships as raw SVG + pre-rendered
+            // @1x/@2x PNG fallbacks. Copying plain files into Resources/ makes
+            // Bundle.module.image(forResource:) work reliably across toolchains
+            // (SPM does not always invoke actool for Asset Catalogs). The button
+            // code marks the loaded image as a template so menu-bar light/dark
+            // theming kicks in; a missing asset falls back to an SF Symbol.
             resources: [.process("Resources")]
         ),
         // Dev helper: writes the Anthropic key into the same Keychain
@@ -93,6 +106,12 @@ let package = Package(
             name: "SupervisorDevTools",
             dependencies: ["SupervisorCore"],
             path: "Sources/SupervisorDevTools"
+        ),
+        // Context Health window preview harness (see product note above).
+        .executableTarget(
+            name: "ContextWikiPreview",
+            dependencies: ["SupervisorCore", "SupervisorUI"],
+            path: "Sources/ContextWikiPreview"
         ),
         // v0.1.4: fake-Claude harness for ProcessLocator tests. Writes
         // realistic-shaped JSONL events to a target path at a configurable

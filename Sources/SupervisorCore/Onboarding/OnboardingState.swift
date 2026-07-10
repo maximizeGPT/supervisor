@@ -1,11 +1,14 @@
 // OnboardingState.swift
 //
-// The state machine for the three-step onboarding flow:
-//   1. keyEntry      → user enters their Anthropic API key
-//   2. axCheck       → user grants Accessibility in System Settings
-//   3. notifCheck    → user grants Notifications (or proceeds with
-//                      `denied`, accepting the degradation banner)
-//   complete         → onboarding window dismisses, main app comes up
+// The state machine for the onboarding flow:
+//   1. keyEntry            → user enters their Anthropic API key
+//   2. axCheck             → user grants Accessibility in System Settings
+//   3. screenRecordingCheck → user grants Screen Recording in System Settings
+//                            (needed so Supervisor can see which Claude
+//                            desktop conversation to drive or answer)
+//   4. notifCheck          → user grants Notifications (or proceeds with
+//                            `denied`, accepting the degradation banner)
+//   complete               → onboarding window dismisses, main app comes up
 //
 // State is a sum type so the UI binds against one value, and so all
 // invalid combinations (e.g. axCheck with a key-entry error attached)
@@ -27,9 +30,24 @@ public enum OnboardingState: Sendable, Equatable {
     /// only show it once per onboarding session.
     case axCheck(prompted: Bool = false)
 
+    /// Waiting for the user to grant Screen Recording. `prompted` indicates
+    /// whether the macOS "open System Settings?" request has already been
+    /// triggered. We only fire it once per onboarding session, the same
+    /// shape as axCheck. Screen Recording lets Supervisor screenshot and
+    /// read the Claude desktop sidebar on-device so it can target the right
+    /// conversation when it drives or answers; without it desktop driving
+    /// degrades to a notify.
+    case screenRecordingCheck(prompted: Bool = false)
+
     /// Notifications step. `status` is the most recently observed
     /// authorization status; UI branches on it.
     case notifCheck(status: NotificationAuthStatus)
+
+    /// Customization explanation step: shows where config files live, that
+    /// editing them changes Supervisor's behavior, and where exports go.
+    /// Added after the notifications step so it is the last informational
+    /// step before `.complete`.
+    case customization(notifDegraded: Bool)
 
     /// Onboarding is done. UI dismisses the window. `notifDegraded` is
     /// true when the user proceeded with notifications denied — main app
@@ -48,13 +66,15 @@ public enum KeyEntryError: Sendable, Equatable {
 }
 
 public extension OnboardingState {
-    /// The numeric step (1, 2, 3, or 4) for progress indicators.
+    /// The numeric step (1 through 5) for progress indicators.
     var step: Int {
         switch self {
         case .keyEntry, .keyValidating: return 1
         case .axCheck:                  return 2
-        case .notifCheck:               return 3
-        case .complete:                 return 4
+        case .screenRecordingCheck:     return 3
+        case .notifCheck:               return 4
+        case .customization:            return 5
+        case .complete:                 return 6
         }
     }
 }

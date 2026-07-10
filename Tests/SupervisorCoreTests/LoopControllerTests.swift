@@ -45,7 +45,6 @@ final class LoopControllerTests: XCTestCase {
         sessionResetIdle: TimeInterval = LoopController.defaultSessionResetIdle,
         ownerPresenceBackoff: TimeInterval = 0,
         loopCapDisabled: @escaping @Sendable () -> Bool = { false },
-        ownerPresenceBackoffDisabled: @escaping @Sendable () -> Bool = { false },
         loopStore: LoopDispatchStore? = nil
     ) -> LoopController {
         LoopController(
@@ -55,7 +54,6 @@ final class LoopControllerTests: XCTestCase {
             consecutiveLowThreshold: consecutiveLowThreshold,
             now: { clock.now },
             loopCapDisabled: loopCapDisabled,
-            ownerPresenceBackoffDisabled: ownerPresenceBackoffDisabled,
             trace: TraceLog(path: FileManager.default.temporaryDirectory
                 .appendingPathComponent("loop-tests-\(UUID().uuidString).log")),
             loopStore: loopStore
@@ -113,23 +111,6 @@ final class LoopControllerTests: XCTestCase {
         let decision = await lc.canDispatch(sessionId: "s-fresh")
         guard case .proceed = decision else {
             return XCTFail("no operator message → expected .proceed, got \(decision)")
-        }
-    }
-
-    func testOwnerPresenceBackoffDisabledDrivesImmediately() async {
-        // The demo toggle (2026-06-16): with the presence backoff disabled, the loop
-        // dispatches the moment a session is idle even though the operator JUST
-        // messaged — so a give-it-one-prompt screen-record demo drives on camera
-        // instead of waiting out the 10-min hold.
-        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
-        let lc = makeController(clock: clock, ownerPresenceBackoff: 600,
-                                ownerPresenceBackoffDisabled: { true })
-        await lc.notePause(sessionId: "s-1", reason: .userMessage)
-        await lc.clearPause(sessionId: "s-1")
-        clock.advance(by: 1)   // operator messaged 1s ago — normally a 600s hold
-        let decision = await lc.canDispatch(sessionId: "s-1")
-        guard case .proceed = decision else {
-            return XCTFail("backoff disabled → expected .proceed despite recent message, got \(decision)")
         }
     }
 
@@ -252,73 +233,6 @@ final class LoopControllerTests: XCTestCase {
         await lc.clearPause(sessionId: "s-1")
         if case .stopped = await lc.canDispatch(sessionId: "s-1") {
             XCTFail("loop must re-engage after new direction + resume")
-        }
-    }
-
-    // 2026-06-16 — pause-holds-the-loop. When Supervisor fires a pause
-    // intervention it marks the loop with .safetyPause so the worker going idle
-    // right after the interrupt isn't immediately re-driven ("it stopped and then
-    // Supervisor injected something else"). It must (a) hold the loop, (b) NOT
-    // count as operator presence, and (c) NOT clear a hard stop.
-    func testSafetyPauseHoldsLoopThenReleasesOnResume() async {
-        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
-        let lc = makeController(clock: clock)
-
-        await lc.notePause(sessionId: "s-1", reason: .safetyPause)
-        let held = await lc.canDispatch(sessionId: "s-1")
-        guard case let .paused(reason) = held else {
-            return XCTFail("expected .paused after a safety pause, got \(held)")
-        }
-        XCTAssertEqual(reason, "safety_pause")
-
-        // The worker resuming (a new tool call → clearPause) releases the hold.
-        await lc.clearPause(sessionId: "s-1")
-        let resumed = await lc.canDispatch(sessionId: "s-1")
-        if case .paused = resumed { XCTFail("worker resume must release the safety pause") }
-        if case .stopped = resumed { XCTFail("a safety pause must not stop the loop") }
-    }
-
-    func testSafetyPauseIsNotOperatorPresence() async {
-        // A safety pause is Supervisor interrupting the worker — NOT the operator
-        // arriving. It must not stamp owner-presence (which would hold the loop for
-        // the whole backoff window even after the worker resumes). Contrast
-        // testOwnerPresenceBackoffHoldsLoopThenResumes, where .userMessage DOES.
-        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
-        let lc = makeController(clock: clock, ownerPresenceBackoff: 600)
-
-        await lc.notePause(sessionId: "s-1", reason: .safetyPause)
-        await lc.clearPause(sessionId: "s-1")
-
-        let presenceSnap = await lc.snapshot(sessionId: "s-1")
-        XCTAssertNil(presenceSnap?.lastOwnerMessageAt,
-                     "a safety pause must never stamp operator presence")
-        // 1 min later: no presence backoff (unlike a real operator message), so
-        // once the worker resumed the loop is free to proceed.
-        clock.advance(by: 60)
-        let decision = await lc.canDispatch(sessionId: "s-1")
-        guard case .proceed = decision else {
-            return XCTFail("safety pause must not engage the presence backoff, got \(decision)")
-        }
-    }
-
-    func testSafetyPauseDoesNotClearThreeConsecutiveLowStop() async {
-        // A user message is NEW DIRECTION and clears a 3-low stop. A safety pause
-        // is the opposite — it's holding a RISKY session — so it must leave a hard
-        // stop intact.
-        let clock = ClockHolder(Date(timeIntervalSince1970: 1_700_000_000))
-        let lc = makeController(clock: clock)
-        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "1"))
-        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "2"))
-        await lc.recordDispatch(sessionId: "s-1", result: .lowConfidence(reasoning: "3"))
-        guard case .stopped = await lc.canDispatch(sessionId: "s-1") else {
-            return XCTFail("precondition: stopped after 3 lows")
-        }
-        await lc.notePause(sessionId: "s-1", reason: .safetyPause)
-        let stopSnap = await lc.snapshot(sessionId: "s-1")
-        XCTAssertEqual(stopSnap?.stopReason, .threeConsecutiveLow,
-                       "a safety pause must NOT clear a three-low hard stop")
-        guard case .stopped = await lc.canDispatch(sessionId: "s-1") else {
-            return XCTFail("session must stay stopped after a safety pause")
         }
     }
 

@@ -1,9 +1,9 @@
 // AXCheckStep.swift
 //
-// Step 2 content body — Accessibility permission. The step indicator and
+// Step 2 content body, Accessibility permission. The step indicator and
 // title now live on OnboardingScene. The "Open System Settings" primary
 // and the "Skip" secondary both moved to the footer (Skip is left,
-// primary right). "Re-check now" is gone entirely — vm.tick() polls
+// primary right). "Re-check now" is gone entirely, vm.tick() polls
 // every 1.5s and advances the moment AX is granted.
 
 import AppKit
@@ -16,7 +16,7 @@ struct AXCheckStep: View {
     let prompted: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: BrandSpacing.md) {
             Text("Supervisor needs Accessibility access to type into your terminal when it acts for you. Open System Settings, then turn Supervisor on under Privacy and Security, then Accessibility.")
                 .font(BrandFont.body)
                 .foregroundStyle(BrandColor.inkDeep.color)

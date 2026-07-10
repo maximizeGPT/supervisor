@@ -4,10 +4,22 @@
 // while it itself is running. The status-bar companion reads this file
 // to decide whether the main supervisor stack is healthy.
 //
-// In Phase B/C this will additionally check the main app's mach port and
-// only emit heartbeats while the port is reachable. For Phase A it just
-// writes unconditionally — the test is whether killing this process makes
-// the status bar turn red within 30s.
+// The status bar turning red when this process (or its parent, the main
+// app) dies is HALF the honest-health guarantee: it proves the process TREE
+// is alive. Two things stop the writes: SIGINT/SIGTERM (clean teardown by the
+// parent), and parent-liveness (getppid()==1 → the parent crashed and we were
+// reparented to launchd; see the timer handler). Both let the heartbeat go
+// stale so the reader flips the icon to red rather than lying green over a
+// dead supervisor.
+//
+// A live process is NOT proof the triage ENGINE is progressing — if the engine
+// hangs while the app process stays up, this timer keeps stamping fresh beats.
+// The other half of the guarantee (FIX 4) is the engine-progress token the MAIN
+// app writes from its own run loop (ConfigPaths.engineProgressPath / the
+// EngineProgress writer); the status bar folds that into its evaluate() so a
+// hung engine reads amber/red. This process deliberately does NOT touch that
+// token — it has no engine signal, which is exactly why engine liveness must be
+// stamped by the engine itself, not by this dumb-timer child.
 
 import Foundation
 import SupervisorCore
@@ -49,6 +61,19 @@ let queue = DispatchQueue(label: "supervisor.heartbeat", qos: .utility)
 let timer = DispatchSource.makeTimerSource(queue: queue)
 timer.schedule(deadline: .now(), repeating: 5.0)
 timer.setEventHandler {
+    // Parent-liveness. This process is spawned as a direct child of the main
+    // Supervisor.app (see startHeartbeat in SupervisorApp/main.swift). If the
+    // main app crashes, this orphaned child is reparented to launchd, so
+    // getppid() returns 1. Without this check the orphan keeps writing a fresh
+    // heartbeat forever and the menu-bar icon stays green over a dead
+    // supervisor — the exact "green dot lying" the product must never do. Stop
+    // writing so the heartbeat goes stale and the status-bar icon honestly
+    // turns red.
+    if getppid() == 1 {
+        trace.emit("heartbeat", "parent gone (getppid=1) — stopping so the icon can go red")
+        trace.sync()
+        exit(0)
+    }
     let beat = Heartbeat(timestamp: Date(), flags: [])
     do {
         let bytes = try heartbeat.write(beat)

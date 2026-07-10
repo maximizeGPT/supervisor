@@ -243,6 +243,124 @@ final class StorageTests: XCTestCase {
         XCTAssertEqual(total, 6.0, accuracy: 0.0001)
     }
 
+    // MARK: - PlanStore (v0.2.0 M2a)
+
+    /// Helper: a session row to satisfy the plans.session_id FK.
+    private func seedSession(_ db: SupervisorDatabase, id: String) throws {
+        try SessionStore(database: db).upsert(StoredSession(
+            id: id, projectHash: "p", cwd: "/c",
+            startedAt: Date(), lastSeenAt: Date(), jsonlPath: "/x"
+        ))
+    }
+
+    /// create -> currentPlan -> updateStep -> reload, asserting each hop.
+    func testPlanCreateLoadUpdateStepRoundTrip() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try seedSession(db, id: "sess-plan")
+        let store = PlanStore(database: db)
+
+        let plan = Plan(
+            id: "plan-1",
+            sessionId: "sess-plan",
+            objective: "Ship the planner harness",
+            steps: [
+                PlanStep(id: "step-0", index: 0, title: "Model",
+                         objective: "Add Plan + PlanStep", doneCriteria: "types compile"),
+                PlanStep(id: "step-1", index: 1, title: "Store",
+                         objective: "Add PlanStore", doneCriteria: "round-trip passes"),
+            ],
+            status: .draft,
+            currentStepIndex: 0
+        )
+        try store.create(plan)
+
+        // Load the current plan and assert the round-trip is faithful.
+        let loaded = try XCTUnwrap(try store.currentPlan(sessionId: "sess-plan"))
+        XCTAssertEqual(loaded.id, "plan-1")
+        XCTAssertEqual(loaded.objective, "Ship the planner harness")
+        XCTAssertEqual(loaded.status, .draft)
+        XCTAssertEqual(loaded.steps.map { $0.id }, ["step-0", "step-1"], "steps come back ordered by index")
+        XCTAssertEqual(loaded.steps[0].status, .pending)
+        XCTAssertNil(loaded.steps[0].lastVerdict)
+
+        // Update step 0: pass it with a verdict and a second attempt.
+        try store.updateStep(
+            stepId: "step-0",
+            status: .passed,
+            attempts: 2,
+            verdict: PlanStep.Verdict(passed: true, score: 0.91, feedback: "criteria met")
+        )
+
+        // Reload and assert the step update persisted, including the
+        // JSON-column verdict round-trip.
+        let reloaded = try XCTUnwrap(try store.currentPlan(sessionId: "sess-plan"))
+        let step0 = try XCTUnwrap(reloaded.steps.first { $0.id == "step-0" })
+        XCTAssertEqual(step0.status, .passed)
+        XCTAssertEqual(step0.attempts, 2)
+        let verdict = try XCTUnwrap(step0.lastVerdict)
+        XCTAssertEqual(verdict.passed, true)
+        XCTAssertEqual(verdict.score, 0.91, accuracy: 0.0001)
+        XCTAssertEqual(verdict.feedback, "criteria met")
+        // The untouched step is unchanged.
+        XCTAssertEqual(reloaded.steps.first { $0.id == "step-1" }?.status, .pending)
+    }
+
+    /// updatePlan + markApproved persist plan-level state.
+    func testPlanUpdatePlanAndMarkApproved() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try seedSession(db, id: "s")
+        let store = PlanStore(database: db)
+        try store.create(Plan(id: "p", sessionId: "s", objective: "obj",
+                              steps: [PlanStep(index: 0, title: "t",
+                                               objective: "o", doneCriteria: "d")],
+                              status: .draft))
+
+        try store.updatePlan(planId: "p", status: .running, currentStepIndex: 1)
+        var loaded = try XCTUnwrap(try store.plan(id: "p"))
+        XCTAssertEqual(loaded.status, .running)
+        XCTAssertEqual(loaded.currentStepIndex, 1)
+        XCTAssertNil(loaded.approvedAt)
+
+        let approvedAt = Date(timeIntervalSince1970: 1_700_000_500)
+        try store.markApproved(planId: "p", at: approvedAt)
+        loaded = try XCTUnwrap(try store.plan(id: "p"))
+        XCTAssertEqual(loaded.status, .approved)
+        XCTAssertEqual(loaded.approvedAt?.timeIntervalSince1970 ?? 0,
+                       approvedAt.timeIntervalSince1970, accuracy: 1.0)
+    }
+
+    /// currentPlan returns the most recently created plan for a session.
+    func testPlanCurrentReturnsLatest() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try seedSession(db, id: "s")
+        let store = PlanStore(database: db)
+        let early = Date(timeIntervalSince1970: 1_700_000_000)
+        let late = Date(timeIntervalSince1970: 1_700_001_000)
+        try store.create(Plan(id: "old", sessionId: "s", objective: "old",
+                              createdAt: early, updatedAt: early))
+        try store.create(Plan(id: "new", sessionId: "s", objective: "new",
+                              createdAt: late, updatedAt: late))
+        XCTAssertEqual(try store.currentPlan(sessionId: "s")?.id, "new")
+        // No plan for an unknown session.
+        XCTAssertNil(try store.currentPlan(sessionId: "nope"))
+    }
+
+    /// Steps cascade-delete when their plan's session is deleted.
+    func testPlanStepsCascadeOnSessionDelete() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try seedSession(db, id: "s")
+        let store = PlanStore(database: db)
+        try store.create(Plan(id: "p", sessionId: "s", objective: "o",
+                              steps: [PlanStep(index: 0, title: "t",
+                                               objective: "o", doneCriteria: "d")]))
+        try SessionStore(database: db).delete(id: "s")
+        XCTAssertNil(try store.plan(id: "p"))
+        try db.queue.read { conn in
+            XCTAssertEqual(try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM plan_steps"), 0,
+                           "plan_steps should cascade away with the plan")
+        }
+    }
+
     // MARK: - Heartbeat
 
     func testHeartbeatWriteReadRoundTrip() throws {
@@ -322,5 +440,173 @@ final class StorageTests: XCTestCase {
         try HeartbeatFile(path: tmp).write(Heartbeat(flags: []))
         let raw = try String(contentsOf: tmp)
         XCTAssertTrue(raw.contains(" -"))
+    }
+
+    // MARK: - AuditStore (v0.2.0 observability A)
+
+    /// v5 migration creates the audit_entries table with the expected columns.
+    func testV5MigrationCreatesAuditEntriesTable() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try db.queue.read { conn in
+            XCTAssertTrue(try conn.tableExists("audit_entries"))
+            let cols = try conn.columns(in: "audit_entries").map { $0.name }
+            for expected in [
+                "id", "session_id", "created_at", "kind", "summary",
+                "question", "context_used", "authorizing_rule",
+                "command", "target_path", "risk_reason", "classification", "detail",
+            ] {
+                XCTAssertTrue(cols.contains(expected), "audit_entries missing column \(expected); got \(cols)")
+            }
+        }
+    }
+
+    /// record -> entries round-trip is faithful across all the optional
+    /// structured fields, and entries come back newest-first.
+    func testAuditStoreRecordAndFetchRoundTrip() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try seedSession(db, id: "sess-audit")
+        let store = AuditStore(database: db)
+
+        let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+        // An auto-answer with the full justification trail.
+        let answer = StoredAuditEntry(
+            id: "a-1", sessionId: "sess-audit", createdAt: t0,
+            kind: .autoAnswer,
+            summary: "Answered Claude Code's question: Yes, commit it",
+            question: "Should I commit this?",
+            contextUsed: "PRINCIPLES.md + live repo context",
+            authorizingRule: "§1c"
+        )
+        // A destructive block "receipt".
+        let block = StoredAuditEntry(
+            id: "a-2", sessionId: "sess-audit", createdAt: t0.addingTimeInterval(10),
+            kind: .block,
+            summary: "Paused before `git reset --hard`",
+            command: "git reset --hard",
+            targetPath: "/repo",
+            riskReason: "git reset --hard: discards all uncommitted and staged changes"
+        )
+        // A nudge carrying the PART B classification.
+        let nudge = StoredAuditEntry(
+            id: "a-3", sessionId: "sess-audit", createdAt: t0.addingTimeInterval(20),
+            kind: .nudge,
+            summary: "Nudged a stalled session",
+            classification: StallClassification.subAgentFanout.rawValue
+        )
+        try store.record(answer)
+        try store.record(block)
+        try store.record(nudge)
+
+        XCTAssertEqual(try store.count(sessionId: "sess-audit"), 3)
+
+        let entries = try store.entries(sessionId: "sess-audit")
+        XCTAssertEqual(entries.map { $0.id }, ["a-3", "a-2", "a-1"], "newest-first")
+
+        // The auto-answer round-trips every field.
+        let gotAnswer = try XCTUnwrap(entries.first { $0.id == "a-1" })
+        XCTAssertEqual(gotAnswer.kind, .autoAnswer)
+        XCTAssertEqual(gotAnswer.question, "Should I commit this?")
+        XCTAssertEqual(gotAnswer.contextUsed, "PRINCIPLES.md + live repo context")
+        XCTAssertEqual(gotAnswer.authorizingRule, "§1c")
+        XCTAssertNil(gotAnswer.command, "an auto-answer leaves block-only fields nil")
+
+        // The block receipt round-trips.
+        let gotBlock = try XCTUnwrap(entries.first { $0.id == "a-2" })
+        XCTAssertEqual(gotBlock.kind, .block)
+        XCTAssertEqual(gotBlock.command, "git reset --hard")
+        XCTAssertEqual(gotBlock.targetPath, "/repo")
+        XCTAssertEqual(gotBlock.riskReason, "git reset --hard: discards all uncommitted and staged changes")
+
+        // The nudge classification round-trips.
+        let gotNudge = try XCTUnwrap(entries.first { $0.id == "a-3" })
+        XCTAssertEqual(gotNudge.classification, "subAgentFanout")
+    }
+
+    /// Audit entries cascade-delete with their session (the FK + cascade).
+    func testAuditEntriesCascadeOnSessionDelete() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let sessions = SessionStore(database: db)
+        try seedSession(db, id: "sess-cascade")
+        let store = AuditStore(database: db)
+        try store.record(StoredAuditEntry(
+            sessionId: "sess-cascade", kind: .nudge, summary: "x"))
+        XCTAssertEqual(try store.count(sessionId: "sess-cascade"), 1)
+
+        try sessions.delete(id: "sess-cascade")
+        XCTAssertEqual(try store.count(sessionId: "sess-cascade"), 0)
+    }
+
+    // MARK: - Deterministic-catch dedupe ledger (v8, launch-audit fix)
+
+    func testV8MigrationCreatesDeterministicCatchesTable() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try db.queue.read { conn in
+            XCTAssertTrue(try conn.tableExists("deterministic_catches"))
+            let cols = try conn.columns(in: "deterministic_catches").map { $0.name }
+            XCTAssertTrue(cols.contains("event_uuid"))
+            XCTAssertTrue(cols.contains("session_id"))
+            XCTAssertTrue(cols.contains("ts"))
+        }
+    }
+
+    func testDeterministicCatchDedupeRoundTrip() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let store = AuditStore(database: db)
+
+        XCTAssertFalse(try store.hasDeterministicCatch(eventUuid: "toolu-1"),
+                       "an unseen event uuid must read false — a new destructive event always fires")
+
+        try store.recordDeterministicCatch(eventUuid: "toolu-1", sessionId: "s1", at: Date())
+        XCTAssertTrue(try store.hasDeterministicCatch(eventUuid: "toolu-1"),
+                      "a recorded catch must dedupe on replay")
+
+        // A different event is untouched by the first record.
+        XCTAssertFalse(try store.hasDeterministicCatch(eventUuid: "toolu-2"))
+
+        // Re-recording the same uuid is idempotent (INSERT OR REPLACE), not an error.
+        try store.recordDeterministicCatch(eventUuid: "toolu-1", sessionId: "s1", at: Date())
+        XCTAssertTrue(try store.hasDeterministicCatch(eventUuid: "toolu-1"))
+    }
+
+    /// The ledger must survive a process restart — that IS the fix. In-memory
+    /// would trivially pass dedupe within one process, so use a file-backed DB
+    /// and re-open it.
+    func testDeterministicCatchSurvivesReopen() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("supervisor-catch-dedupe-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let db1 = try SupervisorDatabase(path: tmp)
+        try AuditStore(database: db1).recordDeterministicCatch(
+            eventUuid: "toolu-restart", sessionId: "s1", at: Date())
+
+        let db2 = try SupervisorDatabase(path: tmp)
+        XCTAssertTrue(try AuditStore(database: db2).hasDeterministicCatch(eventUuid: "toolu-restart"),
+                      "the dedupe row must be visible after a re-open (engine restart)")
+    }
+
+    /// Rows older than the retention window are pruned on the next write, so
+    /// the ledger stays bounded; rows inside the window survive the same write.
+    func testDeterministicCatchRetentionPrunesOldRows() throws {
+        let db = try SupervisorDatabase.inMemory()
+        let store = AuditStore(database: db)
+        let now = Date()
+
+        // One row just past retention, one comfortably inside it.
+        try store.recordDeterministicCatch(
+            eventUuid: "toolu-old", sessionId: "s1",
+            at: now.addingTimeInterval(-AuditStore.deterministicCatchRetention - 60))
+        try store.recordDeterministicCatch(
+            eventUuid: "toolu-recent", sessionId: "s1",
+            at: now.addingTimeInterval(-60))
+
+        // The pruning write.
+        try store.recordDeterministicCatch(eventUuid: "toolu-new", sessionId: "s1", at: now)
+
+        XCTAssertFalse(try store.hasDeterministicCatch(eventUuid: "toolu-old"),
+                       "a row past the retention window must be pruned by a later write")
+        XCTAssertTrue(try store.hasDeterministicCatch(eventUuid: "toolu-recent"),
+                      "a row inside the retention window must survive the prune")
+        XCTAssertTrue(try store.hasDeterministicCatch(eventUuid: "toolu-new"))
     }
 }

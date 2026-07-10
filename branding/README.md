@@ -2,13 +2,15 @@
 
 This directory holds the canonical brand exports for Supervisor v0.1.x. The
 build pipeline reads from here — don't move files without updating
-`Scripts/build-app.sh` and `Sources/SupervisorStatusBar/Resources/`.
+`Scripts/build-app.sh` (which copies the status-bar icon PNGs into
+`Supervisor.app/Contents/Resources/`).
 
 ## Files
 
 | File                          | Use                                                                                          |
 |-------------------------------|----------------------------------------------------------------------------------------------|
-| `supervisor-statusbar.svg`    | 16×16 monochrome template image. Source for `Sources/SupervisorStatusBar/Resources/StatusBarIcon.{svg,png,@2x.png}`, loaded as an `NSImage` with `isTemplate = true` for menu-bar light/dark theming. |
+| `supervisor-statusbar.svg`    | 16×16 monochrome template image. SVG source for `branding/StatusBarIcon.png` (+ `@2x`), which `Scripts/build-app.sh` copies into `Supervisor.app/Contents/Resources/`; loaded by the main app as an `NSImage` with `isTemplate = true` for menu-bar light/dark theming. |
+| `StatusBarIcon.png` / `@2x`   | 16×16 (and 32×32 retina) PNG renders of `supervisor-statusbar.svg`. These are the files the build copies into the app bundle's `Resources/`; the main app loads them via `Bundle.main.image(forResource: "StatusBarIcon")`. |
 | `supervisor-appicon-1024.png` | 1024×1024 RGBA master with the macOS squircle baked in. `Scripts/make-icns.sh` rescales it through the standard 10-size iconset into `AppIcon.icns`. |
 | `supervisor-wordmark.svg`     | Three lockup variants in one file: `#lockup-horizontal`, `#lockup-stacked`, `#wordmark-only`. All glyphs are outlined paths from Inter Medium with -2% tracking — zero font dependency at render time. Used in docs, GitHub social card, and the (future v0.1.7+) expanded panel. |
 | `AppIcon.icns`                | Generated artifact (committed). Reflects the current state of `supervisor-appicon-1024.png`; `make-icns.sh` rebuilds it whenever the master is newer. The intermediate `AppIcon.iconset/` directory is `.gitignore`d. |
@@ -24,7 +26,7 @@ Hex values, mapped to their role in the system:
 | Ink-deep   | `#1A1B1E` | Squircle gradient bottom stop on the app icon                       |
 | Paper-warm | `#EDEDEB` | Secondary surface, dividers                                         |
 | Signal     | `#2D7A4E` | Brand green. Symbol fill on app icon + wordmark. Hover-dot "running" color. |
-| Mute       | `#A6A6A2` | Secondary text, deemphasis                                          |
+| Mute       | `#6E6E68` | Secondary text, deemphasis (darkened from `#A6A6A2` in v0.1.6.4 for WCAG-AA body contrast) |
 
 ## Type system
 
@@ -52,12 +54,11 @@ flagging an action before it lands, and the symbol carries that meaning.
 
 ## Updating brand assets
 
-1. Edit / re-export from Claude Design (or whatever the active source-of-truth tool is) and replace files under `branding/`. Don't touch the generated `Sources/SupervisorStatusBar/Resources/StatusBarIcon.*` files directly — they should be regenerated from the SVG.
-2. For the status-bar fallbacks, re-run:
+1. Edit / re-export from Claude Design (or whatever the active source-of-truth tool is) and replace files under `branding/`. Don't touch the generated `branding/StatusBarIcon.*` PNGs directly — they should be regenerated from the SVG.
+2. For the status-bar icon PNGs (which `Scripts/build-app.sh` copies into `Supervisor.app/Contents/Resources/`), re-run:
    ```bash
-   cp branding/supervisor-statusbar.svg Sources/SupervisorStatusBar/Resources/StatusBarIcon.svg
-   sips -s format png -z 16 16 branding/supervisor-statusbar.svg --out Sources/SupervisorStatusBar/Resources/StatusBarIcon.png
-   sips -s format png -z 32 32 branding/supervisor-statusbar.svg --out Sources/SupervisorStatusBar/Resources/StatusBarIcon@2x.png
+   sips -s format png -z 16 16 branding/supervisor-statusbar.svg --out branding/StatusBarIcon.png
+   sips -s format png -z 32 32 branding/supervisor-statusbar.svg --out branding/StatusBarIcon@2x.png
    ```
 3. For the app icon, `Scripts/build-app.sh` re-runs `make-icns.sh` automatically on the next build whenever the master is newer than `AppIcon.icns`.
 4. Visual-smoke: build via `./Scripts/build-app.sh debug`, launch each

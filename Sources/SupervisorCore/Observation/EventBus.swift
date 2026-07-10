@@ -50,6 +50,8 @@ public final class EventBus: Sendable {
             return "bashToolCall(\(head))"
         case .bashToolResult(let v):
             return "bashToolResult(isError=\(v.isError), bytes=\(v.output.utf8.count))"
+        case .fileEdit(let v):
+            return "fileEdit(\(v.toolName) \(v.filePath) hunks=\(v.hunks.count))"
         case .systemSignal(let v):
             return "systemSignal(\(v.subtype), preventedContinuation=\(v.preventedContinuation))"
         }

@@ -17,7 +17,7 @@ final class InjectClaimHonestyTests: XCTestCase {
 
     func testDegradedInjectNeverClaimsAnswered() {
         let r = HoverViewModel.actionForOutcome(
-            .injectDegraded(intendedText: "the answer text", reason: "desktop_targeting_failed")
+            .injectDegraded(intendedText: "the answer text", reason: "desktop_targeting_failed", copiedToClipboard: true)
         )
         let label = r?.label ?? ""
         XCTAssertFalse(
@@ -45,7 +45,7 @@ final class InjectClaimHonestyTests: XCTestCase {
             HoverViewModel.actionForOutcome(.continueFired(pid: 1, bytes: 2, promptHead: "do x"))?.label,
             "Sent Claude Code its next task"
         )
-        let proposed = HoverViewModel.actionForOutcome(.continueProposedMedium(proposal: "do x", justification: "y"))
+        let proposed = HoverViewModel.actionForOutcome(.continueProposedMedium(proposal: "do x", justification: "y", copiedToClipboard: false))
         XCTAssertEqual(proposed?.action, .continue)
         XCTAssertFalse(
             (proposed?.label ?? "").localizedCaseInsensitiveContains("sent"),

@@ -26,6 +26,19 @@ public enum BrandColor: String, Sendable, CaseIterable {
                      // ink is far darker (#0E0F11) and the tracking+
                      // uppercase on "STEP N OF 3" still carries its
                      // weight without needing extra-light gray.
+    case attention   // #B8772A — the ONE calm amber attention tone, added
+                     // in v0.2.0 M3 to reconcile the Stitch brief's
+                     // failed/attention states. NOT a second accent: signal
+                     // green still owns live/active/success and the one
+                     // primary action. Amber marks only "needs a look": a
+                     // medium-severity flag, a failed plan step, a failed
+                     // evaluator verdict. It is intentionally desaturated
+                     // (a warm ochre, not a system `.orange`) so the panel
+                     // never reads as an alarm console. Used as a solid
+                     // label/glyph tone and, at a low opacity, as a tint
+                     // fill (see SeverityBadge / StepStateIcon). The exact
+                     // hex is the brief's calm-amber target tuned to sit
+                     // beside ink/mute/paper without shouting.
 
     public var color: Color {
         switch self {
@@ -35,6 +48,7 @@ public enum BrandColor: String, Sendable, CaseIterable {
         case .paperWarm: return Color(red: 0xED / 255, green: 0xED / 255, blue: 0xEB / 255)
         case .signal:    return Color(red: 0x2D / 255, green: 0x7A / 255, blue: 0x4E / 255)
         case .mute:      return Color(red: 0x6E / 255, green: 0x6E / 255, blue: 0x68 / 255)
+        case .attention: return Color(red: 0xB8 / 255, green: 0x77 / 255, blue: 0x2A / 255)
         }
     }
 }

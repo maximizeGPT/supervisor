@@ -144,7 +144,9 @@ public func migrateLegacyKeyIfPresent(
     let legacy = Keychain(service: legacyService)
 
     // If we already have an Anthropic-namespaced key, no migration needed.
-    if let existing = try? keys.read(.anthropic), existing != nil {
+    // (`try?` flattens the nested optional, so a non-nil result already means
+    // "read succeeded AND a key is stored" — no second nil check needed.)
+    if (try? keys.read(.anthropic)) != nil {
         return false
     }
     // Read the legacy item.

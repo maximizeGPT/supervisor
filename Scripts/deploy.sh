@@ -14,9 +14,7 @@ cd "$(dirname "$0")/.."
 
 VERSION="${1:-}"
 SRC="build/Supervisor.app"
-SRC_STATUSBAR="build/SupervisorStatusBar.app"
 DEST="/Applications/Supervisor.app"
-DEST_STATUSBAR="/Applications/SupervisorStatusBar.app"
 APP_SUPPORT="$HOME/Library/Application Support/Supervisor"
 MARKER="$APP_SUPPORT/self-rebuild.marker"
 
@@ -47,15 +45,15 @@ swap_bundle() {
     fi
 }
 
-# 1. Stop the running instances.
+# 1. Stop the running instance.
 echo "[deploy] stopping running Supervisor"
 pkill -f "/Applications/Supervisor.app/Contents/MacOS/Supervisor" 2>/dev/null || true
-pkill -f "/Applications/SupervisorStatusBar.app" 2>/dev/null || true
 sleep 1
 
-# 2. Atomic swap both bundles.
+# 2. Atomic swap the bundle. The menu-bar status item now lives inside
+# Supervisor.app (the former SupervisorStatusBar process was folded in),
+# so there is no second bundle to swap.
 swap_bundle "$SRC" "$DEST"
-swap_bundle "$SRC_STATUSBAR" "$DEST_STATUSBAR"
 
 # 3. Record the self-rebuild so the new instance announces it.
 mkdir -p "$APP_SUPPORT"
@@ -69,7 +67,6 @@ LOG_BEFORE=0
 [[ -f "$LOG" ]] && LOG_BEFORE=$(wc -l < "$LOG")
 echo "[deploy] relaunching"
 open "$DEST"
-[[ -d "$DEST_STATUSBAR" ]] && open "$DEST_STATUSBAR" || true
 
 # 5. Post-deploy smoke test. The app's own trace is the authoritative
 # signal: it logs the onboarding decision (with axOK) only after the

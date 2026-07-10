@@ -49,6 +49,17 @@ public struct ProcessHandle: Sendable, Equatable {
 public protocol ProcessLocator: Sendable {
     func locate(targetCwd: String) -> ProcessHandle?
 
+    /// Same cwd walk, with the v0.3.1 Claude.app desktop fallback gated by
+    /// `allowDesktopFallback`. The SIGNAL paths (pause/kill) pass `false`:
+    /// the fallback PID is the SHARED desktop Electron process, and a POSIX
+    /// SIGSTOP/SIGTERM to it would freeze/quit every conversation in the
+    /// app — so a locate destined for `kill(2)` must return nil rather than
+    /// that PID. Inject paths keep the fallback (typing into the desktop
+    /// app is legitimate — delivery goes through keystrokes, not signals).
+    /// Default forwards to `locate(targetCwd:)` so existing conformers
+    /// (test stubs) stay source-compatible.
+    func locate(targetCwd: String, allowDesktopFallback: Bool) -> ProcessHandle?
+
     /// Locate the process for a specific session by its session id (the
     /// transcript UUID), matched against the process argv (`--resume <id>`
     /// / `--session-id <id>`). This is the RELIABLE primitive when cwd
@@ -60,10 +71,26 @@ public protocol ProcessLocator: Sendable {
     /// concurrent sessions instead of safe-degrading. Default nil so the
     /// stub locators in tests opt out without implementing it.
     func locate(bySessionId sessionId: String) -> ProcessHandle?
+
+    /// TOCTOU re-check (Finding 4): confirm `pid` STILL resolves to a
+    /// Claude-shaped process, called immediately before a GROUP signal.
+    /// Between the `locate…` above and `kill(-pgid)` the pid can be reused by
+    /// an unrelated process, and a group signal would then hit a FOREIGN
+    /// process group — the `getpgrp()` self-guard in DarwinSignalSender only
+    /// protects Supervisor's OWN group, not a stranger's. The router calls
+    /// this right before `sendToGroup` and degrades to notify on false.
+    /// Default returns true so existing conformers / test stubs stay
+    /// source-compatible (they resolve the pid themselves and don't model
+    /// reuse).
+    func stillClaudeProcess(pid: pid_t) -> Bool
 }
 
 public extension ProcessLocator {
     func locate(bySessionId sessionId: String) -> ProcessHandle? { nil }
+    func locate(targetCwd: String, allowDesktopFallback: Bool) -> ProcessHandle? {
+        locate(targetCwd: targetCwd)
+    }
+    func stillClaudeProcess(pid: pid_t) -> Bool { true }
 }
 
 /// Production implementation backed by libproc on macOS. No entitlements
@@ -75,7 +102,14 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
     private let supervisorPID: pid_t
 
     public init(
-        execNamePatterns: [String] = ["claude", "claude-code"],
+        // "codex" added so a Codex CLI session is located + intervened on
+        // exactly like a Claude Code one (the router routes purely by cwd, so
+        // recognizing the process is the whole parity change). Case-sensitive
+        // exact-basename match means Codex.app's GUI binary "Codex" (capital)
+        // is NOT matched, and the desktop `codex app-server` backend is
+        // additionally guarded out of the signal path (see isCodexServerProcess)
+        // so a POSIX signal can never freeze the Codex GUI.
+        execNamePatterns: [String] = ["claude", "claude-code", "codex"],
         trace: TraceLog = .shared
     ) {
         self.execNamePatterns = execNamePatterns
@@ -84,6 +118,10 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
     }
 
     public func locate(targetCwd: String) -> ProcessHandle? {
+        locate(targetCwd: targetCwd, allowDesktopFallback: true)
+    }
+
+    public func locate(targetCwd: String, allowDesktopFallback: Bool) -> ProcessHandle? {
         let pids: [pid_t]
         do {
             pids = try Self.enumerateAllPIDs()
@@ -140,6 +178,15 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
             }
             guard let cwd = Self.cwd(pid: pid) else { continue }
             guard cwd == targetCwd else { continue }
+            // Never treat the Codex desktop app's own `codex app-server` (or
+            // other server-mode) backend as an interactive session to signal —
+            // a SIGSTOP/SIGTERM to it would freeze the Codex GUI (the same class
+            // of incident that froze Supervisor via Claude.app). The cwd filter
+            // already excludes it (its cwd is "/"), but this is belt-and-braces.
+            if Self.isCodexServerProcess(execPath: execPath, pid: pid) {
+                trace.emit("locator", "locator.codex_server_excluded pid=\(pid) cwd=\(targetCwd) exec=\(execPath) — server-mode codex is not an interactive session target")
+                continue
+            }
             matches.append(ProcessHandle(pid: pid, execPath: execPath, cwd: cwd))
         }
 
@@ -169,6 +216,15 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
             // pipeline answer hit `intervention.inject.degraded
             // reason=locator_nil` despite cwd resolving correctly.
             if let claudeAppPID = Self.findClaudeDesktopAppPID() {
+                guard allowDesktopFallback else {
+                    // Signal path: the fallback PID is the shared desktop
+                    // Electron process — a POSIX signal to it would freeze/
+                    // quit EVERY conversation in Claude Desktop. Surface the
+                    // candidate PID for diagnosis, return nil so the caller
+                    // degrades instead of signaling it.
+                    trace.emit("locator", "locator.desktop_fallback_suppressed pid=\(claudeAppPID) targetCwd=\(targetCwd) note=caller disallowed the Claude.app fallback (signal path) — returning nil instead of the shared desktop PID")
+                    return nil
+                }
                 trace.emit("locator", "locator.claude_app_fallback pid=\(claudeAppPID) targetCwd=\(targetCwd) note=cli-locator missed; using Claude.app NSRunningApplication PID for inject delivery")
                 return ProcessHandle(pid: claudeAppPID, execPath: "/Applications/Claude.app/Contents/MacOS/Claude", cwd: "/")
             }
@@ -235,6 +291,71 @@ public final class LiveProcessLocator: ProcessLocator, @unchecked Sendable {
             trace.emit("locator", "locator.session.ambiguous sessionId=\(trimmed) pids=\(pidList)")
             return nil
         }
+    }
+
+    /// TOCTOU re-check (Finding 4): re-read `pid`'s exec path (and argv for
+    /// the interpreter case) and confirm it's still Claude-shaped. A vanished
+    /// pid (`proc_pidpath` fails) or a pid reused by an unrelated process
+    /// returns false, so the router degrades to notify instead of group-
+    /// signaling a stranger. Cheap: one `proc_pidpath`, plus one
+    /// KERN_PROCARGS2 read only for the `node …/cli.mjs` interpreter shape —
+    /// the same recognition logic `locate` uses, so a process this locator
+    /// would have matched a moment ago still passes.
+    public func stillClaudeProcess(pid: pid_t) -> Bool {
+        // Supervisor is never a legitimate signal target (it holds Claude's
+        // JSONLs open and could otherwise look Claude-shaped to a naive check).
+        if pid == supervisorPID { return false }
+        guard let execPath = Self.execPath(pid: pid) else {
+            trace.emit("locator", "locator.recheck.gone pid=\(pid) (proc_pidpath failed — process exited)")
+            return false
+        }
+        if matchesExecName(execPath) {
+            // A server-mode codex (the desktop app-server backend) must never be
+            // a signal target even if it passes the name match — refuse it here
+            // too so the TOCTOU recheck can't re-admit it before a group signal.
+            if Self.isCodexServerProcess(execPath: execPath, pid: pid) {
+                trace.emit("locator", "locator.recheck.codex_server pid=\(pid) execPath=\(execPath) (server-mode codex — refusing group signal)")
+                return false
+            }
+            return true
+        }
+        let execBase = (execPath as NSString).lastPathComponent
+        if Self.interpreterBasenames.contains(execBase),
+           let argv = Self.readProcessArgv(pid: pid),
+           Self.argvContainsClaudeCodeMarker(argv) {
+            return true
+        }
+        trace.emit("locator", "locator.recheck.reused pid=\(pid) execPath=\(execPath) (pid no longer resolves to a Claude-shaped process — refusing group signal)")
+        return false
+    }
+
+    // MARK: - Codex server-mode guard
+
+    /// Codex subcommands that run a long-lived SERVER, not an interactive
+    /// session: these back the desktop app / IDE and must never be signalled.
+    internal static let codexServerSubcommands: Set<String> = [
+        "app-server", "mcp-server", "exec-server", "remote-control",
+    ]
+
+    /// True when `pid` is a `codex` binary running in a server mode (e.g. the
+    /// Codex desktop app's `codex app-server` child). Only reads argv for
+    /// codex-basename processes, so it costs nothing for Claude Code lookups.
+    internal static func isCodexServerProcess(execPath: String, pid: pid_t) -> Bool {
+        guard (execPath as NSString).lastPathComponent == "codex" else { return false }
+        return isCodexServerArgv(readProcessArgv(pid: pid))
+    }
+
+    /// The pure argv → server-mode rule, split out so it's testable without a
+    /// live process. Scans EVERY argv token (not just argv[1]) because global
+    /// flags can precede the subcommand (`codex --log-level debug app-server`
+    /// is still the server). A nil argv (KERN_PROCARGS2 unreadable: EPERM,
+    /// racing exit, …) FAILS CLOSED — we can't prove a codex-named process is
+    /// an interactive session, and mistaking the desktop app's server child
+    /// for one means signalling it and freezing the GUI. Refusing an
+    /// uninspectable codex costs only a degraded notify.
+    internal static func isCodexServerArgv(_ argv: [String]?) -> Bool {
+        guard let argv else { return true }
+        return argv.contains { codexServerSubcommands.contains($0) }
     }
 
     // MARK: - Claude.app fallback (v0.3.1)

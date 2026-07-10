@@ -266,7 +266,10 @@ public struct RecoveryDocWriter: Sendable {
         out.append("All state is intact. To resume:")
         out.append("")
         out.append("```sh")
-        out.append("kill -CONT \(pid)")
+        // The pause stops the whole process group (so an already-forked
+        // shell child freezes too); the resume must be group-wide for the
+        // same reason, or the parent wakes and hangs on a stopped child.
+        out.append("kill -CONT -\"$(ps -o pgid= -p \(pid) | tr -d ' ')\"")
         out.append("```")
         out.append("")
         out.append("Before resuming, decide: **was the flagged action correct?**")

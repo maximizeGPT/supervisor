@@ -64,6 +64,11 @@ final class v0_3_0_CanaryTest: XCTestCase {
             costStore: nil,
             redactor: DefaultRedactor(),
             questionAnswerer: answerer,
+            // Honest-health: the canary runs the real 1s background idle loop for
+            // up to ~45s. No-op the engine-progress recorder so the canary never
+            // stamps the REAL global engine-progress.txt liveness token (which
+            // would mask a hung production engine as GREEN while tests run).
+            recordEngineProgress: {},
             trace: trace
         )
 

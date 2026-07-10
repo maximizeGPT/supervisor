@@ -21,13 +21,12 @@ they're missing. `swift test` runs 130 tests; one (`testRealHaikuLiveCall`)
 is skipped unless `ANTHROPIC_API_KEY` is exported — that one hits the
 real Anthropic API and bills against your key.
 
-For an end-to-end smoke test that builds, signs, and launches all three
+For an end-to-end smoke test that builds, signs, and launches both
 `.app` bundles with the brand icons baked in:
 
 ```bash
 ./Scripts/build-app.sh debug
 open ./build/Supervisor.app
-open ./build/SupervisorStatusBar.app
 ```
 
 ## Filing a useful bug report
@@ -41,7 +40,7 @@ tail -50 ~/Library/Logs/Supervisor/supervisor.log
 
 Paste those 50 lines into the issue, then describe what you were doing
 when it happened. The trace log is append-only and tagged per subsystem
-(`onboarding`, `app`, `flag`, `statusbar`), which makes it easy to spot
+(`onboarding`, `app`, `flag`), which makes it easy to spot
 where the surprise originated. Trim or redact any line that contains
 something you don't want public — the trace log is local-only and isn't
 filtered for sensitive content.

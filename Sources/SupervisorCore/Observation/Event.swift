@@ -64,6 +64,17 @@ public enum SupervisorEvent: Sendable, Equatable {
     /// `isError` and the first ~2KB of output (truncated for the prompt).
     case bashToolResult(BashToolResultInfo)
 
+    /// A file-writing tool call — `Edit`, `Write`, or `MultiEdit`. Carries the
+    /// path and the change hunks (old→new for Edit/MultiEdit; the full content
+    /// for Write). The REVIEW dimension (v0.3.x, opt-in) consumes this to review
+    /// the code a worker writes on the fly. The safety TriageEngine deliberately
+    /// IGNORES this case (it guards it out of its window) so the destructive-
+    /// action triage path is unchanged — file edits are a review surface, not a
+    /// new safety trigger. This is the case the v0.1.0 header note anticipated
+    /// ("Edit/Write/Read tool calls will add cases without breaking existing
+    /// consumers").
+    case fileEdit(FileEditInfo)
+
     /// A `system` line with `preventedContinuation: true` (a hook said no).
     /// Currently emitted but not consumed in v0.1.0; v0.1.4 wires the
     /// `prevented_continuation_ignored` rubric category to it.
@@ -76,6 +87,7 @@ public enum SupervisorEvent: Sendable, Equatable {
         case .assistantText(let v):    return v.sessionId
         case .bashToolCall(let v):     return v.sessionId
         case .bashToolResult(let v):   return v.sessionId
+        case .fileEdit(let v):         return v.sessionId
         case .systemSignal(let v):     return v.sessionId
         }
     }
@@ -87,6 +99,7 @@ public enum SupervisorEvent: Sendable, Equatable {
         case .assistantText(let v):    return v.ts
         case .bashToolCall(let v):     return v.ts
         case .bashToolResult(let v):   return v.ts
+        case .fileEdit(let v):         return v.ts
         case .systemSignal(let v):     return v.ts
         }
     }
@@ -98,6 +111,7 @@ public enum SupervisorEvent: Sendable, Equatable {
         case .assistantText(let v):    return v.channel
         case .bashToolCall(let v):     return v.channel
         case .bashToolResult(let v):   return v.channel
+        case .fileEdit(let v):         return v.channel
         case .systemSignal(let v):     return v.channel
         }
     }
@@ -193,6 +207,51 @@ public struct BashToolResultInfo: Sendable, Equatable {
         self.toolUseId = toolUseId
         self.output = output
         self.isError = isError
+        self.ts = ts
+        self.channel = channel
+    }
+}
+
+/// One change within a file-editing tool call. For `Edit` there is one hunk;
+/// for `MultiEdit` there is one per edit in the array; for `Write` there is a
+/// single hunk whose `oldString` is nil (a whole-file write) and `newString`
+/// is the full content. Kept as value hunks (not a raw diff) so the reviewer
+/// sees exactly what the worker changed.
+public struct FileEditHunk: Sendable, Equatable {
+    /// The text being replaced. `nil` for a `Write` (there is no prior text in
+    /// the tool call — it overwrites/creates the whole file).
+    public let oldString: String?
+    /// The replacement text (for `Write`, the full new file content).
+    public let newString: String
+
+    public init(oldString: String?, newString: String) {
+        self.oldString = oldString
+        self.newString = newString
+    }
+}
+
+/// A file-writing tool call (`Edit` / `Write` / `MultiEdit`). The REVIEW
+/// dimension reviews the change; the safety triage ignores it.
+public struct FileEditInfo: Sendable, Equatable {
+    public let sessionId: String
+    /// The tool name as written in the transcript: "Edit" | "Write" | "MultiEdit".
+    public let toolName: String
+    /// Absolute path the worker edited (the tool's `file_path` argument).
+    public let filePath: String
+    /// The change(s). One for Edit/Write, one-per-edit for MultiEdit.
+    public let hunks: [FileEditHunk]
+    public let toolUseId: String
+    public let turnUUID: String
+    public let ts: Date
+    public var channel: EventChannel = .jsonl
+
+    public init(sessionId: String, toolName: String, filePath: String, hunks: [FileEditHunk], toolUseId: String, turnUUID: String, ts: Date, channel: EventChannel = .jsonl) {
+        self.sessionId = sessionId
+        self.toolName = toolName
+        self.filePath = filePath
+        self.hunks = hunks
+        self.toolUseId = toolUseId
+        self.turnUUID = turnUUID
         self.ts = ts
         self.channel = channel
     }

@@ -3,7 +3,9 @@
 // kqueue-backed tail of a single Claude Code session JSONL.
 //
 // Lifecycle:
-//   1. Open file at saved offset (from SessionStore.jsonlOffset) or EOF.
+//   1. Open file at saved offset (from SessionStore.jsonlOffset). With no
+//      saved offset: byte 0 for small fresh files, fast-forward to EOF for
+//      pre-existing history (see the seek policy in start()).
 //   2. Register DispatchSourceFileSystemObject(.write|.extend|.delete|.rename)
 //      on the fd. Handler reads to EOF, buffers partial lines, parses
 //      complete lines via EventParser, publishes to EventBus.
@@ -20,14 +22,61 @@ import Foundation
 
 public final class SessionTail: @unchecked Sendable {
 
+    // Backfill skip (the v0.1.1 "mtime heuristic", finally): when a tail
+    // starts with NO saved offset, a file that is already large or hasn't
+    // been written to in a while is pre-existing history — Supervisor
+    // installed/restarted over a live transcript, or a `claude --resume` /
+    // post-compact continuation whose new JSONL carries the FULL copied
+    // conversation. Replaying it pushes every historical Bash line through
+    // triage: one model call each, deterministic pauses for commands that
+    // ran long ago, a notification storm. A fast-forward start emits only
+    // sessionStart (derived from the head) and tails new appends from EOF.
+    // Small fresh files — the common brand-new session — still replay from
+    // byte 0 so the opening prompt reaches Triage. Both thresholds are
+    // overridable via init so tests can exercise both paths cheaply.
+    static let defaultFastForwardSizeThresholdBytes: Int64 = 131_072       // 128 KB
+    static let defaultFastForwardMtimeThresholdSeconds: TimeInterval = 300 // 5 min
+
+    // Inactivity close (audit H4): a heavy user accrues hundreds/thousands
+    // of transcripts. Holding an fd + DispatchSource + offset timer open for
+    // every one until the process dies exhausts the fd limit — and it's the
+    // NEWEST, live session whose open() then fails. When a tail sees no new
+    // bytes for this long we tear it down (cancel source, close fd, cancel
+    // timer) and signal SessionDiscovery to drop its entry, freeing the fd.
+    // The offset is flushed first, so a later scan re-opens with a saved
+    // offset > 0 and RESUMES from there — it does NOT re-run the seek policy's
+    // fast-forward or byte-0 branch (those only apply at savedOffset <= 0).
+    // Overridable via init so tests can exercise the close cheaply.
+    static let defaultInactivityTimeoutSeconds: TimeInterval = 1_800  // 30 min
+
+    /// Cap on how much of the head is scanned for the sessionStart-bearing
+    /// line during a fast-forward start. The parser emits sessionStart from
+    /// the first cwd-bearing line, normally within the first few lines; the
+    /// cap just bounds pathological files.
+    private static let headScanCapBytes: Int64 = 262_144
+
     public let sessionId: String
 
     private let path: URL
-    private let parser: EventParser
+    // The per-file line parser. Defaults to Claude Code's EventParser; a
+    // TranscriptSource (e.g. Codex) may inject its own parser so the SAME
+    // hardened tail (offsets, backfill/fast-forward, inactivity close) drives a
+    // second agent's transcripts. Used only for `.parse(line:)`.
+    private let parser: any TranscriptLineParser
     private let bus: EventBus
     private let sessionStore: SessionStore?
     private let trace: TraceLog
     private let offsetPersistInterval: TimeInterval
+    private let fastForwardSizeThresholdBytes: Int64
+    private let fastForwardMtimeThresholdSeconds: TimeInterval
+    private let inactivityTimeout: TimeInterval
+
+    /// Invoked, ON THIS TAIL'S OWN QUEUE, when the tail SELF-terminates —
+    /// inactivity close or the file being deleted/renamed. SessionDiscovery
+    /// sets this to prune its `tails[id]` entry so the fd is freed and the
+    /// session can be re-adopted later (for inactivity, re-opened at the saved
+    /// offset). NOT called by the external `stop()` teardown path.
+    public var onTerminated: ((String) -> Void)?
 
     /// Set once the real cwd has been persisted to the session record, so we
     /// only write the UPDATE once per tail (the placeholder -> real transition).
@@ -41,22 +90,36 @@ public final class SessionTail: @unchecked Sendable {
     private var lastPersistedOffset: Int64 = 0
     private var currentOffset: Int64 = 0
 
+    /// Wall-clock of the last read that yielded new bytes. Drives the
+    /// inactivity close. Accessed only on `queue` (handleEvent + timer tick).
+    private var lastActivityAt = Date()
+    /// Guards the teardown paths (terminate / stop) so they run once.
+    private var terminated = false
+
     public init(
         sessionId: String,
         path: URL,
         projectHash: String,
         bus: EventBus,
         sessionStore: SessionStore?,
+        parser injectedParser: (any TranscriptLineParser)? = nil,
         startOffset: Int64? = nil,
         offsetPersistInterval: TimeInterval = 30,
+        fastForwardSizeThresholdBytes: Int64? = nil,
+        fastForwardMtimeThresholdSeconds: TimeInterval? = nil,
+        inactivityTimeout: TimeInterval? = nil,
         trace: TraceLog = .shared
     ) {
         self.sessionId = sessionId
         self.path = path
-        self.parser = EventParser(projectHash: projectHash, jsonlPath: path.path)
+        // Injected parser (Codex etc.) or the default Claude Code EventParser.
+        self.parser = injectedParser ?? EventParser(projectHash: projectHash, jsonlPath: path.path)
         self.bus = bus
         self.sessionStore = sessionStore
         self.offsetPersistInterval = offsetPersistInterval
+        self.fastForwardSizeThresholdBytes = fastForwardSizeThresholdBytes ?? SessionTail.defaultFastForwardSizeThresholdBytes
+        self.fastForwardMtimeThresholdSeconds = fastForwardMtimeThresholdSeconds ?? SessionTail.defaultFastForwardMtimeThresholdSeconds
+        self.inactivityTimeout = inactivityTimeout ?? SessionTail.defaultInactivityTimeoutSeconds
         self.trace = trace
         self.queue = DispatchQueue(label: "supervisor.tail.\(sessionId)", qos: .utility)
         self.lastPersistedOffset = startOffset ?? 0
@@ -75,14 +138,17 @@ public final class SessionTail: @unchecked Sendable {
         self.fd = fd
 
         // Seek policy:
-        //   - savedOffset == 0 (we've never observed this session): read
-        //     from byte 0. This means the first events of the session —
-        //     sessionStart, the user's opening prompt — flow through the
-        //     pipeline so Triage has context. Cost: if Supervisor is
-        //     installed mid-session over an existing large JSONL, the
-        //     whole history replays through Haiku once. Acceptable for
-        //     v0.1.0; v0.1.1 adds a mtime heuristic that skips backfill
-        //     on multi-MB pre-existing files.
+        //   - savedOffset == 0 (we've never observed this session) and the
+        //     file looks pre-existing (large, or not written to recently):
+        //     fast-forward start — emit sessionStart from the head, then
+        //     tail from EOF. Replaying the history would push every old
+        //     Bash line through triage (model calls, deterministic pauses
+        //     for commands that already ran) — see the threshold comment
+        //     at the top of the class.
+        //   - savedOffset == 0 and the file is small and fresh: read from
+        //     byte 0 so the first events of the session — sessionStart,
+        //     the user's opening prompt — flow through the pipeline and
+        //     Triage has context.
         //   - savedOffset > 0 and <= EOF: resume from saved.
         //   - savedOffset > EOF (file truncated/rotated since last run):
         //     reset to byte 0 — the saved offset is stale.
@@ -90,6 +156,10 @@ public final class SessionTail: @unchecked Sendable {
         let resumeOff: off_t
         if lastPersistedOffset > 0 && lastPersistedOffset <= endOff {
             resumeOff = lseek(fd, off_t(lastPersistedOffset), SEEK_SET)
+        } else if lastPersistedOffset <= 0 && shouldFastForward(fileSize: Int64(endOff)) {
+            emitSessionStartFromHead(fd: fd, fileSize: Int64(endOff))
+            resumeOff = lseek(fd, 0, SEEK_END)
+            trace.emit("tail", "fast_forward session=\(sessionId) skippedBytes=\(resumeOff) — pre-existing history not replayed; sessionStart emitted from head")
         } else {
             resumeOff = lseek(fd, 0, SEEK_SET)
         }
@@ -121,22 +191,128 @@ public final class SessionTail: @unchecked Sendable {
             self?.handleEvent(mask: [])
         }
 
-        // Periodic offset persistence.
+        // Periodic offset persistence + inactivity check. Fresh start counts
+        // as activity so a just-opened (or fast-forwarded) tail isn't closed
+        // before it has had a chance to see any writes.
+        lastActivityAt = Date()
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + offsetPersistInterval, repeating: offsetPersistInterval)
-        t.setEventHandler { [weak self] in self?.persistOffsetIfNeeded() }
+        t.setEventHandler { [weak self] in self?.onTimerTick() }
         t.resume()
         self.offsetTimer = t
     }
 
-    public func stop() {
-        queue.sync {
-            self.offsetTimer?.cancel()
-            self.offsetTimer = nil
-            self.source?.cancel()
-            self.source = nil
-            // Final offset persist on the way out.
+    /// Timer-driven housekeeping (runs on `queue`): flush the offset if it
+    /// moved, then close the tail if it has gone quiet for `inactivityTimeout`.
+    private func onTimerTick() {
+        persistOffsetIfNeeded()
+        if Date().timeIntervalSince(lastActivityAt) > inactivityTimeout {
+            terminate(reason: "inactive \(Int(inactivityTimeout))s+ with no new bytes")
         }
+    }
+
+    /// Self-termination (inactivity close or delete/rename). MUST run on
+    /// `queue`. Cancels the offset timer + file source (whose cancel handler
+    /// closes the fd), flushes the offset so a later re-open RESUMES from the
+    /// saved offset rather than fast-forwarding, then signals
+    /// SessionDiscovery to drop the entry. Idempotent.
+    private func terminate(reason: String) {
+        guard !terminated else { return }
+        terminated = true
+        offsetTimer?.cancel()
+        offsetTimer = nil
+        source?.cancel()
+        source = nil
+        persistOffsetIfNeeded(force: true)
+        trace.emit("tail", "session=\(sessionId) tail closed (\(reason)) finalOffset=\(currentOffset) — entry pruned; a later scan re-opens at the saved offset")
+        onTerminated?(sessionId)
+    }
+
+    // MARK: - Fast-forward start (backfill skip)
+
+    /// Should a no-saved-offset start skip the existing content? True when
+    /// the file is bigger than the size threshold OR its mtime is older
+    /// than the mtime threshold — both are strong signals the content is
+    /// pre-existing history, not a session that just started.
+    private func shouldFastForward(fileSize: Int64) -> Bool {
+        guard fileSize > 0 else { return false }
+        if fileSize > fastForwardSizeThresholdBytes { return true }
+        if let mtime = (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date,
+           Date().timeIntervalSince(mtime) > fastForwardMtimeThresholdSeconds {
+            return true
+        }
+        return false
+    }
+
+    /// Read just enough of the head to let the parser derive sessionStart
+    /// (it emits one from the first cwd-bearing line) and publish ONLY that
+    /// event — none of the historical ones. Parsing through the shared
+    /// parser also marks its sessionStart as emitted, so the live tail
+    /// won't produce a duplicate. If no cwd-bearing line appears within the
+    /// scan cap we publish nothing; the live tail may still surface a
+    /// sessionStart from a later appended line. Caller re-seeks afterwards.
+    private func emitSessionStartFromHead(fd: Int32, fileSize: Int64) {
+        guard lseek(fd, 0, SEEK_SET) == 0 else { return }
+        let scanCap = min(fileSize, Self.headScanCapBytes)
+        var head = Data()
+        var scanned: Int64 = 0
+        let chunk = 65_536
+        var scratch = Data(count: chunk)
+        var foundSessionStart = false
+        headScan: while scanned < scanCap {
+            let n = scratch.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return read(fd, base, chunk)
+            }
+            if n <= 0 { break }
+            head.append(scratch.prefix(n))
+            scanned += Int64(n)
+            while let nlIndex = head.firstIndex(of: 0x0A) {
+                let lineData = head.prefix(upTo: nlIndex)
+                head.removeSubrange(0...nlIndex)
+                guard let line = String(data: lineData, encoding: .utf8) else { continue }
+                for event in parser.parse(line: line) {
+                    guard case .sessionStart(let info) = event else { continue }
+                    bus.publish(event)
+                    foundSessionStart = true
+                    // Same placeholder → real cwd transition as handleEvent.
+                    if !persistedResolvedCwd,
+                       info.cwd != "<resolving>", info.cwd != "<unknown>", !info.cwd.isEmpty {
+                        try? sessionStore?.updateResolvedCwd(sessionId: sessionId, cwd: info.cwd)
+                        persistedResolvedCwd = true
+                        trace.emit("tail", "session=\(sessionId) resolved cwd=\(info.cwd) branch=\(info.gitBranch ?? "?") (fast-forward head scan)")
+                    }
+                    break headScan
+                }
+            }
+        }
+        // Finding 5 (2026-07-03): the head scan bounded out (or the whole file
+        // was scanned) without a sessionStart-bearing line. cwd never resolves,
+        // so pause/kill/inject degrade forever for this session — silently,
+        // until now. Emit a loud, distinct, diagnosable trace: the tag names
+        // the failure and reports how many bytes were scanned vs the cap so a
+        // "sessionStart is past the head cap" case is distinguishable from a
+        // file that genuinely has no lead-in line.
+        if !foundSessionStart {
+            trace.emit("tail", "fast_forward.no_sessionstart_in_head session=\(sessionId) scannedBytes=\(scanned) scanCap=\(scanCap) fileSize=\(fileSize) headScanCapBytes=\(Self.headScanCapBytes)")
+        }
+    }
+
+    public func stop() {
+        // External teardown (SessionDiscovery.stop / tests). Distinct from
+        // terminate(): does NOT call onTerminated — the caller owns the entry.
+        // Shares the `terminated` guard so a tail that already self-closed
+        // (inactivity / delete) is a no-op here.
+        let alreadyTornDown = queue.sync { () -> Bool in
+            if terminated { return true }
+            terminated = true
+            offsetTimer?.cancel()
+            offsetTimer = nil
+            source?.cancel()
+            source = nil
+            return false
+        }
+        guard !alreadyTornDown else { return }
         persistOffsetIfNeeded(force: true)
         trace.emit("tail", "stop session=\(sessionId) finalOffset=\(currentOffset)")
     }
@@ -150,9 +326,12 @@ public final class SessionTail: @unchecked Sendable {
 
     private func handleEvent(mask: DispatchSource.FileSystemEvent) {
         if mask.contains(.delete) || mask.contains(.rename) {
-            trace.emit("tail", "session=\(sessionId) file disappeared (delete/rename) — stopping tail")
-            source?.cancel()
-            source = nil
+            // Full self-termination — NOT just a source cancel. The old code
+            // cancelled the source but left SessionDiscovery's tails[id] entry
+            // and this tail's offset timer alive (a leak; the entry also made
+            // a deleted-then-recreated same-id session un-tailable). terminate()
+            // cancels the timer, flushes the offset, and prunes the entry.
+            terminate(reason: "file disappeared (delete/rename)")
             return
         }
 
@@ -161,6 +340,7 @@ public final class SessionTail: @unchecked Sendable {
         // Drain everything new from the fd into our buffer.
         let chunk = 65_536
         var scratch = Data(count: chunk)
+        var readAny = false
         while true {
             let n = scratch.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Int in
                 guard let base = raw.baseAddress else { return -1 }
@@ -169,7 +349,10 @@ public final class SessionTail: @unchecked Sendable {
             if n <= 0 { break }
             buffer.append(scratch.prefix(n))
             currentOffset += Int64(n)
+            readAny = true
         }
+        // Any new bytes count as activity and defer the inactivity close.
+        if readAny { lastActivityAt = Date() }
 
         // Split on newlines. Lines without a trailing newline stay in the
         // buffer for the next event (kqueue coalesces; we may have read a

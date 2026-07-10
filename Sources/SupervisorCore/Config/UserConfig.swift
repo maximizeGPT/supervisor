@@ -2,10 +2,10 @@
 //
 // Reads `~/Library/Application Support/Supervisor/config.yaml` and
 // exposes user-configurable knobs. The YAML subset is deliberately
-// minimal — one top-level key `hover` with one sub-key
-// `known_terminals` (list of bundle IDs). Parsed with string
-// operations, no Yams dependency; if the config format grows complex,
-// Yams lands then per §1a (restraint).
+// minimal — `hover.known_terminals` (list of bundle IDs) and, as of
+// v0.3.0, `cost.daily_cap_usd` (hard daily spend cap). Parsed with
+// string operations, no Yams dependency; if the config format grows
+// complex, Yams lands then per §1a (restraint).
 //
 // v0.1.x Issue #3: user-configurable terminals list.
 
@@ -17,8 +17,21 @@ public struct UserConfig: Sendable, Equatable {
     /// hardcoded defaults in HoverWindowController.claudeCodeHostApps.
     public let additionalHostApps: [String]
 
-    public init(additionalHostApps: [String] = []) {
+    /// v0.3.0: hard daily spend cap in USD (`cost.daily_cap_usd`).
+    /// nil = no cap configured (the default). Once today's recorded
+    /// spend reaches this value, LLM calls are refused before any
+    /// network request is made.
+    public let dailyCostCapUSD: Double?
+
+    /// Whether to also supervise OpenAI Codex sessions (`supervise_codex:`).
+    /// nil = auto (on when ~/.codex exists); false explicitly opts out. Codex
+    /// sessions flow through the identical triage + safety rubric as Claude Code.
+    public let superviseCodex: Bool?
+
+    public init(additionalHostApps: [String] = [], dailyCostCapUSD: Double? = nil, superviseCodex: Bool? = nil) {
         self.additionalHostApps = additionalHostApps
+        self.dailyCostCapUSD = dailyCostCapUSD
+        self.superviseCodex = superviseCodex
     }
 
     /// Parse a config.yaml string. Returns a default (empty) config
@@ -30,6 +43,8 @@ public struct UserConfig: Sendable, Equatable {
 
         var inKnownTerminals = false
         var bundleIDs: [String] = []
+        var dailyCostCapUSD: Double?
+        var superviseCodex: Bool?
 
         for rawLine in yaml.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(rawLine)
@@ -41,6 +56,37 @@ public struct UserConfig: Sendable, Equatable {
             // Detect the `known_terminals:` key.
             if trimmed == "known_terminals:" {
                 inKnownTerminals = true
+                continue
+            }
+
+            // Detect the `daily_cap_usd:` key (nominally under `cost:`,
+            // but — like known_terminals — the parser is forgiving about
+            // nesting depth). Garbage or non-positive values degrade to
+            // nil (no cap) silently, matching the file's contract.
+            if trimmed.hasPrefix("daily_cap_usd:") {
+                inKnownTerminals = false
+                let value = trimmed.dropFirst("daily_cap_usd:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                    // Strip inline comments.
+                    .components(separatedBy: " #").first?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                if let cap = Double(value), cap > 0, cap.isFinite {
+                    dailyCostCapUSD = cap
+                }
+                continue
+            }
+
+            // Detect the `supervise_codex:` boolean toggle (forgiving about
+            // nesting, like the other keys). Unrecognized values leave it nil
+            // (auto), which is on when Codex is installed.
+            if trimmed.hasPrefix("supervise_codex:") {
+                inKnownTerminals = false
+                let value = trimmed.dropFirst("supervise_codex:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                    .components(separatedBy: " #").first?
+                    .trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+                if value == "true" || value == "yes" { superviseCodex = true }
+                else if value == "false" || value == "no" { superviseCodex = false }
                 continue
             }
 
@@ -62,7 +108,7 @@ public struct UserConfig: Sendable, Equatable {
             }
         }
 
-        return UserConfig(additionalHostApps: bundleIDs)
+        return UserConfig(additionalHostApps: bundleIDs, dailyCostCapUSD: dailyCostCapUSD, superviseCodex: superviseCodex)
     }
 
     /// Load from disk. Returns default config if the file doesn't exist

@@ -76,6 +76,11 @@ final class EndToEndPipelineTests: XCTestCase {
             model: "claude-haiku-4-5-20251001",
             windowSize: 30,
             costStore: nil,
+            // Honest-health: this end-to-end harness runs the real 1s background
+            // idle loop. No-op the engine-progress recorder so `swift test` can
+            // never freshen the REAL global engine-progress.txt liveness token
+            // (which would mask a hung production engine as GREEN).
+            recordEngineProgress: {},
             trace: trace
         )
 
@@ -83,8 +88,12 @@ final class EndToEndPipelineTests: XCTestCase {
         // decision → flagStore.insert + Notifier copy + hoverVM.flagRaised.
         let routed = RoutedFlagSink()
         engine.onActivityChange = { activity in
-            if case .flagged(let sev, let action, let plain) = activity {
-                hoverVM.flagRaised(severity: sev, action: action, reasoningPlain: plain)
+            // Mirror SupervisorApp's wire exactly, including the flagged session
+            // identity the engine now threads through so the pause/resume pin
+            // targets the flagged session, not the last-started one (Finding 5).
+            if case .flagged(let sev, let action, let plain, let sid, let cwd) = activity {
+                hoverVM.flagRaised(severity: sev, action: action, reasoningPlain: plain,
+                                   flaggedSessionId: sid, flaggedSessionCwd: cwd)
             }
         }
         engine.onDecision = { decision in
@@ -165,12 +174,19 @@ final class EndToEndPipelineTests: XCTestCase {
 
         // HoverViewModel state.
         XCTAssertEqual(hoverVM.flagCount, 1)
-        if case .flagged(let sev, let action, _) = hoverVM.activity {
+        if case .flagged(let sev, let action, _, _, _) = hoverVM.activity {
             XCTAssertEqual(sev, .high)
             XCTAssertEqual(action, .pause, "Haiku recommended pause; hover activity should carry that")
         } else {
             XCTFail("hover activity should be .flagged(.high, ...), got \(hoverVM.activity)")
         }
+        // The pause pin must record the FLAGGED session (Finding 5): the engine
+        // threads the decision's session id through the Activity, so the hover
+        // pins that session rather than whatever `currentSessionId` happened to
+        // hold. Single-session here, so it must be exactly the flagged session.
+        XCTAssertTrue(hoverVM.isPaused, "a pause flag must mark the hover paused")
+        XCTAssertEqual(hoverVM.pausedSessionId, sessionId,
+                       "the pause must pin the engine-flagged session id")
         // Plain label should reflect the flag, not raw tool jargon.
         XCTAssertFalse(hoverVM.plainLabel.isEmpty,
                        "hover plain label should be set after flag, got empty")

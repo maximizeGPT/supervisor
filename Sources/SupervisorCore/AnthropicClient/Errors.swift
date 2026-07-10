@@ -39,6 +39,40 @@ public enum AnthropicClientError: Error, Sendable, Equatable {
     case redactorMissing
 }
 
+/// v0.3.0 (P0-4): the user's daily spend cap has been reached. Thrown by
+/// `LLMClient.createMessage` BEFORE any network call is made, when the
+/// injected cap-check hook reports today's spend at or above the
+/// configured cap (`cost.daily_cap_usd` in config.yaml). Deliberately
+/// local — no request left the machine, no tokens were billed.
+///
+/// A standalone type rather than a new `AnthropicClientError` case on
+/// purpose: `OnboardingViewModel.mapClientError` switches exhaustively
+/// over the enum (no default), so a new case would force every
+/// error-mapping site to grow an arm — and the cap is a local policy
+/// refusal, not a wire-level provider failure, so callers that map
+/// provider errors should not have to handle it. Catch it explicitly:
+///   catch let cap as DailyCapExceededError { ... }
+public struct DailyCapExceededError: Error, Sendable, Equatable {
+    /// The configured daily cap, in USD.
+    public let capUSD: Double
+    /// Today's recorded spend at the time of the refused call, in USD.
+    public let spentUSD: Double
+
+    public init(capUSD: Double, spentUSD: Double) {
+        self.capUSD = capUSD
+        self.spentUSD = spentUSD
+    }
+}
+
+extension DailyCapExceededError: LocalizedError {
+    public var errorDescription: String? {
+        String(
+            format: "Daily cost cap reached: spent $%.2f of $%.2f cap; call skipped",
+            spentUSD, capUSD
+        )
+    }
+}
+
 extension AnthropicClientError: LocalizedError {
     public var errorDescription: String? {
         switch self {

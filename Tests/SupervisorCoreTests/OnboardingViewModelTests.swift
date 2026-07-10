@@ -17,12 +17,18 @@ final class OnboardingViewModelTests: XCTestCase {
         var notif: NotificationAuthStatus = .notDetermined
         var screen: Bool = false
         var requestAXReturn: Bool = false
+        var requestScreenRecordingReturn: Bool = false
         var requestNotifResult: Result<Bool, Error> = .success(false)
         var promptedCount = 0
+        var screenRecordingPromptedCount = 0
 
         func isAXGranted() -> Bool { ax }
         func notificationStatus() async -> NotificationAuthStatus { notif }
         func isScreenRecordingGranted() -> Bool { screen }
+        func requestScreenRecording() -> Bool {
+            screenRecordingPromptedCount += 1
+            return requestScreenRecordingReturn
+        }
         func requestAX(prompt: Bool) -> Bool {
             if prompt { promptedCount += 1 }
             return requestAXReturn
@@ -226,49 +232,218 @@ final class OnboardingViewModelTests: XCTestCase {
         // User grants AX out-of-band in System Settings:
         checker.ax = true
         await vm.recheckAX()
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+    }
+
+    // MARK: - Screen Recording step
+
+    func testPromptForScreenRecordingOnlyFiresOnce() async {
+        let checker = StubChecker()
+        checker.ax = true
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
+        let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
+        await vm.recheckAX()
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+
+        vm.promptForScreenRecording()
+        vm.promptForScreenRecording()
+        vm.promptForScreenRecording()
+        XCTAssertEqual(checker.screenRecordingPromptedCount, 1)
+        XCTAssertEqual(vm.state, .screenRecordingCheck(prompted: true))
+    }
+
+    func testRecheckScreenRecordingAdvancesWhenGranted() async {
+        let checker = StubChecker()
+        checker.ax = true
+        checker.screen = false
+        checker.notif = .authorized
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
+        let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
+        await vm.recheckAX()
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+
+        await vm.recheckScreenRecording()
+        XCTAssertEqual(vm.state, .screenRecordingCheck())  // still pending
+
+        // User grants Screen Recording out-of-band in System Settings:
+        checker.screen = true
+        await vm.recheckScreenRecording()
+        XCTAssertEqual(vm.state, .notifCheck(status: .authorized))
+    }
+
+    func testConfirmScreenRecordingAdvancesEvenWhenNotDetected() async {
+        // The self-built-app case: the grant is on in System Settings but
+        // macOS does not report it back. Continue must advance anyway.
+        let checker = StubChecker()
+        checker.ax = true
+        checker.screen = false
+        checker.notif = .denied
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
+        let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
+        await vm.recheckAX()
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+
+        await vm.confirmScreenRecording()
+        XCTAssertEqual(vm.state, .notifCheck(status: .denied))
+    }
+
+    /// RC fix #6: a granted Screen Recording is not effective for capture until
+    /// the app relaunches. Observing the grant (via the poll) must latch the
+    /// relaunch-needed state so the UI can surface a "Quit & relaunch" affordance.
+    func testRecheckScreenRecordingGrantSurfacesRelaunchState() async {
+        let checker = StubChecker()
+        checker.ax = true
+        checker.screen = false
+        checker.notif = .authorized
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
+        let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
+        await vm.recheckAX()
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+        XCTAssertFalse(vm.screenRecordingNeedsRelaunch)
+
+        // User grants Screen Recording out-of-band:
+        checker.screen = true
+        await vm.recheckScreenRecording()
+        XCTAssertTrue(vm.screenRecordingNeedsRelaunch,
+            "a granted Screen Recording must surface the relaunch-needed state")
+        XCTAssertEqual(vm.state, .notifCheck(status: .authorized))
+    }
+
+    /// Confirm (the manual "I enabled it" path) latches the relaunch state when
+    /// macOS DOES report the grant.
+    func testConfirmScreenRecordingWhenDetectedSurfacesRelaunch() async {
+        let checker = StubChecker()
+        checker.ax = true
+        checker.screen = true
+        checker.notif = .denied
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
+        let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
+        await vm.recheckAX()
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+
+        await vm.confirmScreenRecording()
+        XCTAssertTrue(vm.screenRecordingNeedsRelaunch)
+        XCTAssertEqual(vm.state, .notifCheck(status: .denied))
+    }
+
+    /// When macOS does NOT report the grant, Continue still advances (trusting
+    /// the user) but must NOT claim a relaunch is needed — we cannot assert a
+    /// grant we can't see.
+    func testConfirmScreenRecordingWhenNotDetectedDoesNotClaimRelaunch() async {
+        let checker = StubChecker()
+        checker.ax = true
+        checker.screen = false
+        checker.notif = .denied
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
+        let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
+        await vm.recheckAX()
+
+        await vm.confirmScreenRecording()
+        XCTAssertEqual(vm.state, .notifCheck(status: .denied))
+        XCTAssertFalse(vm.screenRecordingNeedsRelaunch)
+    }
+
+    func testSkipScreenRecordingAdvancesToNotif() async {
+        let checker = StubChecker()
+        checker.ax = true
+        checker.screen = false
+        checker.notif = .authorized
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
+        let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
+        await vm.recheckAX()
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+
+        await vm.skipScreenRecording()
+        XCTAssertEqual(vm.state, .notifCheck(status: .authorized))
+    }
+
+    func testTickAdvancesThroughScreenRecordingWhenGranted() async {
+        // The full poll-driven path: AX granted, then Screen Recording granted,
+        // then notifications: tick() walks the whole chain.
+        let checker = StubChecker()
+        checker.ax = true
+        checker.screen = true
+        checker.notif = .authorized
+        let store = InMemoryProviderKeyStore()
+        try? store.write("sk-ant-x", for: .anthropic)
+        let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
+        XCTAssertEqual(vm.state, .axCheck())
+
+        await vm.tick()  // AX granted → screenRecordingCheck
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+        await vm.tick()  // Screen Recording granted → notifCheck
         XCTAssertEqual(vm.state, .notifCheck(status: .authorized))
     }
 
     // MARK: - Notifications step
 
+    /// Shared helper for the notifications-step tests: walk the flow up to
+    /// the notification step by granting AX and Screen Recording, so each test
+    /// starts from notifCheck without re-deriving the AX → screen-recording
+    /// transitions.
+    private func advanceToNotif(_ vm: OnboardingViewModel) async {
+        await vm.recheckAX()
+        await vm.recheckScreenRecording()
+    }
+
     func testFinishNotificationStepAuthorizedNotDegraded() async {
         let checker = StubChecker()
         checker.ax = true
+        checker.screen = true
         checker.notif = .authorized
         let store = InMemoryProviderKeyStore()
         try? store.write("sk-ant-x", for: .anthropic)
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
 
-        await vm.recheckAX()
+        await advanceToNotif(vm)
         XCTAssertEqual(vm.state, .notifCheck(status: .authorized))
 
         vm.finishNotificationStep()
+        XCTAssertEqual(vm.state, .customization(notifDegraded: false))
+
+        // The customization step then advances to complete.
+        vm.finishCustomizationStep()
         XCTAssertEqual(vm.state, .complete(notifDegraded: false))
     }
 
     func testFinishNotificationStepDeniedFlagsDegradation() async {
         let checker = StubChecker()
         checker.ax = true
+        checker.screen = true
         checker.notif = .denied
         let store = InMemoryProviderKeyStore()
         try? store.write("sk-ant-x", for: .anthropic)
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
 
-        await vm.recheckAX()
+        await advanceToNotif(vm)
         vm.finishNotificationStep()
+        XCTAssertEqual(vm.state, .customization(notifDegraded: true))
+
+        vm.finishCustomizationStep()
         XCTAssertEqual(vm.state, .complete(notifDegraded: true))
     }
 
     func testFinishNotificationStepProvisionalNotDegraded() async {
         let checker = StubChecker()
         checker.ax = true
+        checker.screen = true
         checker.notif = .provisional
         let store = InMemoryProviderKeyStore()
         try? store.write("sk-ant-x", for: .anthropic)
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
 
-        await vm.recheckAX()
+        await advanceToNotif(vm)
         vm.finishNotificationStep()
+        XCTAssertEqual(vm.state, .customization(notifDegraded: false))
+
+        vm.finishCustomizationStep()
         XCTAssertEqual(vm.state, .complete(notifDegraded: false))
     }
 
@@ -276,13 +451,14 @@ final class OnboardingViewModelTests: XCTestCase {
         // Spike-2-shape failure: requestAuthorization throws Code=1.
         let checker = StubChecker()
         checker.ax = true
+        checker.screen = true
         checker.notif = .denied  // status after request reflects what macOS now says
         checker.requestNotifResult = .failure(NSError(domain: "UNErrorDomain", code: 1))
         let store = InMemoryProviderKeyStore()
         try? store.write("sk-ant-x", for: .anthropic)
         let (vm, _, _) = makeVM(permissions: checker, keyStore: store)
 
-        await vm.recheckAX()
+        await advanceToNotif(vm)
         XCTAssertEqual(vm.state, .notifCheck(status: .denied))
 
         await vm.requestNotifications()
@@ -301,8 +477,10 @@ final class OnboardingViewModelTests: XCTestCase {
         XCTAssertEqual(OnboardingState.keyEntry().step, 1)
         XCTAssertEqual(OnboardingState.keyValidating.step, 1)
         XCTAssertEqual(OnboardingState.axCheck().step, 2)
-        XCTAssertEqual(OnboardingState.notifCheck(status: .denied).step, 3)
-        XCTAssertEqual(OnboardingState.complete(notifDegraded: false).step, 4)
+        XCTAssertEqual(OnboardingState.screenRecordingCheck().step, 3)
+        XCTAssertEqual(OnboardingState.notifCheck(status: .denied).step, 4)
+        XCTAssertEqual(OnboardingState.customization(notifDegraded: false).step, 5)
+        XCTAssertEqual(OnboardingState.complete(notifDegraded: false).step, 6)
     }
 }
 

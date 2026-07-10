@@ -19,6 +19,7 @@ final class PermissionMonitorTests: XCTestCase {
         func isAXGranted() -> Bool { ax }
         func notificationStatus() async -> NotificationAuthStatus { notif }
         func isScreenRecordingGranted() -> Bool { screen }
+        func requestScreenRecording() -> Bool { screen }
         func requestAX(prompt: Bool) -> Bool { ax }
         func requestNotifications() async throws -> Bool { true }
         func snapshot() async -> PermissionSnapshot {

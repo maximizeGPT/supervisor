@@ -3,7 +3,9 @@
 // Boots SupervisorCore, runs onboarding if needed, then enters the
 // running state:
 //
-//   - Spawns SupervisorHeartbeat as a child process
+//   - Spawns SupervisorHeartbeat (writes heartbeat.txt) and
+//     SupervisorStatusBar (reads it, owns the menu-bar health icon) as
+//     child processes
 //   - Starts PermissionMonitor (AX revoke → popover)
 //   - Opens SupervisorDatabase (sessions / flags / cost)
 //   - Constructs AnthropicClient with key from Keychain + DefaultRedactor
@@ -22,6 +24,7 @@ import Combine
 import Foundation
 import SupervisorCore
 import SupervisorUI
+import UserNotifications
 
 @MainActor
 final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
@@ -37,20 +40,39 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
     // Running state
     private var hoverVM: HoverViewModel?
+    /// Ambient Context Health monitor — retained for the app's lifetime; feeds the
+    /// panel's Context Health line and re-audits in the background on demand.
+    private var contextHealthMonitor: ContextHealthMonitor?
+    /// Opens the Context Health window; shared by the panel line, the menu item,
+    /// and the nudge notification's "Show me" action.
+    private var openContextHealthWindow: (() -> Void)?
     private var hoverWindow: HoverWindowController?
     private var database: SupervisorDatabase?
     private var sessionStore: SessionStore?
     private var flagStore: FlagStore?
     private var costStore: CostStore?
     private var loopDispatchStore: LoopDispatchStore?
+    private var planStore: PlanStore?
+    private var auditStore: AuditStore?
     private var loopController: LoopController?
     private var configWatcher: ConfigWatcher?
     private var llm: LLMClient?
     private var triageEngine: TriageEngine?
+    private var reviewFindingStore: ReviewFindingStore?
+    private var reviewEngine: ReviewEngine?
     private var discovery: SessionDiscovery?
+    private var codexDiscovery: CodexSessionDiscovery?
     private var notifier: Notifier?
     private var router: InterventionRouter?
     private var bus: EventBus?
+
+    // Menu-bar status item lives in the SupervisorStatusBar COMPANION process,
+    // not here. An in-process NSStatusItem dies with the app — a crash makes
+    // the icon vanish instead of turning red, and a hung engine keeps a static
+    // green icon forever because nothing re-reads liveness. The companion polls
+    // heartbeat.txt and honestly shows red/amber when supervision is dead/hung.
+    // Spawned in step 7 (startStatusBar), torn down at teardown (stopStatusBar).
+    private var statusBarProcess: Process?
 
     // Permission monitor
     private var permissionMonitor: PermissionMonitor?
@@ -78,10 +100,11 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         trace.emit("app", "applicationDidFinishLaunching pid=\(ProcessInfo.processInfo.processIdentifier)")
 
-        // v0.8.1: single-instance guard. Kill any prior Supervisor
-        // instance so we don't get duplicate hover windows after a
-        // self-rebuild/relaunch.
-        terminatePriorInstances()
+        // Single-instance guard. If another Supervisor is already
+        // watching, this duplicate quits instead of fighting it.
+        // Returns early when we decided to quit so we never enter the
+        // running state as a second band.
+        guard enforceSingleInstance() else { return }
 
         // v0.2.0: "has key" now means a key exists for whatever provider
         // the user marked as active. Falls back to .anthropic for fresh
@@ -102,10 +125,19 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         trace.emit("app", "applicationWillTerminate; tearing down")
         triageEngine?.stop()
+        reviewEngine?.stop()
         discovery?.stop()
+        codexDiscovery?.stop()
         permissionMonitor?.stop()
         hoverWindow?.dismiss()
+        stopStatusBar()
         stopHeartbeat()
+        // Release the single-instance lock so the next launch claims it
+        // cleanly. Only removes the pidfile if it still records our pid.
+        SingleInstanceGuard.releaseLock(
+            at: paths.pidfilePath,
+            myPID: ProcessInfo.processInfo.processIdentifier
+        )
         trace.sync()
     }
 
@@ -117,7 +149,6 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
     private func presentOnboarding() {
         NSApp.setActivationPolicy(.regular)
-        installAppMenu()
 
         let vm = OnboardingViewModel(
             permissions: permissions,
@@ -148,39 +179,6 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         enterRunningState(notifDegraded: notifDegraded)
     }
 
-    /// Onboarding runs while the app is `.regular`, which surfaces a menu
-    /// bar. Without a main menu there's no Edit menu, so the standard
-    /// editing shortcuts (Cmd+V/C/X/A) have no action to route to the
-    /// focused control — a user can TYPE their API key but not PASTE it.
-    /// Since keys are 50+ char strings, that silently blocks the whole
-    /// first-run flow. Install a minimal main menu whose Edit submenu is
-    /// wired to the responder-chain editing selectors (nil target → reaches
-    /// the focused SecureField's field editor).
-    private func installAppMenu() {
-        let mainMenu = NSMenu()
-
-        // AppKit treats the first submenu as the application menu.
-        let appItem = NSMenuItem()
-        mainMenu.addItem(appItem)
-        let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "Quit Supervisor",
-                        action: #selector(NSApplication.terminate(_:)),
-                        keyEquivalent: "q")
-        appItem.submenu = appMenu
-
-        // Edit menu — the load-bearing part for paste support.
-        let editItem = NSMenuItem()
-        mainMenu.addItem(editItem)
-        let editMenu = NSMenu(title: "Edit")
-        editMenu.addItem(withTitle: "Cut",        action: #selector(NSText.cut(_:)),       keyEquivalent: "x")
-        editMenu.addItem(withTitle: "Copy",       action: #selector(NSText.copy(_:)),      keyEquivalent: "c")
-        editMenu.addItem(withTitle: "Paste",      action: #selector(NSText.paste(_:)),     keyEquivalent: "v")
-        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        editItem.submenu = editMenu
-
-        NSApp.mainMenu = mainMenu
-    }
-
     // MARK: - Running state
 
     private func enterRunningState(notifDegraded: Bool) {
@@ -195,6 +193,25 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             // the same SQLite DB. Migration v3 (loop_dispatches table)
             // ran during the SupervisorDatabase init above.
             self.loopDispatchStore = LoopDispatchStore(database: db)
+            // v0.2.0 M2a: plan state lives in the same SQLite DB.
+            // Migration v4 (plans + plan_steps tables) ran during the
+            // SupervisorDatabase init above. The store is constructed
+            // here; the Planner/Evaluator/loop lifecycle that uses it
+            // lands in later v0.2.0 milestones.
+            self.planStore = PlanStore(database: db)
+            // v0.2.0 observability (Reddit feedback A): the unified audit log
+            // lives in the same SQLite DB. Migration v5 (audit_entries table)
+            // ran during the SupervisorDatabase init above. The store is
+            // recorded into ADDITIVELY from the existing decision hooks
+            // (QuestionAnswerer auto-answer, the DeterministicCatch block, the
+            // stall watchdog nudge, and PlanLoop/Evaluator) and read back by
+            // SessionReportExporter (PART C).
+            self.auditStore = AuditStore(database: db)
+            // v0.3.x REVIEW dimension: the code-review finding ledger (dedup +
+            // durable record). Migration v6 (review_findings) ran during the
+            // SupervisorDatabase init above. Written into only when the REVIEW
+            // feature is opted in; empty otherwise.
+            self.reviewFindingStore = ReviewFindingStore(database: db)
             trace.emit("app", "storage opened at \(paths.databasePath.path)")
         } catch {
             trace.emit("app", "FATAL: storage open failed: \(error)")
@@ -218,9 +235,51 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             initialFlagCount: historicFlagCount,
             costStore: costStore,
             flagStore: flagStore,
+            // v0.2.0 M3: the panel's live Plan view reads the watched session's
+            // current plan from here. Additive — nil-safe in the planner-off path.
+            planStore: planStore,
+            // v0.2.0 observability (Reddit feedback D): the panel's Activity view
+            // reads the watched session's audit entries from here. Additive +
+            // read-only; nil-safe when no audit log exists.
+            auditStore: auditStore,
+            // v0.3.x REVIEW dimension: the panel's Review tab reads the watched
+            // session's code-review findings from here. Additive + read-only;
+            // nil-safe when the feature is off / no findings exist.
+            reviewStore: reviewFindingStore,
             modelName: activeProviderForHover.defaultTriageModel
         )
         self.hoverVM = hoverVM
+
+        // Context Health (ambient audit surface): a cheap deterministic audit of
+        // the owner's skills setup runs in the background, feeds the panel's quiet
+        // Context Health line, and opens the full window on tap. Additive + on
+        // demand — the auditor never runs in the triage loop, and if unwired the
+        // panel section simply doesn't render.
+        let chRoot = paths.home.appendingPathComponent(".claude/skills", isDirectory: true)
+        let chStore = self.database.map { ContextAuditStore(database: $0) }
+        let chTrace = trace   // local binding: no self-capture in the stored closure below
+        let healthMonitor = ContextHealthMonitor(root: chRoot, store: chStore, trace: chTrace)
+        // The single earned nudge: post ONE notification the first time a
+        // background audit finds notable drift (the monitor guarantees once-ever).
+        // Captures self weakly (no cycle); `notifier` is set just below and the
+        // audit completes async, so it exists by the time this fires. Returns
+        // whether the post ACTUALLY landed — the monitor persists its once-ever
+        // flag only on success, so a failed center.add (or a race where the
+        // notifier isn't wired yet) doesn't silently burn the one nudge.
+        healthMonitor.onFirstNotable = { [weak self] count, lines in
+            chTrace.emit("context-health", "first notable crossing: \(count) cleanups (~\(lines) lines) — posting nudge")
+            guard let notifier = self?.notifier else { return false }
+            return await notifier.postContextHealth(count: count, lines: lines) == .posted
+        }
+        hoverVM.contextHealth = healthMonitor
+        // One window, many doors: the panel line, the menu item, and the nudge's
+        // "Show me" action all open this.
+        let openContextHealth = { ContextHealthPresenter.shared.present(root: chRoot, store: chStore) }
+        hoverVM.onOpenContextHealth = openContextHealth
+        self.openContextHealthWindow = openContextHealth
+        self.contextHealthMonitor = healthMonitor
+        healthMonitor.refresh()   // warm the verdict so the line is ready on first expand
+
         // v0.1.4 Gap 8: hover visibility depends on whether Supervisor
         // is actually tailing a session. discovery is constructed later
         // (step 6) so we read it lazily via a closure capturing self.
@@ -231,10 +290,22 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             isAnySessionActive: { [weak self] in
                 (self?.discovery?.activeSessions().isEmpty == false)
             },
+            // Live session count from discovery: lets the one hover band read
+            // "Watching N sessions. All clear" when Supervisor is busy, instead
+            // of the label flipping between project names per session event.
+            activeSessionCount: { [weak self] in
+                self?.discovery?.activeSessions().count ?? 0
+            },
             additionalHostApps: userConfig.additionalHostApps
         )
         self.hoverWindow = hoverWindow
         hoverWindow.present()
+
+        // Menu-bar health icon is owned by the SupervisorStatusBar companion,
+        // spawned in step 7 (startStatusBar) so it reads the heartbeat this app
+        // + its heartbeat child keep fresh. Not created in-process: an
+        // in-process icon can't honestly report a crash or a hang (see the
+        // statusBarProcess property comment).
 
         // Self-rebuild announcement: if the deploy step left a marker, the
         // app was just rebuilt and relaunched over a running instance.
@@ -286,14 +357,95 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             trace.emit("app", "FATAL: no API key for provider=\(activeProvider.rawValue) after onboarding; aborting")
             return
         }
+        // v0.3.0 (P0-4): both LLMClient hooks are wired HERE, on the one client
+        // instance every model call flows through — TriageEngine,
+        // QuestionAnswerer, Dispatcher, and the injector's conversation matcher
+        // all share `client` — so every createMessage is recorded exactly once
+        // and gated by the daily cap. TriageEngine still HAS per-call-site
+        // recordHaiku sites (owned by the engine agent), so to avoid
+        // double-counting we pass `costStore: nil` into the engine below and
+        // let the choke-point recorder here be the single source of spend. (The
+        // onboarding clientFactory stays unhooked on purpose: it runs before the
+        // DB opens, and its 1-token key-validation call must not be refused by a
+        // spent cap.)
+        guard let hookCostStore = self.costStore else {
+            trace.emit("app", "FATAL: costStore missing before LLM client construction")
+            return
+        }
+        let configPath = paths.configPath
         let client = LLMClient(
             provider: activeProvider,
             apiKey: key,
             redactor: DefaultRedactor(),
-            traceLog: trace
+            traceLog: trace,
+            costRecorder: { model, usage in
+                try? hookCostStore.recordHaiku(
+                    inputTokens: usage.input_tokens,
+                    outputTokens: usage.output_tokens,
+                    costUSD: TokenAccounting.costUSD(model: model, usage: usage)
+                )
+            },
+            capCheck: {
+                // Re-read config.yaml at each gate so a cap edit takes effect
+                // without a restart (same live-config posture as ConfigWatcher).
+                // The file is tiny; model calls are network-bound and seconds apart.
+                guard let cap = UserConfig.load(from: configPath).dailyCostCapUSD else { return nil }
+                let spent = (try? hookCostStore.todayTotalUSD()) ?? 0
+                return (cap: cap, spent: spent)
+            }
         )
         self.llm = client
-        trace.emit("app", "LLM client ready provider=\(activeProvider.rawValue) model=\(activeProvider.defaultTriageModel)")
+        trace.emit("app", "LLM client ready provider=\(activeProvider.rawValue) model=\(activeProvider.defaultTriageModel) costRecorder=on capCheck=on")
+
+        // Multi-model panel ("Second opinion"): wire the hover's panel handler to
+        // a PanelCoordinator built from ALL configured provider keys, with the
+        // SAME cost recorder + daily-cap gate as the main client so panel spend
+        // counts against one budget. Rebuilt per request so a mode switch (DIY /
+        // Fusion) takes effect without a relaunch. `panelReady` gates the
+        // affordance so it only appears when a panel can actually run: two or more
+        // non-OpenRouter providers (a cross-provider DIY panel), or an OpenRouter
+        // key (Fusion). Off by default regardless — the owner opts in in the panel.
+        let panelKeyStore = self.keyStore
+        let panelCostStore = hookCostStore
+        let panelConfigPath = configPath
+        let panelTrace = trace
+        let panelCostRecorder: @Sendable (String, AnthropicUsage) -> Void = { model, usage in
+            try? panelCostStore.recordHaiku(
+                inputTokens: usage.input_tokens,
+                outputTokens: usage.output_tokens,
+                costUSD: TokenAccounting.costUSD(model: model, usage: usage)
+            )
+        }
+        let panelCapCheck: @Sendable () -> (cap: Double, spent: Double)? = {
+            guard let cap = UserConfig.load(from: panelConfigPath).dailyCostCapUSD else { return nil }
+            let spent = (try? panelCostStore.todayTotalUSD()) ?? 0
+            return (cap: cap, spent: spent)
+        }
+        let panelAvailable = panelKeyStore.availableProviders()
+        hoverVM.setConfiguredProviders(panelAvailable)
+        // Let the user add more provider keys from the panel settings without
+        // re-onboarding. Writes through the SAME per-provider Keychain store
+        // triage uses (correct account/ACL, so the app reads it immediately),
+        // and returns the refreshed availability so `panelReady` flips on.
+        // The write THROWS through to the VM on Keychain failure so the panel
+        // surfaces the error — the old `try?` swallowed it and the UI claimed
+        // the key was saved when nothing was stored.
+        hoverVM.addProviderKeyHandler = { provider, key in
+            try panelKeyStore.write(key, for: provider)
+            return panelKeyStore.availableProviders()
+        }
+        hoverVM.secondOpinionHandler = { decision in
+            guard let coordinator = PanelCoordinator.live(
+                keyStore: panelKeyStore,
+                mode: MultiModelPanelStore.mode(),
+                redactor: DefaultRedactor(),
+                traceLog: panelTrace,
+                costRecorder: panelCostRecorder,
+                capCheck: panelCapCheck
+            ) else { return nil }
+            return try? await coordinator.secondOpinion(on: decision)
+        }
+        trace.emit("app", "multi-model panel wired panelReady=\(hoverVM.panelReady) providers=[\(panelAvailable.map(\.rawValue).joined(separator: ","))]")
 
         // 4. Notifier + Intervention router (v0.1.4 Part A3) + v0.1.6
         // RecoveryDocWriter (writes handoff markdown before SIGSTOP/SIGTERM).
@@ -313,6 +465,11 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor [weak hoverVM] in hoverVM?.recordInterventionOutcome(decision, outcome) }
         })
         self.notifier = notifier
+        // Context Health nudge plumbing: register the "Show me" category and make
+        // this delegate handle the tap (open the window). Additive — it doesn't
+        // change flag notifications, which use no category and no action.
+        notifier.registerContextHealthCategory()
+        UNUserNotificationCenter.current().delegate = self
         let recoveryWriter = RecoveryDocWriter(
             directory: paths.recoveryDir,
             trace: trace
@@ -380,19 +537,38 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // pure logic — no external deps). LoopDispatchStore was set up
         // in step 1 above. Both are passed into the engine; tests
         // bypass them by passing nil.
-        let loopController = LoopController(trace: trace, loopStore: loopDispatchStore)
+        let loopController = LoopController(trace: trace, loopStore: loopDispatchStore, planStore: planStore)
         self.loopController = loopController
+        // v0.2.0 M2d-2: the Planner/Evaluator harness driver. Constructed when
+        // PRINCIPLES.md + the PlanStore are available, but INERT until the owner
+        // flips the planner-enabled marker on (RuntimeToggles.plannerEnabled).
+        // With the marker OFF (the default) the engine's idle path is the
+        // unchanged Dispatcher path; passing this in changes nothing until opt-in.
+        let planLoop = loadPlanLoop(
+            client: client, planStore: planStore, loopController: loopController,
+            dispatchHistory: loopDispatchStore, auditStore: auditStore, trace: trace
+        )
         let engine = TriageEngine(
             client: client,
             bus: bus,
             model: activeProvider.defaultTriageModel,
             windowSize: 30,
-            costStore: costStore,
+            // Single-source-of-spend invariant: the shared `client` above
+            // records every createMessage via its costRecorder hook. Passing
+            // the engine a nil costStore keeps its own per-call recordHauku
+            // sites inert (they are `if let costStore`-guarded) so triage spend
+            // is counted exactly once, not twice. NOTE for the engine agent:
+            // TriageEngine's recordHaiku sites are now dead in production —
+            // they can be removed when the engine is next touched; recording
+            // lives at the LLMClient choke point.
+            costStore: nil,
             redactor: DefaultRedactor(),
             questionAnswerer: questionAnswerer,
             dispatcher: dispatcher,
             loopController: loopController,
             loopStore: loopDispatchStore,
+            auditStore: auditStore,
+            planLoop: planLoop,
             // cwd-exclusivity gate: count live sessions (last 10 min) sharing a
             // cwd, so repo grounding is omitted when this isn't the sole worker
             // in that dir — prevents one session's git state bleeding into a
@@ -415,7 +591,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             switch activity {
             case .triaging:           self?.hoverVM?.triageStarted()
             case .idle:                                self?.hoverVM?.triageFinishedNoFlag()
-            case .flagged(let sev, let action, let plain): self?.hoverVM?.flagRaised(severity: sev, action: action, reasoningPlain: plain)
+            case .flagged(let sev, let action, let plain, let sid, let cwd): self?.hoverVM?.flagRaised(severity: sev, action: action, reasoningPlain: plain, flaggedSessionId: sid, flaggedSessionCwd: cwd)
             }
         }
         engine.onDecision = { [weak self] decision in
@@ -424,6 +600,76 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         }
         engine.start()
         self.triageEngine = engine
+
+        // 5b. Review engine (v0.3.x REVIEW dimension) — a SECOND observer that
+        // reviews the code a worker writes and surfaces substantive quality
+        // issues in the hover panel's Activity tab. It shares the one cost-gated
+        // `client` (so review spend rides the same daily cap + recorder as
+        // triage) and the same EventBus, but is otherwise independent of the
+        // safety path: it consumes only the additive `.fileEdit` event (which
+        // TriageEngine ignores) and never pauses/kills/injects. INERT by default
+        // — with the `review-enabled.marker` OFF it short-circuits on every event
+        // and spends nothing (RuntimeToggles.reviewEnabled), so wiring it in
+        // changes no shipped behavior until the owner opts in. Reviews surface as
+        // calm Activity-tab entries (pull), never banners (push).
+        let reviewEngine = ReviewEngine(
+            client: client,
+            bus: bus,
+            model: activeProvider.defaultTriageModel,
+            reviewStore: reviewFindingStore,
+            auditStore: auditStore,
+            redactor: DefaultRedactor(),
+            onFinding: { [weak hoverVM] surfaced in
+                hoverVM?.noteReviewFinding(title: surfaced.title)
+            },
+            trace: trace
+        )
+        reviewEngine.start()
+        self.reviewEngine = reviewEngine
+        trace.emit("app", "review engine wired (INERT until review-enabled.marker is set)")
+
+        // v0.2.0 M3: wire the panel's "Approve plan" button to the engine's
+        // approval path — the SAME marked + ledgered approvePlan(planId:) the
+        // approve-plan marker drives, so the human gate has one implementation.
+        // [weak engine] on the Task (not the @Sendable closure) mirrors the
+        // Notifier onResult pattern above for the Swift-5.10 capture rule.
+        hoverVM.approvePlanHandler = { planId in
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                Task { @MainActor [weak engine] in
+                    await engine?.approvePlan(planId: planId)
+                    cont.resume()
+                }
+            }
+        }
+
+        // v0.2.0 observability (Reddit feedback D): wire the panel's "Export
+        // session report" button to SessionReportExporter. It gathers the
+        // session's audit log + flags + plan + verdicts and writes a JSON +
+        // Markdown bundle into ~/Downloads/Supervisor Reports/ (a stable,
+        // user-reachable location), returning the file paths so the VM can reveal
+        // the file in Finder. The exporter only READS the stores + WRITES two
+        // files; it changes nothing in the engine. Built lazily inside the
+        // handler from the same stores so it always reflects the live DB.
+        if let auditStore, let flagStore, let planStore, let sessionStore {
+            let exporter = SessionReportExporter(
+                auditStore: auditStore,
+                flagStore: flagStore,
+                planStore: planStore,
+                sessionStore: sessionStore
+            )
+            let reportsDir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads/Supervisor Reports", isDirectory: true)
+            hoverVM.exportReportHandler = { [trace] sessionId in
+                do {
+                    let out = try exporter.export(sessionId: sessionId, to: reportsDir)
+                    trace.emit("app", "session report exported session=\(sessionId) -> \(out.markdownPath.path)")
+                    return out
+                } catch {
+                    trace.emit("app", "session report export FAILED session=\(sessionId): \(error)")
+                    return nil
+                }
+            }
+        }
 
         // 6. Discovery (kicks off tails for every Claude Code session)
         let discovery = SessionDiscovery(
@@ -435,17 +681,32 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         discovery.start()
         self.discovery = discovery
 
-        // 7. Companions: heartbeat + permission monitor
-        startHeartbeat()
-        startPermissionMonitor()
+        // 6b. Codex discovery — the second agent. Additive: a separate watcher on
+        // ~/.codex/sessions feeding the SAME EventBus, so Codex sessions are
+        // triaged by the identical rubric. Auto-enabled when Codex is installed
+        // (~/.codex/sessions exists) unless `supervise_codex: false` in config.
+        let codexSessionsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/sessions", isDirectory: true)
+        let codexEnabled = (userConfig.superviseCodex ?? true)
+            && FileManager.default.fileExists(atPath: codexSessionsDir.path)
+        if codexEnabled {
+            let codexDiscovery = CodexSessionDiscovery(
+                codexSessionsDir: codexSessionsDir,
+                bus: bus,
+                sessionStore: sessionStore,
+                trace: trace
+            )
+            codexDiscovery.start()
+            self.codexDiscovery = codexDiscovery
+            trace.emit("app", "codex supervision ON — watching \(codexSessionsDir.path)")
+        } else {
+            trace.emit("app", "codex supervision OFF (superviseCodex=\(String(describing: userConfig.superviseCodex)), dirExists=\(FileManager.default.fileExists(atPath: codexSessionsDir.path)))")
+        }
 
-        // The menu-bar health icon (green check / red glyph) lives only in
-        // SupervisorStatusBar.app, and the main app runs as .accessory with no
-        // Dock icon, status item, or Quit. Launch the companion now so a fresh
-        // user always sees the health indicator and has an honest quit path,
-        // even if they never opened SupervisorStatusBar.app from the DMG.
-        // Degrades silently — the harness is fully functional without it.
-        launchStatusBarCompanion()
+        // 7. Companions: heartbeat + status-bar health icon + permission monitor
+        startHeartbeat()
+        startStatusBar()
+        startPermissionMonitor()
 
         if notifDegraded {
             trace.emit("app", "running with notification degradation (banner suppressed; flags still appear in Notification Center)")
@@ -522,27 +783,6 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             await self?.router?.dispatch(decision: decision)
         }
 
-        // 2b. Pause/kill HOLDS the drive loop for this session, so the worker
-        //     going idle right after the interrupt isn't immediately re-driven
-        //     (the "it stopped and then Supervisor injected something else" case,
-        //     2026-06-16). pause = transient hold (clears when the worker resumes
-        //     with a tool call → clearPause); kill = sticky stop (the worker is
-        //     gone). Held on the DECISION: correct when the interrupt lands, and
-        //     harmless when it degrades — a still-running worker's next tool call
-        //     clears the pause on its own.
-        switch candidate.action {
-        case .pause:
-            Task { [weak self] in
-                await self?.loopController?.notePause(sessionId: decision.sessionId, reason: .safetyPause)
-            }
-        case .kill:
-            Task { [weak self] in
-                await self?.loopController?.stop(sessionId: decision.sessionId, reason: .killFired)
-            }
-        default:
-            break
-        }
-
         // 3. v0.9.0 (integrity): do NOT record the action here. The old eager
         //    record fired at DECISION time with the INTENT label ("Answered a
         //    question") — before the inject ran, and it stayed even when the
@@ -580,12 +820,101 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func locateHeartbeatExecutable() -> URL? {
+        locateCompanionExecutable(named: "SupervisorHeartbeat")
+    }
+
+    // MARK: - Status-bar companion (owns the menu-bar health icon)
+
+    /// Bounded respawn budget for the status-bar companion. If the companion
+    /// dies UNEXPECTEDLY (crash, external kill — never a deliberate stop, see
+    /// stopStatusBar), it is respawned after a short delay up to this many
+    /// times per app run, then we give up with an honest trace ERROR. The
+    /// bound is the point: a companion that crashes on every boot must not
+    /// become a spawn loop.
+    private var statusBarRespawnCount = 0
+    private let statusBarRespawnLimit = 3
+
+    /// Spawn the SupervisorStatusBar companion. It is a direct child of this
+    /// process, so its own getppid()-style watching (and the heartbeat child's)
+    /// hangs off the same parent. It reads heartbeat.txt and drives the menu-bar
+    /// icon red/amber/green — the honest-health surface that must survive a
+    /// crash of THIS app (which an in-process NSStatusItem could not).
+    private func startStatusBar() {
+        stopStatusBar()
+        guard let url = locateStatusBarExecutable() else {
+            trace.emit("app", "ERROR cannot locate SupervisorStatusBar executable — menu-bar health icon unavailable")
+            return
+        }
+        let proc = Process()
+        proc.executableURL = url
+        // Supervise the health surface itself: without this handler a crashed
+        // companion stays dead for the rest of the app run — no icon, no
+        // honest red later, no Quit/Restart affordance. The handler runs on a
+        // background thread, so hop to the main actor before touching any
+        // delegate state (same Task { @MainActor } idiom as the engine wiring
+        // above). Installed BEFORE run() so an instantly-exiting child cannot
+        // slip past it.
+        proc.terminationHandler = { [weak self] process in
+            let status = process.terminationStatus
+            Task { @MainActor [weak self] in
+                self?.statusBarDidExit(process, status: status)
+            }
+        }
+        do {
+            try proc.run()
+            statusBarProcess = proc
+            trace.emit("app", "spawned status-bar pid=\(proc.processIdentifier) path=\(url.path)")
+        } catch {
+            trace.emit("app", "ERROR failed to spawn status-bar: \(error)")
+        }
+    }
+
+    /// Unexpected status-bar exit. Deliberate stops never land here (they
+    /// clear the terminationHandler first), so this is a crash or an external
+    /// kill: respawn with a bounded per-app-run budget, and past the budget
+    /// trace an honest ERROR and give up rather than spin.
+    private func statusBarDidExit(_ proc: Process, status: Int32) {
+        // Ignore stale notifications: only the currently-tracked companion
+        // counts. Belt-and-suspenders against a late handler firing after a
+        // newer instance was already spawned.
+        guard proc === statusBarProcess else { return }
+        statusBarProcess = nil
+        statusBarRespawnCount += 1
+        guard statusBarRespawnCount <= statusBarRespawnLimit else {
+            trace.emit("app", "ERROR status-bar exited (status=\(status)) after \(statusBarRespawnLimit) respawns — giving up; menu-bar health icon unavailable for the rest of this run")
+            return
+        }
+        trace.emit("app", "status-bar exited unexpectedly status=\(status) — respawning (\(statusBarRespawnCount)/\(statusBarRespawnLimit)) in 2s")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            self?.startStatusBar()
+        }
+    }
+
+    private func stopStatusBar() {
+        guard let proc = statusBarProcess, proc.isRunning else { return }
+        trace.emit("app", "terminating status-bar pid=\(proc.processIdentifier)")
+        // Deliberate stop: clear the crash-respawn handler FIRST so this
+        // expected termination is never mistaken for a crash and respawned.
+        proc.terminationHandler = nil
+        proc.terminate()
+        statusBarProcess = nil
+    }
+
+    private func locateStatusBarExecutable() -> URL? {
+        locateCompanionExecutable(named: "SupervisorStatusBar")
+    }
+
+    /// Find a sibling companion executable next to this app's binary or in its
+    /// Resources/ (build-app.sh lays both companions down in both spots). Shared
+    /// by the heartbeat + status-bar spawns so the lookup rules stay identical.
+    private func locateCompanionExecutable(named name: String) -> URL? {
         var candidates: [URL] = []
         if let res = Bundle.main.resourceURL {
-            candidates.append(res.appendingPathComponent("SupervisorHeartbeat"))
+            candidates.append(res.appendingPathComponent(name))
         }
         if let exec = Bundle.main.executableURL {
-            candidates.append(exec.deletingLastPathComponent().appendingPathComponent("SupervisorHeartbeat"))
+            candidates.append(exec.deletingLastPathComponent().appendingPathComponent(name))
         }
         for candidate in candidates {
             if FileManager.default.isExecutableFile(atPath: candidate.path) {
@@ -595,67 +924,61 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    /// Launch the SupervisorStatusBar.app companion, which owns the menu-bar
-    /// health icon and the Quit affordance. Unlike the embedded heartbeat
-    /// binary (Process-spawned above), this is a full .app bundle that owns an
-    /// NSStatusBar item, so it must launch as an app via NSWorkspace.
+    // MARK: - Single-instance guard
+
+    /// Hard single-instance guard. The OLD guard killed every sibling
+    /// with a different pid, which made two app bundles sharing one
+    /// bundle id ping-pong (A kills B, a relauncher starts B, B kills A,
+    /// repeat). This flips the rule: a pidfile under appSupportDir is the
+    /// source of truth, and if a LIVE incumbent already owns it the
+    /// newcomer surfaces a clear error and quits. The incumbent keeps
+    /// running. A stale pidfile (recorded pid dead, or it is us) does not
+    /// block launch: we take over the lock.
     ///
-    /// Intentionally one-way: we never terminate it on our own exit. That is
-    /// the two-process health design — if the main app dies, the companion
-    /// stays alive and turns the icon red.
-    private func launchStatusBarCompanion() {
-        // Already open (e.g. the user launched it from the DMG)? Do nothing,
-        // so we never end up with two status items.
-        if !NSRunningApplication
-            .runningApplications(withBundleIdentifier: "live.supervisor.statusbar")
-            .isEmpty {
-            trace.emit("app", "status-bar companion already running — not launching a second")
-            return
-        }
+    /// Returns true if this instance may continue (and has claimed the
+    /// lock); false if it is a duplicate that has been told to quit.
+    private func enforceSingleInstance() -> Bool {
+        let pidfile = paths.pidfilePath
+        let myPID = ProcessInfo.processInfo.processIdentifier
 
-        // It ships as a SIBLING of Supervisor.app (both dragged from the DMG to
-        // /Applications; both under build/ in dev). bundleURL is Supervisor.app
-        // itself, so its parent is the directory that contains both bundles.
-        let companion = Bundle.main.bundleURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("SupervisorStatusBar.app")
-
-        guard FileManager.default.fileExists(atPath: companion.path) else {
-            trace.emit("app", "status-bar companion not found at \(companion.path) — menu-bar icon will be absent (harness still functional)")
-            return
-        }
-
-        NSWorkspace.shared.openApplication(
-            at: companion,
-            configuration: NSWorkspace.OpenConfiguration()
-        ) { [weak self] app, error in
-            if let error = error {
-                self?.trace.emit("app", "ERROR failed to launch status-bar companion: \(error)")
-            } else {
-                self?.trace.emit("app", "launched status-bar companion pid=\(app?.processIdentifier ?? -1) path=\(companion.path)")
-            }
+        // Atomic claim (O_CREAT|O_EXCL) instead of read → decide → writePID:
+        // closes the check-then-write TOCTOU where two near-simultaneous
+        // launches both saw "no incumbent" and both entered the running state
+        // (two hover bands, two engines). Exactly one racer wins the create.
+        // The default probe (pidIsAliveSupervisor) also closes the PID-reuse
+        // hole: a stale pid the OS reused for an unrelated process is verified
+        // by executable identity, so it is NOT treated as an incumbent — a
+        // legit launch takes over instead of quitting silently as a duplicate
+        // of a stranger.
+        switch SingleInstanceGuard.claim(at: pidfile, myPID: myPID) {
+        case .incumbentAlive(let incumbentPID):
+            quitAsDuplicate(incumbentPID: incumbentPID)  // never returns
+        case .claimed:
+            trace.emit("app", "single-instance: claimed lock at \(pidfile.path) pid=\(myPID)")
+            return true
         }
     }
 
-    // MARK: - Single-instance guard
-
-    /// Kill any prior Supervisor.app instances so we don't get duplicate
-    /// hover windows after a self-rebuild/relaunch. Identifies siblings by
-    /// bundle identifier, terminates any with a different PID than ours.
-    private func terminatePriorInstances() {
-        let myPID = ProcessInfo.processInfo.processIdentifier
-        let myBundle = Bundle.main.bundleIdentifier ?? "live.supervisor.app"
-        let siblings = NSRunningApplication.runningApplications(
-            withBundleIdentifier: myBundle
-        ).filter { $0.processIdentifier != myPID }
-
-        for app in siblings {
-            trace.emit("app", "terminating prior instance pid=\(app.processIdentifier)")
-            app.terminate()
-        }
-        if !siblings.isEmpty {
-            trace.emit("app", "terminated \(siblings.count) prior instance(s)")
-        }
+    /// A duplicate was launched while another instance already holds the lock.
+    /// Exit IMMEDIATELY so this instance never reaches the running state and
+    /// therefore never draws a second hover band or menu-bar item. The earlier
+    /// version showed a blocking `alert.runModal()`, which left the duplicate
+    /// parked on the modal loop, alive, instead of quitting: that was the
+    /// two-bands bug. This instance owns no state to tear down (it never claimed
+    /// the lock and never started the engine), so a hard `exit(0)` is correct
+    /// and certain. No modal: a duplicate vanishes silently, the incumbent keeps
+    /// running.
+    private func quitAsDuplicate(incumbentPID: Int32) -> Never {
+        let msg = "another Supervisor is already running (pid=\(incumbentPID)); this duplicate exits immediately"
+        trace.emit("app", msg)
+        // Also surface a one-line signal on stderr (Console.app / launchd log)
+        // so a misfire — e.g. the identity check wrongly matching, or a genuine
+        // double-launch — is visible without grepping the trace file. The
+        // substantive PID-reuse fix is the identity-aware probe in the claim;
+        // this is the belt-and-suspenders visibility the audit asked for.
+        FileHandle.standardError.write(Data("Supervisor: \(msg)\n".utf8))
+        trace.sync()
+        exit(0)
     }
 
     // MARK: - Permission monitor
@@ -688,47 +1011,63 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             permissionPopover?.dismiss()
         }
     }
+
+    // MARK: - Menu-bar status item
+    //
+    // Intentionally NOT owned here. The menu-bar health icon lives in the
+    // SupervisorStatusBar companion (spawned by startStatusBar), which polls
+    // heartbeat.txt and shows red/amber/green + a working Restart / Quit
+    // Supervisor / Open Trace Log. An in-process NSStatusItem could not survive
+    // this app crashing (the icon would vanish rather than turn red) or report a
+    // hang (a static green icon would keep lying), which is exactly the
+    // honest-health regression the v0.3.0 fold-in introduced. The companion's
+    // "Recent Flags / Open Recovery Folder / Open Trace Log" items replace the
+    // in-process menu that used to live here.
 }
 
 // MARK: - QuestionAnswerer bootstrap helper
 
-/// Ordered search path for PRINCIPLES.md, most-specific first:
-///   1. user override — ~/Library/Application Support/Supervisor/PRINCIPLES.md
-///      (a user drops their own here to make Supervisor answer their way)
-///   2. the generic default that ships embedded in the app bundle
-///   3. dev convenience — the repo root, when running the unbundled binary
-///      from .../build/ (never present on a shipped install)
-/// The old hard-coded /Users/main/supervisor path is intentionally gone:
-/// a shipped user only ever sees their own override or the bundled default,
-/// never Mohammed's dev manual.
-private func principlesURLCandidates() -> [URL] {
-    let override = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Supervisor/PRINCIPLES.md")
-    return [
-        override,
-        Bundle.main.url(forResource: "PRINCIPLES", withExtension: "md"),
+/// PRINCIPLES.md candidate locations, in priority order:
+///   1. the user's own copy in Application Support. This is the file the
+///      onboarding customization step points at, so edits there actually
+///      take effect (it is checked FIRST, ahead of the bundled default).
+///   2. the repo file, when a dev build runs in place from build/.
+///   3. the generic default bundled inside the app (the safety-net fallback
+///      a fresh install ships with).
+/// compactMap drops the bundle URL on builds that do not embed the resource.
+/// A user's edits always win over the bundled default; the bundled default
+/// is what makes the answer + dispatch features work out of the box.
+private func principlesCandidateURLs() -> [URL] {
+    [
+        ConfigPaths().appSupportDir.appendingPathComponent("PRINCIPLES.md"),
         Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("PRINCIPLES.md"),
+        Bundle.main.url(forResource: "PRINCIPLES", withExtension: "md"),
     ].compactMap { $0 }
 }
 
-/// Load PRINCIPLES.md (see `principlesURLCandidates` for the search order)
-/// and construct a `QuestionAnswerer`. Returns nil — silently — if no
-/// PRINCIPLES.md is found anywhere; the engine treats nil as "no secondary
-/// call," which degrades user_question_pending flags to plain notify
-/// without breaking the primary triage path.
+/// Load PRINCIPLES.md (see principlesCandidateURLs for the priority order:
+/// the user's Application Support copy, then the in-place repo file, then the
+/// bundled generic default) and construct a `QuestionAnswerer`. Returns nil,
+/// silently, if every candidate is missing or a stub; the engine treats nil
+/// as "no secondary call," which degrades user_question_pending flags to plain
+/// notify without breaking the primary triage path.
 @MainActor
 private func loadQuestionAnswerer(client: LLMClient, trace: TraceLog) -> QuestionAnswerer? {
-    let candidates = principlesURLCandidates()
+    let candidates = principlesCandidateURLs()
 
-    for url in candidates {
-        if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
-            trace.emit("app", "loaded PRINCIPLES.md for QuestionAnswerer from \(url.path) (\(text.count) chars)")
-            return QuestionAnswerer(client: client, principlesText: text, trace: trace)
+    guard let resolved = PrinciplesResolver.resolve(
+        candidates: candidates,
+        read: { try? String(contentsOf: $0, encoding: .utf8) },
+        onStub: { url, count in
+            trace.emit("app", "PRINCIPLES candidate at \(url.path) is only \(count) chars (looks like a stub, below \(PrinciplesResolver.stubThreshold)); skipping")
         }
+    ) else {
+        trace.emit("app", "no real PRINCIPLES.md found (all candidates missing or stub); QuestionAnswerer disabled — user_question_pending flags will surface as plain notify")
+        return nil
     }
-    trace.emit("app", "no PRINCIPLES.md found; QuestionAnswerer disabled — user_question_pending flags will surface as plain notify")
-    return nil
+    trace.emit("app", "loaded PRINCIPLES.md for QuestionAnswerer from \(resolved.path.path) (\(resolved.text.count) chars)")
+    return QuestionAnswerer(client: client, principlesText: resolved.text, trace: trace)
 }
 
 /// v0.4.0 Part D: construct the Dispatcher used by the worker-idle
@@ -747,25 +1086,93 @@ private func loadDispatcher(
     trace: TraceLog,
     dispatchHistory: (any DispatchHistoryReading)? = nil
 ) -> Dispatcher? {
-    let candidates = principlesURLCandidates()
+    let candidates = principlesCandidateURLs()
 
-    for url in candidates {
-        if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
-            trace.emit("app", "loaded PRINCIPLES.md for Dispatcher from \(url.path) (\(text.count) chars)")
-            return Dispatcher(
-                client: client,
-                principlesText: text,
-                principlesPath: url,
-                issueFetcher: GitHubIssueFetcher(trace: trace),
-                commitFetcher: GitBranchCommitFetcher(trace: trace),
-                dispatchHistory: dispatchHistory,
-                grounder: RepoProposalGrounder(trace: trace),
-                trace: trace
-            )
+    guard let resolved = PrinciplesResolver.resolve(
+        candidates: candidates,
+        read: { try? String(contentsOf: $0, encoding: .utf8) },
+        onStub: { url, count in
+            trace.emit("app", "PRINCIPLES candidate at \(url.path) is only \(count) chars (looks like a stub, below \(PrinciplesResolver.stubThreshold)); skipping")
         }
+    ) else {
+        trace.emit("app", "no real PRINCIPLES.md found (all candidates missing or stub); Dispatcher disabled — worker_idle_post_completion flags will surface as plain notify (no auto-dispatch)")
+        return nil
     }
-    trace.emit("app", "no PRINCIPLES.md found; Dispatcher disabled — worker_idle_post_completion flags will surface as plain notify (no auto-dispatch)")
-    return nil
+    trace.emit("app", "loaded PRINCIPLES.md for Dispatcher from \(resolved.path.path) (\(resolved.text.count) chars)")
+    return Dispatcher(
+        client: client,
+        principlesText: resolved.text,
+        principlesPath: resolved.path,
+        issueFetcher: GitHubIssueFetcher(trace: trace),
+        commitFetcher: GitBranchCommitFetcher(trace: trace),
+        prFetcher: GitHubPRFetcher(trace: trace),
+        dispatchHistory: dispatchHistory,
+        grounder: RepoProposalGrounder(trace: trace),
+        trace: trace
+    )
+}
+
+/// v0.2.0 M2d-2: build the Planner/Evaluator harness driver, or nil if the
+/// PlanStore / PRINCIPLES.md aren't available. Always constructed when possible;
+/// it is INERT until the owner flips the planner-enabled marker on (the
+/// RuntimeToggles.plannerEnabled opt-in gate), so wiring it in changes no default
+/// behavior. The Planner mirrors the Dispatcher's grounding (same fetchers +
+/// grounder); the Evaluator inherits the shared client's redaction.
+private func loadPlanLoop(
+    client: LLMClient,
+    planStore: PlanStore?,
+    loopController: LoopController,
+    dispatchHistory: (any DispatchHistoryReading)? = nil,
+    auditStore: AuditStore? = nil,
+    trace: TraceLog
+) -> PlanLoop? {
+    guard let planStore else {
+        trace.emit("app", "no PlanStore; PlanLoop disabled (planner harness unavailable)")
+        return nil
+    }
+    let candidates = principlesCandidateURLs()
+
+    guard let resolved = PrinciplesResolver.resolve(
+        candidates: candidates,
+        read: { try? String(contentsOf: $0, encoding: .utf8) },
+        onStub: { url, count in
+            trace.emit("app", "PRINCIPLES candidate at \(url.path) is only \(count) chars (looks like a stub, below \(PrinciplesResolver.stubThreshold)); skipping")
+        }
+    ) else {
+        trace.emit("app", "no real PRINCIPLES.md found (all candidates missing or stub); PlanLoop disabled (planner harness unavailable)")
+        return nil
+    }
+    let planner = Planner(
+        client: client,
+        store: planStore,
+        principlesText: resolved.text,
+        principlesPath: resolved.path,
+        issueFetcher: GitHubIssueFetcher(trace: trace),
+        commitFetcher: GitBranchCommitFetcher(trace: trace),
+        dispatchHistory: dispatchHistory,
+        grounder: RepoProposalGrounder(trace: trace),
+        trace: trace
+    )
+    // v0.2.0 (Reddit feedback E): the Evaluator pass threshold follows
+    // the owner's decision-sensitivity setting. At .balanced (the
+    // default) this resolves to 0.8 == Evaluator.defaultThreshold, so
+    // the grader is unchanged unless the owner moves the dial; Cautious
+    // raises the bar (redirect/retry more), Decisive lowers it.
+    let evaluator = Evaluator(
+        client: client,
+        store: planStore,
+        threshold: DecisionSensitivityStore.current().evaluatorPassThreshold,
+        trace: trace
+    )
+    trace.emit("app", "PlanLoop ready (planner harness wired, INERT until planner-enabled marker is set) PRINCIPLES from \(resolved.path.path)")
+    return PlanLoop(
+        planner: planner,
+        evaluator: evaluator,
+        planStore: planStore,
+        loopController: loopController,
+        auditStore: auditStore,
+        trace: trace
+    )
 }
 
 // MARK: - Bootstrap
@@ -776,4 +1183,34 @@ MainActor.assumeIsolated {
     app.delegate = delegate
     app.setActivationPolicy(.accessory)
     app.run()
+}
+
+// MARK: - Context Health notification handling
+
+/// Opens the Context Health window when the owner taps the one earned nudge (or
+/// its "Show me" action). Additive: it only acts on the Context Health category;
+/// flag notifications (no category) fall through untouched. `nonisolated` +
+/// hop-to-MainActor is the standard way to satisfy the SDK's nonisolated delegate
+/// requirement from a main-actor app delegate.
+extension SupervisorAppDelegate: UNUserNotificationCenterDelegate {
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let isContextHealth = response.notification.request.content.categoryIdentifier == Notifier.contextHealthCategoryID
+        if isContextHealth {
+            Task { @MainActor in self.openContextHealthWindow?() }
+        }
+        completionHandler()
+    }
 }

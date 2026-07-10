@@ -66,8 +66,23 @@ public enum InterventionOutcome: Sendable, Equatable {
     case injectSucceeded(pid: pid_t, bytes: Int)
     /// v0.3.0: inject couldn't run. The banner falls back to surfacing
     /// the intended text so the user can paste it manually. `reason`
-    /// goes into the trace, not the banner.
-    case injectDegraded(intendedText: String, reason: String)
+    /// goes into the trace, not the banner. `copiedToClipboard` reports
+    /// whether the router's clipboard write ACTUALLY succeeded
+    /// (NSPasteboard.setString can fail) — the banner only claims "it's
+    /// on your clipboard" when it's true, and falls back to embedding
+    /// the text when it isn't.
+    case injectDegraded(intendedText: String, reason: String, copiedToClipboard: Bool)
+    /// Fix #4a: a desktop inject (or continue-dispatch) could not target the
+    /// Claude conversation because Screen Recording is off. Unlike the generic
+    /// degrade, this is ACTIONABLE: the banner names the missing permission and
+    /// where to grant it, so the operator knows the plan did not die, it is
+    /// waiting on one toggle. `intendedText` is the prompt that did not land so
+    /// the user can still paste it manually. Both the inject and the
+    /// continue-dispatch paths route here when they see screen_recording_denied,
+    /// once per (re)injection, not per tick. `copiedToClipboard` is the real
+    /// clipboard-write result (see `injectDegraded`) so the banner never
+    /// claims a clipboard it didn't populate.
+    case screenRecordingDenied(intendedText: String, copiedToClipboard: Bool)
     /// v0.4.0 Part B: continue dispatched. CGEventPost typed the
     /// dispatcher's next_task_proposal into Claude Code. `promptHead`
     /// is the first ~80 chars so the banner can show what got sent.
@@ -75,8 +90,11 @@ public enum InterventionOutcome: Sendable, Equatable {
     /// v0.4.0 Part B: dispatcher returned medium confidence — surface
     /// the proposal to the user via banner rather than injecting it.
     /// `proposal` is the next_task_proposal text; the banner invites
-    /// the user to paste it themselves.
-    case continueProposedMedium(proposal: String, justification: String)
+    /// the user to paste it themselves. `copiedToClipboard` is true only
+    /// when this outcome is a HIGH-confidence dispatch that degraded on a
+    /// delivery failure and the router actually placed the proposal on the
+    /// clipboard (a genuine medium proposal never touches the clipboard).
+    case continueProposedMedium(proposal: String, justification: String, copiedToClipboard: Bool)
     /// v0.4.0 Part B: dispatcher returned low confidence — supervisor
     /// saw the idle state but couldn't pick a next task. `reasoning`
     /// is the dispatcher's justification (lands in the banner so the
@@ -116,6 +134,50 @@ public final class Notifier: Notifying, @unchecked Sendable {
         self.center = center
         self.trace = trace
         self.onResult = onResult
+    }
+
+    // MARK: - Context Health (the single earned nudge)
+
+    /// Category + action identifiers for the one Context Health notification. The
+    /// app registers the category and handles the action to open the window.
+    public static let contextHealthCategoryID = "SUPERVISOR_CONTEXT_HEALTH"
+    public static let contextHealthShowActionID = "SUPERVISOR_SHOW_CONTEXT_HEALTH"
+
+    /// Register the Context Health notification category (its "Show me" action).
+    /// Call once at launch. (Flags don't use categories, so setting this one is
+    /// safe; if that ever changes, merge with the existing set instead.)
+    public func registerContextHealthCategory() {
+        let show = UNNotificationAction(
+            identifier: Self.contextHealthShowActionID, title: "Show me", options: [.foreground])
+        let category = UNNotificationCategory(
+            identifier: Self.contextHealthCategoryID, actions: [show], intentIdentifiers: [], options: [])
+        center.setNotificationCategories([category])
+    }
+
+    /// Post THE single Context Health nudge — the one earned notification fired the
+    /// first time a background audit finds notable context drift. Carries a "Show
+    /// me" action (the app opens the window) and NO sound, so it reads as a calm
+    /// heads-up, never a safety alarm.
+    @discardableResult
+    public func postContextHealth(count: Int, lines: Int) async -> Outcome {
+        let content = UNMutableNotificationContent()
+        content.title = "Context Health"
+        let lineClause = lines > 0 ? " (~\(lines) lines)" : ""
+        content.body = "Supervisor found \(count) cleanup\(count == 1 ? "" : "s") in your Claude context\(lineClause). Nothing changed."
+        content.categoryIdentifier = Self.contextHealthCategoryID
+        let request = UNNotificationRequest(
+            identifier: "supervisor.contexthealth.\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        do {
+            try await center.add(request)
+            trace.emit("notifier", "posted context-health nudge: \(count) cleanups")
+            return .posted
+        } catch {
+            trace.emit("notifier", "context-health nudge failed: \(error)")
+            return .failed(reason: "\(error)")
+        }
     }
 
     /// Post a notification for a triage decision. Returns the outcome
@@ -174,6 +236,8 @@ public final class Notifier: Notifying, @unchecked Sendable {
             return "Supervisor answered a question"
         case .injectDegraded:
             return "Supervisor has an answer for you"
+        case .screenRecordingDenied:
+            return "Supervisor needs Screen Recording to drive Claude"
         case .continueFired:
             return "Supervisor kept Claude Code working"
         case .continueProposedMedium:
@@ -196,6 +260,13 @@ public final class Notifier: Notifying, @unchecked Sendable {
     /// Recovery details (doc paths, PIDs) go to a second line when
     /// relevant, never the headline.
     public func body(for decision: TriageDecision, outcome: InterventionOutcome) -> String {
+        Self.composeBody(for: decision, outcome: outcome)
+    }
+
+    /// The pure composer behind `body(for:outcome:)` — static so tests can
+    /// assert the REAL banner copy (constructing a Notifier needs
+    /// UNUserNotificationCenter, which aborts in the xctest harness).
+    public static func composeBody(for decision: TriageDecision, outcome: InterventionOutcome) -> String {
         let plain = decision.candidate.reasoningPlain
         switch outcome {
         case .notifyOnly:
@@ -214,19 +285,49 @@ public final class Notifier: Notifying, @unchecked Sendable {
             }
         case .injectSucceeded:
             return plain + "\n\nSupervisor answered the question directly. Check your terminal to see the response."
-        case .injectDegraded(let intendedText, _):
-            return plain + "\n\nSupervisor couldn't type the answer automatically. Paste this into Claude Code:\n\(intendedText)"
+        case .injectDegraded(let intendedText, _, let copiedToClipboard):
+            // The answer is COPIED TO THE CLIPBOARD by the router (a notification
+            // body truncates and isn't selectable, so embedding the text here made
+            // it useless). Point the owner at the clipboard; a short head lets them
+            // confirm which answer it is. HONESTY: only claim the clipboard when
+            // the write actually succeeded — otherwise fall back to embedding the
+            // text (truncated, but real) rather than pointing at an empty pasteboard.
+            if copiedToClipboard {
+                return plain + "\n\nSupervisor couldn't type the answer automatically, so it copied it to your clipboard — paste it into Claude Code with Cmd-V." + Self.clipboardHead(intendedText)
+            } else {
+                return plain + "\n\nSupervisor couldn't type the answer automatically, and copying it to your clipboard also failed. Here is the answer to paste yourself:\n\n" + intendedText
+            }
+        case .screenRecordingDenied(let intendedText, let copiedToClipboard):
+            let base = plain + "\n\nSupervisor could not drive the Claude desktop app: Screen Recording permission is off. Grant it in System Settings > Privacy and Security > Screen Recording, then Supervisor will resume."
+            if copiedToClipboard {
+                return base + "\n\nThe answer is on your clipboard — paste it into Claude with Cmd-V." + Self.clipboardHead(intendedText)
+            } else {
+                return base + "\n\nHere is the answer to paste into Claude yourself:\n\n" + intendedText
+            }
         case .continueFired(_, _, let promptHead):
             let head = promptHead.count >= 80 ? promptHead + "..." : promptHead
             return "Supervisor sent Claude Code its next task: \(head)"
-        case .continueProposedMedium(let proposal, _):
-            return "Supervisor thinks Claude Code should work on this next, but wants your approval:\n\n\(proposal)\n\nPaste this into Claude Code if you agree, or write your own direction."
+        case .continueProposedMedium(let proposal, _, let copiedToClipboard):
+            let closing = copiedToClipboard
+                ? "It's on your clipboard — paste it into Claude Code with Cmd-V if you agree, or write your own direction."
+                : "Paste this into Claude Code if you agree, or write your own direction."
+            return "Supervisor thinks Claude Code should work on this next, but wants your approval:\n\n\(proposal)\n\n" + closing
         case .continueLowConfidence(let reasoning):
             return "Claude Code finished its work and Supervisor couldn't decide what to do next. \(reasoning)\n\nTell Claude Code what to work on, or add items to the issue queue."
         case .queued(let promptHead):
             let head = promptHead.count >= 80 ? promptHead + "..." : promptHead
             return "Claude Code is busy, so Supervisor queued this and will send it when the worker is ready:\n\n\(head)"
         }
+    }
+
+    /// A short "(starts: …)" tail so the owner recognizes which answer is on the
+    /// clipboard, without dumping the full (often long) text into a banner that
+    /// would truncate it anyway. Empty for empty text.
+    static func clipboardHead(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let head = trimmed.replacingOccurrences(of: "\n", with: " ").prefix(60)
+        return "\n(starts: \"\(head)\(trimmed.count > 60 ? "…" : "")\")"
     }
 
     /// v0.1.4 Gap 1+2+3: post a banner reflecting the actual outcome
