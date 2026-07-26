@@ -35,7 +35,7 @@ Supervisor watches each session and acts in your place:
 
 Everything runs on your Mac, on your own API key. Nothing leaves your machine except the same model calls you would make yourself.
 
-**New in 0.3.0:** Codex sessions are supervised too. An opt-in second-opinion panel checks borderline calls across other models, context health monitoring warns when a long session starts degrading, and the portable Agent Skill below puts Supervisor inside your own agent, no download required.
+**New in 0.3.1:** launch reliability, hardened (the app always opens, or tells you why it can't) and an opt-in Second Brain that keeps what your sessions teach in a local memory you own. From 0.3.0: Codex sessions are supervised too, an opt-in second-opinion panel checks borderline calls across other models, context health monitoring warns when a long session starts degrading, and the portable Agent Skill below puts Supervisor inside your own agent, no download required.
 
 ## Install
 
