@@ -6,9 +6,66 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet. The entries that previously sat here (the Context Wiki auditor,
-Context Health, and the code-review dimension) merged to the release branch
-and now live under [0.3.0] below.
+Nothing yet.
+
+## [0.3.1] — 2026-07-25 (launch reliability, second brain, e2e harness)
+
+### Fixed
+
+- **The app always opens or says why it can't.** A field report ("sometimes
+  opens, sometimes doesn't; restarting the laptop fixes it") led to four
+  launch-path fixes: a notification-center crash guard (constructing
+  `UNUserNotificationCenter` without app-bundle context SIGABRTed the whole
+  launch — notifications now degrade instead), duplicate-launch arbitration
+  against a main-run-loop app-alive marker (a hung invisible incumbent is
+  taken over instead of silently deferred to until reboot; a healthy one is
+  surfaced), Keychain reads moved off the pre-UI main thread with a visible
+  "Supervisor is starting" panel when macOS parks the launch on a
+  SecurityAgent prompt, and a loud alert-then-exit on database-open failure
+  instead of a lock-holding zombie. Plus: dock re-click surfaces the UI,
+  translocated from-the-dmg launches get a move-to-Applications prompt, and
+  the single-instance release no longer unlinks the pidfile (a rare
+  permanent two-instance race).
+- **Transcript tailing**: shared `TranscriptTail` fixes a UTF-8
+  tail-boundary drop and maps EOF to empty data (an empty transcript is
+  `[]`, not an error).
+- **Intervention honesty**: outcomes and banner dismissals persist per
+  flag, so the audit log reflects what was actually delivered and seen.
+
+### Added
+
+- **Second Brain (iterative memory)** — the Context Wiki subsystem gains a
+  closed loop: Supervisor distills the knowledge users reveal in their own
+  sessions (corrections, decisions, preferences — user-authored text only,
+  fully redacted before it exists) into a locally-owned, provider-agnostic
+  memory that measurably improves each iteration. Motivated by Nadella's
+  "Reverse Information Paradox" (July 2026): you pay for AI twice — money,
+  plus the proprietary knowledge you reveal to make it useful — so that
+  second payment should accumulate in *your* tenant, not evaporate. Per
+  iteration: capture → redact → merge (re-observed facts confirm and gain
+  confidence) → retire (contradicted or stale facts) → measure (an
+  `IterationDelta`: added/confirmed/merged/retired/active) → render
+  (`SECOND-BRAIN.md`). Plain Markdown + JSON on disk and rows in the local
+  sqlite DB (migration v9, root-keyed history like `context_audits`), so
+  switching models or providers never loses the brain. Opt-in and additive:
+  nothing runs unless invoked (`SupervisorDevTools second-brain <root>`).
+  The optional LLM refinement pass follows the SourceSurveyor pattern —
+  injectable, nil by default, deterministic fallback on any failure.
+- **Agent Skill: "Build a second brain" workflow** — the portable twin in
+  `skills/supervisor/`: `scripts/second_brain.py` (extract → host-agent
+  curation → merge, same entry vocabulary and loop contract — with three
+  documented divergences, see `references/second-brain.md` — deterministic
+  ids, idempotent merges, atomic ledger writes, corrupt-ledger refusal) plus
+  a curation rubric in `references/second-brain.md`. The brain lives at
+  `<project>/.supervisor/second-brain/` (memory.md regenerated from
+  brain.json each merge; append-only iteration-log.md). The skill never
+  auto-edits CLAUDE.md or other agent instruction files — promotions are
+  propose-only.
+- **True-new-user E2E harness** — `Scripts/e2e/`: launches a fully isolated
+  Supervisor instance (fake home via `SUPERVISOR_HOME`, namespaced Keychain
+  via `SUPERVISOR_KEYCHAIN_PREFIX`, pre-launch `--print-paths` gate) and
+  drives real new-user scenarios: running state, scripted fake sessions,
+  double-launch, crash-relaunch. Failed runs preserve their evidence.
 
 ## [0.3.0] — 2026-06-29 (planner + evaluator + generator harness, observability, and hardening)
 

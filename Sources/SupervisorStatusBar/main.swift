@@ -330,6 +330,19 @@ final class StatusBarController: NSObject {
     }
 
     private func tick() {
+        // Parent-liveness, same rule as the heartbeat child: spawned as a
+        // direct child of Supervisor.app, so a dead/killed parent reparents
+        // us to launchd (getppid()==1). Without this, a taken-over or
+        // SIGKILLed main app leaves an orphaned second menu-bar icon that
+        // reads the NEW instance's heartbeat, shows green, and whose Quit
+        // targets the wrong process. Exit; the replacement instance spawns
+        // its own icon.
+        if getppid() == 1 {
+            trace.emit("statusbar", "parent gone (getppid=1) — exiting so a replacement instance owns the icon")
+            trace.sync()
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+            return
+        }
         let age = (try? heartbeat.ageSeconds()) ?? .infinity
         // FIX 4: fold in the engine-progress token. A read failure or a missing
         // file both surface as .infinity → engine-stale, so a live process over a

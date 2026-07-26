@@ -36,6 +36,28 @@ public enum FlagUserResponse: String, Codable, Sendable, CaseIterable {
     case approved, dismissed, falsePositive = "false_positive", rejected
 }
 
+/// issue #60 follow-up: the payload-free, string-coded kind of a real
+/// `InterventionOutcome`, persisted on `flags.intervention_outcome`
+/// (migration v10). One case per InterventionOutcome case — the associated
+/// values (PIDs, intended text, doc paths) stay in the trace/banner where
+/// they already live; the scorecard only needs WHICH outcome happened.
+/// String-coded snake_case for a stable on-disk representation (same
+/// pattern as FlagSeverity / FlagAction / FlagUserResponse). Like those
+/// enums, decoding an UNKNOWN raw value throws and fails the row fetch —
+/// adding a case is a forward migration concern, not silently absorbed.
+public enum InterventionOutcomeKind: String, Codable, Sendable, CaseIterable {
+    case notifyOnly = "notify_only"
+    case pauseSucceeded = "pause_succeeded"
+    case killSucceeded = "kill_succeeded"
+    case injectSucceeded = "inject_succeeded"
+    case injectDegraded = "inject_degraded"
+    case screenRecordingDenied = "screen_recording_denied"
+    case continueFired = "continue_fired"
+    case continueProposedMedium = "continue_proposed_medium"
+    case continueLowConfidence = "continue_low_confidence"
+    case queued
+}
+
 // MARK: - Session
 
 public struct StoredSession: Codable, FetchableRecord, PersistableRecord, Sendable, Equatable {
@@ -100,6 +122,11 @@ public struct StoredFlag: Codable, FetchableRecord, PersistableRecord, Sendable,
     public var asymmetryNote: String?            // v0.1.2: optional asymmetry-of-being-wrong note
     public var evidenceUuids: String             // JSON-encoded array; v0.1.x small enough not to need a join table
     public var userResponse: FlagUserResponse?
+    /// issue #60 follow-up: what the intervention ACTUALLY did (migration v10),
+    /// written after the fact by FlagStore.markInterventionOutcome from the
+    /// Notifier's result hook. nil = no outcome recorded (rows predating the
+    /// column, or a decision that never reached the router's result hook).
+    public var interventionOutcome: InterventionOutcomeKind?
 
     public var haikuInputTokens: Int?
     public var haikuOutputTokens: Int?
@@ -118,6 +145,7 @@ public struct StoredFlag: Codable, FetchableRecord, PersistableRecord, Sendable,
         asymmetryNote: String? = nil,
         evidenceUuids: [String] = [],
         userResponse: FlagUserResponse? = nil,
+        interventionOutcome: InterventionOutcomeKind? = nil,
         haikuInputTokens: Int? = nil,
         haikuOutputTokens: Int? = nil,
         sonnetInputTokens: Int? = nil,
@@ -136,6 +164,7 @@ public struct StoredFlag: Codable, FetchableRecord, PersistableRecord, Sendable,
         let data = (try? JSONEncoder().encode(evidenceUuids)) ?? Data("[]".utf8)
         self.evidenceUuids = String(data: data, encoding: .utf8) ?? "[]"
         self.userResponse = userResponse
+        self.interventionOutcome = interventionOutcome
         self.haikuInputTokens = haikuInputTokens
         self.haikuOutputTokens = haikuOutputTokens
         self.sonnetInputTokens = sonnetInputTokens
@@ -163,6 +192,7 @@ public struct StoredFlag: Codable, FetchableRecord, PersistableRecord, Sendable,
         case asymmetryNote = "asymmetry_note"
         case evidenceUuids = "evidence_uuids"
         case userResponse = "user_response"
+        case interventionOutcome = "intervention_outcome"
         case haikuInputTokens = "haiku_input_tokens"
         case haikuOutputTokens = "haiku_output_tokens"
         case sonnetInputTokens = "sonnet_input_tokens"

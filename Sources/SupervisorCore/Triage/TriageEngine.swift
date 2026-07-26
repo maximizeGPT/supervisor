@@ -31,6 +31,16 @@ public struct TriageDecision: Sendable {
     /// v0.1.6: the most recent user prompt in the window, surfaced separately
     /// so the recovery doc can quote it verbatim without re-walking events.
     public let lastUserPrompt: String?
+    /// issue #60 follow-up: the `flags` table row id this decision was
+    /// persisted as. The app layer stamps it right after the FlagStore insert
+    /// (main.swift handle(decision:)), BEFORE the router dispatch, so the
+    /// Notifier's result hook can write the REAL InterventionOutcome back onto
+    /// this exact row (FlagStore.markInterventionOutcome) and the banner can
+    /// carry the id for the dismiss-response delegate path. nil for a decision
+    /// that was never persisted (tests, older callers) — every persistence
+    /// consumer skips on nil. `var` (not `let`) precisely so the app layer can
+    /// stamp it post-insert without reconstructing the whole decision.
+    public var flagId: String?
 
     public enum PrePost: Sendable {
         case preExecution     // tool_result not yet in window
@@ -47,7 +57,8 @@ public struct TriageDecision: Sendable {
         model: String,
         prePost: PrePost,
         recentEvents: [SupervisorEvent] = [],
-        lastUserPrompt: String? = nil
+        lastUserPrompt: String? = nil,
+        flagId: String? = nil
     ) {
         self.sessionId = sessionId
         self.cwd = cwd
@@ -59,6 +70,7 @@ public struct TriageDecision: Sendable {
         self.prePost = prePost
         self.recentEvents = recentEvents
         self.lastUserPrompt = lastUserPrompt
+        self.flagId = flagId
     }
 }
 
@@ -1595,7 +1607,10 @@ public final class TriageEngine {
     /// per idle tick so it toggles live without a restart. Disables ONLY the
     /// worker_idle auto-dispatch loop; safety triage is a different path.
     nonisolated public static var autoDispatchDisabled: Bool {
-        let marker = FileManager.default.homeDirectoryForCurrentUser
+        // resolvedHome, not homeDirectoryForCurrentUser: a SUPERVISOR_HOME-
+        // isolated instance (E2E harness) must read ITS OWN dispatch marker,
+        // never toggle-with / read the live app's.
+        let marker = ConfigPaths.resolvedHome
             .appendingPathComponent("Library/Application Support/Supervisor/dispatch-disabled.marker")
         return FileManager.default.fileExists(atPath: marker.path)
     }

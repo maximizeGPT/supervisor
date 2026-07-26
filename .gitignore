@@ -47,3 +47,6 @@ trials/runs/
 
 # Stray, unreferenced entitlements (signing uses Scripts/default-entitlements.plist)
 supervisor.entitlements
+
+# Python bytecode from running the skill self-tests
+__pycache__/

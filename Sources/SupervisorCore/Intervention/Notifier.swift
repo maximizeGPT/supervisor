@@ -109,12 +109,85 @@ public enum InterventionOutcome: Sendable, Equatable {
     case queued(promptHead: String)
 }
 
+public extension InterventionOutcome {
+    /// issue #60 follow-up: the payload-free kind persisted to
+    /// `flags.intervention_outcome` (FlagStore.markInterventionOutcome). The
+    /// associated values (PIDs, intended text, doc paths) stay in the trace +
+    /// banner where they already live; the scorecard only needs WHICH outcome
+    /// the executor actually produced.
+    var kind: InterventionOutcomeKind {
+        switch self {
+        case .notifyOnly:             return .notifyOnly
+        case .pauseSucceeded:         return .pauseSucceeded
+        case .killSucceeded:          return .killSucceeded
+        case .injectSucceeded:        return .injectSucceeded
+        case .injectDegraded:         return .injectDegraded
+        case .screenRecordingDenied:  return .screenRecordingDenied
+        case .continueFired:          return .continueFired
+        case .continueProposedMedium: return .continueProposedMedium
+        case .continueLowConfidence:  return .continueLowConfidence
+        case .queued:                 return .queued
+        }
+    }
+}
+
+/// Gate in front of every `UNUserNotificationCenter.current()` touch.
+/// `current()` does not return nil on failure — it raises
+/// NSInternalInconsistencyException and the uncaught exception abort()s the
+/// process — whenever the process has no bundle identifier (a bare binary,
+/// a detached spawn, the SPM xctest harness). That abort took down real user
+/// launches: three identical SIGABRTs on 2026-07-05, crash frame
+/// `+[UNUserNotificationCenter currentNotificationCenter]` inside
+/// `enterRunningState`. Notifications must degrade; they must never decide
+/// whether the app launches.
+public enum NotificationCenterGate {
+    /// A bundle identifier alone is NOT sufficient: the SPM xctest runner
+    /// has one, and `current()` still aborts there with
+    /// "bundleProxyForCurrentProcess is nil" (proven by this package's own
+    /// test run). The condition UserNotifications actually needs is a real
+    /// registered .app bundle, so gate on both.
+    public static var available: Bool {
+        Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
+    }
+}
+
+/// The degraded stand-in when the notification center is unavailable: keeps
+/// the InterventionRouter fully functional (inject/pause/kill still run) and
+/// records every banner it could not post in the trace log.
+public struct TraceOnlyNotifier: Notifying {
+    private let trace: TraceLog
+
+    public init(trace: TraceLog = .shared) {
+        self.trace = trace
+    }
+
+    public func post(decision: TriageDecision) async -> Notifier.Outcome {
+        trace.emit("notifier", "degraded (no bundle identifier): banner suppressed for \(decision.candidate.category)")
+        return .failed(reason: "notification center unavailable: no bundle identifier")
+    }
+}
+
 public final class Notifier: Notifying, @unchecked Sendable {
 
     public enum Outcome: Sendable, Equatable {
         case posted
         case skippedDeniedSilently  // Spike-2 path: center.add succeeded but no banner
         case failed(reason: String)
+    }
+
+    /// The only safe way to build a real Notifier from app code. Returns nil
+    /// (instead of crashing the launch) when `UNUserNotificationCenter.current()`
+    /// would abort — see NotificationCenterGate. The plain `init` stays for
+    /// tests that inject their own center.
+    public static func ifAvailable(
+        trace: TraceLog = .shared,
+        onResult: (@Sendable (TriageDecision, InterventionOutcome) -> Void)? = nil
+    ) -> Notifier? {
+        guard NotificationCenterGate.available else {
+            trace.emit("notifier", "ERROR notification center unavailable (no bundle identifier); notifications disabled, launch continues")
+            return nil
+        }
+        return Notifier(trace: trace, onResult: onResult)
     }
 
     private let center: UNUserNotificationCenter
@@ -136,22 +209,41 @@ public final class Notifier: Notifying, @unchecked Sendable {
         self.onResult = onResult
     }
 
-    // MARK: - Context Health (the single earned nudge)
+    // MARK: - Notification categories
 
     /// Category + action identifiers for the one Context Health notification. The
     /// app registers the category and handles the action to open the window.
     public static let contextHealthCategoryID = "SUPERVISOR_CONTEXT_HEALTH"
     public static let contextHealthShowActionID = "SUPERVISOR_SHOW_CONTEXT_HEALTH"
 
-    /// Register the Context Health notification category (its "Show me" action).
-    /// Call once at launch. (Flags don't use categories, so setting this one is
-    /// safe; if that ever changes, merge with the existing set instead.)
-    public func registerContextHealthCategory() {
+    /// issue #60 follow-up: the category every flag banner now carries. It has
+    /// NO actions (banner appearance is unchanged) — its one job is
+    /// `.customDismissAction`, which makes macOS deliver an explicit banner
+    /// dismissal (UNNotificationDismissActionIdentifier) to the app delegate,
+    /// where it lands as `flags.user_response = dismissed` via
+    /// FlagStore.markUserResponseIfUnset. A plain tap (default action) is
+    /// engagement, not a response, and is deliberately NOT recorded.
+    public static let flagCategoryID = "SUPERVISOR_FLAG"
+
+    /// userInfo key carrying the `flags` table row id on a flag banner, so the
+    /// delegate's dismiss handler can address the exact persisted row. Only
+    /// set when the decision was actually persisted (decision.flagId != nil).
+    public static let flagIdUserInfoKey = "supervisor_flag_id"
+
+    /// Register the notification categories: Context Health (its "Show me"
+    /// action) + the flag category (dismiss-action delivery). Call once at
+    /// launch. `setNotificationCategories` REPLACES the set, so both are
+    /// registered together (the merge the old per-category comment promised
+    /// once flags started using a category).
+    public func registerNotificationCategories() {
         let show = UNNotificationAction(
             identifier: Self.contextHealthShowActionID, title: "Show me", options: [.foreground])
-        let category = UNNotificationCategory(
+        let contextHealth = UNNotificationCategory(
             identifier: Self.contextHealthCategoryID, actions: [show], intentIdentifiers: [], options: [])
-        center.setNotificationCategories([category])
+        let flag = UNNotificationCategory(
+            identifier: Self.flagCategoryID, actions: [], intentIdentifiers: [],
+            options: [.customDismissAction])
+        center.setNotificationCategories([contextHealth, flag])
     }
 
     /// Post THE single Context Health nudge — the one earned notification fired the
@@ -189,6 +281,7 @@ public final class Notifier: Notifying, @unchecked Sendable {
         content.title = Self.plainTitle(for: .notifyOnly)
         content.body = body(for: decision)
         content.sound = .default
+        Self.attachFlagIdentity(to: content, decision: decision)
 
         let request = UNNotificationRequest(
             identifier: "supervisor.flag.\(UUID().uuidString)",
@@ -349,6 +442,7 @@ public final class Notifier: Notifying, @unchecked Sendable {
         content.title = Self.plainTitle(for: outcome)
         content.body = body(for: decision, outcome: outcome)
         content.sound = .default
+        Self.attachFlagIdentity(to: content, decision: decision)
 
         let request = UNNotificationRequest(
             identifier: "supervisor.flag.\(UUID().uuidString)",
@@ -374,6 +468,19 @@ public final class Notifier: Notifying, @unchecked Sendable {
         } catch {
             trace.emit("notifier", "ERROR center.add threw outcome=\(outcome): \(error)")
             return .failed(reason: "\(error)")
+        }
+    }
+
+    /// issue #60 follow-up: stamp a flag banner with the flag category (so its
+    /// explicit dismissal is delivered to the delegate — `.customDismissAction`)
+    /// and, when the decision was persisted, the flag row id in userInfo so the
+    /// dismiss handler can address the exact row. Shared by both flag-banner
+    /// paths (`post` + `postInterventionResult`); the Context Health nudge has
+    /// its own category and never routes through here.
+    private static func attachFlagIdentity(to content: UNMutableNotificationContent, decision: TriageDecision) {
+        content.categoryIdentifier = flagCategoryID
+        if let flagId = decision.flagId {
+            content.userInfo[flagIdUserInfoKey] = flagId
         }
     }
 

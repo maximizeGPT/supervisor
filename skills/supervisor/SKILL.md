@@ -1,6 +1,6 @@
 ---
 name: supervisor
-description: Supervise your other coding-agent sessions from the agent you are already in. Lists active Claude Code sessions and Codex CLI rollouts, reviews what each one is doing, and flags real problems (destructive commands pending, fabricated claims, stuck loops, credential exposure, scope creep) using Supervisor's triage rubric. Can also install a hook that blocks destructive shell commands, and generate a per-repo principles.md for unattended runs. Use when the user asks to supervise, watch, babysit, or check on their agent sessions, asks what their other sessions are doing, or wants guardrails for running agents unattended.
+description: Supervise your other coding-agent sessions from the agent you are already in. Lists active Claude Code sessions and Codex CLI rollouts, reviews what each one is doing, and flags real problems (destructive commands pending, fabricated claims, stuck loops, credential exposure, scope creep) using Supervisor's triage rubric. Can also install a hook that blocks destructive shell commands, generate a per-repo principles.md for unattended runs, and build a second brain, a plain-Markdown project memory distilled from the user's own sessions that improves each iteration. Use when the user asks to supervise, watch, babysit, or check on their agent sessions, asks what their other sessions are doing, wants guardrails for running agents unattended, or wants the project to remember decisions, corrections, and preferences across sessions.
 license: MIT
 compatibility: Requires python3 (3.9+) and Claude Code session transcripts in ~/.claude/projects. Guard mode requires an agent that supports Claude Code style PreToolUse hooks.
 metadata:
@@ -16,7 +16,7 @@ This skill is the portable version of [Supervisor](https://github.com/maximizeGP
 - The skill **cannot** answer questions inside other sessions, pause them, or kill them. The Mac app does that.
 - Guard mode **can** block destructive shell commands, but only in the session where the hook is installed.
 
-Three workflows. Pick by what the user asked for.
+Four workflows. Pick by what the user asked for.
 
 ## 1. Check on sessions (the default)
 
@@ -75,6 +75,32 @@ When the user wants their unattended sessions to make better calls, generate a p
 2. Study the repo: README, contributing docs, deploy scripts, test setup, anything that shows which actions are low-stakes here and which are consequential.
 3. Write a tailored `principles.md` at the repo root (or where the user prefers), keeping the answer-versus-defer structure and the hard rule that destructive or irreversible actions are never self-authorized. Make it concrete to this repo: name the real commands, the real deploy path, the real test suite.
 4. Tell the user to reference it from their agent instructions (CLAUDE.md, AGENTS.md, or equivalent) so unattended sessions actually load it.
+
+## 4. Build a second brain (iterative memory)
+
+When the user wants the project to remember what their sessions taught them, run the second-brain loop. The motivation is what Nadella called the Reverse Information Paradox (July 2026): users pay for AI twice, in money and in the proprietary knowledge they reveal in prompts and corrections, and that second payment evaporates when the session ends. The second brain captures it into plain Markdown that lives in the user's own repo, readable by any model or agent, and measured every iteration. Honest scope, same shape as the rest of this skill: it watches and distills. It never auto-edits CLAUDE.md or any agent instruction file, and the memory never leaves the user's repo.
+
+Division of labor: the script does the deterministic mechanics (transcript discovery, redaction, merge, retirement, measurement); you do the judgment (curation).
+
+1. Extract candidates from this project's recent transcripts:
+   ```bash
+   python3 "${CLAUDE_SKILL_DIR:-.}/scripts/second_brain.py" extract --project "$(pwd)" --since-hours 24
+   ```
+   Output is JSON: candidate entries pulled from user-authored messages only, already redacted (same rules as the other scripts; treat `<redacted:...>` placeholders as secrets that existed). The heuristics are deliberately narrow and will miss things you noticed in your own session; you add those during curation.
+
+2. Curate against `references/second-brain.md` (read it before your first curation in a conversation). Keep durable project facts, drop noise, rewrite for precision, and never store secrets, even redacted-adjacent ones.
+
+3. Merge the curated list, as JSON on stdin:
+   ```bash
+   python3 "${CLAUDE_SKILL_DIR:-.}/scripts/second_brain.py" merge --brain-dir "$(pwd)/.supervisor/second-brain" <<'EOF'
+   [{"kind": "decision", "text": "use ruff for linting, not flake8"}]
+   EOF
+   ```
+   The script confirms exact re-observations (bumping confidence a step), merges near-duplicates, retires entries unconfirmed for 5 iterations, regenerates memory.md from brain.json, and prints the iteration delta (added / confirmed / merged / retired / active_total). Report the delta to the user: it is the evidence the memory is improving, not just growing. An empty list `[]` is a valid iteration that only ages stale entries.
+
+4. `show --brain-dir ...` prints where the memory lives and its current state. When an entry has earned promotion into CLAUDE.md (criteria in the reference), propose the exact line for the user to paste; the user applies it, never you.
+
+The brain is three files under `<project>/.supervisor/second-brain/`: memory.md (human-readable, regenerated on every merge, so hand-edits there are lost by design), brain.json (the ledger, source of truth), and iteration-log.md (append-only measurement history). Whether to commit the directory is the user's call; suggest it, since a memory that lives in the repo travels with the repo.
 
 ## Rules that always apply
 

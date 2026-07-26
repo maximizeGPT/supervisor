@@ -352,6 +352,55 @@ public final class SupervisorDatabase: @unchecked Sendable {
             )
         }
 
+        // v0.4.x Second Brain: one row per memory-optimization iteration. Like
+        // context_audits this is keyed to a PROJECT ROOT, not a live session —
+        // the brain outlives any one session, so there is no sessions FK (and
+        // dedupe/retire state must survive session-row cascades). The delta
+        // columns (added/confirmed/merged/retired/active) make "is the brain
+        // growing or converging" a cheap SQL read; the full `MemoryLedger` is
+        // kept verbatim in `ledger_json` — the loop's resume point — the same
+        // JSON-in-a-column choice flags.evidence_uuids / plan_steps.last_verdict
+        // / context_audits.report_json already make. Every string in the blob
+        // was redacted BEFORE distillation, so no transcript secret can reach
+        // this table.
+        m.registerMigration("v9_second_brain_ledgers") { db in
+            try db.create(table: "second_brain_ledgers") { t in
+                t.column("id", .text).primaryKey()
+                t.column("root", .text).notNull()               // project root the brain belongs to
+                t.column("generated_at", .datetime).notNull()
+                t.column("iteration", .integer).notNull().defaults(to: 0)
+                t.column("added_count", .integer).notNull().defaults(to: 0)
+                t.column("confirmed_count", .integer).notNull().defaults(to: 0)
+                t.column("merged_count", .integer).notNull().defaults(to: 0)
+                t.column("retired_count", .integer).notNull().defaults(to: 0)
+                t.column("active_entries", .integer).notNull().defaults(to: 0)
+                t.column("ledger_json", .text).notNull().defaults(to: "{}")      // full MemoryLedger, re-renderable
+            }
+            try db.create(
+                index: "second_brain_ledgers_by_root_generated",
+                on: "second_brain_ledgers",
+                columns: ["root", "generated_at"]
+            )
+        }
+
+        // issue #60 follow-up: persist the REAL intervention outcome per flag.
+        // The executor's result (InterventionOutcome: injectSucceeded vs
+        // injectDegraded, pauseSucceeded, continueFired, queued, ...) used to
+        // flow Notifier -> HoverViewModel.recordInterventionOutcome into the
+        // in-memory recentActions list and the TraceLog ONLY, so the trust
+        // scorecard could not count what the interventions actually did. One
+        // nullable TEXT column on `flags` (written by
+        // FlagStore.markInterventionOutcome from the same result hook that
+        // drives the banner + hover label) — not a new table, because the
+        // outcome is 1:1 with the flag row the decision already persisted.
+        // NULL means "no outcome recorded": every row predating this column,
+        // and any flag whose decision never reached the router's result hook.
+        m.registerMigration("v10_flag_intervention_outcome") { db in
+            try db.alter(table: "flags") { t in
+                t.add(column: "intervention_outcome", .text)
+            }
+        }
+
         return m
     }
 }

@@ -80,7 +80,7 @@ public final class EventParser: Sendable {
         if !emittedSessionStart,
            let sessionId = obj["sessionId"] as? String,
            let cwd = obj["cwd"] as? String, !cwd.isEmpty,
-           let ts = parseTS(obj["timestamp"]) ?? parseTS(obj["timestamp"] as? String) {
+           let ts = TranscriptTail.parseTS(obj["timestamp"]) {
             let gitBranch = obj["gitBranch"] as? String
             emitted.append(.sessionStart(.init(
                 sessionId: sessionId,
@@ -120,7 +120,7 @@ public final class EventParser: Sendable {
 
     private func parseUserMessage(_ obj: [String: Any]) -> [SupervisorEvent] {
         guard let sessionId = obj["sessionId"] as? String,
-              let ts = parseTS(obj["timestamp"]) else { return [] }
+              let ts = TranscriptTail.parseTS(obj["timestamp"]) else { return [] }
         guard let message = obj["message"] as? [String: Any] else { return [] }
 
         var out: [SupervisorEvent] = []
@@ -172,7 +172,7 @@ public final class EventParser: Sendable {
 
     private func parseAssistantMessage(_ obj: [String: Any]) -> [SupervisorEvent] {
         guard let sessionId = obj["sessionId"] as? String,
-              let ts = parseTS(obj["timestamp"]),
+              let ts = TranscriptTail.parseTS(obj["timestamp"]),
               let turnUUID = obj["uuid"] as? String else { return [] }
         guard let message = obj["message"] as? [String: Any],
               let content = message["content"] as? [[String: Any]] else { return [] }
@@ -233,7 +233,7 @@ public final class EventParser: Sendable {
 
     private func parseSystem(_ obj: [String: Any]) -> [SupervisorEvent] {
         guard let sessionId = obj["sessionId"] as? String,
-              let ts = parseTS(obj["timestamp"]) else { return [] }
+              let ts = TranscriptTail.parseTS(obj["timestamp"]) else { return [] }
         let subtype = (obj["subtype"] as? String) ?? "unknown"
         let prevented = (obj["preventedContinuation"] as? Bool) ?? false
         return [.systemSignal(.init(
@@ -245,22 +245,6 @@ public final class EventParser: Sendable {
     }
 
     // MARK: - Helpers
-
-    private static let isoFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-    private static let isoFormatterNoFrac: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
-
-    private func parseTS(_ raw: Any?) -> Date? {
-        guard let str = raw as? String else { return nil }
-        return Self.isoFormatter.date(from: str) ?? Self.isoFormatterNoFrac.date(from: str)
-    }
 
     /// True when a user-role message's text is machine-generated, not typed
     /// by the owner: slash-command echoes (the CLI records the expansion as a

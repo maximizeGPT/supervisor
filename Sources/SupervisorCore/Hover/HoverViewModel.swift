@@ -1098,6 +1098,23 @@ public final class HoverViewModel: ObservableObject {
     /// the banner; it NEVER claims it answered. This replaces the old eager
     /// record that fired at decision time with the intent label.
     public func recordInterventionOutcome(_ decision: TriageDecision, _ outcome: InterventionOutcome) {
+        // issue #60 follow-up: persist the REAL outcome onto the flag row
+        // FIRST, before the action-log gate below — a notifyOnly or
+        // continueLowConfidence records no in-memory action, but it is still a
+        // real outcome the trust scorecard counts. The decision carries the
+        // flag row id (main.swift stamps it right after the FlagStore insert);
+        // nil flagId (tests / a decision that was never persisted) or no
+        // flagStore skips the write, and a write failure is traced and
+        // swallowed — persistence is observability, it must never break the
+        // hover's honest-label path it rides on.
+        if let flagId = decision.flagId, let store = flagStore {
+            do {
+                try store.markInterventionOutcome(flagId: flagId, outcome: outcome.kind)
+                trace.emit("hover", "intervention outcome persisted flagId=\(flagId) outcome=\(outcome.kind.rawValue)")
+            } catch {
+                trace.emit("hover", "intervention outcome persist ERROR flagId=\(flagId): \(error)")
+            }
+        }
         guard let result = Self.actionForOutcome(outcome) else { return }
         recordAction(action: result.action, description: result.label)
         plainLabel = result.label

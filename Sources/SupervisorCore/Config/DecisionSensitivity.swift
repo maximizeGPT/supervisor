@@ -104,7 +104,7 @@ public enum DecisionSensitivityStore {
     /// or the stored value is unrecognized (forward/backward safe).
     /// `defaults` is injectable for tests so a round-trip never touches the
     /// app's real `.standard` domain.
-    public static func current(defaults: UserDefaults = .standard) -> DecisionSensitivity {
+    public static func current(defaults: UserDefaults = SupervisorDefaults.shared) -> DecisionSensitivity {
         guard let raw = defaults.string(forKey: defaultsKey),
               let value = DecisionSensitivity(rawValue: raw) else {
             return .balanced
@@ -115,7 +115,7 @@ public enum DecisionSensitivityStore {
     /// Persist a sensitivity. Survives relaunch; the engine and planner-loop
     /// construction read `current()` so the change applies (the engine on its
     /// next answer decision; the evaluator at the next planner-loop build).
-    public static func set(_ value: DecisionSensitivity, defaults: UserDefaults = .standard) {
+    public static func set(_ value: DecisionSensitivity, defaults: UserDefaults = SupervisorDefaults.shared) {
         defaults.set(value.rawValue, forKey: defaultsKey)
     }
 }

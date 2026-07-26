@@ -134,19 +134,49 @@ public enum LLMProvider: String, Codable, CaseIterable, Sendable {
     /// in the macOS Keychain. Each provider gets its own service
     /// so users can switch back and forth without re-entering.
     public var keychainService: String {
+        keychainService(base: Self.keychainServiceBase)
+    }
+
+    /// Injectable-base variant (unit-testable without touching the process
+    /// environment): `<base>.<provider-suffix>`.
+    public func keychainService(base: String) -> String {
+        let suffix: String
         switch self {
-        case .anthropic: return "live.supervisor.api.anthropic"
-        case .deepseek:  return "live.supervisor.api.deepseek"
-        case .moonshot:  return "live.supervisor.api.moonshot"
-        case .minimax:   return "live.supervisor.api.minimax"
-        case .qwenHF:    return "live.supervisor.api.qwenhf"
-        case .openrouter: return "live.supervisor.api.openrouter"
+        case .anthropic:  suffix = "anthropic"
+        case .deepseek:   suffix = "deepseek"
+        case .moonshot:   suffix = "moonshot"
+        case .minimax:    suffix = "minimax"
+        case .qwenHF:     suffix = "qwenhf"
+        case .openrouter: suffix = "openrouter"
         }
+        return base + "." + suffix
+    }
+
+    /// Base of every Supervisor Keychain service name. Production:
+    /// `live.supervisor.api`. When `$SUPERVISOR_KEYCHAIN_PREFIX` is set
+    /// (e.g. `test.supervisor.e2e`), it replaces the base, so an isolated
+    /// E2E instance's key writes — including onboarding's first save and
+    /// `migrateLegacyKeyIfPresent()`'s DELETE of the legacy item — land on
+    /// items fully disjoint from a live Supervisor's real keys.
+    public static var keychainServiceBase: String {
+        keychainServiceBase(environment: ProcessInfo.processInfo.environment)
+    }
+
+    /// Injectable-environment variant so tests can assert the override logic
+    /// without `setenv` (ProcessInfo caches its environment snapshot on first
+    /// access, so an in-test `setenv` is not reliably visible).
+    public static func keychainServiceBase(environment: [String: String]) -> String {
+        if let prefix = environment["SUPERVISOR_KEYCHAIN_PREFIX"], !prefix.isEmpty {
+            return prefix
+        }
+        return "live.supervisor.api"
     }
 
     /// Where the v0.1.x Anthropic-only Keychain item lived. Used by
-    /// `migrateLegacyKeyIfPresent()` once on v0.2.0 first launch.
-    public static let legacyAnthropicKeychainService = "live.supervisor.api"
+    /// `migrateLegacyKeyIfPresent()` once on v0.2.0 first launch. Computed
+    /// off `keychainServiceBase` (it IS the bare base) so an E2E instance's
+    /// migration path deletes only a prefixed test item, never the live one.
+    public static var legacyAnthropicKeychainService: String { keychainServiceBase }
 }
 
 /// Wire-protocol shape — what kind of JSON the provider speaks.

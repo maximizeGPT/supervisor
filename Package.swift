@@ -113,21 +113,43 @@ let package = Package(
             dependencies: ["SupervisorCore", "SupervisorUI"],
             path: "Sources/ContextWikiPreview"
         ),
+        // E2E-harness support: the pure JSONL line-rewriting FakeClaudeCLI's
+        // --script mode uses (placeholder substitution + timestamp restamping).
+        // A separate leaf LIBRARY — not code inside the executable — because
+        // XCTest can't import an executable target, and folding it into
+        // SupervisorCore would break FakeClaudeCLI's independence from the
+        // code under test. Foundation-only.
+        .target(
+            name: "FakeClaudeScript",
+            dependencies: [],
+            path: "Sources/FakeClaudeScript"
+        ),
         // v0.1.4: fake-Claude harness for ProcessLocator tests. Writes
         // realistic-shaped JSONL events to a target path at a configurable
         // cadence, holds the fd open (or simulates the bad case where
         // Claude open-writes-closes), and records its PID to a sidecar
         // file so tests can verify the locator returned the right PID.
-        // Foundation-only, no SupervisorCore dependency — keeps the
-        // harness independent of the code under test.
+        // No SupervisorCore dependency — keeps the harness independent of
+        // the code under test (FakeClaudeScript is harness-side, not
+        // system-under-test). E2E harness adds --script replay mode.
         .executableTarget(
             name: "FakeClaudeCLI",
-            dependencies: [],
+            dependencies: ["FakeClaudeScript"],
             path: "Sources/FakeClaudeCLI"
+        ),
+        // E2E harness AX driver: dumps/drives an isolated Supervisor
+        // instance's AX tree BY PID from Scripts/e2e scenario scripts (tree /
+        // windows / press / set). Foundation + ApplicationServices only, no
+        // SupervisorCore — a leaf tool that stays usable even when the app
+        // is broken. Never shipped.
+        .executableTarget(
+            name: "SupervisorE2EDriver",
+            dependencies: [],
+            path: "Sources/SupervisorE2EDriver"
         ),
         .testTarget(
             name: "SupervisorCoreTests",
-            dependencies: ["SupervisorCore"],
+            dependencies: ["SupervisorCore", "FakeClaudeScript"],
             path: "Tests/SupervisorCoreTests"
         ),
         // v0.1.6.1: minimal UI test target so the host-app set has a

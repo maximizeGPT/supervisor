@@ -13,7 +13,11 @@ import Foundation
 public enum RuntimeToggles {
 
     private static var markerDir: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        // ConfigPaths.resolvedHome, not homeDirectoryForCurrentUser: a
+        // SUPERVISOR_HOME-isolated instance (E2E harness) must read/write ITS
+        // OWN markers — with the raw home here, a test instance would flip the
+        // LIVE app's pause/dispatch markers (the worst cross-instance leak).
+        ConfigPaths.resolvedHome
             .appendingPathComponent("Library/Application Support/Supervisor", isDirectory: true)
     }
 

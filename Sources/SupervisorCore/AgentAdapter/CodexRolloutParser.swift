@@ -75,7 +75,7 @@ public final class CodexRolloutParser: TranscriptLineParser {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = obj["type"] as? String,
               let payload = obj["payload"] as? [String: Any] else { return [] }
-        let ts = parseTS(obj["timestamp"]) ?? Date()
+        let ts = TranscriptTail.parseTS(obj["timestamp"]) ?? Date()
 
         switch type {
         case "session_meta":
@@ -245,19 +245,5 @@ public final class CodexRolloutParser: TranscriptLineParser {
         }
         if let any = raw { return "\(any)" }
         return ""
-    }
-
-    // MARK: - Timestamps (same shapes as EventParser)
-
-    private static let isoFrac: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
-    }()
-    private static let isoNoFrac: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f
-    }()
-
-    private func parseTS(_ raw: Any?) -> Date? {
-        guard let s = raw as? String else { return nil }
-        return Self.isoFrac.date(from: s) ?? Self.isoNoFrac.date(from: s)
     }
 }

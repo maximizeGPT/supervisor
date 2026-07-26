@@ -1,0 +1,3 @@
+{"type":"queue-operation","timestamp":"2026-01-01T00:00:00.000Z","sessionId":"__SESSION_ID__","cwd":"__CWD__","gitBranch":"main"}
+{"type":"user","timestamp":"2026-01-01T00:00:01.000Z","sessionId":"__SESSION_ID__","uuid":"u-0","message":{"role":"user","content":"add a README section about installation"}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","sessionId":"__SESSION_ID__","uuid":"a-1","message":{"role":"assistant","content":[{"type":"text","text":"Done — the installation section is added and the file is saved."}],"stop_reason":"end_turn"}}

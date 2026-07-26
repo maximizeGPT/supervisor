@@ -39,7 +39,11 @@ public enum SafeRoots {
     ///   here.
     /// - `~/Documents`, `~/Desktop` — user content.
     public static var defaults: [String] {
-        let home = NSHomeDirectory()
+        // ConfigPaths.resolvedHome (not NSHomeDirectory): under the E2E
+        // harness's SUPERVISOR_HOME the safe-listed cache/log roots must be
+        // the FAKE home's, or fixture commands touching the fake home would
+        // be judged against the live user's tree.
+        let home = ConfigPaths.resolvedHome.path
         return [
             "/tmp",
             "/var/tmp",

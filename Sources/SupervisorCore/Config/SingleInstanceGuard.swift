@@ -288,15 +288,16 @@ public enum SingleInstanceGuard {
         try? String(pid).write(to: pidfile, atomically: true, encoding: .utf8)
     }
 
-    /// Release the single-instance lock on normal termination. Removes the
-    /// pidfile only if it still records our pid (don't delete a lock a newer
-    /// instance may own), and drops our OS-level `flock` by closing the held
-    /// fd. The kernel would release the lock on exit anyway; closing here keeps
-    /// it from lingering if the process keeps running after releasing.
+    /// Release the single-instance lock on normal termination by closing the
+    /// held fd. The pidfile itself is NEVER unlinked: its content is purely
+    /// diagnostic, and unlinking opens a real two-instance hole — if the
+    /// unlink lands between a launching newcomer's open(O_CREAT) and its
+    /// flock(), the newcomer holds an exclusive lock on an inode no path
+    /// points to, and every later launch creates a fresh inode, flocks it,
+    /// and also "wins": two full instances, indefinitely. A stale pidfile
+    /// with no flock on it costs nothing (the flock, not the file, is the
+    /// mutex), so the safe release is close-only.
     public static func releaseLock(at pidfile: URL, myPID: Int32) {
-        if readRecordedPID(at: pidfile) == myPID {
-            try? FileManager.default.removeItem(at: pidfile)
-        }
         if heldLockFD >= 0 {
             close(heldLockFD)
             heldLockFD = -1

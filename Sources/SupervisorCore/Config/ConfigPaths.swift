@@ -4,6 +4,7 @@
 // `home` to redirect the whole tree under a temp directory; production
 // code uses the real home.
 
+import CryptoKit
 import Foundation
 
 public struct ConfigPaths: Sendable {
@@ -11,8 +12,53 @@ public struct ConfigPaths: Sendable {
     /// Root of the user's home directory. Production: `~`. Tests: a temp dir.
     public let home: URL
 
-    public init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
+    public init(home: URL = ConfigPaths.resolvedHome) {
         self.home = home
+    }
+
+    /// The home directory every Supervisor path derivation should hang off:
+    /// `$SUPERVISOR_HOME` (as a file URL) when set, else the real home.
+    ///
+    /// This env seam exists because stubbing `$HOME` does NOT work on macOS —
+    /// Foundation's `homeDirectoryForCurrentUser` resolves the passwd entry,
+    /// so a test instance launched with a fake `$HOME` still reads and writes
+    /// the LIVE user's Application Support, Logs, pause markers, and pidfile.
+    /// `SUPERVISOR_HOME` is our own variable, honored at every raw home
+    /// derivation (this type, RuntimeToggles, SafeRoots, the app's report /
+    /// Codex dirs, the desktop targeter's fallbacks), which is what lets the
+    /// E2E harness run a "true new user" instance fully disjoint from a live
+    /// Supervisor on the same machine.
+    public static var resolvedHome: URL {
+        resolvedHome(environment: ProcessInfo.processInfo.environment)
+    }
+
+    /// Injectable-environment variant so tests can assert the override logic
+    /// without `setenv` (ProcessInfo caches its environment snapshot on first
+    /// access, so an in-test `setenv` is not reliably visible).
+    public static func resolvedHome(environment: [String: String]) -> URL {
+        if let override = environment["SUPERVISOR_HOME"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    /// Short stable identity for THIS instance's home — the first 12 hex
+    /// chars of sha256(resolvedHome.path). Anything cross-process but
+    /// machine-GLOBAL (the duplicate-launch activate DistributedNotification,
+    /// the SUPERVISOR_HOME UserDefaults suite) is namespaced by this, so two
+    /// instances with different homes (the live app + an E2E test instance)
+    /// can never signal or share state with each other, while poster and
+    /// observer WITHIN one instance's world always agree. 12 hex = 48 bits:
+    /// collision-proof for the handful of homes one machine ever sees, short
+    /// enough to read inside a notification name.
+    public static var homeIdentityHash: String {
+        identityHash(forHomePath: resolvedHome.path)
+    }
+
+    /// Pure variant for tests and callers that already resolved a home.
+    public static func identityHash(forHomePath path: String) -> String {
+        let digest = SHA256.hash(data: Data(path.utf8))
+        return String(digest.map { String(format: "%02x", $0) }.joined().prefix(12))
     }
 
     /// `~/Library/Application Support/Supervisor/` — config + DB + heartbeat.
@@ -42,6 +88,17 @@ public struct ConfigPaths: Sendable {
     /// SingleInstanceGuard).
     public var pidfilePath: URL {
         appSupportDir.appendingPathComponent("supervisor.pid", isDirectory: false)
+    }
+
+    /// `~/Library/Application Support/Supervisor/app-alive.txt`
+    /// Touched every ~5s by a Timer on the app's MAIN run loop from the
+    /// moment it claims the single-instance lock. Distinct from
+    /// heartbeat.txt on purpose: heartbeat freshness means "supervision is
+    /// live" (menu-bar health), app-alive freshness means "the main thread
+    /// is turning" — which is what a duplicate launch consults to decide
+    /// activate-vs-takeover (see DuplicateLaunchPolicy).
+    public var appAlivePath: URL {
+        appSupportDir.appendingPathComponent("app-alive.txt", isDirectory: false)
     }
 
     /// `~/Library/Application Support/Supervisor/recovery/` — one markdown file

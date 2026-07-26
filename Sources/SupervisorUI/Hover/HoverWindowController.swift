@@ -260,6 +260,25 @@ public final class HoverWindowController {
         currentlyVisible = true
     }
 
+    /// User-attention surface (dock reopen / duplicate launch): show the
+    /// band unconditionally for a few seconds, then hand visibility back to
+    /// the normal frontmost-terminal gate. The gated `present()` is a silent
+    /// no-op when the user just clicked in Finder (Finder is frontmost), so
+    /// attention events ride the same force mechanism as action flashes.
+    public func surfaceBriefly(for seconds: TimeInterval = 4) {
+        forcedVisibleByFlash = true
+        forceShowForFlash()
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            guard let self else { return }
+            // A real action flash may have taken over meanwhile; if so its
+            // own revert path owns visibility now.
+            if !self.vm.actionFlash {
+                self.forcedVisibleByFlash = false
+                self.applyVisibility()
+            }
+        }
+    }
+
     private func applyVisibility() {
         // While a substantial action is flashing, keep the hover up no
         // matter what — the whole point is that the user sees Supervisor

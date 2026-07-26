@@ -39,6 +39,36 @@ public struct FlagStore: Sendable {
         }
     }
 
+    /// issue #60 follow-up: record a user response ONLY when none exists yet.
+    /// The notification-banner dismiss path uses this instead of
+    /// `markUserResponse`: a swiped-away banner is a weaker signal than an
+    /// explicit panel click (Dismiss / Override / False positive), so it must
+    /// never overwrite one. An unknown flag id or an already-responded row is
+    /// a silent no-op, mirroring the UPDATE-no-match behavior above.
+    public func markUserResponseIfUnset(flagId: String, response: FlagUserResponse) throws {
+        try db.queue.write { conn in
+            try conn.execute(
+                sql: "UPDATE flags SET user_response = ? WHERE id = ? AND user_response IS NULL",
+                arguments: [response.rawValue, flagId]
+            )
+        }
+    }
+
+    /// issue #60 follow-up: persist what the intervention ACTUALLY did onto
+    /// the flag row (migration v10), mirroring `markUserResponse`. Written
+    /// from the Notifier's result hook with the same outcome that drives the
+    /// banner body, AFTER the router's executor finishes — never from intent.
+    /// A re-delivered outcome for the same flag overwrites (last result wins,
+    /// matching the banner the user last saw).
+    public func markInterventionOutcome(flagId: String, outcome: InterventionOutcomeKind) throws {
+        try db.queue.write { conn in
+            try conn.execute(
+                sql: "UPDATE flags SET intervention_outcome = ? WHERE id = ?",
+                arguments: [outcome.rawValue, flagId]
+            )
+        }
+    }
+
     public func count(sessionId: String? = nil) throws -> Int {
         try db.queue.read { conn in
             var request = StoredFlag.all()

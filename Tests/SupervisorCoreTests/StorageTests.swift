@@ -196,6 +196,81 @@ final class StorageTests: XCTestCase {
         XCTAssertEqual(recent[0].userResponse, .falsePositive)
     }
 
+    /// issue #60 follow-up: the v10 migration adds the nullable
+    /// intervention_outcome column, and a freshly inserted flag reads NULL
+    /// (no outcome recorded) rather than some default bucket.
+    func testV10MigrationAddsInterventionOutcomeColumn() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try db.queue.read { conn in
+            let cols = try conn.columns(in: "flags").map { $0.name }
+            XCTAssertTrue(cols.contains("intervention_outcome"),
+                          "expected intervention_outcome column after v10 migration; got: \(cols)")
+        }
+        try seedSession(db, id: "s")
+        let store = FlagStore(database: db)
+        let flag = StoredFlag(
+            sessionId: "s", category: "c", severity: .low, action: .notify,
+            reasoningPlain: "p", reasoningTechnical: "t"
+        )
+        try store.insert(flag)
+        XCTAssertNil(try store.recent(sessionId: "s")[0].interventionOutcome,
+                     "a flag with no recorded outcome must read nil, never a default bucket")
+    }
+
+    /// issue #60 follow-up: markInterventionOutcome round-trips the executor's
+    /// real result onto the flag row, and a later result overwrites (last
+    /// banner wins), mirroring markUserResponse's shape.
+    func testFlagMarkInterventionOutcome() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try seedSession(db, id: "s")
+        let store = FlagStore(database: db)
+        let flag = StoredFlag(
+            sessionId: "s", category: "user_question_pending", severity: .medium,
+            action: .inject, reasoningPlain: "p", reasoningTechnical: "t"
+        )
+        try store.insert(flag)
+
+        try store.markInterventionOutcome(flagId: flag.id, outcome: .injectDegraded)
+        XCTAssertEqual(try store.recent(sessionId: "s")[0].interventionOutcome, .injectDegraded)
+
+        // A re-delivered outcome for the same flag overwrites (last result wins).
+        try store.markInterventionOutcome(flagId: flag.id, outcome: .injectSucceeded)
+        XCTAssertEqual(try store.recent(sessionId: "s")[0].interventionOutcome, .injectSucceeded)
+
+        // An unknown flag id is a silent no-op, not an error.
+        try store.markInterventionOutcome(flagId: "nope", outcome: .queued)
+        XCTAssertEqual(try store.recent(sessionId: "s").count, 1)
+    }
+
+    /// issue #60 follow-up: the banner-dismiss path (markUserResponseIfUnset)
+    /// records a response only when none exists — it must never overwrite an
+    /// explicit panel click, while markUserResponse (the panel path) still can.
+    func testFlagMarkUserResponseIfUnsetNeverOverwrites() throws {
+        let db = try SupervisorDatabase.inMemory()
+        try seedSession(db, id: "s")
+        let store = FlagStore(database: db)
+        let flag = StoredFlag(
+            sessionId: "s", category: "c", severity: .medium, action: .notify,
+            reasoningPlain: "p", reasoningTechnical: "t"
+        )
+        try store.insert(flag)
+
+        // Unset -> the banner dismissal lands.
+        try store.markUserResponseIfUnset(flagId: flag.id, response: .dismissed)
+        XCTAssertEqual(try store.recent(sessionId: "s")[0].userResponse, .dismissed)
+
+        // Already set -> a later banner dismissal must NOT clobber it.
+        try store.markUserResponse(flagId: flag.id, response: .falsePositive)
+        try store.markUserResponseIfUnset(flagId: flag.id, response: .dismissed)
+        XCTAssertEqual(try store.recent(sessionId: "s")[0].userResponse, .falsePositive,
+                       "a banner dismissal is weaker than an explicit panel response and must not overwrite it")
+
+        // An unknown flag id (e.g. a dismissed banner from a pre-v10 build
+        // whose row carries no id match) is a silent no-op, not an error.
+        XCTAssertNoThrow(try store.markUserResponseIfUnset(flagId: "no-such-flag", response: .dismissed))
+        XCTAssertEqual(try store.recent(sessionId: "s")[0].userResponse, .falsePositive)
+    }
+
     func testFlagCascadeOnSessionDelete() throws {
         let db = try SupervisorDatabase.inMemory()
         let sessions = SessionStore(database: db)

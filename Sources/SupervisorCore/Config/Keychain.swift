@@ -25,7 +25,10 @@ public struct KeychainAPIKeyStore: APIKeyStore, @unchecked Sendable {
     // framework, which is documented as such). @unchecked is the pragmatic
     // path until KeychainAccess gains real Sendable conformance.
 
-    public static let defaultService = "live.supervisor.api"
+    /// The v0.1.x single-item service. Computed off the shared base so
+    /// `$SUPERVISOR_KEYCHAIN_PREFIX` (E2E isolation) namespaces this legacy
+    /// slot the same way it namespaces the per-provider ones.
+    public static var defaultService: String { LLMProvider.keychainServiceBase }
     public static let accountName = "anthropic-api-key"
 
     private let keychain: Keychain

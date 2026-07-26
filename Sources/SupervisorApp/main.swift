@@ -37,6 +37,11 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
     // Onboarding
     private var onboarding: OnboardingWindowController?
+    /// Main-run-loop liveness beat (see startAppAliveBeat).
+    private var appAliveTimer: Timer?
+    /// Small floating panel shown when the launch keychain probe exceeds
+    /// its watchdog (a SecurityAgent prompt is likely up, possibly hidden).
+    private var keychainWaitPanel: NSPanel?
 
     // Running state
     private var hoverVM: HoverViewModel?
@@ -89,10 +94,12 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         self.keyStore = KeychainProviderKeyStore()
         self.activeProviderStore = FileActiveProviderStore(path: paths.activeProviderPath)
         super.init()
-        // v0.2.0: one-shot migration of the v0.1.x single-key Keychain
-        // item into the per-provider layout. Idempotent — every launch
-        // after the first is a no-op.
-        migrateLegacyKeyIfPresent(keys: keyStore, active: activeProviderStore, trace: trace)
+        // v0.2.0's one-shot legacy-key migration used to run right here,
+        // synchronously, before applicationDidFinishLaunching. It now runs
+        // inside routeAfterKeychainProbe, off the main thread: it is a
+        // Keychain read, and a Keychain read on the main thread before any
+        // UI exists can park the whole launch on an invisible SecurityAgent
+        // prompt (trial-notes 2026-06: the ACL'd-to-old-signature hang).
     }
 
     // MARK: - NSApplicationDelegate
@@ -100,30 +107,117 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         trace.emit("app", "applicationDidFinishLaunching pid=\(ProcessInfo.processInfo.processIdentifier)")
 
+        // Gatekeeper App Translocation: launched straight from the mounted
+        // dmg (or an unstripped quarantine copy), macOS runs the app from a
+        // randomized read-only path that CHANGES between launches. That
+        // breaks the Keychain ACL each time (fresh "allow keychain" prompt
+        // per launch, the pre-UI hang above) and generally produces the
+        // "works one launch, not the next" reports. Say so, up front, once.
+        if Bundle.main.bundlePath.contains("/AppTranslocation/") {
+            trace.emit("app", "translocated launch detected at \(Bundle.main.bundlePath)")
+            let alert = NSAlert()
+            alert.messageText = "Move Supervisor to Applications"
+            alert.informativeText = "Supervisor is running from a temporary location (macOS App Translocation), usually because it was opened straight from the downloaded dmg. Drag Supervisor.app into your Applications folder and open it from there — otherwise macOS re-asks Keychain permission on every launch and launches can appear to do nothing."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Quit and Move Manually")
+            alert.addButton(withTitle: "Continue Anyway")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn {
+                trace.sync()
+                exit(0)
+            }
+        }
+
         // Single-instance guard. If another Supervisor is already
         // watching, this duplicate quits instead of fighting it.
         // Returns early when we decided to quit so we never enter the
         // running state as a second band.
         guard enforceSingleInstance() else { return }
 
-        // v0.2.0: "has key" now means a key exists for whatever provider
-        // the user marked as active. Falls back to .anthropic for fresh
-        // installs so the v0.1.x logic still holds.
-        let activeProvider = (try? activeProviderStore.read()) ?? .anthropic
-        let hasKey: Bool = ((try? keyStore.read(activeProvider)) ?? nil)?.isEmpty == false
-        let axOK = permissions.isAXGranted()
+        // Main-run-loop liveness beat: touch app-alive.txt now and every 5s
+        // from a main-run-loop Timer. A duplicate launch reads this file's
+        // age to tell a healthy incumbent (activate it) from a hung one
+        // (take over) — see DuplicateLaunchPolicy. The first touch happens
+        // before anything that can block, so a racing loser sees a fresh
+        // marker within milliseconds of us winning the lock.
+        startAppAliveBeat()
 
-        if !hasKey || !axOK {
-            trace.emit("app", "onboarding needed (provider=\(activeProvider.rawValue) hasKey=\(hasKey) axOK=\(axOK))")
-            presentOnboarding()
-        } else {
-            trace.emit("app", "onboarding skipped; entering running state (provider=\(activeProvider.rawValue))")
-            enterRunningState(notifDegraded: false)
+        // The winner listens for a duplicate launch's "surface yourself"
+        // signal, so double-clicking Supervisor.app while it is already
+        // running re-presents the UI instead of doing visibly nothing (the
+        // duplicate exits either way; see handleDuplicateLaunch).
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name(DuplicateLaunchPolicy.activateNotification),
+            object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.surfaceForUserAttention() }
+        }
+
+        routeAfterKeychainProbe()
+    }
+
+    /// Decide onboarding-vs-running WITHOUT touching the Keychain on the
+    /// main thread. With a signature/ACL mismatch (new certificate,
+    /// re-downloaded or translocated copy), a Keychain read parks the calling
+    /// thread on a SecurityAgent "Always Allow / Deny" prompt — and that
+    /// prompt can sit behind other windows. On the main thread before any UI
+    /// exists, that is indistinguishable from "the app didn't open". Off the
+    /// main thread, the run loop stays alive and a watchdog makes the wait
+    /// visible in the trace instead of silent.
+    private func routeAfterKeychainProbe() {
+        let keyStore = self.keyStore
+        let activeProviderStore = self.activeProviderStore
+        let trace = self.trace
+
+        let watchdog = DispatchWorkItem { [weak self] in
+            let msg = "keychain probe still pending after 10s — a macOS Keychain permission prompt (SecurityAgent) is likely waiting for the user; launch continues when it is answered"
+            trace.emit("app", msg)
+            FileHandle.standardError.write(Data("Supervisor: \(msg)\n".utf8))
+            // Trace lines don't help the user staring at "nothing opened":
+            // put a small panel on screen saying what to look for.
+            self?.showKeychainWaitPanel()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: watchdog)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // v0.2.0: one-shot migration of the v0.1.x single-key Keychain
+            // item into the per-provider layout. Idempotent — every launch
+            // after the first is a no-op. Runs here (not in init) because it
+            // is also a Keychain read.
+            migrateLegacyKeyIfPresent(keys: keyStore, active: activeProviderStore, trace: trace)
+
+            // v0.2.0: "has key" now means a key exists for whatever provider
+            // the user marked as active. Falls back to .anthropic for fresh
+            // installs so the v0.1.x logic still holds.
+            let activeProvider = (try? activeProviderStore.read()) ?? .anthropic
+            let hasKey: Bool = ((try? keyStore.read(activeProvider)) ?? nil)?.isEmpty == false
+
+            DispatchQueue.main.async { [weak self] in
+                watchdog.cancel()
+                guard let self else { return }
+                self.dismissKeychainWaitPanel()
+                let axOK = self.permissions.isAXGranted()
+                if !hasKey || !axOK {
+                    self.trace.emit("app", "onboarding needed (provider=\(activeProvider.rawValue) hasKey=\(hasKey) axOK=\(axOK))")
+                    self.presentOnboarding()
+                } else {
+                    self.trace.emit("app", "onboarding skipped; entering running state (provider=\(activeProvider.rawValue))")
+                    self.enterRunningState(notifDegraded: false)
+                }
+            }
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         trace.emit("app", "applicationWillTerminate; tearing down")
+        // Stop the alive beat and DELETE the marker: a clean quit must not
+        // leave a fresh-looking marker behind, or a relaunch-within-30s that
+        // hangs pre-UI would read as a live incumbent to the next duplicate
+        // (which would then activate a corpse and exit silently — the
+        // original bug, back through a side door).
+        appAliveTimer?.invalidate()
+        appAliveTimer = nil
+        try? FileManager.default.removeItem(at: paths.appAlivePath)
         triageEngine?.stop()
         reviewEngine?.stop()
         discovery?.stop()
@@ -146,6 +240,74 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Onboarding
+
+    /// The user tried to open Supervisor while this instance already runs
+    /// (dock/Finder reopen event, or a second process that bowed out and
+    /// pinged us): surface whatever UI this instance owns so the click did
+    /// something visible. The hover is FORCE-shown briefly — its normal
+    /// visibility gate requires a terminal frontmost, and the user who just
+    /// clicked in Finder fails that gate, which made the old present() call
+    /// a silent no-op.
+    private func surfaceForUserAttention() {
+        trace.emit("app", "user-attention event (reopen or duplicate launch); surfacing UI")
+        NSApp.activate(ignoringOtherApps: true)
+        if let onboarding {
+            onboarding.present()
+        } else {
+            hoverWindow?.surfaceBriefly()
+        }
+    }
+
+    /// Dock-icon click / Finder double-click on the already-running app.
+    /// Without this, LaunchServices activates the process, no window
+    /// appears (accessory app), and the user concludes "it didn't open".
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        surfaceForUserAttention()
+        return false
+    }
+
+    // MARK: - Keychain-wait panel
+
+    private func showKeychainWaitPanel() {
+        guard keychainWaitPanel == nil else { return }
+        let text = NSTextField(wrappingLabelWithString:
+            "Supervisor is waiting on a macOS Keychain permission prompt.\n\nLook for a dialog asking to allow access to \"Supervisor\" (it can be behind other windows) and click Always Allow.")
+        text.frame = NSRect(x: 16, y: 14, width: 328, height: 92)
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 120),
+            styleMask: [.titled, .nonactivatingPanel],
+            backing: .buffered, defer: false
+        )
+        panel.title = "Supervisor is starting"
+        panel.level = .floating
+        panel.contentView?.addSubview(text)
+        panel.center()
+        panel.orderFrontRegardless()
+        keychainWaitPanel = panel
+    }
+
+    private func dismissKeychainWaitPanel() {
+        keychainWaitPanel?.orderOut(nil)
+        keychainWaitPanel = nil
+    }
+
+    // MARK: - App-alive beat (main-run-loop liveness marker)
+
+    private func startAppAliveBeat() {
+        touchAppAlive()
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            self?.touchAppAlive()
+        }
+        timer.tolerance = 1
+        RunLoop.main.add(timer, forMode: .common)
+        appAliveTimer = timer
+    }
+
+    private func touchAppAlive() {
+        // mtime is the signal; the content is a debugging courtesy.
+        try? "\(ProcessInfo.processInfo.processIdentifier) \(Date().timeIntervalSince1970)\n"
+            .write(to: paths.appAlivePath, atomically: true, encoding: .utf8)
+    }
 
     private func presentOnboarding() {
         NSApp.setActivationPolicy(.regular)
@@ -215,7 +377,18 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             trace.emit("app", "storage opened at \(paths.databasePath.path)")
         } catch {
             trace.emit("app", "FATAL: storage open failed: \(error)")
-            return
+            // Be loud, then die. The old `return` left a zombie: no UI, but
+            // the single-instance lock already claimed — so every relaunch
+            // silently exited as a "duplicate" of a process showing nothing.
+            let alert = NSAlert()
+            alert.messageText = "Supervisor can't open its local database"
+            alert.informativeText = "The database at \(paths.databasePath.path) failed to open:\n\n\(error.localizedDescription)\n\nIf this repeats, quit Supervisor, move that file aside, and relaunch — Supervisor will start fresh (past flags and cost history stay in the old file)."
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "Quit")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            trace.sync()
+            exit(1)
         }
 
         // 2. Bus + Hover
@@ -454,7 +627,12 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // hover so every recorded action is driven by what actually happened
         // (answered vs "couldn't place it, here it is to paste"). Hops to the
         // main actor for the @MainActor hover.
-        let notifier = Notifier(trace: trace, onResult: { decision, outcome in
+        // Notifier.ifAvailable, never the bare init: UNUserNotificationCenter
+        // .current() abort()s in a process without a bundle identifier, and it
+        // did — three identical launch SIGABRTs on 2026-07-05 died on this very
+        // construction. Without a center the app still launches; the router
+        // gets a trace-only stand-in and banners are the one thing lost.
+        let notifier = Notifier.ifAvailable(trace: trace, onResult: { decision, outcome in
             // [weak hoverVM] on the Task, NOT the outer @Sendable closure:
             // capturing the weak var in the nested concurrently-executing Task
             // is the Swift-5.10 "capture of var in concurrently-executing code"
@@ -465,11 +643,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor [weak hoverVM] in hoverVM?.recordInterventionOutcome(decision, outcome) }
         })
         self.notifier = notifier
-        // Context Health nudge plumbing: register the "Show me" category and make
-        // this delegate handle the tap (open the window). Additive — it doesn't
-        // change flag notifications, which use no category and no action.
-        notifier.registerContextHealthCategory()
-        UNUserNotificationCenter.current().delegate = self
+        // Notification-category plumbing: register the Context Health "Show me"
+        // category AND the flag category (issue #60 follow-up: the flag category
+        // requests .customDismissAction so an explicitly dismissed flag banner
+        // reaches didReceive and lands as flags.user_response = dismissed), and
+        // make this delegate handle both. A plain tap on a flag banner is
+        // engagement, not a response, and is deliberately not recorded.
+        if let notifier {
+            notifier.registerNotificationCategories()
+            UNUserNotificationCenter.current().delegate = self
+        }
         let recoveryWriter = RecoveryDocWriter(
             directory: paths.recoveryDir,
             trace: trace
@@ -483,7 +666,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // authorization for a destructive action.
         let injectionLedger = InjectionLedger()
         let router = InterventionRouter(
-            notifier: notifier,
+            notifier: notifier ?? TraceOnlyNotifier(trace: trace),
             locator: locator,
             signalSender: signalSender,
             injector: CGEventInjector(trace: trace, llm: client),
@@ -657,7 +840,10 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
                 planStore: planStore,
                 sessionStore: sessionStore
             )
-            let reportsDir = FileManager.default.homeDirectoryForCurrentUser
+            // paths.home (the SUPERVISOR_HOME-aware root), not the raw home:
+            // an isolated E2E instance must export reports into ITS fake home,
+            // not litter the live user's Downloads.
+            let reportsDir = paths.home
                 .appendingPathComponent("Downloads/Supervisor Reports", isDirectory: true)
             hoverVM.exportReportHandler = { [trace] sessionId in
                 do {
@@ -685,7 +871,9 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // ~/.codex/sessions feeding the SAME EventBus, so Codex sessions are
         // triaged by the identical rubric. Auto-enabled when Codex is installed
         // (~/.codex/sessions exists) unless `supervise_codex: false` in config.
-        let codexSessionsDir = FileManager.default.homeDirectoryForCurrentUser
+        // paths.home, not the raw home: honors SUPERVISOR_HOME so the E2E
+        // harness can plant fake Codex rollouts under its fake home.
+        let codexSessionsDir = paths.home
             .appendingPathComponent(".codex/sessions", isDirectory: true)
         let codexEnabled = (userConfig.superviseCodex ?? true)
             && FileManager.default.fileExists(atPath: codexSessionsDir.path)
@@ -742,7 +930,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             trace.emit("app", "screen recording request returned: \(granted)")
         }
 
-        trace.emit("app", "running state ready — watching \(paths.claudeProjectsDir.path)")
+        // The E2E harness's abort-gate greps this line: it echoes the resolved
+        // home and the RESOLVED keychain service base so a scenario script can
+        // PROVE isolation took effect — the fake home actually resolved and
+        // keychain writes are namespaced — before driving any UI. The resolved
+        // base (not the raw env var) on purpose: an empty/unset
+        // SUPERVISOR_KEYCHAIN_PREFIX silently resolves to live.supervisor.api,
+        // and a gate matching the raw env would pass vacuously while the app
+        // wrote live items. Keep the `home=` / `keychainBase=` tokens stable;
+        // Scripts/e2e/common.sh matches on them.
+        trace.emit("app", "running state ready — watching \(paths.claudeProjectsDir.path) home=\(paths.home.path) keychainBase=\(LLMProvider.keychainServiceBase)")
     }
 
     // MARK: - Flag routing
@@ -775,12 +972,24 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             trace.emit("flag", "ERROR persist failed: \(error)")
         }
 
+        // issue #60 follow-up: stamp the persisted row's id onto the decision
+        // BEFORE the router dispatch, so (a) the Notifier's result hook can
+        // write the REAL InterventionOutcome back onto this exact flags row
+        // (HoverViewModel.recordInterventionOutcome -> markInterventionOutcome)
+        // and (b) the banner carries the id for the dismiss-response delegate
+        // path below. A `let` copy, not the mutated `var`, goes into the Task:
+        // capturing a var in concurrently-executing code is the Swift-5.10
+        // error CI flags (same rule as the Notifier onResult wiring above).
+        var stamped = decision
+        stamped.flagId = flag.id
+        let routedDecision = stamped
+
         // 2. Dispatch via router (v0.1.4: handles notify / pause / kill;
         //    inject queued, routed to notify for now). Router internally
         //    handles every locator + signal failure by degrading to a
         //    notify banner — never crashes on a bad PID or revoked perm.
         Task { [weak self] in
-            await self?.router?.dispatch(decision: decision)
+            await self?.router?.dispatch(decision: routedDecision)
         }
 
         // 3. v0.9.0 (integrity): do NOT record the action here. The old eager
@@ -795,6 +1004,14 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Heartbeat child
 
+    /// Bounded respawn budget for the heartbeat child, same shape as the
+    /// status bar's. Without a respawn, a crashed heartbeat child leaves a
+    /// permanently stale heartbeat.txt under a perfectly healthy app — the
+    /// menu-bar icon reads dead forever and honest-health becomes a lie in
+    /// the pessimistic direction.
+    private var heartbeatRespawnCount = 0
+    private let heartbeatRespawnLimit = 3
+
     private func startHeartbeat() {
         stopHeartbeat()
         guard let url = locateHeartbeatExecutable() else {
@@ -803,6 +1020,14 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         }
         let proc = Process()
         proc.executableURL = url
+        // Installed BEFORE run() so an instantly-exiting child cannot slip
+        // past it (same rule as the status bar's handler).
+        proc.terminationHandler = { [weak self] process in
+            let status = process.terminationStatus
+            Task { @MainActor [weak self] in
+                self?.heartbeatDidExit(process, status: status)
+            }
+        }
         do {
             try proc.run()
             heartbeatProcess = proc
@@ -812,9 +1037,28 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Unexpected heartbeat exit (crash / external kill — deliberate stops
+    /// clear the terminationHandler first): bounded respawn, then an honest
+    /// give-up trace.
+    private func heartbeatDidExit(_ proc: Process, status: Int32) {
+        guard proc === heartbeatProcess else { return }
+        heartbeatProcess = nil
+        heartbeatRespawnCount += 1
+        guard heartbeatRespawnCount <= heartbeatRespawnLimit else {
+            trace.emit("app", "ERROR heartbeat exited (status=\(status)) after \(heartbeatRespawnLimit) respawns — giving up; menu-bar health will read stale for the rest of this run")
+            return
+        }
+        trace.emit("app", "heartbeat exited unexpectedly status=\(status) — respawning (\(heartbeatRespawnCount)/\(heartbeatRespawnLimit)) in 2s")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            self?.startHeartbeat()
+        }
+    }
+
     private func stopHeartbeat() {
         guard let proc = heartbeatProcess, proc.isRunning else { return }
         trace.emit("app", "terminating heartbeat pid=\(proc.processIdentifier)")
+        proc.terminationHandler = nil  // deliberate stop, not a crash: no respawn
         proc.terminate()
         heartbeatProcess = nil
     }
@@ -952,10 +1196,83 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // of a stranger.
         switch SingleInstanceGuard.claim(at: pidfile, myPID: myPID) {
         case .incumbentAlive(let incumbentPID):
-            quitAsDuplicate(incumbentPID: incumbentPID)  // never returns
+            return handleDuplicateLaunch(incumbentPID: incumbentPID, pidfile: pidfile, myPID: myPID)
         case .claimed:
             trace.emit("app", "single-instance: claimed lock at \(pidfile.path) pid=\(myPID)")
             return true
+        }
+    }
+
+    /// A live incumbent holds the flock. Healthy incumbent: tell it to
+    /// surface its UI and exit quietly (a second click on the app icon is
+    /// never a silent no-op). Hung incumbent (stale/missing heartbeat, the
+    /// "restart my laptop to open it" report): terminate it and take over —
+    /// the user's launch intent wins over a wedged invisible process.
+    /// Returns true only when this instance took over and now owns the lock.
+    private func handleDuplicateLaunch(incumbentPID: Int32, pidfile: URL, myPID: Int32) -> Bool {
+        func appAliveAge() -> TimeInterval? {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: paths.appAlivePath.path),
+                  let mtime = attrs[.modificationDate] as? Date else { return nil }
+            return Date().timeIntervalSince(mtime)
+        }
+
+        var decision = DuplicateLaunchPolicy.decide(appAliveAge: appAliveAge())
+        if case .takeOver = decision {
+            // Grace re-check: a winner that claimed the lock microseconds ago
+            // touches the marker immediately after claiming, but this loser
+            // may have raced ahead of that first write. Two seconds is orders
+            // of magnitude more than the winner needs; a genuinely hung
+            // incumbent is still hung after it.
+            usleep(2_000_000)
+            decision = DuplicateLaunchPolicy.decide(appAliveAge: appAliveAge())
+        }
+
+        switch decision {
+        case .activateIncumbentAndQuit:
+            trace.emit("app", "duplicate launch: incumbent pid=\(incumbentPID) alive (app-alive \(appAliveAge().map { String(Int($0)) } ?? "?")s); asking it to surface, then exiting")
+            DistributedNotificationCenter.default().postNotificationName(
+                Notification.Name(DuplicateLaunchPolicy.activateNotification),
+                object: nil, userInfo: nil, deliverImmediately: true
+            )
+            quitAsDuplicate(incumbentPID: incumbentPID)  // never returns
+
+        case .takeOver(let reason):
+            // Identity check before signaling: never SIGTERM a pid we cannot
+            // confirm is a Supervisor. If unverifiable, fall back to the old
+            // quiet exit rather than risk killing a stranger.
+            guard incumbentPID > 0, SingleInstanceGuard.pidIsAliveSupervisor(incumbentPID) else {
+                trace.emit("app", "duplicate launch: takeover indicated (\(reason)) but incumbent pid=\(incumbentPID) is not a verifiable Supervisor; exiting instead")
+                quitAsDuplicate(incumbentPID: incumbentPID)  // never returns
+            }
+            let msg = "duplicate launch: taking over from hung incumbent pid=\(incumbentPID) (\(reason))"
+            trace.emit("app", msg)
+            FileHandle.standardError.write(Data("Supervisor: \(msg)\n".utf8))
+            if kill(incumbentPID, SIGTERM) != 0 {
+                trace.emit("app", "takeover kill(SIGTERM) failed errno=\(errno) — falling through to the reclaim poll / stuck alert")
+            }
+
+            // The kernel releases the incumbent's flock the moment it dies;
+            // poll the claim briefly rather than assuming timing.
+            for _ in 0..<20 {  // up to ~5s
+                usleep(250_000)
+                if case .claimed = SingleInstanceGuard.claim(at: pidfile, myPID: myPID) {
+                    trace.emit("app", "single-instance: reclaimed lock after takeover pid=\(myPID)")
+                    return true
+                }
+            }
+
+            // SIGTERM didn't free the lock (wedged with a handler installed).
+            // Be loud and actionable instead of silently vanishing.
+            trace.emit("app", "ERROR takeover failed: incumbent pid=\(incumbentPID) survived SIGTERM and still holds the lock")
+            let alert = NSAlert()
+            alert.messageText = "Supervisor is stuck"
+            alert.informativeText = "A previous copy of Supervisor (process \(incumbentPID)) is running but not responding, and it wouldn't exit. Force-quit it in Activity Monitor (search for Supervisor), then open Supervisor again."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Quit")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            trace.sync()
+            exit(1)
         }
     }
 
@@ -1177,6 +1494,22 @@ private func loadPlanLoop(
 
 // MARK: - Bootstrap
 
+// --print-paths: the E2E harness's PRE-LAUNCH gate. Prints where this binary
+// would put its world and exits before NSApplication (or anything with side
+// effects — no trace file, no dirs, no keychain, no single-instance claim)
+// spins up. The harness runs this FIRST and refuses to launch unless the
+// output shows the fake home and a non-live keychain base: an abort-gate
+// that only greps the post-launch trace can't stop a STALE binary that
+// predates the seams from booting against the real home — where the
+// duplicate-launch takeover path could SIGTERM the live Supervisor. Echoes
+// the RESOLVED values (same rationale as the running-state ready line).
+if CommandLine.arguments.contains("--print-paths") {
+    let paths = ConfigPaths()
+    print("home=\(paths.home.path)")
+    print("keychainBase=\(LLMProvider.keychainServiceBase)")
+    exit(0)
+}
+
 MainActor.assumeIsolated {
     let delegate = SupervisorAppDelegate()
     let app = NSApplication.shared
@@ -1185,13 +1518,19 @@ MainActor.assumeIsolated {
     app.run()
 }
 
-// MARK: - Context Health notification handling
+// MARK: - Notification response handling (Context Health + flag banners)
 
 /// Opens the Context Health window when the owner taps the one earned nudge (or
-/// its "Show me" action). Additive: it only acts on the Context Health category;
-/// flag notifications (no category) fall through untouched. `nonisolated` +
-/// hop-to-MainActor is the standard way to satisfy the SDK's nonisolated delegate
-/// requirement from a main-actor app delegate.
+/// its "Show me" action), and — issue #60 follow-up — records an EXPLICIT flag-
+/// banner dismissal as `flags.user_response = dismissed`. The flag category
+/// requests `.customDismissAction`, so a swiped-away banner arrives here as
+/// UNNotificationDismissActionIdentifier with the flag row id in userInfo.
+/// Honesty rule: only the unambiguous dismiss is recorded — a plain tap
+/// (default action) opens the app, which is engagement, not approval, so it is
+/// deliberately NOT written. The write goes through markUserResponseIfUnset so
+/// a banner dismissal never overwrites an explicit panel response. `nonisolated`
+/// + hop-to-MainActor is the standard way to satisfy the SDK's nonisolated
+/// delegate requirement from a main-actor app delegate (PR #45's pattern).
 extension SupervisorAppDelegate: UNUserNotificationCenterDelegate {
 
     nonisolated func userNotificationCenter(
@@ -1207,9 +1546,21 @@ extension SupervisorAppDelegate: UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let isContextHealth = response.notification.request.content.categoryIdentifier == Notifier.contextHealthCategoryID
-        if isContextHealth {
+        let content = response.notification.request.content
+        if content.categoryIdentifier == Notifier.contextHealthCategoryID {
             Task { @MainActor in self.openContextHealthWindow?() }
+        } else if content.categoryIdentifier == Notifier.flagCategoryID,
+                  response.actionIdentifier == UNNotificationDismissActionIdentifier,
+                  let flagId = content.userInfo[Notifier.flagIdUserInfoKey] as? String {
+            Task { @MainActor in
+                guard let store = self.flagStore else { return }
+                do {
+                    try store.markUserResponseIfUnset(flagId: flagId, response: .dismissed)
+                    self.trace.emit("app", "flag banner dismissed -> user_response=dismissed (if unset) flagId=\(flagId)")
+                } catch {
+                    self.trace.emit("app", "ERROR flag banner dismiss persist failed flagId=\(flagId): \(error)")
+                }
+            }
         }
         completionHandler()
     }

@@ -1,0 +1,4 @@
+{"type":"queue-operation","timestamp":"2026-01-01T00:00:00.000Z","sessionId":"__SESSION_ID__","cwd":"__CWD__","gitBranch":"main"}
+{"type":"user","timestamp":"2026-01-01T00:00:01.000Z","sessionId":"__SESSION_ID__","uuid":"u-0","message":{"role":"user","content":"clean up the old data directory"}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","sessionId":"__SESSION_ID__","uuid":"a-1","message":{"role":"assistant","content":[{"type":"text","text":"I'll remove the legacy data directory now."}]}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:03.000Z","sessionId":"__SESSION_ID__","uuid":"a-2","message":{"role":"assistant","content":[{"type":"tool_use","id":"t-1","name":"Bash","input":{"command":"rm -rf /Users/e2e-fake-user/Documents/legacy-data","description":"Delete the legacy data directory"}}]}}

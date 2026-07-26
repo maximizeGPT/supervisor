@@ -130,6 +130,31 @@ final class NotifierTests: XCTestCase {
         XCTAssertTrue(str.contains("Open the panel for details"),
                       "malformed-verdict banner must surface the panel-redirect hint")
     }
+
+    // MARK: - Outcome-kind persistence mapping (issue #60 follow-up)
+
+    /// Every InterventionOutcome case maps to its payload-free persisted kind,
+    /// and the on-disk raw values are the stable snake_case contract the trust
+    /// scorecard buckets on. (The enum has associated values so CaseIterable
+    /// can't sweep it — each case is asserted explicitly; a new case breaks
+    /// the `kind` switch at compile time anyway.)
+    func testInterventionOutcomeKindMapsEveryCaseStably() {
+        XCTAssertEqual(InterventionOutcome.notifyOnly.kind, .notifyOnly)
+        XCTAssertEqual(InterventionOutcome.pauseSucceeded(pid: 1, recoveryDocPath: nil).kind, .pauseSucceeded)
+        XCTAssertEqual(InterventionOutcome.killSucceeded(recoveryDocPath: nil).kind, .killSucceeded)
+        XCTAssertEqual(InterventionOutcome.injectSucceeded(pid: 1, bytes: 2).kind, .injectSucceeded)
+        XCTAssertEqual(InterventionOutcome.injectDegraded(intendedText: "t", reason: "r", copiedToClipboard: false).kind, .injectDegraded)
+        XCTAssertEqual(InterventionOutcome.screenRecordingDenied(intendedText: "t", copiedToClipboard: false).kind, .screenRecordingDenied)
+        XCTAssertEqual(InterventionOutcome.continueFired(pid: 1, bytes: 2, promptHead: "h").kind, .continueFired)
+        XCTAssertEqual(InterventionOutcome.continueProposedMedium(proposal: "p", justification: "j", copiedToClipboard: false).kind, .continueProposedMedium)
+        XCTAssertEqual(InterventionOutcome.continueLowConfidence(reasoning: "r").kind, .continueLowConfidence)
+        XCTAssertEqual(InterventionOutcome.queued(promptHead: "h").kind, .queued)
+
+        XCTAssertEqual(InterventionOutcomeKind.notifyOnly.rawValue, "notify_only")
+        XCTAssertEqual(InterventionOutcomeKind.injectDegraded.rawValue, "inject_degraded")
+        XCTAssertEqual(InterventionOutcomeKind.screenRecordingDenied.rawValue, "screen_recording_denied")
+        XCTAssertEqual(InterventionOutcomeKind.queued.rawValue, "queued")
+    }
 }
 
 /// A pure-body extractor we can exercise without touching UN. Mirrors

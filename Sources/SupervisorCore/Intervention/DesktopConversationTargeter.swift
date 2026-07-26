@@ -742,7 +742,10 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         sessionId: String,
         projectsDir: URL? = nil
     ) -> String? {
-        let base = projectsDir ?? FileManager.default.homeDirectoryForCurrentUser
+        // resolvedHome, not homeDirectoryForCurrentUser: a SUPERVISOR_HOME-
+        // isolated instance must scan ITS OWN fake ~/.claude/projects, never
+        // the live user's transcripts. (Same for the two fallbacks below.)
+        let base = projectsDir ?? ConfigPaths.resolvedHome
             .appendingPathComponent(".claude/projects", isDirectory: true)
         guard let projects = try? FileManager.default.contentsOfDirectory(
             at: base, includingPropertiesForKeys: nil
@@ -783,7 +786,7 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         sessionId: String,
         storeDir: URL? = nil
     ) -> String? {
-        let base = storeDir ?? FileManager.default.homeDirectoryForCurrentUser
+        let base = storeDir ?? ConfigPaths.resolvedHome
             .appendingPathComponent("Library/Application Support/Claude/claude-code-sessions", isDirectory: true)
         guard let walker = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) else { return nil }
         for case let url as URL in walker {
@@ -818,7 +821,7 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
     /// delivery (a paste into an unfocused composer vanishes and still reports
     /// "success"), so the router watches this file grow before claiming success.
     public static func transcriptURL(sessionId: String, projectsDir: URL? = nil) -> URL? {
-        let base = projectsDir ?? FileManager.default.homeDirectoryForCurrentUser
+        let base = projectsDir ?? ConfigPaths.resolvedHome
             .appendingPathComponent(".claude/projects", isDirectory: true)
         guard let projects = try? FileManager.default.contentsOfDirectory(
             at: base, includingPropertiesForKeys: nil

@@ -23,8 +23,10 @@ public struct ClaudeCodeSource: TranscriptSource {
     /// `projectsDir` defaults to ~/.claude/projects; overridable for tests and to
     /// match ConfigPaths.claudeProjectsDir in production wiring.
     public init(projectsDir: URL? = nil) {
+        // resolvedHome: honors SUPERVISOR_HOME so an isolated E2E instance
+        // watches its fake home's transcripts, not the live user's.
         self.projectsDir = projectsDir
-            ?? FileManager.default.homeDirectoryForCurrentUser
+            ?? ConfigPaths.resolvedHome
                 .appendingPathComponent(".claude/projects", isDirectory: true)
     }
 

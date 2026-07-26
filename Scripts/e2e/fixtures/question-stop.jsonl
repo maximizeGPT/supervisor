@@ -1,0 +1,3 @@
+{"type":"queue-operation","timestamp":"2026-01-01T00:00:00.000Z","sessionId":"__SESSION_ID__","cwd":"__CWD__","gitBranch":"main"}
+{"type":"user","timestamp":"2026-01-01T00:00:01.000Z","sessionId":"__SESSION_ID__","uuid":"u-0","message":{"role":"user","content":"migrate the database schema"}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","sessionId":"__SESSION_ID__","uuid":"a-1","message":{"role":"assistant","content":[{"type":"text","text":"The migration will drop the deprecated `events_v1` table. Should I proceed with the destructive migration, or keep the old table as a backup?"}],"stop_reason":"end_turn"}}

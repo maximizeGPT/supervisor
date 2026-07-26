@@ -55,9 +55,12 @@ public struct ExpandedPanelView: View {
     /// state persists across panel opens via @AppStorage. The pattern follows
     /// Fantastical / Things / Raycast: one quiet context line up top, one
     /// scrolling body, collapsible secondary controls at the bottom.
-    @AppStorage("panel.controlsExpanded") private var controlsExpanded = false
-    @AppStorage("panel.sensitivityExpanded") private var sensitivityExpanded = false
-    @AppStorage("panel.multiModelExpanded") private var multiModelExpanded = false
+    /// Stored via SupervisorDefaults (not the implicit `.standard`) so an
+    /// E2E instance running under SUPERVISOR_HOME keeps its panel state in
+    /// its own suite instead of mutating the live app's preferences.
+    @AppStorage("panel.controlsExpanded", store: SupervisorDefaults.shared) private var controlsExpanded = false
+    @AppStorage("panel.sensitivityExpanded", store: SupervisorDefaults.shared) private var sensitivityExpanded = false
+    @AppStorage("panel.multiModelExpanded", store: SupervisorDefaults.shared) private var multiModelExpanded = false
 
     /// Panel-local state for the "Add a provider key" mini-form inside the
     /// multi-model settings. Reset when the panel closes/reopens.

@@ -195,7 +195,10 @@ public struct AsyncWorkScanner: Sendable {
     /// fabricated stalls). `now` is injected so the recency arm is deterministic
     /// in tests.
     public func scan(sessionId: String, now: Date) -> Scan {
-        guard let url = transcriptURL(sessionId), let lines = readTailLines(url) else {
+        // Shared tail reader (TranscriptTail): nil on read error is treated as
+        // "no transcript -> no stall" — we never fabricate a stall.
+        guard let url = transcriptURL(sessionId),
+              let lines = TranscriptTail.readTailLines(url, tailBytes: tailBytes) else {
             return .none
         }
         // One real tail-read + parse just happened; let an injected probe count it
@@ -256,7 +259,7 @@ public struct AsyncWorkScanner: Sendable {
             guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let type = obj["type"] as? String else { continue }
-            let ts = parseTS(obj["timestamp"]) ?? Date.distantPast
+            let ts = TranscriptTail.parseTS(obj["timestamp"]) ?? Date.distantPast
 
             switch type {
             case "assistant":
@@ -439,47 +442,5 @@ public struct AsyncWorkScanner: Sendable {
         if let s = input["run_in_background"] as? String { return s.lowercased() == "true" }
         if let n = input["run_in_background"] as? NSNumber { return n.boolValue }
         return false
-    }
-
-    // MARK: - Timestamp parsing (mirrors EventParser)
-
-    private static let isoFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-    private static let isoFormatterNoFrac: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
-
-    static func parseTS(_ raw: Any?) -> Date? {
-        guard let str = raw as? String else { return nil }
-        return isoFormatter.date(from: str) ?? isoFormatterNoFrac.date(from: str)
-    }
-
-    // MARK: - Tail read
-
-    /// Read the last `tailBytes` of the file and split into lines. Drops a
-    /// leading partial line (the byte window may start mid-line). Returns nil on
-    /// any read error (caller treats as "no transcript -> no stall").
-    private func readTailLines(_ url: URL) -> [String]? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let start = size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0
-        do {
-            try handle.seek(toOffset: start)
-        } catch {
-            return nil
-        }
-        guard let data = try? handle.readToEnd() else { return nil }
-        if data.isEmpty { return [] }
-        guard let text = String(data: data, encoding: .utf8) else { return [] }
-        var lines = text.components(separatedBy: "\n")
-        // If we started mid-file, the first element is likely a partial line.
-        if start > 0, !lines.isEmpty { lines.removeFirst() }
-        return lines
     }
 }

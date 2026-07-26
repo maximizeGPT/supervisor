@@ -51,9 +51,9 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Redaction.
 #
-# Duplicated in sessions.py ON PURPOSE: the skill's scripts are
-# self-contained with no cross-script imports (per the skill design brief).
-# If you change a pattern here, change it in sessions.py too.
+# Duplicated in sessions.py and second_brain.py ON PURPOSE: the skill's
+# scripts never depend on a cross-script import for redaction (per the skill
+# design brief). If you change a pattern here, change it in both of them too.
 #
 # Ported from Sources/SupervisorCore/Redact/Patterns.swift + Redactor.swift
 # (release/v0.3.0-rc line): fixed "<redacted:type>" placeholders, patterns

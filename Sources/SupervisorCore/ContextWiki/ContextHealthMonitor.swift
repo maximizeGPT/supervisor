@@ -71,7 +71,7 @@ public final class ContextHealthMonitor: ObservableObject {
         auditor: ContextAuditor = ContextAuditor(),
         store: ContextAuditStore? = nil,
         trace: TraceLog = .shared,
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = SupervisorDefaults.shared
     ) {
         self.root = root
         self.auditor = auditor

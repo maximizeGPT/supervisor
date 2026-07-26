@@ -123,7 +123,10 @@ public final class LivePermissionChecker: PermissionChecker, @unchecked Sendable
     }
 
     public func notificationStatus() async -> NotificationAuthStatus {
-        await withCheckedContinuation { (cont: CheckedContinuation<NotificationAuthStatus, Never>) in
+        // NotificationCenterGate: current() abort()s in a process with no
+        // bundle identifier; report .denied instead of crashing the caller.
+        guard NotificationCenterGate.available else { return .denied }
+        return await withCheckedContinuation { (cont: CheckedContinuation<NotificationAuthStatus, Never>) in
             UNUserNotificationCenter.current().getNotificationSettings { settings in
                 cont.resume(returning: NotificationAuthStatus(settings.authorizationStatus))
             }
@@ -145,7 +148,8 @@ public final class LivePermissionChecker: PermissionChecker, @unchecked Sendable
     }
 
     public func requestNotifications() async throws -> Bool {
-        try await UNUserNotificationCenter.current()
+        guard NotificationCenterGate.available else { return false }
+        return try await UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .sound, .badge])
     }
 

@@ -31,6 +31,19 @@
 //                         one matches a given target cwd.
 //   --session-id <uuid>   Override the generated session ID. Useful when
 //                         tests need a predictable JSONL filename.
+//   --script <file.jsonl> E2E-harness replay mode: instead of the built-in
+//                         synthetic user/assistant cycle, replay the given
+//                         caller-authored JSONL file line by line on the
+//                         same cadence (--interval-ms between lines). Each
+//                         line's top-level `timestamp` is restamped to NOW
+//                         (TriageEngine discards events older than ~120s and
+//                         SessionDiscovery has a 48h recency window, so a
+//                         verbatim replay of a stored fixture is invisible),
+//                         and the __CWD__ / __SESSION_ID__ placeholders are
+//                         substituted (see ScriptRestamper). No synthetic
+//                         header is emitted — the script owns every line.
+//                         --max-events is ignored (the script's length is
+//                         the event count); the other flags behave as usual.
 //   --child               Internal flag — set when this process was
 //                         spawned by a --multi-instance parent. Suppresses
 //                         further self-spawning (no infinite recursion)
@@ -42,6 +55,7 @@
 // and removing any JSONL files they created.
 
 import Darwin
+import FakeClaudeScript
 import Foundation
 
 // MARK: - Self exec path
@@ -78,6 +92,7 @@ struct Args {
     var multiInstance: Bool = false
     var isChild: Bool = false
     var sessionId: String = UUID().uuidString
+    var scriptPath: String?
 }
 
 func parseArgs() -> Args {
@@ -101,6 +116,7 @@ func parseArgs() -> Args {
         case "--interval-ms":    args.intervalMs = Int(value()) ?? args.intervalMs
         case "--max-events":     args.maxEvents = Int(value()) ?? args.maxEvents
         case "--session-id":     args.sessionId = value()
+        case "--script":         args.scriptPath = value()
         case "--no-fd-hold":     args.holdFd = false
         case "--multi-instance": args.multiInstance = true
         case "--child":          args.isChild = true
@@ -124,6 +140,13 @@ guard let cwd = args.cwd else {
 }
 
 // MARK: - chdir
+
+// Resolve --script BEFORE chdir: a relative fixture path is relative to
+// where the harness invoked us, not to the simulated cwd we're about to
+// enter.
+let resolvedScriptPath: String? = args.scriptPath.map { p in
+    p.hasPrefix("/") ? p : FileManager.default.currentDirectoryPath + "/" + p
+}
 
 if chdir(cwd) != 0 {
     let msg = String(cString: strerror(errno))
@@ -177,8 +200,11 @@ if args.holdFd {
     }
 }
 
-func writeEvent(_ json: [String: Any]) {
-    guard var data = try? JSONSerialization.data(withJSONObject: json, options: []) else { return }
+/// Raw-line writer shared by the synthetic and --script paths: one line,
+/// newline-terminated, fsync'd when holding the fd (so a tailing Supervisor
+/// sees each event as soon as the cadence emits it).
+func writeRawLine(_ data: Data) {
+    var data = data
     data.append(0x0A) // newline
     if args.holdFd {
         _ = data.withUnsafeBytes { ptr -> Int in
@@ -195,53 +221,82 @@ func writeEvent(_ json: [String: Any]) {
     }
 }
 
+func writeEvent(_ json: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: json, options: []) else { return }
+    writeRawLine(data)
+}
+
 // MARK: - Event sequence
 
-// Header (queue-operation lookalike; carries cwd + sessionId so EventParser
-// can emit sessionStart on the first line).
-writeEvent([
-    "type": "queue-operation",
-    "timestamp": isoFormatter.string(from: Date()),
-    "sessionId": args.sessionId,
-    "cwd": cwd,
-    "gitBranch": "main",
-])
+if let scriptPath = resolvedScriptPath {
+    // --script replay: the caller-authored fixture owns every line; this
+    // process only paces them (--interval-ms), substitutes placeholders, and
+    // restamps timestamps to now (see ScriptRestamper for why a verbatim
+    // replay would be silently discarded by the ingest gates).
+    guard let script = try? String(contentsOfFile: scriptPath, encoding: .utf8) else {
+        FileHandle.standardError.write(Data("FakeClaudeCLI: cannot read --script \(scriptPath)\n".utf8))
+        exit(1)
+    }
+    let lines = script.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+    for (i, line) in lines.enumerated() {
+        // First line lands immediately (the harness's discovery assertions
+        // shouldn't wait a full interval for the session header to exist).
+        if i > 0 {
+            Thread.sleep(forTimeInterval: TimeInterval(args.intervalMs) / 1000.0)
+        }
+        let restamped = ScriptRestamper.restampLine(
+            line, now: Date(), cwd: cwd, sessionId: args.sessionId
+        )
+        writeRawLine(Data(restamped.utf8))
+    }
+} else {
+    // Synthetic mode (the original v0.1.4 ProcessLocator harness behavior).
+    // Header (queue-operation lookalike; carries cwd + sessionId so EventParser
+    // can emit sessionStart on the first line).
+    writeEvent([
+        "type": "queue-operation",
+        "timestamp": isoFormatter.string(from: Date()),
+        "sessionId": args.sessionId,
+        "cwd": cwd,
+        "gitBranch": "main",
+    ])
 
-// Alternating user prompt + assistant tool_use cycle. Realistic-ish:
-// matches the shape EventParser handles (user message with string content,
-// assistant message with content array containing a Bash tool_use block).
-for i in 0..<args.maxEvents {
-    Thread.sleep(forTimeInterval: TimeInterval(args.intervalMs) / 1000.0)
-    let ts = isoFormatter.string(from: Date())
-    if i % 2 == 0 {
-        writeEvent([
-            "type": "user",
-            "timestamp": ts,
-            "sessionId": args.sessionId,
-            "uuid": "u-\(i)",
-            "message": [
-                "role": "user",
-                "content": "fake user prompt \(i)",
-            ] as [String: Any],
-        ])
-    } else {
-        writeEvent([
-            "type": "assistant",
-            "timestamp": ts,
-            "sessionId": args.sessionId,
-            "uuid": "a-\(i)",
-            "message": [
-                "role": "assistant",
-                "content": [
-                    [
-                        "type": "tool_use",
-                        "id": "t-\(i)",
-                        "name": "Bash",
-                        "input": ["command": "echo fake-claude tick \(i)"] as [String: Any],
-                    ] as [String: Any]
-                ] as [Any],
-            ] as [String: Any],
-        ])
+    // Alternating user prompt + assistant tool_use cycle. Realistic-ish:
+    // matches the shape EventParser handles (user message with string content,
+    // assistant message with content array containing a Bash tool_use block).
+    for i in 0..<args.maxEvents {
+        Thread.sleep(forTimeInterval: TimeInterval(args.intervalMs) / 1000.0)
+        let ts = isoFormatter.string(from: Date())
+        if i % 2 == 0 {
+            writeEvent([
+                "type": "user",
+                "timestamp": ts,
+                "sessionId": args.sessionId,
+                "uuid": "u-\(i)",
+                "message": [
+                    "role": "user",
+                    "content": "fake user prompt \(i)",
+                ] as [String: Any],
+            ])
+        } else {
+            writeEvent([
+                "type": "assistant",
+                "timestamp": ts,
+                "sessionId": args.sessionId,
+                "uuid": "a-\(i)",
+                "message": [
+                    "role": "assistant",
+                    "content": [
+                        [
+                            "type": "tool_use",
+                            "id": "t-\(i)",
+                            "name": "Bash",
+                            "input": ["command": "echo fake-claude tick \(i)"] as [String: Any],
+                        ] as [String: Any]
+                    ] as [Any],
+                ] as [String: Any],
+            ])
+        }
     }
 }
 

@@ -22,11 +22,21 @@ import SupervisorCore
 
 let args = CommandLine.arguments
 guard args.count >= 2 else {
-    print("usage: SupervisorDevTools <inject-key KEY | inject-key-from-env | delete-key | show | seed-offsets-eof DIR>")
+    print("usage: SupervisorDevTools <subcommand>")
+    print("  keys:      inject-key KEY | inject-key-from-env | delete-key | show")
+    print("  sessions:  seed-offsets-eof DIR | locate-session | inject-test")
+    print("  desktop:   desktop-target | desktop-ocr-dump | desktop-title | ocr-dump | match-test | composer-probe | composer-focus-test | scroll-test")
+    print("  analysis:  context-wiki ROOT | second-brain ROOT | trust-scorecard [--since DAYS]")
     exit(2)
 }
 
+// KeychainAPIKeyStore.defaultService honors $SUPERVISOR_KEYCHAIN_PREFIX (the
+// E2E isolation seam), so running these commands with the prefix exported
+// operates on the TEST-namespaced items, never the live ones. Echo the
+// service in every keychain command's output so which namespace was touched
+// is always visible in the transcript.
 let store = KeychainAPIKeyStore()
+let keychainServiceLabel = KeychainAPIKeyStore.defaultService
 
 switch args[1] {
 case "inject-key":
@@ -36,7 +46,7 @@ case "inject-key":
     }
     do {
         try store.write(args[2])
-        print("ok: key written (len=\(args[2].count))")
+        print("ok: key written (len=\(args[2].count)) service=\(keychainServiceLabel)")
     } catch {
         print("ERROR: \(error)")
         exit(1)
@@ -48,20 +58,20 @@ case "inject-key-from-env":
     }
     do {
         try store.write(key)
-        print("ok: key from env written (len=\(key.count))")
+        print("ok: key from env written (len=\(key.count)) service=\(keychainServiceLabel)")
     } catch {
         print("ERROR: \(error)")
         exit(1)
     }
 case "delete-key":
-    do { try store.delete(); print("ok: deleted") }
+    do { try store.delete(); print("ok: deleted service=\(keychainServiceLabel)") }
     catch { print("ERROR: \(error)"); exit(1) }
 case "show":
     do {
         if let k = try store.read() {
-            print("present (len=\(k.count))")
+            print("present (len=\(k.count)) service=\(keychainServiceLabel)")
         } else {
-            print("absent")
+            print("absent service=\(keychainServiceLabel)")
         }
     } catch {
         print("ERROR: \(error)")
@@ -451,6 +461,154 @@ case "context-wiki":
             print("WARN: could not persist audit: \(error)")
         }
     }
+case "second-brain":
+    // Run ONE Second Brain iteration against a project root: distill candidate
+    // memories from its recent session transcripts (deterministic, redacted),
+    // optimize them into the ledger (merge/confirm/retire), and render
+    // SECOND-BRAIN.md (+ the plain-JSON ledger twin). Prints the iteration's
+    // delta summary.
+    //
+    //   second-brain <root> [--out DIR] [--persist]
+    //     --out DIR  where to write artifacts (default: appSupport/second-brain/<name>).
+    //                Passing it is an explicit request for files, so artifacts
+    //                are written even without --persist.
+    //     --persist  record the iteration in the Supervisor DB (second_brain_ledgers).
+    //                Without --persist (and without an explicit --out) the run
+    //                is a dry preview: the prior persisted ledger is still READ
+    //                (so the iteration number is honest), but the new state is
+    //                not saved and no artifacts are written.
+    guard args.count >= 3 else {
+        print("usage: SupervisorDevTools second-brain <root> [--out DIR] [--persist]")
+        exit(2)
+    }
+    let root = URL(fileURLWithPath: args[2], isDirectory: true)
+    let persist = args.contains("--persist")
+    let explicitOutDir: URL? = {
+        if let i = args.firstIndex(of: "--out"), i + 1 < args.count {
+            return URL(fileURLWithPath: args[i + 1], isDirectory: true)
+        }
+        return nil
+    }()
+    let defaultOutDir: URL = {
+        let name = root.lastPathComponent.isEmpty ? "root" : root.lastPathComponent
+        return ConfigPaths().appSupportDir
+            .appendingPathComponent("second-brain", isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
+    }()
+    let outDir = explicitOutDir ?? defaultOutDir
+
+    // DB open stays here (the CLI decides how loudly to degrade); the loop's
+    // business rules live in SecondBrainCoordinator (issue #54 item 2) so the
+    // app and the CLI can never diverge on resume/dry-run/persist semantics.
+    var db: SupervisorDatabase? = nil
+    do {
+        let paths = ConfigPaths()
+        try paths.ensureDirectoriesExist()
+        db = try SupervisorDatabase(path: paths.databasePath)
+    } catch {
+        print("WARN: could not open Supervisor DB (\(error)) — starting a fresh ledger")
+    }
+
+    // Write files only when asked: --persist saves state, and an explicit
+    // --out is a request for files. A plain dry preview writing the SAME
+    // artifacts a persisted run writes would desync the files from the DB
+    // while promising "the new state is not saved".
+    let artifactsDir: URL? = (persist || explicitOutDir != nil) ? outDir : nil
+
+    let dbForTask = db
+    let iterationBox = IterationBox()
+    let brainSem = DispatchSemaphore(value: 0)
+    Task {
+        do {
+            iterationBox.result = try await SecondBrainCoordinator().runIteration(
+                root: root,
+                database: dbForTask,
+                persistToDatabase: persist,
+                artifactsDir: artifactsDir
+            )
+        } catch {
+            iterationBox.error = error
+        }
+        brainSem.signal()
+    }
+    brainSem.wait()
+
+    if let error = iterationBox.error {
+        // Artifact-write failure still shows the full iteration report the
+        // pre-coordinator CLI printed before attempting the write.
+        if let failure = error as? SecondBrainCoordinator.ArtifactWriteFailure {
+            if let n = failure.resumedFromIteration {
+                print("resuming from iteration \(n) (\(failure.resumedActiveEntryCount ?? 0) active entries)")
+            }
+            print("")
+            print(failure.consoleSummary)
+            print("")
+            print("ERROR writing artifacts: \(failure.underlying)")
+        } else {
+            print("ERROR writing artifacts: \(error)")
+        }
+        exit(1)
+    }
+    guard let result = iterationBox.result else {
+        print("ERROR: iteration did not run")
+        exit(1)
+    }
+    if let n = result.resumedFromIteration {
+        print("resuming from iteration \(n) (\(result.resumedActiveEntryCount ?? 0) active entries)")
+    }
+    print("")
+    print(result.consoleSummary)
+    print("")
+    if let paths = result.artifactPaths {
+        print("artifacts written to \(outDir.path):")
+        print("  \(paths.brain.lastPathComponent)")
+        print("  \(paths.ledgerJSON.lastPathComponent)")
+    } else {
+        print("dry preview: artifacts/ledger not written (pass --persist to save, or --out DIR for files)")
+    }
+    if let rowID = result.persistedRowID {
+        print("persisted iteration row id=\(rowID) (second_brain_ledgers)")
+    }
+    for warning in result.warnings {
+        print("WARN: \(warning)")
+    }
+case "trust-scorecard":
+    // issue #60 metric 1: the dismissal-rate half of the measured-experience
+    // gate. Aggregates per-category flag outcomes straight from the local
+    // sqlite — volume by severity, the explicit user responses the hover panel
+    // records on flags.user_response (approved / dismissed / false_positive /
+    // rejected / none — the panel labels "rejected" as Override), and the
+    // actions Supervisor actually took (audit_entries.kind) — over a trailing
+    // window. No LLM, no network, no row writes (first run on a fresh machine
+    // still creates the empty DB file, matching every other DB-backed
+    // subcommand). A rising dismissal rate = users learning to ignore
+    // Supervisor, measured before they churn.
+    //
+    //   trust-scorecard [--since DAYS]
+    //     --since DAYS  trailing window in days (default 30).
+    var sinceDays = 30
+    if let i = args.firstIndex(of: "--since") {
+        guard i + 1 < args.count, let days = Int(args[i + 1]), days > 0 else {
+            print("usage: SupervisorDevTools trust-scorecard [--since DAYS]  (DAYS = positive integer)")
+            exit(2)
+        }
+        sinceDays = days
+    }
+    let paths = ConfigPaths()
+    let db: SupervisorDatabase
+    do {
+        try paths.ensureDirectoriesExist()
+        db = try SupervisorDatabase(path: paths.databasePath)
+    } catch {
+        print("ERROR db open: \(error)")
+        exit(1)
+    }
+    do {
+        print(try TrustScorecard.load(database: db, sinceDays: sinceDays).render())
+    } catch {
+        print("ERROR: \(error)")
+        exit(1)
+    }
 default:
     print("unknown subcommand: \(args[1])")
     exit(2)
@@ -460,3 +618,9 @@ default:
 /// the semaphore without mutating a captured `var` (Swift 6 strict concurrency).
 /// Named `…2` to avoid colliding with the `ResultBox` in the inject-test case.
 final class ResultBox2: @unchecked Sendable { var report: AuditReport? = nil }
+
+/// Same pattern for the second-brain iteration Task.
+final class IterationBox: @unchecked Sendable {
+    var result: SecondBrainCoordinator.IterationResult? = nil
+    var error: Error? = nil
+}

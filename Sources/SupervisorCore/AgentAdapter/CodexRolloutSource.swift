@@ -18,8 +18,9 @@ public struct CodexRolloutSource: TranscriptSource {
 
     /// `codexHome` defaults to ~/.codex; overridable for tests.
     public init(codexHome: URL? = nil) {
+        // resolvedHome: honors SUPERVISOR_HOME (see ClaudeCodeAdapter).
         self.codexHome = codexHome
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+            ?? ConfigPaths.resolvedHome.appendingPathComponent(".codex", isDirectory: true)
     }
 
     public var watchRoots: [URL] {

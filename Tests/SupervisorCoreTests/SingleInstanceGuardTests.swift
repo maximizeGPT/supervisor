@@ -72,12 +72,17 @@ final class SingleInstanceGuardTests: XCTestCase {
         SingleInstanceGuard.writePID(4242, to: pidfile)
         XCTAssertEqual(SingleInstanceGuard.readRecordedPID(at: pidfile), 4242)
 
-        // Release only removes the file if it still records our pid.
+        // Release NEVER unlinks the pidfile — unlinking opened a two-instance
+        // hole (unlink racing a newcomer's open→flock leaves the newcomer
+        // locking an unlinked inode; every later launch then wins a fresh
+        // inode's lock). The flock, not the file, is the mutex; a leftover
+        // file with a stale pid is free.
         SingleInstanceGuard.releaseLock(at: pidfile, myPID: 9999) // not ours
         XCTAssertEqual(SingleInstanceGuard.readRecordedPID(at: pidfile), 4242)
 
         SingleInstanceGuard.releaseLock(at: pidfile, myPID: 4242) // ours
-        XCTAssertNil(SingleInstanceGuard.readRecordedPID(at: pidfile))
+        XCTAssertEqual(SingleInstanceGuard.readRecordedPID(at: pidfile), 4242,
+                       "releaseLock must be close-only; the pidfile stays as a diagnostic")
     }
 
     func testGarbagePidfileReadsAsNil() throws {

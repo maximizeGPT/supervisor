@@ -42,22 +42,22 @@ public enum MultiModelPanelStore {
 
     /// Off unless the owner turns it on. `UserDefaults.bool` returns false for
     /// an unset key, which is exactly the default we want.
-    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+    public static func isEnabled(defaults: UserDefaults = SupervisorDefaults.shared) -> Bool {
         defaults.bool(forKey: enabledKey)
     }
 
-    public static func setEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
+    public static func setEnabled(_ enabled: Bool, defaults: UserDefaults = SupervisorDefaults.shared) {
         defaults.set(enabled, forKey: enabledKey)
     }
 
-    public static func mode(defaults: UserDefaults = .standard) -> PanelMode {
+    public static func mode(defaults: UserDefaults = SupervisorDefaults.shared) -> PanelMode {
         guard let raw = defaults.string(forKey: modeKey), let m = PanelMode(rawValue: raw) else {
             return .diy
         }
         return m
     }
 
-    public static func setMode(_ mode: PanelMode, defaults: UserDefaults = .standard) {
+    public static func setMode(_ mode: PanelMode, defaults: UserDefaults = SupervisorDefaults.shared) {
         defaults.set(mode.rawValue, forKey: modeKey)
     }
 }

@@ -79,9 +79,9 @@ public struct ReviewFindingStore: Sendable {
 
     /// Deterministic dedup key for a finding. Combines the session, the file, and
     /// a NORMALIZED title (lowercased, whitespace-collapsed, capped) so trivial
-    /// rewordings of the same observation collapse to one fingerprint. Uses a
-    /// stable FNV-1a hash (NOT Swift's `Hasher`, which is per-run randomized and
-    /// would break persistence-based dedup across launches).
+    /// rewordings of the same observation collapse to one fingerprint. Uses the
+    /// shared stable FNV-1a hash (NOT Swift's `Hasher`, which is per-run
+    /// randomized and would break persistence-based dedup across launches).
     public static func fingerprint(sessionId: String, filePath: String, title: String) -> String {
         let normTitle = title
             .lowercased()
@@ -90,18 +90,6 @@ public struct ReviewFindingStore: Sendable {
             .joined(separator: " ")
             .prefix(120)
         let key = "\(sessionId)\u{1F}\(filePath)\u{1F}\(normTitle)"
-        return fnv1a64Hex(key)
-    }
-
-    /// FNV-1a 64-bit over the UTF-8 bytes, hex-encoded. Deterministic across
-    /// processes — the property persistence-based dedup needs.
-    private static func fnv1a64Hex(_ s: String) -> String {
-        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-        let prime: UInt64 = 0x0000_0100_0000_01b3
-        for byte in s.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* prime
-        }
-        return String(hash, radix: 16)
+        return StableHash.fnv1a64Hex(key)
     }
 }
