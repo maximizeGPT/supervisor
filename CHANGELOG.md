@@ -8,6 +8,24 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing yet.
 
+## [0.3.2] — 2026-07-26 (onboarding unblocked)
+
+### Fixed
+
+- **Onboarding step 5 dead-end.** The final onboarding step's content
+  outgrew the fixed window and pushed the Done button below the bottom
+  edge — every fresh install stalled at "Make it yours" with no way
+  forward (field report, with screenshot). Step content now scrolls;
+  the footer with the forward button is always on screen.
+
+### Added
+
+- **s13-hung-takeover E2E scenario**: reproduces the v0.3.0 field
+  report's exact failure state (alive-but-frozen instance holding the
+  launch lock) and proves the v0.3.1 takeover recovers without a
+  reboot. Plus shipped-binary harness fixes (release-build gate marker,
+  ACL-preserving keychain seeding).
+
 ## [0.3.1] — 2026-07-25 (launch reliability, second brain, e2e harness)
 
 ### Fixed

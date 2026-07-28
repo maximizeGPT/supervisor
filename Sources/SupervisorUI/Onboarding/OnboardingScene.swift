@@ -161,22 +161,34 @@ public struct OnboardingScene: View {
                 CompleteStep()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             default:
-                VStack(alignment: .leading, spacing: BrandSpacing.sm) {
-                    Text(stepIndicatorText)
-                        .font(BrandFont.indicator)
-                        .tracking(1)
-                        .textCase(.uppercase)
-                        .foregroundStyle(BrandColor.mute.color)
-                    Text(stepTitle)
-                        .font(BrandFont.title)
-                        .foregroundStyle(BrandColor.ink.color)
-                    stepBody
-                        .padding(.top, BrandSpacing.xs)
+                // ScrollView, not a bare VStack: the window is a fixed
+                // 480x420 (header 80 + content ~284 + footer 56), and a
+                // step whose body outgrows the band — step 5's two cards
+                // did, all its texts being fixedSize — otherwise overflows
+                // PAST the footer, pushing the primary Done button below
+                // the window edge. A user then sees "no button to move
+                // forward" (real field report, v0.3.1 onboarding). Tall
+                // content now scrolls inside the band; the footer, and
+                // with it the primary button, is always on screen.
+                ScrollView {
+                    VStack(alignment: .leading, spacing: BrandSpacing.sm) {
+                        Text(stepIndicatorText)
+                            .font(BrandFont.indicator)
+                            .tracking(1)
+                            .textCase(.uppercase)
+                            .foregroundStyle(BrandColor.mute.color)
+                        Text(stepTitle)
+                            .font(BrandFont.title)
+                            .foregroundStyle(BrandColor.ink.color)
+                        stepBody
+                            .padding(.top, BrandSpacing.xs)
+                    }
+                    .padding(.horizontal, BrandSpacing.xl)
+                    .padding(.top, BrandSpacing.lg)
+                    .padding(.bottom, BrandSpacing.md)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .padding(.horizontal, BrandSpacing.xl)
-                .padding(.top, BrandSpacing.lg)
-                .padding(.bottom, BrandSpacing.md)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

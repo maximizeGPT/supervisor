@@ -130,12 +130,17 @@ verify_print_paths_gate() {
     local out_file="$RUN_ROOT/print-paths.out" gate_pid waited=0
     local out home_line base_line
 
-    # Static check FIRST — zero execution: a binary that predates the seam
-    # has no "--print-paths" literal in its Mach-O, and running such a binary
-    # at all (even to probe the flag) would boot the full app against the
-    # real home. grep -q on a binary matches the embedded string constant.
-    grep -q -- "--print-paths" "$APP_BIN" \
-        || fail "PRE-LAUNCH GATE: $APP_BIN has no --print-paths support (stale binary predating the isolation seams) — refusing to execute it"
+    # Static check FIRST — zero execution: a binary that predates the seams
+    # must never be run at all (even to probe the flag), or it would boot
+    # the full app against the real home. Marker: the literal
+    # "SUPERVISOR_KEYCHAIN_PREFIX" (26 chars). NOT "--print-paths": at 13
+    # chars Swift's small-string optimization embeds it as register
+    # immediates in release builds, so the grep false-negatived on the
+    # notarized dmg binary even though the flag worked. Any binary with the
+    # seams reads this env var, and a 26-char string always lands in the
+    # data section, in every build configuration.
+    grep -q "SUPERVISOR_KEYCHAIN_PREFIX" "$APP_BIN" \
+        || fail "PRE-LAUNCH GATE: $APP_BIN lacks the isolation seams (no SUPERVISOR_KEYCHAIN_PREFIX in its Mach-O; stale binary) — refusing to execute it"
 
     # Now run it, but never trust it to exit: poll and kill OUR gate pid if
     # the flag somehow fell through to a full boot.
@@ -278,10 +283,23 @@ E2E_PROVIDERS="anthropic deepseek moonshot minimax qwenhf openrouter"
 # binary (KeychainAccess gets errSecAuthFailed and onboarding re-triggers).
 seed_provider_key() {
     local provider="$1" key="$2"
-    security add-generic-password \
-        -s "$SUPERVISOR_KEYCHAIN_PREFIX.$provider" -a "api-key" -w "$key" -A -U \
-        >/dev/null
-    info "seeded keychain item $SUPERVISOR_KEYCHAIN_PREFIX.$provider"
+    # Separate statement: bash 3.2 + set -u can't see $provider from within
+    # the same `local` compound line.
+    local service="$SUPERVISOR_KEYCHAIN_PREFIX.$provider"
+    # Reuse an existing item whenever its value already matches: deleting and
+    # recreating (the old behavior) resets the item's ACL, which resets the
+    # user's one-time "Always Allow" — turning the single SecurityAgent
+    # approval into a prompt on EVERY run. Only (re)write when the key value
+    # actually changed (e.g. a real E2E_API_KEY run after fake-key runs);
+    # that one rewrite re-triggers a single approval, which is honest.
+    local existing
+    existing="$(security find-generic-password -s "$service" -a "api-key" -w 2>/dev/null || true)"
+    if [ "$existing" = "$key" ]; then
+        info "keychain item $service already seeded (ACL/approval preserved)"
+        return
+    fi
+    security add-generic-password -s "$service" -a "api-key" -w "$key" -A -U >/dev/null
+    info "seeded keychain item $service"
 }
 
 seed_active_provider() {
@@ -292,11 +310,23 @@ seed_active_provider() {
 }
 
 delete_test_keychain_items() {
+    # Per-run teardown keeps the per-provider test items: they hold fake (or
+    # expendable test) keys in a namespace the live app never reads, and
+    # keeping them preserves their ACL — i.e. the user's one-time "Always
+    # Allow" — across runs. Deleting them every run made macOS re-prompt on
+    # every scenario. Full cleanup is explicit: e2e_purge_keychain.
+    # The legacy (bare-base) slot IS still deleted: the migration path
+    # recreates it as part of what's under test.
+    security delete-generic-password -s "$SUPERVISOR_KEYCHAIN_PREFIX" >/dev/null 2>&1 || true
+}
+
+# Explicit full cleanup (never called by teardown): remove every test
+# keychain item, e.g. before handing the machine back to a pristine state.
+e2e_purge_keychain() {
     local p
     for p in $E2E_PROVIDERS; do
         security delete-generic-password -s "$SUPERVISOR_KEYCHAIN_PREFIX.$p" >/dev/null 2>&1 || true
     done
-    # The legacy (bare-base) slot the migration path may have written/read.
     security delete-generic-password -s "$SUPERVISOR_KEYCHAIN_PREFIX" >/dev/null 2>&1 || true
 }
 
