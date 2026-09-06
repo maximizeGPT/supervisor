@@ -671,6 +671,286 @@ public final class HoverViewModel: ObservableObject {
         return s
     }
 
+    // MARK: - Remote escalation (panel Controls row)
+
+    /// Lifecycle of the panel's "Send test" button. `delivered` carries the
+    /// moment it landed so the row can say "delivered just now" honestly;
+    /// `failed` carries a short reason (never the URL).
+    public enum RemoteTestState: Equatable, Sendable {
+        case idle
+        case running
+        case delivered(Date)
+        case failed(reason: String)
+    }
+
+    /// Whether a webhook URL is stored in the Keychain. Seeded by the app at
+    /// launch (from the same off-main probe the notifier uses) and flipped
+    /// the moment a panel save succeeds — never optimistically.
+    @Published public private(set) var remoteWebhookConfigured = false
+
+    /// Mirror of `remote_notify.enabled` in config.yaml. Seeded at launch and
+    /// re-seeded by the config watcher, so a hand edit and a panel toggle
+    /// stay consistent whichever came last.
+    @Published public private(set) var remoteNotifyEnabled = false
+
+    /// Mirror of `remote_notify.detail`. Same seeding rule as the switch.
+    @Published public private(set) var remoteNotifyDetail: RemoteNotifyDetail = .minimal
+
+    /// C13: mirror of `remote_notify.format`. nil = auto-detect from the
+    /// webhook host (Discord, Slack and ntfy.sh all detect); an explicit
+    /// `.ntfy` is for a self-hosted ntfy server on a host that says nothing.
+    @Published public private(set) var remoteNotifyFormat: RemoteNotifyFormat?
+
+    /// True while a webhook save is in flight (disables the Save button).
+    @Published public private(set) var isSavingRemoteWebhook = false
+
+    /// Set when the last webhook save FAILED (a shape problem, or the
+    /// Keychain write threw). The message never contains the URL — it is a
+    /// bearer credential and this string renders on screen and may be
+    /// screenshotted into a bug report.
+    @Published public private(set) var remoteWebhookSaveError: String?
+
+    /// The current "Send test" state, rendered inline on the row.
+    @Published public private(set) var remoteTestState: RemoteTestState = .idle
+
+    /// Wired in main.swift: validates nothing (the VM already did), writes
+    /// the URL through KeychainRemoteNotifyURLStore — from inside the app,
+    /// so the app's own signature owns the item's ACL — and applies the
+    /// endpoint to the RUNNING RemoteNotifier so no relaunch is needed.
+    /// THROWS on Keychain failure so the panel can say so. nil in tests.
+    public var saveRemoteWebhookHandler: ((String) async throws -> Void)?
+
+    /// Wired in main.swift: persists (enabled, detail, format) into
+    /// config.yaml's `remote_notify` block and applies the triple to the
+    /// running notifier. Returns false when the config write failed, in
+    /// which case the published state is left untouched — the panel must
+    /// never show a switch position the file does not hold. nil in tests.
+    public var setRemoteNotifyHandler: ((_ enabled: Bool, _ detail: RemoteNotifyDetail, _ format: RemoteNotifyFormat?) async -> Bool)?
+
+    /// Wired in main.swift to the RUNNING app's `RemoteNotifier.sendTest()`,
+    /// so a green test proves the real channel, not a fresh lookalike.
+    public var sendRemoteTestHandler: (() async -> Notifier.Outcome)?
+
+    /// C7: reads the running RemoteNotifier's delivery-health snapshot at
+    /// render time (the currentPlan pattern: pull, not push, so no timer
+    /// churns publishes for a row that is usually collapsed). nil in tests
+    /// or before wiring, where the row simply shows no health line.
+    public var remoteDeliveryHealthProvider: (() -> RemoteNotifier.DeliveryHealth?)?
+
+    /// The row's delivery-health line, or nil when there is nothing honest
+    /// to say (no provider wired, or no delivery attempted this run).
+    public func remoteDeliveryHealthLine(now: Date = Date()) -> String? {
+        Self.remoteHealthLine(remoteDeliveryHealthProvider?(), now: now)
+    }
+
+    /// Whether the health line is reporting a failing channel (drives the
+    /// attention tint in the panel).
+    public func remoteDeliveryIsFailing() -> Bool {
+        (remoteDeliveryHealthProvider?()?.consecutiveFailures ?? 0) > 0
+    }
+
+    /// Pure formatter behind the line, so the wording is a table in tests.
+    /// Healthy: "Remote: delivered 3m ago". Failing: "Remote: last N
+    /// attempts failed, first at HH:MM". Silent before any attempt — an
+    /// untested channel is unknown, not healthy, and claiming either would
+    /// be a guess.
+    public nonisolated static func remoteHealthLine(_ health: RemoteNotifier.DeliveryHealth?, now: Date) -> String? {
+        guard let health else { return nil }
+        if health.consecutiveFailures > 0, let first = health.firstFailureAt {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "HH:mm"
+            let clock = formatter.string(from: first)
+            if health.consecutiveFailures == 1 {
+                return "Remote: last attempt failed at \(clock)"
+            }
+            return "Remote: last \(health.consecutiveFailures) attempts failed, first at \(clock)"
+        }
+        if let success = health.lastSuccessAt {
+            let seconds = max(0, now.timeIntervalSince(success))
+            let ago: String
+            if seconds < 60 { ago = "just now" }
+            else if seconds < 3600 { ago = "\(Int(seconds / 60))m ago" }
+            else if seconds < 86400 { ago = "\(Int(seconds / 3600))h ago" }
+            else { ago = "\(Int(seconds / 86400))d ago" }
+            return "Remote: delivered \(ago)"
+        }
+        return nil
+    }
+
+    /// Seed the row's state at launch (and on config re-load), so it shows
+    /// the truth on first open instead of defaults.
+    public func seedRemoteEscalation(
+        webhookConfigured: Bool,
+        enabled: Bool,
+        detail: RemoteNotifyDetail,
+        format: RemoteNotifyFormat? = nil
+    ) {
+        remoteWebhookConfigured = webhookConfigured
+        remoteNotifyEnabled = enabled
+        remoteNotifyDetail = detail
+        remoteNotifyFormat = format
+    }
+
+    /// The row's one-line summary of current state. Derived (not stored) so
+    /// it can never disagree with the flags it summarizes.
+    public var remoteEscalationStatusLine: String {
+        guard remoteWebhookConfigured else {
+            return "No webhook URL stored yet. Paste one to get paged off this Mac."
+        }
+        return remoteNotifyEnabled
+            ? "Webhook stored. Delivery is on (\(remoteNotifyDetail.rawValue))."
+            : "Webhook stored. Delivery is off."
+    }
+
+    /// Save a webhook URL pasted into the panel. The URL is validated FIRST
+    /// (https-only, parseable) so a shape problem surfaces immediately and
+    /// nothing unusable ever reaches the Keychain; only then does the
+    /// handler write and live-apply it. Honest save flow throughout, per the
+    /// provider-key pattern: `remoteWebhookConfigured` flips only after the
+    /// write actually succeeded.
+    public func saveRemoteWebhook(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isSavingRemoteWebhook else { return }
+        do {
+            _ = try RemoteWebhookURL(validating: trimmed)
+        } catch {
+            // The validation error describes the SHAPE problem and never
+            // quotes the input (RemoteNotifyError's contract).
+            remoteWebhookSaveError = (error as? RemoteNotifyError)?.errorDescription
+                ?? "That does not look like a usable webhook URL."
+            trace.emit("hover", "remote webhook rejected before save: \(remoteWebhookSaveError ?? "?")")
+            return
+        }
+        guard let handler = saveRemoteWebhookHandler else {
+            remoteWebhookSaveError = "Saving is unavailable."
+            trace.emit("hover", "saveRemoteWebhook: no handler wired")
+            return
+        }
+        isSavingRemoteWebhook = true
+        remoteWebhookSaveError = nil
+        // The test result belongs to the endpoint that was tested. Leaving it
+        // up across a swap made the row report a green "Delivered" about the
+        // PREVIOUS webhook, right where the owner looks to find out whether
+        // the new one works. Cleared before the write, so the stale verdict is
+        // gone even if the save then fails.
+        remoteTestState = .idle
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await handler(trimmed)
+                self.remoteWebhookConfigured = true
+                self.remoteWebhookSaveError = nil
+                self.trace.emit("hover", "remote webhook saved and applied live")
+            } catch {
+                self.remoteWebhookSaveError = "Couldn't save the webhook URL to the Keychain. It was NOT stored. Try again."
+                self.trace.emit("hover", "remote webhook save FAILED: \(type(of: error))")
+            }
+            self.isSavingRemoteWebhook = false
+        }
+    }
+
+    /// The full remote-notify triple every write persists as one unit.
+    private typealias RemoteNotifyTriple = (enabled: Bool, detail: RemoteNotifyDetail, format: RemoteNotifyFormat?)
+
+    /// The triple the NEXT setter should compute its change against: the
+    /// last ENQUEUED write while one is still pending, else the published
+    /// state. Without this, two rapid clicks each read the published (still
+    /// old) values and the second write silently reverts the first — the
+    /// stale-triple interleave the settings serialization exists to kill.
+    private var pendingRemoteNotifyTarget: RemoteNotifyTriple?
+
+    /// Tail of the strictly-serial write queue: each write awaits the one
+    /// before it, so config.yaml always ends at the last thing clicked.
+    private var remoteNotifyWriteTask: Task<Void, Never>?
+
+    private var currentRemoteNotifyTarget: RemoteNotifyTriple {
+        pendingRemoteNotifyTarget ?? (remoteNotifyEnabled, remoteNotifyDetail, remoteNotifyFormat)
+    }
+
+    /// Flip `remote_notify.enabled`. State updates only after the config
+    /// write succeeded, so the pill never shows a position config.yaml does
+    /// not hold. A no-op (logged) when no handler is wired.
+    public func setRemoteNotifyEnabled(_ enabled: Bool) {
+        let base = currentRemoteNotifyTarget
+        guard enabled != base.enabled else { return }
+        enqueueRemoteNotifyWrite((enabled, base.detail, base.format))
+    }
+
+    /// Select the detail level (minimal / full). Same honesty rule as the
+    /// switch: published state follows the successful write, never precedes it.
+    public func setRemoteNotifyDetail(_ detail: RemoteNotifyDetail) {
+        let base = currentRemoteNotifyTarget
+        guard detail != base.detail else { return }
+        enqueueRemoteNotifyWrite((base.enabled, detail, base.format))
+    }
+
+    /// C13: pin the wire shape (nil = auto-detect). Same write-then-reflect
+    /// rule as the other two settings.
+    public func setRemoteNotifyFormat(_ format: RemoteNotifyFormat?) {
+        let base = currentRemoteNotifyTarget
+        guard format != base.format else { return }
+        enqueueRemoteNotifyWrite((base.enabled, base.detail, format))
+    }
+
+    private func enqueueRemoteNotifyWrite(_ target: RemoteNotifyTriple) {
+        guard let handler = setRemoteNotifyHandler else {
+            trace.emit("hover", "remote notify setting: no handler wired (enabled=\(target.enabled) detail=\(target.detail.rawValue)) - ignoring")
+            return
+        }
+        pendingRemoteNotifyTarget = target
+        let previous = remoteNotifyWriteTask
+        remoteNotifyWriteTask = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return }
+            if await handler(target.enabled, target.detail, target.format) {
+                self.remoteNotifyEnabled = target.enabled
+                self.remoteNotifyDetail = target.detail
+                self.remoteNotifyFormat = target.format
+                self.trace.emit("hover", "owner set remote_notify enabled=\(target.enabled) detail=\(target.detail.rawValue) format=\(target.format?.rawValue ?? "auto")")
+            } else {
+                self.trace.emit("hover", "remote notify setting write FAILED (enabled=\(target.enabled) detail=\(target.detail.rawValue)); panel state unchanged")
+            }
+            // The last queued write (success OR failure) retires the
+            // pending marker, so the next click computes against the
+            // published truth again.
+            if let pending = self.pendingRemoteNotifyTarget, pending == target {
+                self.pendingRemoteNotifyTarget = nil
+            }
+        }
+    }
+
+    /// Fire one test message through the running app's remote channel and
+    /// surface the real delivery result inline. Mirrors exportSessionReport:
+    /// a running state, the awaited handler, then the honest outcome.
+    public func sendRemoteTest() {
+        guard remoteTestState != .running else { return }
+        guard let handler = sendRemoteTestHandler else {
+            remoteTestState = .failed(reason: "Test send is unavailable.")
+            trace.emit("hover", "sendRemoteTest: no handler wired")
+            return
+        }
+        guard remoteWebhookConfigured else {
+            remoteTestState = .failed(reason: "Store a webhook URL first.")
+            return
+        }
+        remoteTestState = .running
+        trace.emit("hover", "remote test send requested")
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            switch await handler() {
+            case .posted:
+                self.remoteTestState = .delivered(Date())
+                self.trace.emit("hover", "remote test delivered")
+            case .skippedDeniedSilently:
+                self.remoteTestState = .failed(reason: "No webhook URL is stored yet.")
+                self.trace.emit("hover", "remote test skipped (no endpoint)")
+            case .failed(let reason):
+                self.remoteTestState = .failed(reason: "Delivery failed (\(reason)). Check the URL and your network.")
+                self.trace.emit("hover", "remote test failed reason=\(reason)")
+            }
+        }
+    }
+
     /// v0.2.0 M3: approve a plan from the panel's "Approve plan" button. Routes
     /// through `approvePlanHandler`, which the app wires to
     /// `TriageEngine.approvePlan(planId:)` — the same approval path the
@@ -868,6 +1148,17 @@ public final class HoverViewModel: ObservableObject {
         // observes actionFlash and forces the hover visible for the
         // duration, so this is seen even when no terminal is frontmost.
         beginActionFlash(label: description, holdSeconds: 2.5)
+    }
+
+    /// C2/D1: surface a Supervisor-is-down notice (cost cap hit, provider
+    /// unavailable, breaker opened) on the hover. Rides the action-flash
+    /// path so the band force-shows for the hold even with no terminal
+    /// frontmost — the whole point of these notices is that triage went
+    /// dark, which no flag will ever announce. The engine throttles
+    /// emissions to once per hour per kind, so this cannot flood.
+    public func announceSystemNotice(_ label: String) {
+        trace.emit("hover", "system notice: \(label)")
+        beginActionFlash(label: label, holdSeconds: 5.0)
     }
 
     /// Announce that Supervisor rebuilt and relaunched itself. Shows a

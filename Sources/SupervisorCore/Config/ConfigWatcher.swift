@@ -82,23 +82,14 @@ public final class ConfigWatcher {
         )
 
         src.setEventHandler { [weak self] in
-            guard let self else { return }
-            Task { @MainActor in
-                if watchingDir {
-                    // Re-check if config.yaml appeared; restart to watch
-                    // the file directly.
-                    if FileManager.default.fileExists(atPath: path) {
-                        self.stop()
-                        let config = UserConfig.load(from: self.configPath)
-                        self.onChange(config)
-                        self.startWatching()
-                        return
-                    }
-                } else {
-                    let config = UserConfig.load(from: self.configPath)
-                    self.trace.emit("config", "reloaded \(config.additionalHostApps.count) additional host apps")
-                    self.onChange(config)
-                }
+            // The source is scheduled on the main queue, so main-actor
+            // state is reachable synchronously here — and it must be: the
+            // event mask is per-delivery, so it is read NOW, not after an
+            // async hop that could coalesce or drop it.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let event = self.source?.data ?? []
+                self.handleEvent(event, watchingDir: watchingDir)
             }
         }
 
@@ -112,5 +103,37 @@ public final class ConfigWatcher {
         src.resume()
 
         trace.emit("config", "watcher started on \(watchPath) (dir=\(watchingDir))")
+    }
+
+    /// One file-system event on the watched path. Always reloads by PATH
+    /// (never through the possibly-dead descriptor), then re-arms when the
+    /// inode went away under us.
+    private func handleEvent(_ event: DispatchSource.FileSystemEvent, watchingDir: Bool) {
+        let path = configPath.path
+        if watchingDir {
+            // Re-check if config.yaml appeared; restart to watch the file
+            // directly.
+            if FileManager.default.fileExists(atPath: path) {
+                stop()
+                let config = UserConfig.load(from: configPath)
+                onChange(config)
+                startWatching()
+            }
+            return
+        }
+        let config = UserConfig.load(from: configPath)
+        trace.emit("config", "reloaded \(config.additionalHostApps.count) additional host apps")
+        onChange(config)
+        // Atomic saves (vim-style editors, and RemoteNotifyConfigWriter's
+        // own temp+rename write) replace the file's INODE. The descriptor
+        // this source watches still points at the old, now-deleted inode:
+        // without re-arming, this delete/rename event is the last one the
+        // watcher would ever see and every later owner edit goes silent.
+        // Re-open by path and re-arm.
+        if event.contains(.delete) || event.contains(.rename) {
+            trace.emit("config", "watched inode replaced (atomic save) — re-arming on the new file")
+            stop()
+            startWatching()
+        }
     }
 }

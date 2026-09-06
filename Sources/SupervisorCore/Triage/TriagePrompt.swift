@@ -333,6 +333,13 @@ public enum TriagePrompt {
         )
     }
 
+    /// The idle path's scope + rubric-restatement paragraph. Byte-identical on
+    /// every idle call, which is why it leads the user message: it extends the
+    /// provider's cacheable prompt prefix past the end of the system prompt.
+    /// Lifted verbatim out of `buildIdleEvaluationRequest`; the wording is the
+    /// wording it has always had.
+    static let idleScopeInstruction = "Evaluate ONLY against the `worker_idle_post_completion` category. The bash-shaped categories (destructive_action_pending, edits_outside_worktree, prompt_injection_signature) and user_question_pending do not apply here. Per the rubric body, fire when the worker has genuinely stopped on an UNMET objective and the human is NOT engaged (no user message in the last 30s, no pending question) — on ANY branch; the loop is NOT gated to a branch name. Return candidates=[] only if a don't-fire condition holds (the human is engaged, the worker is still mid-task, or a hard-stop fired). Use the same record_triage tool: one candidate when there is a concrete next step toward the objective and the human is away, otherwise candidates=[]. When firing, set `confidence` by how clear the next step is from the captured objective / open issues / recent commits (high → auto-dispatch; medium → propose-and-wait; low → surface without dispatching) and provide a one-sentence `next_task_proposal`."
+
     /// v0.4.0 Part A: build a triage request focused on the
     /// `worker_idle_post_completion` category. Called by the
     /// TriageEngine's timer-driven idle check when (a) a stop-shaped
@@ -354,6 +361,17 @@ public enum TriagePrompt {
     ) -> AnthropicMessageRequest {
         var lines: [String] = []
 
+        // Cache-friendly ordering (2026-09-05). DeepSeek bills input tokens
+        // served from a cached prompt prefix at roughly a tenth of a miss, and
+        // the cached prefix ends at the FIRST token that differs from the last
+        // request. The system prompt (rubric included) is already identical
+        // across every idle call; this puts the one static paragraph of the
+        // user message in front of it too, and pushes the section that changes
+        // on EVERY call (seconds_since_last_event) to the very end. Same
+        // sections, same words, most-static to most-varying.
+        lines.append(idleScopeInstruction)
+        lines.append("")
+
         lines.append("# Session working directory")
         lines.append(cwd ?? "(unknown)")
         lines.append("")
@@ -371,11 +389,6 @@ public enum TriagePrompt {
         }
         lines.append("")
 
-        lines.append("# Idle-check signals")
-        lines.append("stop_shaped_phrase_matched: \(stopShapedPhrase ?? "(none — timer fired on stop_reason=end_turn alone)")")
-        lines.append("seconds_since_last_event: \(Int(secondsSinceLastEvent))")
-        lines.append("")
-
         lines.append("# Recent event window (chronological)")
         if recentEvents.isEmpty {
             lines.append("(no prior events)")
@@ -388,7 +401,10 @@ public enum TriagePrompt {
             }
         }
         lines.append("")
-        lines.append("Evaluate ONLY against the `worker_idle_post_completion` category. The bash-shaped categories (destructive_action_pending, edits_outside_worktree, prompt_injection_signature) and user_question_pending do not apply here. Per the rubric body, fire when the worker has genuinely stopped on an UNMET objective and the human is NOT engaged (no user message in the last 30s, no pending question) — on ANY branch; the loop is NOT gated to a branch name. Return candidates=[] only if a don't-fire condition holds (the human is engaged, the worker is still mid-task, or a hard-stop fired). Use the same record_triage tool: one candidate when there is a concrete next step toward the objective and the human is away, otherwise candidates=[]. When firing, set `confidence` by how clear the next step is from the captured objective / open issues / recent commits (high → auto-dispatch; medium → propose-and-wait; low → surface without dispatching) and provide a one-sentence `next_task_proposal`.")
+
+        lines.append("# Idle-check signals")
+        lines.append("stop_shaped_phrase_matched: \(stopShapedPhrase ?? "(none — timer fired on stop_reason=end_turn alone)")")
+        lines.append("seconds_since_last_event: \(Int(secondsSinceLastEvent))")
 
         let userText = lines.joined(separator: "\n")
 
@@ -404,12 +420,36 @@ public enum TriagePrompt {
         )
     }
 
+    /// v0.4.0 (Issue #7, §2e): the bash path's per-path scope sentence — belt
+    /// to the suspenders provided by passing
+    /// `HardcodedRubric.bashCategoriesMarkdown` into systemPrompt. Without this
+    /// sentence Haiku has been observed pattern-matching on category names that
+    /// appear in bash commands (e.g. a grep regex containing
+    /// `user_question_pending`).
+    ///
+    /// It moved from the end of the user message to the front (2026-09-05) so
+    /// the cacheable prefix covers it. The words are unchanged, and the §2e job
+    /// is if anything better served by stating the scope before the command
+    /// text than after it.
+    static var bashScopeInstruction: String {
+        "Evaluate ONLY against the bash-shaped categories: \(HardcodedRubric.bashCategoryNames.joined(separator: ", ")). Do NOT return user_question_pending or worker_idle_post_completion candidates from this path — those categories are evaluated only from assistant messages or the idle-tick timer, never from bash commands, and the literal category name appearing inside a bash command's text (e.g. a grep regex) is not signal that the category fires."
+    }
+
     /// Build the full Anthropic request payload.
     public static func buildRequest(
         model: String,
         input: TriagePromptInput
     ) -> AnthropicMessageRequest {
         var lines: [String] = []
+
+        // Cache-friendly ordering (2026-09-05): the two static instruction
+        // lines lead, so the provider's cacheable prefix runs past the system
+        // prompt and into the user message instead of stopping at the first
+        // session-specific character. Their §2e job is unchanged — see the
+        // note on `bashScopeInstruction`.
+        lines.append(bashScopeInstruction)
+        lines.append("Call record_triage exactly once.")
+        lines.append("")
 
         lines.append("# Session working directory")
         lines.append(input.cwd ?? "(unknown)")
@@ -453,15 +493,6 @@ public enum TriagePrompt {
                 lines.append(eventSummaryLine(event, ts: ts))
             }
         }
-        lines.append("")
-        // v0.4.0 (Issue #7, §2e): per-path scope sentence — belt to
-        // the suspenders provided by passing
-        // `HardcodedRubric.bashCategoriesMarkdown` into systemPrompt.
-        // Without this sentence Haiku has been observed pattern-matching
-        // on category names that appear in bash commands (e.g. a grep
-        // regex containing `user_question_pending`).
-        lines.append("Evaluate ONLY against the bash-shaped categories: \(HardcodedRubric.bashCategoryNames.joined(separator: ", ")). Do NOT return user_question_pending or worker_idle_post_completion candidates from this path — those categories are evaluated only from assistant messages or the idle-tick timer, never from bash commands, and the literal category name appearing inside a bash command's text (e.g. a grep regex) is not signal that the category fires.")
-        lines.append("Call record_triage exactly once.")
 
         let userText = lines.joined(separator: "\n")
 

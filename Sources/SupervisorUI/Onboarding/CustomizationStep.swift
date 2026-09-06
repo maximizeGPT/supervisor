@@ -66,6 +66,13 @@ struct CustomizationStep: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+
+            // One-line pointer to the remote escalation channel. Setup lives
+            // in the hover panel, not here: onboarding only says it exists.
+            Text("Away from the Mac a lot? The hover panel's Controls has a Remote escalation row that can page your phone through a webhook when a session blocks on you.")
+                .font(BrandFont.note)
+                .foregroundStyle(BrandColor.mute.color)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

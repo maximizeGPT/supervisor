@@ -91,6 +91,31 @@ struct OpenAIUsage: Codable, Sendable {
     let prompt_tokens: Int
     let completion_tokens: Int
     let total_tokens: Int?
+    /// DeepSeek's prefix-cache accounting (2026-09-05). Input tokens served
+    /// from a cached prompt prefix bill at roughly a tenth of a miss, so this
+    /// is the number that says whether the cache-friendly prompt ordering is
+    /// actually paying. Provider-specific and OPTIONAL on purpose: every other
+    /// OpenAI-compatible provider omits both keys and decodes exactly as
+    /// before.
+    let prompt_cache_hit_tokens: Int?
+    let prompt_cache_miss_tokens: Int?
+
+    /// Spelled out with defaults so the two cache fields are opt-in for the
+    /// hand-built fixtures in the test suite; decoding still goes through the
+    /// synthesized `init(from:)` and is unaffected.
+    init(
+        prompt_tokens: Int,
+        completion_tokens: Int,
+        total_tokens: Int? = nil,
+        prompt_cache_hit_tokens: Int? = nil,
+        prompt_cache_miss_tokens: Int? = nil
+    ) {
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = total_tokens
+        self.prompt_cache_hit_tokens = prompt_cache_hit_tokens
+        self.prompt_cache_miss_tokens = prompt_cache_miss_tokens
+    }
 }
 
 // MARK: - Error shape

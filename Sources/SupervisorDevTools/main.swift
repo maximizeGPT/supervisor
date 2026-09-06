@@ -15,6 +15,26 @@
 //                               current file size. Stops a fresh Supervisor
 //                               from replaying 40 MB of historical events
 //                               through Haiku on first start.
+//
+// Remote escalation delivery. There is no argv form for the webhook URL on
+// purpose: a Discord or Slack webhook URL is a bearer credential, and argv
+// leaks it into shell history and into Supervisor's own observation of the
+// bash command. Same reasoning as inject-key-from-env.
+//
+//   remote-notify-url-from-env  Read $SUPERVISOR_REMOTE_NOTIFY_SECRET_URL,
+//                               validate it is https, write it to the
+//                               Keychain. The variable name carries SECRET
+//                               on purpose: the env-assignment redaction
+//                               patterns key on that word, so a pasted
+//                               `export SUPERVISOR_REMOTE_NOTIFY_SECRET_URL=...`
+//                               line is scrubbed before any triage call.
+//   remote-notify-show          Print whether a URL is stored, and its host.
+//                               Never prints the URL itself.
+//   remote-notify-delete        Remove the stored URL. With no URL the app
+//                               never builds the remote channel at all.
+//   remote-notify-test          POST one synthetic escalation to the stored
+//                               webhook so the owner can confirm delivery
+//                               BEFORE relying on it to reach them.
 
 import AppKit
 import Foundation
@@ -27,6 +47,7 @@ guard args.count >= 2 else {
     print("  sessions:  seed-offsets-eof DIR | locate-session | inject-test")
     print("  desktop:   desktop-target | desktop-ocr-dump | desktop-title | ocr-dump | match-test | composer-probe | composer-focus-test | scroll-test")
     print("  analysis:  context-wiki ROOT | second-brain ROOT | trust-scorecard [--since DAYS]")
+    print("  remote:    remote-notify-url-from-env | remote-notify-show | remote-notify-delete | remote-notify-test")
     exit(2)
 }
 
@@ -37,6 +58,9 @@ guard args.count >= 2 else {
 // is always visible in the transcript.
 let store = KeychainAPIKeyStore()
 let keychainServiceLabel = KeychainAPIKeyStore.defaultService
+// Same namespacing: the webhook slot is computed off the shared keychain
+// base, so the E2E prefix isolates it exactly like the provider keys.
+let remoteURLStore = KeychainRemoteNotifyURLStore()
 
 switch args[1] {
 case "inject-key":
@@ -607,6 +631,160 @@ case "trust-scorecard":
         print(try TrustScorecard.load(database: db, sinceDays: sinceDays).render())
     } catch {
         print("ERROR: \(error)")
+        exit(1)
+    }
+case "remote-notify-url-from-env":
+    guard let raw = ProcessInfo.processInfo.environment["SUPERVISOR_REMOTE_NOTIFY_SECRET_URL"], !raw.isEmpty else {
+        print("ERROR: SUPERVISOR_REMOTE_NOTIFY_SECRET_URL not set")
+        exit(2)
+    }
+    // Validate BEFORE storing. A URL that would be rejected at launch is a
+    // webhook the owner thinks is armed and is not.
+    let endpoint: RemoteWebhookURL
+    do {
+        endpoint = try RemoteWebhookURL(validating: raw)
+    } catch {
+        print("ERROR: \((error as? RemoteNotifyError)?.errorDescription ?? "\(error)")")
+        exit(1)
+    }
+    do {
+        try remoteURLStore.write(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        print("ok: webhook stored host=\(endpoint.loggableHost) format=\(endpoint.format) service=\(KeychainRemoteNotifyURLStore.service)")
+        // Honest about the live-pickup boundary: a running app applies the
+        // stored URL on the next config.yaml change ONLY if it built the
+        // remote channel at launch (any URL present then, or the switch
+        // already on). An app launched with neither needs a relaunch, and
+        // remote-notify-test's channel check below is how to tell.
+        print("next: set remote_notify.enabled: true in ~/Library/Application Support/Supervisor/config.yaml")
+        print("      (a running Supervisor picks the URL up when that file is saved, unless it launched")
+        print("      with remote delivery fully unconfigured; then relaunch it once)")
+        print("then: swift run SupervisorDevTools remote-notify-test")
+    } catch {
+        print("ERROR: \(error)")
+        exit(1)
+    }
+case "prompt-bundle-probe":
+    // Install-path proof for the dispatcher system prompt. Copy this binary
+    // into a built Supervisor.app/Contents/MacOS/ and run it there: Bundle.main
+    // is then the .app, exactly as it is for the shipping executables, so the
+    // output shows which candidate actually resolved. A path under
+    // Contents/Resources/ proves the packaged app reads its OWN embedded
+    // bundle; a path under .build/ proves it is only working because this
+    // machine has the checkout (i.e. it would fatalError on a user's Mac).
+    print("bundle_main=\(Bundle.main.bundleURL.path)")
+    print("core_bundle_resolved=\(CoreResourceBundle.resolved?.bundlePath ?? "nil")")
+    if let url = Dispatcher.bundledPromptURL {
+        print("prompt_url=\(url.path)")
+    } else {
+        print("prompt_url=nil")
+    }
+    let probePrompt = Dispatcher.systemPrompt
+    print("prompt_bytes=\(probePrompt.utf8.count)")
+    print("prompt_first_line=\(probePrompt.split(separator: "\n").first.map(String.init) ?? "")")
+    // The stub is ~140 chars. Anything in that range means the real prompt did
+    // not load, whichever candidate was blamed.
+    if probePrompt.utf8.count < 2000 {
+        print("ERROR: the loaded prompt is the stub, not the bundled prompt")
+        exit(1)
+    }
+
+case "remote-notify-show":
+    do {
+        guard let raw = try remoteURLStore.read(), !raw.isEmpty else {
+            print("absent service=\(KeychainRemoteNotifyURLStore.service)")
+            break
+        }
+        // The path segment IS the credential, so only the host is printed.
+        if let endpoint = try? RemoteWebhookURL(validating: raw) {
+            print("present host=\(endpoint.loggableHost) format=\(endpoint.format) service=\(KeychainRemoteNotifyURLStore.service)")
+        } else {
+            print("present but INVALID (stored value will not be used at launch)")
+        }
+    } catch {
+        print("ERROR: \(error)")
+        exit(1)
+    }
+case "remote-notify-delete":
+    do { try remoteURLStore.delete(); print("ok: deleted service=\(KeychainRemoteNotifyURLStore.service)") }
+    catch { print("ERROR: \(error)"); exit(1) }
+case "remote-notify-test":
+    // One synthetic escalation through the real notifier and the real
+    // transport. Confirms the URL, the network path and the receiving
+    // endpoint in one shot, without waiting for a real intervention.
+    guard let raw = ((try? remoteURLStore.read()) ?? nil), !raw.isEmpty else {
+        print("ERROR: no webhook stored. Run remote-notify-url-from-env first.")
+        exit(2)
+    }
+    let testEndpoint: RemoteWebhookURL
+    do { testEndpoint = try RemoteWebhookURL(validating: raw) }
+    catch { print("ERROR: \((error as? RemoteNotifyError)?.errorDescription ?? "\(error)")"); exit(1) }
+
+    let remoteNotifier = RemoteNotifier(
+        endpoint: testEndpoint,
+        // Forced on and dedupe off: this subcommand exists to send, and the
+        // owner may well run it twice in a row.
+        configuration: .init(enabled: true, detail: .minimal, dedupeWindow: 0),
+        trace: TraceLog(path: ConfigPaths().traceLogPath)
+    )
+    let probeNow = Date()
+    let probe = TriageDecision(
+        sessionId: "devtools-probe",
+        cwd: FileManager.default.currentDirectoryPath,
+        candidate: TriageCandidate(
+            category: "remote_notify_test",
+            severity: .high,
+            matchedCommand: "SupervisorDevTools remote-notify-test",
+            action: .notify,
+            reasoningPlain: "Test message from Supervisor. Remote escalation delivery is reaching this endpoint.",
+            reasoningTechnical: "Synthetic decision emitted by SupervisorDevTools remote-notify-test."
+        ),
+        triggeringEvent: BashToolCallInfo(
+            sessionId: "devtools-probe",
+            command: "SupervisorDevTools remote-notify-test",
+            description: nil,
+            toolUseId: "devtools-probe",
+            turnUUID: "devtools-probe",
+            ts: probeNow
+        ),
+        usage: AnthropicUsage(input_tokens: 0, output_tokens: 0),
+        model: "none",
+        prePost: .preExecution
+    )
+    let probeSem = DispatchSemaphore(value: 0)
+    final class OutcomeBox: @unchecked Sendable { var value: Notifier.Outcome = .failed(reason: "did not run") }
+    let probeResult = OutcomeBox()
+    Task {
+        probeResult.value = await remoteNotifier.postInterventionResult(decision: probe, outcome: .notifyOnly)
+        probeSem.signal()
+    }
+    while probeSem.wait(timeout: .now()) == .timedOut {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    }
+    switch probeResult.value {
+    case .posted:
+        print("ok: delivered to \(testEndpoint.loggableHost)")
+        // The send above proves the URL + network + endpoint. It says
+        // NOTHING about whether the running app will deliver a real
+        // escalation: that also needs the config switch on and the app's
+        // own channel wired. Check both here so "the test worked" cannot
+        // be mistaken for "the app is armed".
+        let liveConfig = UserConfig.load(from: ConfigPaths().configPath)
+        if !liveConfig.remoteNotifyEnabled {
+            print("WARN: remote_notify.enabled is not true in config.yaml, so the app itself will NOT deliver")
+            print("      real escalations until you set it (this test command bypasses that switch).")
+        }
+        let traceText = (try? String(contentsOf: ConfigPaths().traceLogPath, encoding: .utf8)) ?? ""
+        if traceText.contains("remote.channel_wired") {
+            print("ok: the app's trace log shows remote.channel_wired, so a Supervisor launch has built the remote channel")
+        } else {
+            print("WARN: no remote.channel_wired line in the app's trace log. The running Supervisor has not")
+            print("      built the remote channel (it launched before the URL/switch existed). Relaunch it once.")
+        }
+    case .skippedDeniedSilently:
+        print("ERROR: gated before sending (unexpected for this subcommand)")
+        exit(1)
+    case .failed(let reason):
+        print("ERROR: not delivered (\(reason)). See ~/Library/Logs/Supervisor/supervisor.log")
         exit(1)
     }
 default:

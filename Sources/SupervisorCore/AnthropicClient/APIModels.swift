@@ -143,6 +143,22 @@ public struct AnthropicUsage: Codable, Sendable {
     public let output_tokens: Int
     public let cache_creation_input_tokens: Int?
     public let cache_read_input_tokens: Int?
+
+    /// The memberwise init was internal, so anything outside SupervisorCore
+    /// that needed to build a `TriageDecision` (the dev-tools remote-notify
+    /// probe, any future harness) could only get one by decoding JSON.
+    /// Additive and non-behavioral: the decode path is untouched.
+    public init(
+        input_tokens: Int,
+        output_tokens: Int,
+        cache_creation_input_tokens: Int? = nil,
+        cache_read_input_tokens: Int? = nil
+    ) {
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_creation_input_tokens = cache_creation_input_tokens
+        self.cache_read_input_tokens = cache_read_input_tokens
+    }
 }
 
 // MARK: - Error response

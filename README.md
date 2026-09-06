@@ -33,9 +33,9 @@ Supervisor watches each session and acts in your place:
 - **Keeps it moving.** It nudges an idle session forward toward its objective instead of letting it stall the moment you step away.
 - **Stops the dangerous stuff.** When an action looks destructive, it flags it and tells you why, in one sentence you can actually read, and pauses the session when it can do so safely.
 
-Everything runs on your Mac, on your own API key. Nothing leaves your machine except the same model calls you would make yourself.
+Everything runs on your Mac, on your own API key. Nothing leaves your machine except the same model calls you would make yourself, plus the escalation message described in [Remote escalation delivery](#remote-escalation-delivery) if you turn that on yourself. It ships off, and its default message quotes nothing from your session.
 
-**New in 0.3.1:** launch reliability, hardened (the app always opens, or tells you why it can't) and an opt-in Second Brain that keeps what your sessions teach in a local memory you own. From 0.3.0: Codex sessions are supervised too, an opt-in second-opinion panel checks borderline calls across other models, context health monitoring warns when a long session starts degrading, and the portable Agent Skill below puts Supervisor inside your own agent, no download required.
+**New in 0.4.0:** escalations reach your phone. Discord, Slack or ntfy, off by default, and the status-bar companion pages you when the app itself crashes or hangs, because the process that most needs reporting is the one that cannot report itself. Model spend is now metered, traced hourly, and capped at $5/day by default: the idle path used to re-buy the same verdict every 60 seconds, about $11/day against sessions that had been silent for hours, and it now settles onto a 30-minute rung for well under $1. From 0.3.x: launch reliability, an opt-in Second Brain, supervised Codex sessions, a second-opinion panel across other models, context health monitoring, and the portable Agent Skill below.
 
 ## Install
 
@@ -88,15 +88,62 @@ Four intervention types, ordered by escalation. `notify` is the floor: every str
 
 Three things make it trustworthy:
 
-- **Local and private.** Everything runs on your Mac. A redaction layer strips secrets (API keys, tokens, credentials) before any model call, and refuses to send a request without it. Fail-closed by design.
+- **Local and private.** Everything runs on your Mac. A redaction layer strips secrets (API keys, tokens, credentials) before any model call, and refuses to send a request without it. Fail-closed by design. The one optional exception is the escalation message described in [Remote escalation delivery](#remote-escalation-delivery), which ships off only if you turn that on yourself.
 - **Bring your own key.** No server, no subscription, no per-seat pricing. Use the key you already have: Anthropic, DeepSeek, Moonshot Kimi, MiniMax, Qwen, or OpenRouter. Your usage is billed to you, at cost.
 - **Honest health.** A companion menu-bar process reports green, amber, or red, so you always know whether Supervisor is actually watching.
 
 The architecture at a glance: [docs/architecture.svg](./docs/architecture.svg).
 
+## Remote escalation delivery
+
+The whole point is the moment you step away from the Mac. Until now the escalation path ended at a macOS banner on a screen you were not looking at, so a paused session sat there until you came back to find it.
+
+Remote delivery posts an escalation to a webhook you supply. Discord, Slack, and [ntfy](https://ntfy.sh) endpoints are detected from the URL and get their native payload shape; anything else receives a flat JSON envelope. For a self-hosted ntfy server, set `remote_notify.format: ntfy` (or pick ntfy in the panel) since the host alone says nothing.
+
+**The zero-infrastructure default is ntfy.** No account, no server, about 30 seconds: install the ntfy app on your phone, subscribe to a topic name only you would guess (the topic name is the whole secret, so make it long and random), and your webhook URL is `https://ntfy.sh/your-topic-name`. Discord and Slack work exactly as well if you already live there.
+
+**The easiest setup is in the app.** Open the hover panel, expand Controls, and use the Remote escalation row: paste the webhook URL, flip delivery on, pick the detail level, and press Send test. A green result there means the real channel delivered. The CLI path below does the same thing and stays supported:
+
+```bash
+# 1. Store the URL. Env form only: the URL is a bearer credential, and argv
+#    leaks it into shell history and into Supervisor's own observation of
+#    the command. read -s takes the pasted URL without echoing it and
+#    without touching disk. Must be https.
+read -rs SUPERVISOR_REMOTE_NOTIFY_SECRET_URL && export SUPERVISOR_REMOTE_NOTIFY_SECRET_URL
+swift run SupervisorDevTools remote-notify-url-from-env
+unset SUPERVISOR_REMOTE_NOTIFY_SECRET_URL
+
+# 2. Turn it on in ~/Library/Application Support/Supervisor/config.yaml
+#    (watched live, no relaunch needed):
+#      remote_notify:
+#        enabled: true
+#        detail: minimal
+
+# 3. Send one synthetic escalation and confirm it arrives.
+swift run SupervisorDevTools remote-notify-test
+```
+
+The first Supervisor launch after storing the URL may show a macOS Keychain permission prompt; click Always Allow so later launches read the webhook without asking again.
+
+**What gets sent.** At `detail: minimal`, the default, the message carries Supervisor's own verdict and nothing quoted from the session: the rubric category, the severity, what Supervisor did, an 8-character session prefix, and the working directory's basename. No command text, no assistant reasoning, no absolute paths. `detail: full` adds the triggering command and the plain-language reasoning, both passed through the same redaction layer the model calls use.
+
+**When it fires.** Only events where the session is blocked on you, plus high-severity flags: pause, kill, a medium-confidence dispatch waiting on your approval, a low-confidence dispatch waiting on your direction, an answer Supervisor could not type for you, a missing Screen Recording permission, and any high-severity notify. Work Supervisor handled by itself stays local. Repeats of the same session, outcome and category collapse to one message per minute, so a stuck loop pages you once.
+
+**The honest caveat.** You get pinged. You cannot answer from your phone, so a blocked session still says "go to your Mac." Delivery is one-way.
+
 ## Pricing
 
-Free and open source. The only thing you pay for is the model usage you would have paid for anyway, billed to you directly and never to us. At heavy use (~6 hours of Claude Code a day) triage runs about $80/month on Anthropic and a few dollars a month on DeepSeek. The in-app cost view shows your real spend, and you can set a hard daily cap that pauses triage when hit.
+Free and open source. The only thing you pay for is the model usage you would have paid for anyway, billed to you directly and never to us. At heavy use (~6 hours of Claude Code a day) triage runs about $80/month on Anthropic and a few dollars a month on DeepSeek. The in-app cost view shows your real spend.
+
+**There is a hard daily cap, and it is on by default at $5.00.** When today's recorded spend reaches it, Supervisor refuses model calls before they leave the machine, pauses triage, and pages you that it has stopped watching. You do not have to configure anything to get this. The cap is a runaway backstop, not a budget: heavy Anthropic use runs about $2.67/day, so a normal day never approaches it. To raise it, lower it, or turn it off, edit `~/Library/Application Support/Supervisor/config.yaml`, which Supervisor writes on first launch with every default commented out (read live, no relaunch):
+
+```yaml
+cost:
+  daily_cap_usd: 10.00   # your ceiling for a day of model spend
+  # daily_cap_usd: 0     # 0 removes the cap entirely. Nothing then bounds spend.
+```
+
+A value that does not parse is treated as a typo, not as "no cap": the $5.00 default stays in force. If Supervisor cannot read today's spend at all, it refuses the spend-heavy calls until the store answers again and tells you the spend record is unreadable. It does not report that as a cap hit, because no spend was measured.
 
 ## Contributing
 

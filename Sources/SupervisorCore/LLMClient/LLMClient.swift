@@ -75,7 +75,13 @@ public final class LLMClient: Sendable {
     /// Wired next to `costRecorder` in SupervisorApp's enterRunningState:
     /// reads UserConfig.dailyCostCapUSD (re-loaded per call, so cap edits
     /// apply live) against CostStore.todayTotalUSD().
-    private let capCheck: (@Sendable () -> (cap: Double, spent: Double)?)?
+    private let capCheck: (@Sendable () -> DailyCapGate.Verdict?)?
+
+    /// Spend visibility (2026-09-05): the per-hour call counters the app drains
+    /// into one `cost.hourly` trace line. Defaults to the process-wide meter so
+    /// triage calls and multi-model panel calls are counted together; tests
+    /// inject their own instance.
+    private let callMeter: LLMCallMeter
 
     /// Finding 3 (2026-07-03): in-flight spend reservation, so the daily-cap
     /// gate holds under concurrent bursts. Guards a single `reserved` Double
@@ -93,7 +99,8 @@ public final class LLMClient: Sendable {
         traceLog: TraceLog = .shared,
         anthropicVersion: String = "2023-06-01",
         costRecorder: (@Sendable (_ model: String, _ usage: AnthropicUsage) -> Void)? = nil,
-        capCheck: (@Sendable () -> (cap: Double, spent: Double)?)? = nil
+        capCheck: (@Sendable () -> DailyCapGate.Verdict?)? = nil,
+        callMeter: LLMCallMeter = .shared
     ) {
         self.provider = provider
         self.apiKey = apiKey
@@ -104,6 +111,7 @@ public final class LLMClient: Sendable {
         self.anthropicVersion = anthropicVersion
         self.costRecorder = costRecorder
         self.capCheck = capCheck
+        self.callMeter = callMeter
     }
 
     // MARK: - Public surface
@@ -135,12 +143,51 @@ public final class LLMClient: Sendable {
         }
     }
 
+    /// What a call does when the daily-cap gate reports a spend it could not
+    /// actually read.
+    ///
+    /// The fail-closed gate (audit B4) is one choke point in front of EVERY
+    /// model call, and it cannot tell "the owner's $2 is spent" from "SQLite is
+    /// locked" — both arrive as spent >= cap. That is right for the spend-heavy
+    /// paths and wrong for the destructive-command path: a full disk would
+    /// silently stop Supervisor from reviewing `rm -rf` while reporting it as a
+    /// budget event. The safety function the product exists for should not be
+    /// collateral damage from a broken ledger.
+    public enum CostGateMode: Sendable, Equatable {
+        /// Refuse on any verdict at or over the cap, unreadable store included.
+        /// Idle evaluation, dispatch, question-answering, review: the paths
+        /// that run on a timer and are where the money actually goes.
+        case failClosed
+        /// Refuse a REAL cap hit, but proceed when the verdict is only "at the
+        /// cap" because the store would not read. For the bash /
+        /// destructive-command path alone: it is event-driven, one call per
+        /// real command, so the exposure is bounded by how many commands the
+        /// worker runs rather than by a clock. The caller is told through
+        /// `onCostGateVerdict` so the owner hears that supervision is running
+        /// unmetered.
+        case proceedOnStoreReadError
+    }
+
     /// Full triage / escalation call. Same input as v0.1.x; under the
     /// hood we dispatch by provider's `apiShape` and translate if
     /// needed. The return type is `AnthropicMessageResponse` regardless
     /// of the wire shape so call sites don't branch.
+    ///
+    /// - Parameters:
+    ///   - costGate: how this particular call treats an unreadable cost store.
+    ///     Defaults to `.failClosed`, so a path that does not think about this
+    ///     gets the safe answer.
+    ///   - onCostGateVerdict: called with `storeReadFailed` whenever the gate is
+    ///     consulted, on either mode. `true` means the ledger could not be read
+    ///     (a `.proceedOnStoreReadError` call then proceeds unmetered; a
+    ///     `.failClosed` call refuses); `false` means the store answered and any
+    ///     standing degraded state can be cleared.
     @discardableResult
-    public func createMessage(_ request: AnthropicMessageRequest) async throws -> AnthropicMessageResponse {
+    public func createMessage(
+        _ request: AnthropicMessageRequest,
+        costGate: CostGateMode = .failClosed,
+        onCostGateVerdict: (@Sendable (_ storeReadFailed: Bool) -> Void)? = nil
+    ) async throws -> AnthropicMessageResponse {
         // v0.3.0 daily-cap gate: refuse BEFORE any network work. The
         // check sits ahead of encoding/redaction on purpose — a capped
         // call should cost nothing, not even CPU.
@@ -160,16 +207,72 @@ public final class LLMClient: Sendable {
         // pre-Finding-3 boundary (`spent >= cap`).
         var reservation: Double? = nil
         if let capCheck, let limit = capCheck() {
+            // Blast-radius carve-out. The verdict says whether `spent` was read
+            // or synthesized; only a `.proceedOnStoreReadError` call is allowed
+            // to act on the difference, and only in the synthesized direction.
+            // A genuine cap hit is `storeReadFailed == false` and still blocks
+            // every path, this one included.
+            // Report the store's health on EVERY gated call, not only the
+            // carve-out ones. A `.failClosed` call has plenty to report: when
+            // the store is broken it is about to refuse, and when the store
+            // reads again it is the signal that closes a standing degraded
+            // incident. Reporting only on the carve-out path meant a degraded
+            // incident opened by an idle tick could never be cleared by an
+            // idle tick, so a later genuine break would never page.
+            onCostGateVerdict?(limit.storeReadFailed)
+            if costGate == .proceedOnStoreReadError {
+                if limit.storeReadFailed {
+                    traceLog.emit(
+                        "api",
+                        "cap.degraded reason=cost_store_unreadable provider=\(provider.rawValue) — proceeding UNMETERED on the destructive-command path; spend for this call is not counted against the cap"
+                    )
+                    // Deliberately no reservation: reserving against a `spent`
+                    // we know is fictional would just re-block the next command
+                    // for the wrong reason.
+                    return try await performCall(request, reservation: nil)
+                }
+            }
+
             let estimate = reservationEstimateUSD(for: request)
             if let blocking = await spendReserve.admit(estimate: estimate, spent: limit.spent, cap: limit.cap) {
-                traceLog.emit(
-                    "api",
-                    "daily cap reached: spent=\(limit.spent) reserved=\(blocking) cap=\(limit.cap) provider=\(provider.rawValue) — call refused"
+                if limit.storeReadFailed {
+                    // Distinct line, and no dollar figures: `limit.spent` here
+                    // is the cap echoed back by the fail-closed gate, not a
+                    // measurement, and printing it as spend is how the owner
+                    // ended up being paged an invented total.
+                    traceLog.emit(
+                        "api",
+                        "cap.fail_closed reason=cost_store_unreadable provider=\(provider.rawValue) — call refused; today's spend is unknown, not at the cap"
+                    )
+                } else {
+                    traceLog.emit(
+                        "api",
+                        "daily cap reached: spent=\(limit.spent) reserved=\(blocking) cap=\(limit.cap) provider=\(provider.rawValue) — call refused"
+                    )
+                }
+                // Carrying storeReadFailed is what lets SystemEscalationEvent
+                // page ".triageDegraded(.costStoreUnreadable)" instead of a
+                // cap hit with synthesized numbers and an impossible remedy.
+                throw DailyCapExceededError(
+                    capUSD: limit.cap,
+                    spentUSD: limit.spent,
+                    storeReadFailed: limit.storeReadFailed
                 )
-                throw DailyCapExceededError(capUSD: limit.cap, spentUSD: limit.spent)
             }
             reservation = estimate
         }
+
+        return try await performCall(request, reservation: reservation)
+    }
+
+    /// Everything after the cap gate: redact, POST, record, meter, release the
+    /// in-flight reservation. Split out of `createMessage` so the degraded
+    /// carve-out above can reach it without duplicating the body or smuggling
+    /// the gate decision through a flag read further down.
+    private func performCall(
+        _ request: AnthropicMessageRequest,
+        reservation: Double?
+    ) async throws -> AnthropicMessageResponse {
 
         do {
             // First redaction pass, over the PLAINTEXT. JSONEncoder writes a
@@ -195,6 +298,19 @@ public final class LLMClient: Sendable {
             // not the wire-echoed one. See the `costRecorder` doc comment for
             // the double-counting handoff with TriageEngine.
             costRecorder?(request.model, response.usage)
+            // Cost telemetry (2026-09-05): one line per call carrying what the
+            // provider says it billed, including the prefix-cache split when it
+            // reports one. Without this the prompt ordering is a guess; with it
+            // the cache hit rate is a number in the trace. `cache_hit=-` means
+            // the provider said nothing about caching, not that it missed.
+            traceLog.emit(
+                "api",
+                "usage model=\(request.model) input=\(response.usage.input_tokens) output=\(response.usage.output_tokens) cache_hit=\(response.usage.cache_read_input_tokens.map(String.init) ?? "-")"
+            )
+            callMeter.record(
+                usage: response.usage,
+                costUSD: TokenAccounting.costUSD(model: request.model, usage: response.usage)
+            )
             // Finding 3: the real cost is now recorded (visible to the next
             // capCheck), so release the estimate from the in-flight total.
             if let reservation { await spendReserve.release(reservation) }
@@ -520,11 +636,41 @@ public final class LLMClient: Sendable {
             blocks.append(.init(type: "text", text: text))
         }
 
+        // DeepSeek reports its prefix cache as prompt_cache_hit/miss_tokens,
+        // which is the same idea as Anthropic's cache_read_input_tokens, so it
+        // lands in the same field and every reader downstream gets it for free.
+        // Both keys are optional; a provider that sends neither maps to nil
+        // exactly as before.
+        //
+        // DOUBLE-BILLING FIX (2026-09-05): the two providers disagree about
+        // what the input count means, and AnthropicUsage carries Anthropic's
+        // meaning because that is the meaning TokenAccounting.costUSD assumes.
+        //   Anthropic: input_tokens EXCLUDES cache_read_input_tokens.
+        //   DeepSeek:  prompt_tokens INCLUDES prompt_cache_hit_tokens
+        //              (prompt_tokens = hit + miss).
+        // Mapping prompt_tokens straight across therefore charged every cached
+        // token twice: once at the full input rate inside input_tokens, once
+        // more at the cache-read rate. Recorded spend inflated and the daily
+        // cap tripped early on a call that was actually CHEAPER than a miss.
+        // Subtract the hits so the field means what its reader thinks it means.
+        //
+        // Surveyed the rest of the OpenAI-compatible family (moonshot, minimax,
+        // qwenHF, openrouter) while fixing this: none of them are decoded for
+        // cache at all. OpenAIUsage only declares DeepSeek's two keys, and the
+        // OpenAI-standard shape for this is `prompt_tokens_details.cached_tokens`,
+        // which we do not decode. So those providers report cache_read as nil,
+        // costUSD adds no cache term, and they are billed at full input price
+        // for every token — under-crediting a cache discount, never
+        // double-charging. Nothing else to correct here today; if
+        // prompt_tokens_details is ever decoded it needs this same subtraction,
+        // because OpenAI's prompt_tokens is inclusive exactly like DeepSeek's.
+        let cacheHits = resp.usage?.prompt_cache_hit_tokens
+        let promptTokens = resp.usage?.prompt_tokens ?? 0
         let usage = AnthropicUsage(
-            input_tokens: resp.usage?.prompt_tokens ?? 0,
+            input_tokens: max(0, promptTokens - (cacheHits ?? 0)),
             output_tokens: resp.usage?.completion_tokens ?? 0,
             cache_creation_input_tokens: nil,
-            cache_read_input_tokens: nil
+            cache_read_input_tokens: cacheHits
         )
 
         return AnthropicMessageResponse(

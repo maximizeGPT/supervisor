@@ -68,6 +68,13 @@ public struct ExpandedPanelView: View {
     @State private var addProviderSelection: LLMProvider = .deepseek
     @State private var addProviderKey = ""
 
+    /// Panel-local state for the Remote escalation row: the pasted webhook
+    /// URL draft, and whether the replace-URL form is open when a URL is
+    /// already stored. Reset when the panel closes/reopens, so a pasted
+    /// credential never outlives the panel.
+    @State private var webhookDraft = ""
+    @State private var showWebhookField = false
+
     public init(vm: HoverViewModel) {
         self.vm = vm
     }
@@ -510,34 +517,274 @@ public struct ExpandedPanelView: View {
     /// Fix-queue #5: the owner pause/resume + 4h-cap toggles, now living in a
     /// collapsible footer group (collapsed by default, persisted). Collapsed,
     /// it is a single tappable header row, so its space reclaims to the Flags
-    /// list above; expanded, it reveals the toggle pills exactly as before.
+    /// list above; expanded, it reveals the toggle pills exactly as before,
+    /// plus the Remote escalation row (webhook, switch, detail, test send).
     private var controlsDisclosure: some View {
         collapsibleSection(title: "Controls", isExpanded: $controlsExpanded) {
-            HStack(spacing: BrandSpacing.sm) {
-                // Global pause / resume, Supervisor goes dormant (no triage,
-                // dispatch, or inject) until resumed. Resume reads in signal
-                // (the way back to live); pausing reads in the calm amber
-                // attention tone (a held, not-live state).
-                togglePill(
-                    title: vm.supervisorPaused ? "Resume Supervisor" : "Pause Supervisor",
-                    systemImage: vm.supervisorPaused ? "play.fill" : "pause.fill",
-                    tint: vm.supervisorPaused ? BrandColor.signal.color : BrandColor.attention.color,
-                    action: { vm.toggleSupervisorPaused() }
-                )
+            VStack(alignment: .leading, spacing: BrandSpacing.sm) {
+                HStack(spacing: BrandSpacing.sm) {
+                    // Global pause / resume, Supervisor goes dormant (no triage,
+                    // dispatch, or inject) until resumed. Resume reads in signal
+                    // (the way back to live); pausing reads in the calm amber
+                    // attention tone (a held, not-live state).
+                    togglePill(
+                        title: vm.supervisorPaused ? "Resume Supervisor" : "Pause Supervisor",
+                        systemImage: vm.supervisorPaused ? "play.fill" : "pause.fill",
+                        tint: vm.supervisorPaused ? BrandColor.signal.color : BrandColor.attention.color,
+                        action: { vm.toggleSupervisorPaused() }
+                    )
 
-                // 4-hour loop cap on / off. "Off" (uncapped) is an attention
-                // state; the default capped state is a quiet neutral.
-                togglePill(
-                    title: vm.loopCapDisabled ? "4h cap: off" : "4h cap: on",
-                    systemImage: vm.loopCapDisabled ? "infinity" : "timer",
-                    tint: vm.loopCapDisabled ? BrandColor.attention.color : BrandColor.mute.color,
-                    action: { vm.toggleLoopCapDisabled() }
-                )
-                Spacer()
+                    // 4-hour loop cap on / off. "Off" (uncapped) is an attention
+                    // state; the default capped state is a quiet neutral.
+                    togglePill(
+                        title: vm.loopCapDisabled ? "4h cap: off" : "4h cap: on",
+                        systemImage: vm.loopCapDisabled ? "infinity" : "timer",
+                        tint: vm.loopCapDisabled ? BrandColor.attention.color : BrandColor.mute.color,
+                        action: { vm.toggleLoopCapDisabled() }
+                    )
+                    Spacer()
+                }
+                remoteEscalationRow
             }
             .padding(.horizontal, BrandSpacing.md)
             .padding(.bottom, BrandSpacing.sm)
         }
+    }
+
+    // MARK: - Remote escalation row (Controls group)
+
+    /// The in-app home of the remote escalation channel: shows the current
+    /// state (URL stored or not, delivery on or off), takes a webhook URL
+    /// (SecureField, because the URL is a bearer credential and must not sit
+    /// readable on a screen-shared panel), flips the config.yaml switch,
+    /// picks the detail level, and fires a test through the RUNNING app's
+    /// channel so a green result proves the real path.
+    private var remoteEscalationRow: some View {
+        VStack(alignment: .leading, spacing: BrandSpacing.xs) {
+            Text("Remote escalation")
+                .font(BrandFont.caption)
+                .tracking(0.4)
+                .foregroundStyle(BrandColor.mute.color)
+                .padding(.top, BrandSpacing.xs)
+
+            Text(vm.remoteEscalationStatusLine)
+                .font(BrandFont.note)
+                .foregroundStyle(BrandColor.mute.color)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if showWebhookField || !vm.remoteWebhookConfigured {
+                webhookEntryForm
+            } else {
+                Button {
+                    withAnimation(BrandMotion.standard) { showWebhookField = true }
+                } label: {
+                    Text("Replace webhook URL")
+                        .font(BrandFont.caption)
+                        .foregroundStyle(BrandColor.signal.color)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+
+            if vm.remoteWebhookConfigured {
+                HStack(spacing: BrandSpacing.sm) {
+                    togglePill(
+                        title: vm.remoteNotifyEnabled ? "Remote: on" : "Remote: off",
+                        systemImage: vm.remoteNotifyEnabled ? "antenna.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash",
+                        tint: vm.remoteNotifyEnabled ? BrandColor.signal.color : BrandColor.mute.color,
+                        action: { vm.setRemoteNotifyEnabled(!vm.remoteNotifyEnabled) }
+                    )
+                    if vm.remoteNotifyEnabled {
+                        detailPill(.minimal, label: "Minimal")
+                        detailPill(.full, label: "Full")
+                    }
+                    Spacer()
+                }
+                if vm.remoteNotifyEnabled {
+                    // C13: wire-shape picker. Auto covers Discord, Slack and
+                    // ntfy.sh by host detection; the explicit ntfy pill is
+                    // for a SELF-HOSTED ntfy server, whose host says nothing.
+                    HStack(spacing: BrandSpacing.xs) {
+                        Text("Endpoint")
+                            .font(BrandFont.note)
+                            .foregroundStyle(BrandColor.mute.color)
+                        formatPill(nil, label: "Auto")
+                        formatPill(.ntfy, label: "ntfy")
+                        Spacer()
+                    }
+                }
+                if vm.remoteNotifyEnabled, vm.remoteNotifyDetail == .full {
+                    Text("Full detail sends the triggering command and the reasoning, redacted, off this Mac.")
+                        .font(BrandFont.note)
+                        .foregroundStyle(BrandColor.attention.color)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                sendTestRow
+                // C7: the channel's delivery health, read live from the
+                // running notifier at render. Absent until something has
+                // actually been attempted this run; amber while failing.
+                if let healthLine = vm.remoteDeliveryHealthLine() {
+                    Text(healthLine)
+                        .font(BrandFont.monoSmall)
+                        .foregroundStyle(
+                            vm.remoteDeliveryIsFailing()
+                                ? BrandColor.attention.color
+                                : BrandColor.mute.color
+                        )
+                }
+            }
+        }
+    }
+
+    /// The webhook entry form: SecureField + honest Save (the field and its
+    /// contents survive until the Keychain write actually succeeds, same
+    /// pattern as the provider-key form).
+    private var webhookEntryForm: some View {
+        VStack(alignment: .leading, spacing: BrandSpacing.xs) {
+            SecureField("https://... webhook URL (Discord, Slack, or your own)", text: $webhookDraft)
+                .textFieldStyle(.roundedBorder)
+                .font(BrandFont.note)
+
+            HStack(spacing: BrandSpacing.sm) {
+                Button {
+                    vm.saveRemoteWebhook(webhookDraft)
+                } label: {
+                    Text(vm.isSavingRemoteWebhook ? "Saving\u{2026}" : "Save")
+                        .font(BrandFont.caption)
+                        .foregroundStyle(BrandColor.paper.color)
+                        .padding(.horizontal, BrandSpacing.sm)
+                        .padding(.vertical, BrandSpacing.xxs)
+                        .background(
+                            BrandColor.signal.color.opacity(webhookDraft.isEmpty ? 0.4 : 1.0),
+                            in: Capsule()
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(webhookDraft.isEmpty || vm.isSavingRemoteWebhook)
+
+                if vm.remoteWebhookConfigured {
+                    Button("Cancel") {
+                        webhookDraft = ""
+                        withAnimation(BrandMotion.standard) { showWebhookField = false }
+                    }
+                    .buttonStyle(.plain)
+                    .font(BrandFont.note)
+                    .foregroundStyle(BrandColor.mute.color)
+                }
+            }
+
+            if let saveError = vm.remoteWebhookSaveError {
+                Text(saveError)
+                    .font(BrandFont.note)
+                    .foregroundStyle(BrandColor.attention.color)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onChange(of: vm.isSavingRemoteWebhook) { saving in
+            // Clear + close only on a CONFIRMED save (finished, no error) —
+            // and clear the field either way once confirmed, so the
+            // credential never lingers in view state.
+            if !saving, vm.remoteWebhookSaveError == nil, vm.remoteWebhookConfigured {
+                webhookDraft = ""
+                withAnimation(BrandMotion.standard) { showWebhookField = false }
+            }
+        }
+    }
+
+    /// "Send test" plus the inline result of the last test, so confirming
+    /// the channel never requires the terminal.
+    private var sendTestRow: some View {
+        HStack(spacing: BrandSpacing.sm) {
+            Button {
+                vm.sendRemoteTest()
+            } label: {
+                HStack(spacing: BrandSpacing.xxs) {
+                    if vm.remoteTestState == .running {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "paperplane")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    Text(vm.remoteTestState == .running ? "Sending\u{2026}" : "Send test")
+                        .font(BrandFont.caption)
+                }
+                .foregroundStyle(BrandColor.mute.color)
+                .padding(.horizontal, BrandSpacing.sm)
+                .padding(.vertical, BrandSpacing.xxs)
+                .background(BrandColor.paper.color, in: Capsule())
+                .overlay(
+                    Capsule().strokeBorder(BrandColor.mute.color.opacity(0.25), lineWidth: BrandMetrics.hairline)
+                )
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(vm.remoteTestState == .running)
+
+            switch vm.remoteTestState {
+            case .idle, .running:
+                EmptyView()
+            case .delivered(let at):
+                Text("Delivered \(Self.relativeTime(at))")
+                    .font(BrandFont.note)
+                    .foregroundStyle(BrandColor.signal.color)
+            case .failed(let reason):
+                Text(reason)
+                    .font(BrandFont.note)
+                    .foregroundStyle(BrandColor.attention.color)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+    }
+
+    /// A wire-format pill (Auto vs explicit ntfy), same chip vocabulary as
+    /// the detail pills below.
+    private func formatPill(_ format: RemoteNotifyFormat?, label: String) -> some View {
+        let selected = vm.remoteNotifyFormat == format
+        return Button(action: { vm.setRemoteNotifyFormat(format) }) {
+            Text(label)
+                .font(BrandFont.note)
+                .foregroundStyle(selected ? BrandColor.ink.color : BrandColor.mute.color)
+                .padding(.horizontal, BrandSpacing.sm)
+                .padding(.vertical, BrandSpacing.xxs)
+                .background(
+                    selected ? BrandColor.signal.color.opacity(0.12) : BrandColor.paper.color,
+                    in: Capsule()
+                )
+                .overlay(
+                    Capsule().strokeBorder(
+                        selected ? BrandColor.signal.color.opacity(0.3) : BrandColor.mute.color.opacity(0.2),
+                        lineWidth: BrandMetrics.hairline
+                    )
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// A detail-level pill (Minimal vs Full), same selected/unselected chip
+    /// vocabulary as the multi-model mode pills.
+    private func detailPill(_ detail: RemoteNotifyDetail, label: String) -> some View {
+        let selected = vm.remoteNotifyDetail == detail
+        return Button(action: { vm.setRemoteNotifyDetail(detail) }) {
+            Text(label)
+                .font(BrandFont.note)
+                .foregroundStyle(selected ? BrandColor.ink.color : BrandColor.mute.color)
+                .padding(.horizontal, BrandSpacing.sm)
+                .padding(.vertical, BrandSpacing.xxs)
+                .background(
+                    selected ? BrandColor.signal.color.opacity(0.12) : BrandColor.paper.color,
+                    in: Capsule()
+                )
+                .overlay(
+                    Capsule().strokeBorder(
+                        selected ? BrandColor.signal.color.opacity(0.3) : BrandColor.mute.color.opacity(0.2),
+                        lineWidth: BrandMetrics.hairline
+                    )
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 
     /// Fix-queue #5: the decision-sensitivity dial, in its own collapsible

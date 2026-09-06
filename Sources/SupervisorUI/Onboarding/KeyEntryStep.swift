@@ -98,7 +98,7 @@ struct KeyEntryStep: View {
     private func introCopy(for provider: LLMProvider) -> String {
         switch provider {
         case .anthropic:
-            return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. At heavy use, expect ~$80/month on your Anthropic bill (one continuous Claude Code session, all interventions enabled)."
+            return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. At heavy use, expect ~$80/month on your Anthropic bill (one continuous Claude Code session, all interventions enabled). A $5/day cap stops a runaway; heavy use is about $2.67/day, so it should never fire."
         case .deepseek:
             return "Stored in macOS Keychain. Used only for Supervisor's triage and escalation calls. DeepSeek's per-token pricing is roughly 1/30th of Anthropic's, so triage cost stays under $5/month at heavy use."
         case .moonshot:

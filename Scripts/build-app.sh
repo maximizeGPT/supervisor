@@ -79,9 +79,9 @@ make_bundle() {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.3.2</string>
+    <string>0.4.0</string>
     <key>CFBundleVersion</key>
-    <string>6</string>
+    <string>7</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -141,6 +141,41 @@ if [[ -d "$UI_BUNDLE" ]]; then
 else
     echo "[build-app] WARNING: $UI_BUNDLE not found — onboarding wordmark will fall back to text" >&2
 fi
+
+# SwiftPM resource bundle for SupervisorCore (the dispatcher system prompt).
+# UNLIKE the two optional bundles above, this one is load-bearing product
+# behavior: without it every install except the build machine dispatches off
+# a 140-character stub (2026-09-03 audit finding B1). So a missing bundle is
+# a HARD build failure, not a warning. Copied pre-sign.
+#
+# Into EVERY .app this script produces, not just the main one. SupervisorApp and
+# SupervisorHeartbeat are both separate bundles that link SupervisorCore (see
+# Package.swift), and SPM's synthesized `Bundle.module` accessor is a
+# fatalError when the bundle is missing — so the heartbeat companion, launched
+# from its own .app rather than from inside Supervisor.app, would CRASH the
+# moment anything it touches reaches through SupervisorCore to a resource. It
+# used to get no copy at all.
+#
+# SupervisorStatusBar also links SupervisorCore but is NOT packaged as its own
+# .app here: it ships as a bare binary inside Supervisor.app/Contents/MacOS/,
+# so its Bundle.main is Supervisor.app and it already resolves the copy below.
+# If it ever gets its own bundle, add it to this list.
+CORE_BUNDLE="$BIN_DIR/Supervisor_SupervisorCore.bundle"
+if [[ ! -d "$CORE_BUNDLE" ]]; then
+    echo "[build-app] ERROR: $CORE_BUNDLE not found — the packaged app would dispatch on the stub prompt" >&2
+    exit 1
+fi
+for core_target in "$APP_APP" "$HB_APP"; do
+    mkdir -p "$core_target/Contents/Resources"
+    cp -R "$CORE_BUNDLE" "$core_target/Contents/Resources/"
+    # Same hard failure on the copy itself: a bundle that did not land is the
+    # same broken install as a bundle that was never built.
+    if [[ ! -d "$core_target/Contents/Resources/$(basename "$CORE_BUNDLE")" ]]; then
+        echo "[build-app] ERROR: failed to embed $CORE_BUNDLE in $core_target" >&2
+        exit 1
+    fi
+    echo "[build-app] embedded SupervisorCore resource bundle (dispatcher prompt) in $core_target/Contents/Resources/" >&2
+done
 
 # Menu-bar glyph PNGs. The out-of-process SupervisorStatusBar loads its branded
 # icon from the SPM resource bundle embedded above and falls back to an SF

@@ -147,6 +147,24 @@ public final class TriageEngine {
         /// rubric and it returned no-fire, don't re-ask every tick.
         /// Cleared when a new event arrives (the world has changed).
         var lastIdleTriageTs: Date?
+        /// Cost fix (2026-09-05): fingerprint of the INPUTS the last
+        /// idle-evaluation triage call was made against — the session
+        /// transcript's tail plus the one time-dependent rubric input (see
+        /// `idleTriageInputFingerprint`). When the next tick computes the same
+        /// fingerprint, re-asking the model cannot produce a different verdict,
+        /// so the tick is skipped BEFORE any request is built. nil means no
+        /// idle triage has run yet, or the transcript could not be read (then
+        /// the backoff ladder, not this gate, bounds the cadence). Deliberately
+        /// NOT cleared by `updateIdleState`: a new event changes the transcript,
+        /// so the comparison already reopens the gate on its own.
+        var lastIdleTriageInputHash: String? = nil
+        /// Cost fix (2026-09-05): how many consecutive idle triages have run
+        /// for this session WITHOUT the fingerprint proving new content. Indexes
+        /// the re-triage backoff ladder (see `idleReTriageBackoffSeconds`), so a
+        /// session whose transcript we cannot fingerprint still costs less and
+        /// less as it sits. Reset to 0 by `updateIdleState` on any new event and
+        /// by a fingerprint that actually moved.
+        var idleBackoffStep: Int = 0
 
         // -- v0.2.0 M7: stall-watchdog state. Independent of the plan loop. --
 
@@ -248,6 +266,32 @@ public final class TriageEngine {
 
     /// Hook for FlagRouter — called when Haiku fires.
     public var onDecision: ((TriageDecision) -> Void)?
+
+    /// C2/D1: hook for SUPERVISOR-IS-DOWN escalations — the cost cap
+    /// tripping, the provider refusing calls with 401/402/403. These have no
+    /// TriageDecision (nothing a worker did; triage itself went dark), so
+    /// they ride their own path: main.swift wires this to the local banner,
+    /// the hover notice, and the remote channel's system-message lane.
+    /// Throttled HERE to once per incident per kind, plus one 6-hour
+    /// still-down repeat (emitSystemEvent), so every wired surface inherits
+    /// the storm protection at the source.
+    public var onSystemEvent: ((SystemEscalationEvent) -> Void)?
+
+    /// D1: the 402 circuit breaker. While open, the engine's triage call
+    /// sites skip the network entirely (silently — the trace gets one line
+    /// per state change, never one per suppressed tick). Only a 402 trips
+    /// it; see TriageCircuitBreaker for why other failures do not.
+    private var breaker = TriageCircuitBreaker()
+
+    /// C2 (revised): per-kind ledger of the CURRENT incident. One emission
+    /// when an incident opens, at most one repeat if it still stands 6
+    /// hours later (SystemEscalationEvent.incidentEmission owns the rule),
+    /// and the whole ledger clears on the first successful provider call —
+    /// so a NEW incident minutes after the old one pages promptly instead
+    /// of hiding inside an hourly window, and a provider that stays dead
+    /// does not buzz the owner's phone every hour all day. In-memory on
+    /// purpose — a relaunch is a new incident and may honestly page again.
+    private var systemEventIncidents: [String: SystemEscalationEvent.IncidentState] = [:]
 
     private var busSubscription: AnyCancellable?
 
@@ -419,6 +463,33 @@ public final class TriageEngine {
     public nonisolated static let defaultDormantSessionSilenceSeconds: TimeInterval = 6 * 60 * 60
     private let dormantSessionSilenceSeconds: TimeInterval
 
+    // MARK: - Cost fix (2026-09-05): don't pay to re-read an unchanged session
+
+    /// Bytes of the session transcript hashed to answer "has anything happened
+    /// since the last idle triage?". The window only has to be wide enough that
+    /// an appended line moves the hash, which any window does; 64 KB keeps the
+    /// per-tick read small while comfortably covering a turn's worth of JSONL.
+    /// (Smaller than the watchdog's 512 KB scan window on purpose — that read
+    /// has to CLASSIFY the tail, this one only has to notice it changed.)
+    private static let idleFingerprintTailBytes = 64 * 1024
+
+    /// The one don't-fire condition in the `worker_idle_post_completion` rubric
+    /// that can flip WITHOUT a new transcript event: "no user message in the
+    /// session's last 30 seconds." It is folded into the fingerprint so the
+    /// unchanged-content gate cannot starve a session whose only reason for a
+    /// no-fire verdict was an engaged human, and it can cost at most ONE extra
+    /// call per user message (the input is a bool that only ever goes
+    /// true -> false by the clock; false -> true needs a new user message,
+    /// which changes the transcript anyway).
+    static let idleHumanEngagedWindowSeconds: TimeInterval = 30
+
+    /// Resolve a session id to its transcript JSONL for the unchanged-content
+    /// fingerprint. Injected so tests can point at a temp file; production uses
+    /// the same lookup the watchdog's AsyncWorkScanner does. Returning nil
+    /// (Codex sessions, a transcript not on disk) disables the fingerprint gate
+    /// for that session and leaves the backoff ladder as the cadence bound.
+    private let transcriptTailURL: @Sendable (String) -> URL?
+
     /// cwd-exclusivity gate (2026-06-13): how many LIVE sessions currently share
     /// a given cwd. git HEAD/branch/commits are directory-global, so they may
     /// only be attributed to a session that is the SOLE live worker in that dir.
@@ -459,6 +530,9 @@ public final class TriageEngine {
         idleCheckIntervalSeconds: TimeInterval = 1,
         staleEventThresholdSeconds: TimeInterval = 120,
         dormantSessionSilenceSeconds: TimeInterval = TriageEngine.defaultDormantSessionSilenceSeconds,
+        transcriptTailURL: @escaping @Sendable (String) -> URL? = { sessionId in
+            DesktopConversationTargeter.transcriptURL(sessionId: sessionId)
+        },
         liveSessionsSharingCwd: @escaping (String) -> Int = { _ in 1 },
         injectionLedger: InjectionLedger? = nil,
         now: @escaping @MainActor () -> Date = { Date() },
@@ -493,6 +567,7 @@ public final class TriageEngine {
         self.idleCheckIntervalSeconds = idleCheckIntervalSeconds
         self.staleEventThresholdSeconds = staleEventThresholdSeconds
         self.dormantSessionSilenceSeconds = dormantSessionSilenceSeconds
+        self.transcriptTailURL = transcriptTailURL
         self.liveSessionsSharingCwd = liveSessionsSharingCwd
         self.now = now
         self.recordEngineProgress = recordEngineProgress
@@ -513,6 +588,127 @@ public final class TriageEngine {
     nonisolated static func groundingCwd(_ cwd: String?, liveSessionsInCwd: Int) -> String? {
         guard let cwd, !cwd.isEmpty else { return cwd }
         return liveSessionsInCwd <= 1 ? cwd : nil
+    }
+
+    // MARK: - LLM failure escalation + 402 circuit breaker (C2/D1)
+
+    /// The one client call the engine's three triage paths (bash,
+    /// assistant-text, idle) go through. Adds two things to a bare
+    /// `client.createMessage`:
+    ///
+    ///   1. The 402 breaker. Open -> return nil WITHOUT a network attempt or
+    ///      a trace line (state changes are traced once, in noteLLMFailure /
+    ///      the success reset below — a suppressed tick every 30s must not
+    ///      become a log line every 30s, which was the storm's other half).
+    ///   2. Failure classification. A thrown call is inspected for the
+    ///      owner-blocking shapes (cap hit, 401/402/403) and escalated
+    ///      through onSystemEvent before rethrowing to the caller's existing
+    ///      catch, whose per-path trace line is unchanged.
+    ///
+    /// The secondary calls (QuestionAnswerer, Dispatcher) stay on the bare
+    /// client: they only run after a primary triage call succeeded, so an
+    /// open breaker starves them upstream.
+    /// - Parameter costGate: forwarded to the client. Only the bash /
+    ///   destructive-command path passes `.proceedOnStoreReadError`; see
+    ///   `LLMClient.CostGateMode` for why that one path is carved out.
+    private func gatedCreateMessage(
+        _ request: AnthropicMessageRequest,
+        costGate: LLMClient.CostGateMode = .failClosed
+    ) async throws -> AnthropicMessageResponse? {
+        if breaker.isOpen(at: now()) { return nil }
+        do {
+            let response = try await client.createMessage(
+                request,
+                costGate: costGate,
+                onCostGateVerdict: { [weak self] storeReadFailed in
+                    // The client calls this from whatever thread it is on; the
+                    // incident ledger is MainActor state.
+                    Task { @MainActor in self?.noteCostGateVerdict(storeReadFailed: storeReadFailed) }
+                }
+            )
+            if case .closed = breaker.recordSuccess() {
+                trace.emit("triage", "breaker.closed provider recovered; triage calls resumed")
+            }
+            // A success closes the CALL-FAILURE incidents: the cap is not
+            // refusing and the key works, so the next failure is a NEW incident
+            // and must page promptly rather than inherit the old ledger entry.
+            //
+            // The degraded incident is deliberately NOT cleared here. It is not
+            // a call-failure incident at all: the call succeeded BECAUSE the
+            // carve-out let it through, so clearing it on success would re-page
+            // on every single command for as long as the store stayed broken.
+            // It clears in noteCostGateVerdict, when the store actually reads.
+            let callFailureKinds = systemEventIncidents.keys.filter { !$0.hasPrefix("triage_degraded") }
+            if !callFailureKinds.isEmpty {
+                for kind in callFailureKinds { systemEventIncidents.removeValue(forKey: kind) }
+                trace.emit("triage", "system_event incidents cleared reason=call_succeeded")
+            }
+            return response
+        } catch {
+            noteLLMFailure(error)
+            throw error
+        }
+    }
+
+    /// The cost gate answered on a carve-out call. `true` means it could not
+    /// read the store and the call went through unmetered, which the owner has
+    /// to be told; `false` means the store is healthy again, so a standing
+    /// degraded incident is closed and a later break pages as a new one.
+    private func noteCostGateVerdict(storeReadFailed: Bool) {
+        let event = SystemEscalationEvent.triageDegraded(reason: .costStoreUnreadable)
+        guard storeReadFailed else {
+            if systemEventIncidents.removeValue(forKey: event.kind) != nil {
+                trace.emit("triage", "system_event incident cleared kind=\(event.kind) reason=cost_store_readable")
+            }
+            return
+        }
+        // emitSystemEvent's ledger is what makes this fire once per incident
+        // (plus the one 6-hour repeat), rather than once per command.
+        emitSystemEvent(event, at: now())
+    }
+
+    /// Classify a failed call, drive the breaker on 402, and emit the
+    /// throttled system escalation. The breaker transition is traced per
+    /// state change here, which with the open-state skip above nets exactly
+    /// one line per change.
+    private func noteLLMFailure(_ error: Error) {
+        let stamp = now()
+        guard let event = SystemEscalationEvent.classify(error) else { return }
+
+        if case .providerUnavailable(status: 402) = event {
+            switch breaker.recordPaymentRequired(at: stamp) {
+            case .opened(let until):
+                trace.emit(
+                    "triage",
+                    "breaker.opened backoff=\(Int(breaker.currentBackoffSeconds ?? 0))s until=\(until) reason=http_402; triage calls paused"
+                )
+            case .reopened(let until):
+                trace.emit(
+                    "triage",
+                    "breaker.reopened backoff=\(Int(breaker.currentBackoffSeconds ?? 0))s until=\(until) reason=http_402_persists"
+                )
+            case .closed, .none:
+                break  // recordPaymentRequired never returns these
+            }
+        }
+
+        emitSystemEvent(event, at: stamp)
+    }
+
+    /// Once per INCIDENT per kind (plus one 6-hour "still down" repeat), so
+    /// a failing provider probed every backoff window produces one banner +
+    /// one hover notice + one page when it breaks, one more if it stays
+    /// broken all day, and nothing in between. The remote channel applies a
+    /// short storm-guard window on its side (RemoteNotifier.postSystemEvent)
+    /// as defense in depth.
+    private func emitSystemEvent(_ event: SystemEscalationEvent, at stamp: Date) {
+        let (ledger, emit) = SystemEscalationEvent.incidentEmission(
+            state: systemEventIncidents[event.kind], now: stamp
+        )
+        systemEventIncidents[event.kind] = ledger
+        guard emit else { return }
+        trace.emit("triage", "system_event kind=\(event.kind)")
+        onSystemEvent?(event)
     }
 
     /// Instance wrapper: resolve the live-session count for `cwd` and apply the
@@ -685,8 +881,10 @@ public final class TriageEngine {
         state.lastEventTs = max(state.lastEventTs, ts)
         // Any new event invalidates a prior idle-triage gate: the world
         // has changed since the rubric last said "no fire," so let the
-        // timer re-ask if conditions hold.
+        // timer re-ask if conditions hold. The backoff ladder resets with it —
+        // a session that just moved has earned the full re-triage cadence back.
         state.lastIdleTriageTs = nil
+        state.idleBackoffStep = 0
 
         // v0.2.0 M7: does THIS event count as worker "movement" that resets the
         // stall-watchdog nudge cycle? Real worker progress (assistant prose, a
@@ -889,12 +1087,35 @@ public final class TriageEngine {
             }
 
             // Re-triage gate: if we already asked Haiku since the last
-            // event change, wait `idleReTriageIntervalSeconds` before
-            // asking again. `lastIdleTriageTs` is cleared by
-            // `updateIdleState` when a new event arrives.
+            // event change, wait out the current backoff rung before asking
+            // again. `lastIdleTriageTs` is cleared by `updateIdleState` when a
+            // new event arrives; the rung (cost fix 2026-09-05) starts at the
+            // configured interval and stretches while nothing new is proven.
+            let reTriageInterval = Self.idleReTriageBackoffSeconds(
+                step: state.idleBackoffStep, base: idleReTriageIntervalSeconds
+            )
             if let lastTriage = state.lastIdleTriageTs {
                 let sinceLast = nowTs.timeIntervalSince(lastTriage)
-                if sinceLast < idleReTriageIntervalSeconds { continue }
+                if sinceLast < reTriageInterval { continue }
+            }
+
+            // Cost fix (2026-09-05): NOTHING CHANGED, so don't buy the same
+            // verdict again. The owner burned $10 of DeepSeek credit overnight
+            // on sessions that had produced no events for hours: every 60s each
+            // one re-sent a ~5.5k-token body describing an unchanged session and
+            // got back the same answer. Fingerprint the transcript tail (plus
+            // the rubric's one clock-dependent input) and skip the tick here,
+            // ahead of the Task hop and the request build, when it matches the
+            // fingerprint the last idle triage ran against. `lastIdleTriageTs`
+            // is re-stamped on the skip so this costs one trace line per
+            // re-triage interval, not one per 1Hz tick.
+            let fingerprint = idleTriageFingerprint(sessionId: sessionId, state: state, nowTs: nowTs)
+            if let fingerprint, fingerprint == state.lastIdleTriageInputHash {
+                var held = state
+                held.lastIdleTriageTs = nowTs
+                idleStates[sessionId] = held
+                trace.emit("triage", "idle.skipped reason=unchanged session=\(sessionId) hash=\(fingerprint) silence=\(Int(silenceElapsed))s")
+                continue
             }
 
             // Stamp the triage timestamp BEFORE the async call lands so
@@ -903,12 +1124,85 @@ public final class TriageEngine {
             // assert "we dispatched a call for this session."
             var updated = state
             updated.lastIdleTriageTs = nowTs
+            updated.lastIdleTriageInputHash = fingerprint
+            // A fingerprint that MOVED is proof of new content, so the ladder
+            // goes back to the bottom. Anything else (no fingerprint at all)
+            // climbs one rung: we are about to pay for a verdict we cannot
+            // show is new, so the next one waits longer.
+            //
+            // Only nil-ness is left to test here. The equal-fingerprint case
+            // already `continue`d at the unchanged-content gate above, so by
+            // this line a non-nil fingerprint is necessarily a MOVED one and
+            // the old `fingerprint != state.lastIdleTriageInputHash` half of
+            // the condition was always true. Same behavior, one fewer
+            // always-true comparison to mislead the next reader.
+            if fingerprint != nil {
+                updated.idleBackoffStep = 0
+            } else {
+                updated.idleBackoffStep = min(state.idleBackoffStep + 1, Self.idleReTriageBackoffMaxStep)
+            }
             idleStates[sessionId] = updated
 
             trace.emit("triage", "idle.tick session=\(sessionId) silence=\(Int(silenceElapsed))s stop_phrase=\(state.lastStopShapedPhrase ?? "?") stop_age=\(Int(nowTs.timeIntervalSince(stopTs)))s")
 
             Task { await self.evaluateIdle(sessionId: sessionId) }
         }
+    }
+
+    // MARK: - Cost fix (2026-09-05): the unchanged-content gate
+
+    /// PURE: the fingerprint of everything an idle-evaluation verdict depends
+    /// on. `tailLines` is the session transcript's tail (nil when it could not
+    /// be read — the caller then has no fingerprint and must not gate on one);
+    /// `humanEngaged` is the rubric's 30-second recent-user-message condition,
+    /// the only input that moves without a transcript write.
+    ///
+    /// Same fingerprint means the model would be shown the same session and
+    /// asked the same question, so its answer is the one we already have. This
+    /// is the whole cost fix: an idle session used to buy that same answer
+    /// again every 60 seconds, ~5.5k input tokens at a time, for as long as it
+    /// sat there.
+    nonisolated static func idleTriageInputFingerprint(
+        tailLines: [String]?,
+        humanEngaged: Bool
+    ) -> String? {
+        guard let tailLines else { return nil }
+        // Unit separator between the two inputs so a transcript that happens to
+        // contain the engaged marker cannot forge a collision.
+        return StableHash.fnv1a64Hex("engaged=\(humanEngaged)\u{1F}\(tailLines.joined(separator: "\n"))")
+    }
+
+    /// PURE: the re-triage backoff ladder, as multiples of the configured
+    /// re-triage interval — 1x, 2x, 5x, 15x, then 30x forever. At the
+    /// production default of 60s that is 60s, 2m, 5m, 15m, capped at 30m,
+    /// exactly as specified; a test harness with a short interval keeps its
+    /// short interval, because the shape is relative, not absolute.
+    ///
+    /// This is defense in depth BEHIND the fingerprint gate, not instead of it.
+    /// The gate is what makes an unchanged session free; the ladder is what
+    /// bounds a session the gate cannot see (no readable transcript, e.g. a
+    /// Codex rollout or a file that moved), which would otherwise stay at a
+    /// flat 60-second cadence forever.
+    nonisolated static func idleReTriageBackoffSeconds(step: Int, base: TimeInterval) -> TimeInterval {
+        let multipliers: [Double] = [1, 2, 5, 15, 30]
+        let index = max(0, min(step, multipliers.count - 1))
+        return base * multipliers[index]
+    }
+
+    /// The last rung of the ladder, so the step counter cannot grow unbounded.
+    nonisolated static let idleReTriageBackoffMaxStep = 4
+
+    /// Read the session's transcript tail and fingerprint it against the
+    /// current clock. nil when there is no readable transcript for the session.
+    private func idleTriageFingerprint(
+        sessionId: String, state: SessionIdleState, nowTs: Date
+    ) -> String? {
+        guard let url = transcriptTailURL(sessionId) else { return nil }
+        let lines = TranscriptTail.readTailLines(url, tailBytes: Self.idleFingerprintTailBytes)
+        let engaged = state.lastUserMsgTs.map {
+            nowTs.timeIntervalSince($0) < Self.idleHumanEngagedWindowSeconds
+        } ?? false
+        return Self.idleTriageInputFingerprint(tailLines: lines, humanEngaged: engaged)
     }
 
     /// Fix-queue #9: is this session dormant (abandoned by the operator), as
@@ -1381,11 +1675,38 @@ public final class TriageEngine {
     /// process the response. Parallel structure to `evaluate(call:)` and
     /// `evaluateAssistantText(info:)` — the same record_triage tool path,
     /// just scoped to the worker_idle_post_completion category.
+    /// Test seam for `evaluateIdle`. The dormancy guard inside it is defense in
+    /// depth against a FUTURE caller that skips `checkIdleStates`, and there is
+    /// no such caller today — so a test that reaches it through the tick walk
+    /// is stopped by the tick walk's own dormancy check and never exercises
+    /// this one. That test could not fail if the guard were deleted. This lets
+    /// a test call the guarded path directly, which is the only way to hold it.
+    /// Internal, not public: the seam is for the test target, not for callers.
+    internal func _evaluateIdleForTesting(sessionId: String) async {
+        await evaluateIdle(sessionId: sessionId)
+    }
+
     private func evaluateIdle(sessionId: String) async {
         // Global pause (owner toggle): stay dormant — no triage, dispatch, or
         // inject, and no API spend. consume() keeps tracking window/idle state,
         // so resume is seamless. Same guard on evaluate + evaluateAssistantText.
         if supervisorPausedRead() { return }
+
+        // Dormant means no triage AT ALL, not just no drive (cost fix
+        // 2026-09-05). The fix-queue #9 guard in `checkIdleStates` stopped the
+        // INJECTION for an abandoned session but the tick still had to buy a
+        // verdict first, so a chat the operator walked away from a day ago kept
+        // paying ~5.5k input tokens an hour to be told, correctly, to do
+        // nothing. Same silence bound, applied one layer down so no future
+        // caller of this path can reintroduce the spend.
+        if let state = idleStates[sessionId] {
+            let nowTs = now()
+            if isSessionDormant(state, nowTs: nowTs) {
+                trace.emit("triage", "idle.skipped reason=session_dormant silence=\(Int(nowTs.timeIntervalSince(state.lastEventTs)))s session=\(sessionId)")
+                return
+            }
+        }
+
         onActivityChange?(.triaging)
 
         let window = perSessionWindow[sessionId] ?? []
@@ -1436,7 +1757,12 @@ public final class TriageEngine {
 
         let response: AnthropicMessageResponse
         do {
-            response = try await client.createMessage(request)
+            guard let gated = try await gatedCreateMessage(request) else {
+                // 402 breaker open: skip quietly (the transition was traced).
+                onActivityChange?(.idle)
+                return
+            }
+            response = gated
         } catch {
             trace.emit("triage", "Idle triage call failed: \(error)")
             onActivityChange?(.idle)
@@ -2212,7 +2538,21 @@ public final class TriageEngine {
 
         let response: AnthropicMessageResponse
         do {
-            response = try await client.createMessage(request)
+            // THE carve-out (see LLMClient.CostGateMode). This is the only path
+            // that passes .proceedOnStoreReadError: reviewing a real command a
+            // worker is about to run is what the product is for, and a cost
+            // store that will not read is a broken ledger, not a spent budget.
+            // A genuine cap hit still refuses here exactly as before, and the
+            // exposure is bounded because this fires once per real command
+            // rather than on a timer.
+            guard let gated = try await gatedCreateMessage(
+                request, costGate: .proceedOnStoreReadError
+            ) else {
+                // 402 breaker open: skip quietly (the transition was traced).
+                onActivityChange?(.idle)
+                return
+            }
+            response = gated
         } catch {
             trace.emit("triage", "Haiku call failed: \(error)")
             onActivityChange?(.idle)
@@ -2327,7 +2667,12 @@ public final class TriageEngine {
 
         let response: AnthropicMessageResponse
         do {
-            response = try await client.createMessage(request)
+            guard let gated = try await gatedCreateMessage(request) else {
+                // 402 breaker open: skip quietly (the transition was traced).
+                onActivityChange?(.idle)
+                return
+            }
+            response = gated
         } catch {
             trace.emit("triage", "Assistant-text triage call failed: \(error)")
             onActivityChange?(.idle)

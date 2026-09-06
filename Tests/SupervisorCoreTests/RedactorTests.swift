@@ -440,6 +440,63 @@ final class RedactorTests: XCTestCase {
         XCTAssertTrue(out.contains("<redacted:stripe-webhook-secret>"))
     }
 
+    // MARK: - Webhook URLs
+
+    func testRedactsDiscordWebhookURL() {
+        // The path IS the credential: the whole URL goes, not a half.
+        for url in [
+            "https://discord.com/api/webhooks/123456789/aBcD-eFgH_secretToken",
+            "https://discordapp.com/api/webhooks/123456789/aBcD-eFgH_secretToken",
+            "https://ptb.discord.com/api/webhooks/123456789/aBcD-eFgH_secretToken",
+        ] {
+            let out = redactor.redact("curl -X POST \(url) -d '{}'")
+            XCTAssertFalse(out.contains("secretToken"), "failed to redact \(url)")
+            XCTAssertTrue(out.contains("<redacted:webhook-url>"))
+        }
+    }
+
+    func testRedactsSlackWebhookURL() {
+        let url = "https://hooks.slack.com/services/T0000/B0000/XXXXsecretXXXX"
+        let out = redactor.redact("posting to \(url) now")
+        XCTAssertFalse(out.contains("XXXXsecretXXXX"))
+        XCTAssertTrue(out.contains("<redacted:webhook-url>"))
+    }
+
+    func testPlainDiscordAndSlackLinksAreNotRedacted() {
+        // Only the webhook shapes are credentials; ordinary links stay.
+        let text = "see https://discord.com/channels/1/2 and https://slack.com/intl/en-gb"
+        XCTAssertEqual(redactor.redact(text), text)
+    }
+
+    func testRedactsNtfyTopicURL() {
+        // The topic name IS the credential on the public server: holding
+        // the URL means posting to and reading the owner's pager channel.
+        for url in [
+            "https://ntfy.sh/supervisor-pages-x7k2m9",
+            "https://NTFY.SH/Upper-Case-Host-Topic",
+        ] {
+            let out = redactor.redact("curl -d 'hi' \(url)")
+            XCTAssertFalse(out.contains("ntfy.sh/s"), "failed to redact \(url): \(out)")
+            XCTAssertFalse(out.contains("Topic"), "failed to redact \(url): \(out)")
+            XCTAssertTrue(out.contains("<redacted:webhook-url>"))
+        }
+        // The topic survives inside a JSON-encoded body too (the encoded
+        // pass is where triage payloads actually travel).
+        let encoded = #"{"cmd":"curl https://ntfy.sh/secret-topic-name"}"#
+        XCTAssertFalse(redactor.redact(encoded).contains("secret-topic-name"))
+    }
+
+    func testNtfyBareHostAndSelfHostedServersAreNotRedacted() {
+        // The bare host with no topic is not a credential.
+        let bare = "ntfy is at https://ntfy.sh and it is neat"
+        XCTAssertEqual(redactor.redact(bare), bare)
+        // Accepted limit, same as the generic webhook family: a SELF-HOSTED
+        // ntfy server is just a URL on someone's domain, indistinguishable
+        // by shape, so it deliberately stays unmatched.
+        let selfHosted = "posting to https://ntfy.example.com/my-topic now"
+        XCTAssertEqual(redactor.redact(selfHosted), selfHosted)
+    }
+
     // MARK: - SendGrid
 
     func testRedactsSendGridKey() {

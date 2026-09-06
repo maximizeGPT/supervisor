@@ -6,7 +6,317 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+## [0.4.0] — 2026-09-05 (remote escalation, honest cost, crash and hang paging)
+
+Escalations can reach the owner when the owner is not at the Mac, and the
+overnight bill stopped being a mystery.
+
+Three themes. **Remote escalation delivery** puts the six owner-blocking
+outcomes on a phone instead of a banner nobody is in front of, with the
+crash and hang paths covered by the surviving companion. **Cost** went from
+unbounded and unexplained to metered, capped and traceable: the idle path
+was re-buying the same verdict every 60 seconds, which burned about $11 a
+day against sessions that had produced no events for hours. And a
+**2026-09-03 audit** plus a six-lens verification pass of this release
+candidate closed a set of defects that would each have shipped as a
+first-launch failure.
+
+### Cost
+
+- **The idle path stopped re-buying verdicts it already had.** A live trace
+  showed 199 `evaluating idle` calls in 40 minutes, about 300 an hour, each
+  a ~5.5k-token body, against sessions that had been silent for hours. That
+  is what filled $10 of DeepSeek credit overnight for one or two flags.
+  Idle verdicts are now fingerprinted on the inputs they actually depend on
+  (the transcript tail plus the engaged flag) and skipped when nothing
+  moved, dormant sessions are cut off inside `evaluateIdle` rather than one
+  layer later, and the flat 60-second re-triage interval became a 1x / 2x /
+  5x / 15x / 30x backoff ladder capped at 30 minutes, reset by any new
+  event. Before: about 300 idle calls an hour on an idle machine, roughly
+  $11/day. After: a silent session settles onto the 30-minute rung, so a
+  normal day is well under $1.
+- **A hard daily cost cap, on by default at $5.00.** There was no default
+  at all: an install nobody configured had a background process calling a
+  metered API on a timer with nothing under it. $5 is a runaway backstop,
+  not a budget, and is set against the numbers rather than picked: heavy
+  Anthropic use is about $2.67/day (the $80/month the onboarding names), so
+  correct use never meets it, and it stops the $11/day runaway before it
+  has cost $6. `daily_cap_usd: 0` still removes the cap; a value that does
+  not parse is a typo, not an opt-out.
+- **The cap gate fails closed** (audit B4). Both cap checks read spend as
+  `(try? store.todayTotalUSD()) ?? 0`, so a thrown read reported "$0 spent
+  today", the one answer that guarantees the cap never trips, exactly when
+  the machine was already unhealthy. An unreadable store now reports AT the
+  cap.
+- **A broken ledger no longer blocks a destructive-command review.** Fail
+  closed is right for the timer-driven idle path, where the money goes, and
+  wrong for the one path a human is waiting on: an unreadable cost store
+  used to stop Supervisor reviewing `rm -rf`. That path proceeds unmetered
+  and says so.
+- **An unreadable ledger pages as a degradation, not a cap hit.** It used
+  to reach the owner as "Today's model spend reached $5.00 of the $5.00
+  cap. Raise cost.daily_cap_usd to resume". That figure was synthesized by
+  the fail-closed gate, and the remedy can never clear it, because the
+  synthesized spend rises to meet whatever cap is set next. It also
+  repeated: `cost_cap_hit` is wiped by the clear-on-success sweep, so any
+  successful call opened a fresh incident and paged again.
+- **A failed spend WRITE is no longer swallowed.** Two `try?` call sites
+  discarded a thrown write with no trace. Reads keep succeeding, so nothing
+  looks wrong, but today's total stops moving and the cap can never trip:
+  the gate fails OPEN. Writes now trace and page once per failure streak.
+- **`config.yaml` is written on first launch**, commented, with every
+  default present. Nothing used to create it, so every message that said
+  "edit config.yaml" pointed at a file a fresh install did not have. That
+  includes the cap-hit message, which names the exact key to raise.
+- **One `cost.hourly` trace line an hour**, carrying calls, input tokens,
+  provider-reported cache hits, estimated dollars and the day's running
+  total against the cap. A line per API call is 300 lines an hour, which is
+  a haystack, not an answer.
+- **Cache-friendly prompt ordering**, the provider's cache split read back,
+  and DeepSeek cache-hit tokens no longer billed twice (`prompt_tokens`
+  INCLUDES `prompt_cache_hit_tokens` there and EXCLUDES it on Anthropic,
+  and the cost model assumes Anthropic's meaning).
+
+### Remote escalation delivery
+
+- `RemoteNotifier` is a second conformer to the existing `Notifying`
+  protocol; `FanoutNotifier` composes it with the banner, which stays
+  PRIMARY, so `InterventionRouter` is unchanged and a remote failure can
+  never suppress or alter the local banner.
+- Off by default and fail-closed: delivery needs BOTH a webhook URL in the
+  Keychain and `remote_notify.enabled: true`. `RemoteWebhookURL` refuses
+  any scheme but https at construction, so no call site can bypass it.
+- Discord, Slack and **ntfy.sh** (the zero-infrastructure endpoint) are
+  detected from the URL host; everything else gets a flat JSON envelope.
+- A volume gate delivers the six owner-blocking outcomes plus high-severity
+  notify, and nothing Supervisor handled itself. **Re-pages every 45
+  minutes** while a session stays blocked on the owner.
+- **In-app setup UI** on the hover panel, with **delivery health** on the
+  row: a channel that delivered three minutes ago and one that has been
+  failing for an hour look identical from a toggle alone.
+- **Crash and hang paging.** The status-bar companion pages on engine death
+  or hang, and on actual app death via the reparent signal, because the
+  process that most needs paging about is the one that cannot page itself.
+  No false pages on sleep/wake, delivery is strictly serial so phone order
+  matches verdict order, and a death page that never confirmed leaves a
+  marker so the next launch sends one combined "was down, and has
+  recovered".
+- **Cost-cap and provider failures page too**, incident-based (one page per
+  incident plus a single 6-hour repeat, not an hourly drumbeat), with a
+  402 circuit breaker.
+
+### Fixed (release-candidate verification)
+
+- **`Bundle.module` would have crashed on every user's Mac.** The
+  synthesized accessor probes the .app root and a hardcoded build-machine
+  path, then calls `fatalError`; `build-app.sh` embeds the bundle in
+  `Contents/Resources/`, which is neither. On the build machine the
+  hardcoded path hid it. Reaching `Dispatcher.systemPrompt` on the
+  default-ON auto-dispatch path would have killed the app outright.
+- The dispatcher system prompt is **bundled into every .app** (audit B1),
+  not just the main one. Without it, every install except the build
+  machine dispatched off a 140-character stub.
+- **The "Supervisor was down" page was lost on the launch that should send
+  it.** Startup recovery ran on the first green tick, which FIFO puts ahead
+  of the webhook cache warm's result, so it found no endpoint and deleted
+  the markers with no retry.
+- **The restart remedy paged a false outage.** The hung-engine page says
+  "Restart Supervisor from the menu bar icon"; Restart force-terminates the
+  hung app, orphaning the companion, which paged "Supervisor stopped" and
+  then "recovered". Intentional restarts are now marked and exempt.
+- **The deploy exemption was inert.** `deploy.sh` wrote the self-rebuild
+  marker seconds after the pkill, and the companion reads it within one 2s
+  tick. It survived only because the unanchored pkill pattern also killed
+  the companion.
+- Atomic `config.yaml` writes that keep the owner's comments, and a config
+  watcher that re-arms on an inode swap.
+- ntfy.sh topic URLs are whole-URL credentials, and the redactor now
+  treats them as such.
+
+### Security
+
+- `SECURITY.md` now lists exhaustively what each `detail` level puts on the
+  wire. The old promise that `minimal` "quotes nothing from the session"
+  was not true: it sends the working directory's **basename**, which is
+  deliberate (with several sessions running it is the only thing that says
+  which one is blocked) but can itself be sensitive.
+
+### Full detail
+
+Everything above, at the level a reviewer or a future maintainer needs.
+
+**Remote escalation delivery** (`Sources/SupervisorCore/Intervention/RemoteNotifier.swift`,
+`RemoteNotifyPolicy.swift`, `RemoteNotifyPayload.swift`, `FanoutNotifier.swift`,
+`Sources/SupervisorCore/Config/RemoteNotifyURLStore.swift`)
+
+- The only push surface was `UNUserNotificationCenter`. Every escalation
+  terminated in a banner on a screen the owner had walked away from, which
+  is precisely the situation the product exists for. A pause nobody sees is
+  a stop.
+- `RemoteNotifier` is a second conformer to the existing `Notifying`
+  protocol. `FanoutNotifier` composes it with the banner: the banner is the
+  PRIMARY and its outcome is still what `InterventionRouter` sees, so the
+  router is unchanged and its `intervention.*.posted outcome=` lines still
+  mean what they meant. A remote failure can never suppress or alter the
+  local banner.
+- Discord and Slack incoming webhooks are detected from the URL host and get
+  their native body shape (`content` / `text`). Everything else gets a flat
+  JSON envelope. No configuration beyond the URL.
+- Off by default and fail-closed. Delivery requires BOTH a webhook URL in
+  the Keychain (`live.supervisor.api.remotenotify`, alongside the provider
+  keys and namespaced by the same `$SUPERVISOR_KEYCHAIN_PREFIX` E2E seam)
+  and `remote_notify.enabled: true` in `config.yaml`. With neither present
+  the app wires the plain banner notifier, byte-identical to before; with
+  only the switch on, the channel is built endpoint-less and stays silent
+  (trace reason `no_endpoint`) until a URL is stored and applied live.
+  `RemoteWebhookURL` refuses any scheme but https at construction, so there
+  is no call site that can bypass the check. The webhook Keychain read
+  happens off the main thread during the launch probe, next to the provider
+  key read, so a pending Keychain permission prompt cannot freeze launch;
+  a failed read traces `keychain_read_failed`, distinct from no URL stored.
+- Volume gate (`RemoteNotifyPolicy`, a pure function). Delivers on the six
+  owner-blocking outcomes (pause, kill, medium-confidence proposal,
+  low-confidence idle, degraded inject, and the Screen Recording denial that
+  only the owner can clear) plus high-severity notify. Skips everything
+  Supervisor handled itself, including a `queued` deferral, which by
+  definition means the human is already at the keyboard. A dedupe window
+  (60s default, keyed on session + outcome + category) means a flapping loop
+  pages once rather than forty times, and the stamp is written on SUCCESS
+  only, so a dropped message is retried by the next escalation instead of
+  being swallowed for the window. An in-flight reservation under the same
+  lock closes the concurrent-duplicate gap the success-only stamp opens
+  (two identical escalations racing before either POST returns), and a
+  window of zero writes no stamps at all, so disabling dedupe cannot grow
+  the map for the life of the process. The category half of the dedupe key
+  and of the wire payload is normalized against the rubric's own category
+  set; a model-invented category becomes `unrecognized_category` instead of
+  session-derived free text on the wire.
+- Privacy contract, enforced in `RemoteNotifyPayload` and asserted on the
+  exact wire bytes. `detail: minimal` (the default) sends Supervisor's own
+  verdict and quotes nothing from the session: category, severity, outcome,
+  an 8-char session prefix, and the cwd BASENAME. No command text, no
+  assistant prose, no absolute paths. `detail: full` adds the triggering
+  command and the plain reasoning. Every free-text field, at both levels,
+  goes through the same `Redactor` the API path uses, so there is no second
+  redaction layer to keep in sync. `reasoning_technical` never leaves at any
+  level. Message text is capped at 1500 characters and each quoted field at
+  400.
+- One POST attempt plus one retry, and only where a retry can help
+  (transport failure, 408, 429, 5xx). A 400 or 404 means the URL is wrong
+  and is not retried. Ten-second timeout on both the request and the
+  resource. The remote attempt runs on the router's dispatch task, strictly
+  after the intervention and the banner, and with the default two attempts,
+  ten-second timeout and two-second retry pause a dead endpoint can extend
+  that task by up to about 22 seconds. Bounded and after the fact; it cannot
+  delay or suppress the intervention itself. The transport uses a dedicated
+  ephemeral URLSession (no cookies, no cache) and refuses redirects, so a
+  3xx from the endpoint surfaces as a rejected status instead of a silent
+  second request carrying the credential elsewhere.
+- Every gate emits a discriminating trace line under the `remote` category:
+  `remote.skipped reason=` (including `no_endpoint` and `in_flight`),
+  `remote.suppressed reason=dedupe_window`, `remote.delivered`,
+  `remote.rejected`, `remote.transport_error`, `remote.config_changed`,
+  `remote.endpoint_applied`, `remote.unconfigured reason=`. The webhook URL
+  is never logged, never put in an error, and never rendered. Only the host
+  is. It is a bearer credential. Transport errors are sanitized before they
+  reach a trace line: URLSession errors carry the full failing URL in their
+  userInfo, so a `URLError` is reduced to its code and localized
+  description and any other error to its type name. The redaction defaults
+  also gain whole-URL patterns for Discord and Slack incoming-webhook URLs
+  (`<redacted:webhook-url>`), so a webhook pasted into a session is
+  scrubbed like any other credential.
+- Live reload. `ConfigWatcher` already re-reads `config.yaml`; the callback
+  now also pushes the switch and the detail level into the running notifier,
+  so flipping remote delivery on does not need a relaunch. When the switch
+  is on and the notifier holds no endpoint yet, the callback re-reads the
+  Keychain off the main thread and applies the URL live, so the documented
+  store-the-URL-then-flip-the-switch order works against a running app.
+- `SupervisorDevTools` gains `remote-notify-url-from-env`,
+  `remote-notify-show`, `remote-notify-delete` and `remote-notify-test`. The
+  URL has an env form only, on the same reasoning as `inject-key-from-env`:
+  argv leaks a credential into shell history and into Supervisor's own
+  observation of the bash command. `remote-notify-test` posts one synthetic
+  escalation so the owner can confirm the path works BEFORE relying on it.
+
+### Changed
+
+- `UserConfig` parses a `remote_notify` block with `enabled` and `detail`,
+  beside the existing `known_terminals`, `cost.daily_cap_usd` and
+  `supervise_codex` keys. An unrecognized `detail` value falls back to
+  `minimal` rather than failing the parse, because a typo must never widen
+  what leaves the machine. The switch lives in `config.yaml` where it is
+  visible and diffable; the secret lives in the Keychain where it is not.
+- `AnthropicUsage` gains a public memberwise initializer. It was internal,
+  so nothing outside SupervisorCore could construct a `TriageDecision`
+  without decoding JSON. Additive; the decode path is untouched.
+- README states the remote channel plainly next to the "nothing leaves your
+  machine" line rather than leaving the claim unqualified.
+
+### Tests
+
+89 new tests (1179 to 1268, 0 failures; 82 of them under
+`swift test --filter RemoteNotif`). `RemoteNotifyPolicyTests` pins the
+verdict for every `InterventionOutcome` case as a readable table.
+`RemoteNotifyPayloadTests` asserts the privacy contract on composed bytes,
+including that `minimal` carries no command, no reasoning and no absolute
+path, that an over-cap composition is really clipped, and that an invented
+category is replaced on the wire. `RemoteNotifierTests` covers URL
+validation, all the gates (the endpoint gate and the in-flight reservation
+included), dedupe expiry against a movable clock with boundary cases at 59s
+and 60s, retry classification, live apply in both directions plus a late
+`apply(endpoint:)`, the fanout ordering invariants, that a transport error
+carrying the failing URL never reaches the trace log, and the Keychain
+namespacing asserted against an injected environment prefix. The real
+`URLSessionRemoteNotifyTransport` is exercised through a mocked
+`URLProtocol`: a 3xx is reported and never followed, and a network failure
+surfaces sanitized. `UserConfigTests` covers the new block, including that
+a stray top-level `enabled: true` outside it changes nothing, that an
+unrecognized key inside it does not close it, and that a trailing comment
+on the header still opens it. `RedactorTests` covers the webhook-URL
+patterns. Delivery tests use a stub transport; no test opens a socket.
+
+### Known gap
+
+You get pinged. You still cannot reply. A blocked session says "go to your
+Mac," which beats silence and stops short of a round trip. The README says
+so plainly instead of implying parity.
+
+**Remote escalation, product scope** (the follow-up feature set on the same
+channel)
+
+- **In-app setup.** The hover panel's Controls group gains a Remote
+  escalation row: paste the webhook URL (written to the Keychain from
+  inside the app, so the app's own signature owns the ACL), flip the
+  config.yaml switch, pick minimal/full detail, and Send test through the
+  RUNNING notifier so a green result proves the real channel. Applies live;
+  no relaunch. `RemoteNotifyConfigWriter` is the one config.yaml writer and
+  touches only the `remote_notify` block.
+- **The survivor pages.** The status-bar companion pages the webhook on
+  engine health transitions: green to red ("engine stopped"), a sustained
+  (2 minute) amber ("engine hung"), an escalation when a hang becomes a
+  death, and one recovery message. One page per transition, armed only
+  after a first green. This is the one sanctioned companion network call
+  (Package.swift documents why: the dead app cannot page itself).
+- **Supervisor-is-down escalations.** A tripped daily cost cap or a
+  provider rejecting calls with 401/402/403 posts one banner, one hover
+  notice, and one remote page per hour per kind, via a parallel
+  system-event path (`SystemEscalationEvent`). After a 402 a circuit
+  breaker pauses triage attempts, 5 minutes doubling to an hour, reset on
+  any success, with one trace line per state change instead of one failed
+  call every 30 seconds.
+- **The 45-minute reminder.** A session still blocked on the owner
+  (unresponded pause, kill, pending approval or direction, an answer to
+  paste, a permission to grant) re-pages every 45 minutes until the block
+  clears: a response, session movement, a restart after a kill, or a 24h
+  horizon.
+- **Delivery health.** The panel row shows "Remote: delivered 3m ago" or
+  "Remote: last N attempts failed, first at HH:MM" from the notifier's own
+  attempt record.
+- **ntfy support.** `RemoteNotifyFormat` gains ntfy: detected for ntfy.sh
+  URLs, selectable (config `remote_notify.format: ntfy` or the panel's
+  Endpoint picker) for self-hosted servers; plain-text body with the title
+  in the `Title` header per ntfy's publish API. README recommends ntfy as
+  the zero-infrastructure default.
 
 ## [0.3.2] — 2026-07-26 (onboarding unblocked)
 

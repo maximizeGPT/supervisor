@@ -2,13 +2,12 @@
 
 ## Supported versions
 
-Only the latest minor release of Supervisor receives security fixes
-during the v0.1.x line.
+Only the latest minor release of Supervisor receives security fixes.
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.1.x   | :white_check_mark: |
-| < 0.1.0 | :x:                |
+| 0.4.x   | :white_check_mark: |
+| < 0.4.0 | :x:                |
 
 ## Reporting a vulnerability
 
@@ -25,11 +24,49 @@ the issue confirms.
 ## Scope
 
 **In scope** — anything that lets the published Supervisor binary leak
-the user's Anthropic API key, the user's session transcripts, the
+the user's provider API keys, the user's session transcripts, the
 contents of their watched JSONL files, or trace-log contents beyond
 the local filesystem. The redaction layer is part of this scope — if
-a pattern lets sensitive data through to `api.anthropic.com`, that's
-a security bug.
+a pattern lets sensitive data through to a model provider, that's a
+security bug.
+
+The remote escalation channel is in scope on both of its sensitive
+edges:
+
+- **The webhook URL is a bearer credential.** Anyone holding it can
+  post as the user (and on ntfy, the topic URL is also readable by
+  anyone holding it). Anything that exposes the stored URL — writing
+  it to the trace log, an error message, config.yaml, a session
+  report, or the UI — is a security bug. It belongs only in the
+  Keychain.
+- **Payload leakage past the detail level.** This is the exhaustive
+  list of what each level sends, because "quotes nothing from the
+  session" was too loose to hold anyone to.
+
+  At `detail: minimal`, the message carries: Supervisor's own verdict
+  and the intervention kind, the rubric category and severity, the
+  first 8 characters of the session UUID, and **the basename of the
+  session's working directory** (the folder name only, never the path).
+  It carries no command text, no model reasoning, no file contents and
+  no transcript.
+
+  The folder name is deliberate: with several sessions running it is
+  the only thing in the message that tells the owner which one is
+  blocked, and without it people set `detail: full` to get their
+  bearings, which sends strictly more. But it can itself be sensitive:
+  a consultant working in `~/work/acme-bankruptcy` publishes that name
+  to their webhook. If that is your situation, work in a neutrally
+  named directory or leave `remote_notify.enabled` off. The basename
+  passes through the same redaction layer as everything else, which
+  catches token-shaped and credential-shaped names, not meaningful
+  ones.
+
+  At `detail: full`, the message adds the triggering command and the
+  plain-language reasoning, both through the same redaction layer the
+  model calls use.
+
+  Anything crossing the network beyond the list above for the level in
+  force is a security bug.
 
 **Out of scope** — vulnerabilities in third-party dependencies (GRDB,
 KeychainAccess), in Anthropic's API itself, in Claude Code's session

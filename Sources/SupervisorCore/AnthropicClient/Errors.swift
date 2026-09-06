@@ -55,18 +55,38 @@ public enum AnthropicClientError: Error, Sendable, Equatable {
 public struct DailyCapExceededError: Error, Sendable, Equatable {
     /// The configured daily cap, in USD.
     public let capUSD: Double
-    /// Today's recorded spend at the time of the refused call, in USD.
+    /// Today's recorded spend at the time of the refused call, in USD. When
+    /// `storeReadFailed` is true this is NOT a measurement: `DailyCapGate`
+    /// synthesizes it equal to `capUSD` so an unreadable ledger fails closed.
     public let spentUSD: Double
+    /// True when the refusal came from a cost store that could not be read,
+    /// not from real spend reaching the cap.
+    ///
+    /// This flag exists because dropping it produced a paging bug worth
+    /// spelling out. Without it, a broken ledger reached the owner as
+    /// "Today's model spend reached $5.00 of the $5.00 cap. Raise
+    /// cost.daily_cap_usd to resume" — a figure that was invented, and a
+    /// remedy that can never work, because the synthesized spend rises with
+    /// whatever new cap the owner sets. The honest event for this state is
+    /// `.triageDegraded(.costStoreUnreadable)`, and `SystemEscalationEvent`
+    /// can only pick it if the error still carries the distinction.
+    public let storeReadFailed: Bool
 
-    public init(capUSD: Double, spentUSD: Double) {
+    /// Defaulted so the many call sites that construct a genuine cap hit read
+    /// exactly as they did before.
+    public init(capUSD: Double, spentUSD: Double, storeReadFailed: Bool = false) {
         self.capUSD = capUSD
         self.spentUSD = spentUSD
+        self.storeReadFailed = storeReadFailed
     }
 }
 
 extension DailyCapExceededError: LocalizedError {
     public var errorDescription: String? {
-        String(
+        if storeReadFailed {
+            return "Cost store unreadable, so spend cannot be checked against the daily cap; call skipped"
+        }
+        return String(
             format: "Daily cost cap reached: spent $%.2f of $%.2f cap; call skipped",
             spentUSD, capUSD
         )

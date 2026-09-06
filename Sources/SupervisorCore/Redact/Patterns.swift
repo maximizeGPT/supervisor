@@ -34,6 +34,9 @@ extension RedactionPattern {
         twilioKey,
         jwt,
         genericOpenAIKey,    // After the named keys so prefix-anchored ones win.
+        discordWebhookURL,   // Whole-URL matches; before the credential-half URL patterns.
+        slackWebhookURL,
+        ntfyTopicURL,        // ntfy.sh topic URLs are whole-URL credentials too.
         urlBasicAuth,
         connectionStringCredentials,
         urlCredentialedQueryParam,
@@ -204,6 +207,46 @@ extension RedactionPattern {
         name: "private-key",
         placeholder: "<redacted:private-key>",
         kind: .regex(re(#"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"#))
+    )
+
+    // MARK: - Webhook URLs
+
+    /// Discord incoming-webhook URL. The path IS the credential (id +
+    /// token): anyone holding the full URL can post as the owner, forever,
+    /// with no other secret — which is why Supervisor's own remote-notify
+    /// URL lives in the Keychain and not in config. Whole-URL match, unlike
+    /// `urlBasicAuth`, because there is no safe half to preserve. Covers
+    /// discord.com, discordapp.com and their subdomains (ptb., canary.).
+    /// `"` and `\` are excluded from the path class so the encoded-body pass
+    /// can't match across JSON string boundaries.
+    public static let discordWebhookURL = RedactionPattern(
+        name: "webhook-url",
+        placeholder: "<redacted:webhook-url>",
+        kind: .regex(re(#"(?i)https://(?:[a-z0-9-]+\.)?discord(?:app)?\.com/api/webhooks/[^\s"'\\<>]+"#))
+    )
+
+    /// Slack incoming-webhook URL. Same bearer-credential shape: the
+    /// `/services/T…/B…/token` path (and the workflow/trigger variants) is
+    /// the whole secret, so any path on hooks.slack.com is treated as one.
+    public static let slackWebhookURL = RedactionPattern(
+        name: "webhook-url",
+        placeholder: "<redacted:webhook-url>",
+        kind: .regex(re(#"(?i)https://hooks\.slack\.com/[^\s"'\\<>]+"#))
+    )
+
+    /// ntfy.sh topic URL. The topic name IS the credential on the public
+    /// server: anyone holding `https://ntfy.sh/<topic>` can both post to
+    /// and subscribe to the owner's pager channel, with no other secret —
+    /// which is exactly why Supervisor's own remote-notify endpoint (C13
+    /// added ntfy support) lives in the Keychain. Whole-URL match, same
+    /// shape and placeholder as the Discord/Slack patterns above. Accepted
+    /// limit, shared with the generic webhook family: a SELF-HOSTED ntfy
+    /// server on the owner's own domain is indistinguishable from any
+    /// other URL by shape, so it is not (and cannot be) matched here.
+    public static let ntfyTopicURL = RedactionPattern(
+        name: "webhook-url",
+        placeholder: "<redacted:webhook-url>",
+        kind: .regex(re(#"(?i)https://ntfy\.sh/[^\s"'\\<>]+"#))
     )
 
     // MARK: - URL credentials

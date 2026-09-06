@@ -244,6 +244,24 @@ final class AnthropicClientTests: XCTestCase {
                        0.70, accuracy: 0.0001)
     }
 
+    /// costUSD charges `input_tokens` at full price and then ADDS the cache-read
+    /// term, so the two fields must be disjoint. This pins the arithmetic the
+    /// OpenAI-compat translate path now has to feed it: of a 10,000-token
+    /// DeepSeek prompt with 8,000 served from the prefix cache, 2,000 are input
+    /// and 8,000 are cache reads.
+    func testTokenAccountingChargesCacheReadsOnceNotTwice() {
+        let usage = AnthropicUsage(
+            input_tokens: 2_000,               // 10,000 prompt tokens minus the 8,000 hits
+            output_tokens: 0,
+            cache_creation_input_tokens: nil,
+            cache_read_input_tokens: 8_000
+        )
+        let expected = 2_000 * (0.28 / 1_000_000) + 8_000 * (0.028 / 1_000_000)
+        XCTAssertEqual(TokenAccounting.costUSD(model: "deepseek-chat", usage: usage),
+                       expected, accuracy: 1e-9)
+        XCTAssertEqual(expected, 0.000784, accuracy: 1e-9)
+    }
+
     func testIsKnownModelDistinguishesUnknownFromFree() {
         XCTAssertFalse(TokenAccounting.isKnownModel("made-up-model"),
                        "unknown model must be distinguishable from a $0 cost")

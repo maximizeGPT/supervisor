@@ -45,20 +45,30 @@ swap_bundle() {
     fi
 }
 
-# 1. Stop the running instance.
+# 1. Record the self-rebuild BEFORE anything is killed.
+#
+# Two jobs, and the second one sets the ordering. The new instance reads this
+# marker to announce "Supervisor updated itself", which could happen any time
+# before the relaunch. But the status-bar companion also reads it, in the
+# moment it notices its parent died (getppid()==1), to decide whether that
+# death was deliberate. That check happens within ONE 2s tick of the pkill
+# below, so a marker written after the pkill is a marker written after the
+# only window in which it is read: the deploy exemption never actually
+# applied. It survived until now only because the unanchored pkill pattern
+# also matched and killed the companion itself.
+mkdir -p "$APP_SUPPORT"
+printf '%s' "$VERSION" > "$MARKER"
+echo "[deploy] wrote self-rebuild marker (version='$VERSION')"
+
+# 2. Stop the running instance.
 echo "[deploy] stopping running Supervisor"
 pkill -f "/Applications/Supervisor.app/Contents/MacOS/Supervisor" 2>/dev/null || true
 sleep 1
 
-# 2. Atomic swap the bundle. The menu-bar status item now lives inside
+# 3. Atomic swap the bundle. The menu-bar status item now lives inside
 # Supervisor.app (the former SupervisorStatusBar process was folded in),
 # so there is no second bundle to swap.
 swap_bundle "$SRC" "$DEST"
-
-# 3. Record the self-rebuild so the new instance announces it.
-mkdir -p "$APP_SUPPORT"
-printf '%s' "$VERSION" > "$MARKER"
-echo "[deploy] wrote self-rebuild marker (version='$VERSION')"
 
 # 4. Relaunch. Record the log position first so the smoke test only
 # reads lines this launch produces.

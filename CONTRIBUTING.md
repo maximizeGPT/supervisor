@@ -17,9 +17,11 @@ swift test
 ```
 
 The first `swift build` triggers Xcode Command Line Tools install if
-they're missing. `swift test` runs 130 tests; one (`testRealHaikuLiveCall`)
-is skipped unless `ANTHROPIC_API_KEY` is exported — that one hits the
-real Anthropic API and bills against your key.
+they're missing. `swift test` runs roughly 1,350 tests in about five
+minutes; a few dozen live suites (e.g. `LLMEvalTests`) are skipped
+unless `SUPERVISOR_LIVE_API=1` plus an API key (`ANTHROPIC_API_KEY` or
+`DEEPSEEK_API_KEY`) are exported — those hit the real provider APIs and
+bill against your key.
 
 For an end-to-end smoke test that builds, signs, and launches both
 `.app` bundles with the brand icons baked in:

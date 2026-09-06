@@ -326,6 +326,39 @@ final class DispatcherTests: XCTestCase {
         // check above is sufficient — the fallback is too short to pass.
     }
 
+    /// The prompt ships two ways: the SPM resource (what every install
+    /// loads) and Tools/dispatch-loop-hook/ (canonical, what the Python
+    /// hook reads). This is the drift tripwire the resource bundling
+    /// (audit B1) depends on: edit one file without the other and this
+    /// fails. Both paths are repo-relative via #filePath so the test runs
+    /// anywhere the checkout exists (CI included).
+    func testBundledPromptMatchesCanonicalToolsFile() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // SupervisorCoreTests/
+            .deletingLastPathComponent()   // Tests/
+            .deletingLastPathComponent()   // <repo>/
+        let canonical = repoRoot.appendingPathComponent("Tools/dispatch-loop-hook/dispatcher-system-prompt.txt")
+        let bundled = repoRoot.appendingPathComponent("Sources/SupervisorCore/Resources/dispatcher-system-prompt.txt")
+        let canonicalText = try String(contentsOf: canonical, encoding: .utf8)
+        let bundledText = try String(contentsOf: bundled, encoding: .utf8)
+        XCTAssertEqual(canonicalText, bundledText,
+                       "the bundled resource copy of the dispatcher prompt has drifted from the canonical Tools/ file; sync them (they must stay byte-identical)")
+    }
+
+    /// The install-path guarantee itself: Bundle.module must resolve the
+    /// prompt resource. On an end user's machine this is the ONLY candidate
+    /// that exists; if this fails, shipped apps are back on the stub.
+    func testBundleModuleCarriesTheDispatcherPrompt() {
+        // Through Dispatcher, not this test target's own Bundle.module —
+        // resource bundles are per-target and the prompt lives in
+        // SupervisorCore's.
+        let url = Dispatcher.bundledPromptURL
+        XCTAssertNotNil(url, "dispatcher-system-prompt.txt missing from SupervisorCore's resource bundle")
+        if let url, let text = try? String(contentsOf: url, encoding: .utf8) {
+            XCTAssertGreaterThan(text.count, 2000)
+        }
+    }
+
     /// Verify the user message includes the new context sections
     /// (direction, known gaps, source markers, diff stat).
     func testUserMessageIncludesEnrichedContext() {

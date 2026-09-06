@@ -240,6 +240,41 @@ final class StallWatchdogEngineTests: XCTestCase {
         return Wired(engine: engine, bus: bus, injector: injector, notifier: notifier, ledger: ledger, dispatcher: dispatcher, trace: engineTrace)
     }
 
+    // MARK: - Waiting for the tick to land (2026-09-05)
+
+    /// Wait until `condition` holds, polling every 20ms up to `timeout`.
+    ///
+    /// These tests drive `checkIdleStates()` synchronously but the nudge lands
+    /// through an unstructured Task and the router, so every assertion below
+    /// needs the work to have finished first. That used to be a flat
+    /// `Task.sleep(300ms)`, which is generous on an idle machine and loses
+    /// under full-suite contention: `testThreeNudgesThenEscalateAndStop` failed
+    /// in CI with "nudge 2 injected: 1 != 2" and passed on its own. A poll is
+    /// the same short wait when the machine is free and a longer one when it is
+    /// busy, so the assertion reads settled state either way, and the fast case
+    /// is now FASTER than the old fixed sleep rather than slower.
+    ///
+    /// Returns quietly on timeout: the assertion that follows is what reports
+    /// the failure, with the message that explains what was expected.
+    private func poll(
+        until condition: @MainActor () -> Bool,
+        timeout: TimeInterval = 5.0
+    ) async {
+        // Wall clock on purpose. The ClockBox the tests advance is the engine's
+        // notion of time, not this deadline's.
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    /// The common case: wait for the injector to hold at least `count` nudges.
+    /// `>=` rather than `==` so an over-fire is caught by the assertion after
+    /// the poll instead of being hidden by a poll that never settles.
+    private func pollInjected(_ w: Wired, count: Int) async {
+        await poll(until: { w.injector.texts.count >= count })
+    }
+
     /// Count how many lines in the engine trace contain `needle`.
     private func traceLineCount(_ w: Wired, containing needle: String) -> Int {
         w.trace.sync()
@@ -273,7 +308,7 @@ final class StallWatchdogEngineTests: XCTestCase {
         // Advance past the 20m haiku interval and tick.
         clock.advance(by: 21 * 60)
         w.engine.checkIdleStates()
-        try await Task.sleep(nanoseconds: 500_000_000)
+        await pollInjected(w, count: 1)
 
         XCTAssertEqual(w.injector.texts.count, 1, "exactly one check-in nudge injected")
         let injected = try XCTUnwrap(w.injector.texts.first)
@@ -303,7 +338,7 @@ final class StallWatchdogEngineTests: XCTestCase {
         // First stall -> nudge 1.
         clock.advance(by: 21 * 60)
         w.engine.checkIdleStates()
-        try await Task.sleep(nanoseconds: 300_000_000)
+        await pollInjected(w, count: 1)
         XCTAssertEqual(w.injector.texts.count, 1, "nudge 1 fired")
 
         // Worker MOVES (a real tool call) -> resets the cycle.
@@ -315,7 +350,7 @@ final class StallWatchdogEngineTests: XCTestCase {
         // Another full stall -> should be nudge 1 again (NOT 2), proving the reset.
         clock.advance(by: 21 * 60)
         w.engine.checkIdleStates()
-        try await Task.sleep(nanoseconds: 300_000_000)
+        await pollInjected(w, count: 2)
         XCTAssertEqual(w.injector.texts.count, 2, "a second nudge fired after the reset")
         // Both injects are the first-of-a-stall nudge (count shown as 1 of 3 in the
         // reasoning is internal; here we simply assert it nudged rather than skipped
@@ -344,14 +379,21 @@ final class StallWatchdogEngineTests: XCTestCase {
         for i in 0..<3 {
             clock.advance(by: 21 * 60)
             w.engine.checkIdleStates()
-            try await Task.sleep(nanoseconds: 300_000_000)
+            await pollInjected(w, count: i + 1)
             XCTAssertEqual(w.injector.texts.count, i + 1, "nudge \(i + 1) injected")
         }
 
         // Fourth tick: nudgeCount is now 3 (== cap) -> ESCALATE, not a 4th nudge.
+        // The escalation is the .notifyOnly outcome (a nudge posts a non-
+        // .notifyOnly one, so `outcomes` is already non-empty), and it is the
+        // thing to wait FOR here. Waiting on it also settles the "no 4th nudge"
+        // assertion: by the time the escalation has landed, a nudge from the
+        // same tick would have landed too.
         clock.advance(by: 21 * 60)
         w.engine.checkIdleStates()
-        try await Task.sleep(nanoseconds: 400_000_000)
+        await poll(until: {
+            w.notifier.outcomes.contains { if case .notifyOnly = $0 { return true } else { return false } }
+        })
         XCTAssertEqual(w.injector.texts.count, 3, "no 4th nudge: the watchdog escalated instead")
         XCTAssertFalse(w.notifier.outcomes.isEmpty, "escalation posts a notify banner")
 
@@ -359,6 +401,9 @@ final class StallWatchdogEngineTests: XCTestCase {
         let notifyCountAfterEscalate = w.notifier.outcomes.count
         clock.advance(by: 21 * 60)
         w.engine.checkIdleStates()
+        // Nothing to poll FOR: this asserts an absence, and a poll would return
+        // on the first empty read rather than proving the tick produced nothing.
+        // A fixed settle is the correct wait for a negative.
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(w.injector.texts.count, 3, "still no further nudge after escalation")
         XCTAssertEqual(w.notifier.outcomes.count, notifyCountAfterEscalate,
@@ -385,7 +430,7 @@ final class StallWatchdogEngineTests: XCTestCase {
         // First stall interval -> nudge 1.
         clock.advance(by: 21 * 60)
         w.engine.checkIdleStates()
-        try await Task.sleep(nanoseconds: 300_000_000)
+        await pollInjected(w, count: 1)
         XCTAssertEqual(w.injector.texts.count, 1, "nudge 1 fired after the first interval")
 
         // Now hammer checkIdleStates at ~1Hz WITHOUT advancing a full interval.
@@ -404,7 +449,7 @@ final class StallWatchdogEngineTests: XCTestCase {
         // Once a full interval elapses since the last nudge, the next nudge fires.
         clock.advance(by: 21 * 60)
         w.engine.checkIdleStates()
-        try await Task.sleep(nanoseconds: 300_000_000)
+        await pollInjected(w, count: 2)
         XCTAssertEqual(w.injector.texts.count, 2, "the second nudge fires only after a full interval")
     }
 
@@ -421,7 +466,7 @@ final class StallWatchdogEngineTests: XCTestCase {
         try await seedStoppedSession(w, clock, sessionId: sid)
         clock.advance(by: 21 * 60)
         w.engine.checkIdleStates()
-        try await Task.sleep(nanoseconds: 400_000_000)
+        await pollInjected(w, count: 1)
         XCTAssertEqual(w.injector.texts.count, 1, "default-on (no marker): the watchdog nudges")
     }
 
@@ -505,7 +550,10 @@ final class StallWatchdogEngineTests: XCTestCase {
 
         clock.advance(by: 5 * 60)
         w.engine.checkIdleStates()
-        try await Task.sleep(nanoseconds: 800_000_000)
+        // This path goes all the way through the canned LLM call, so it is the
+        // slowest wait in the file and the one a fixed 800ms was least likely
+        // to cover under load.
+        await poll(until: { w.dispatcher.calls >= 1 })
         XCTAssertEqual(w.dispatcher.calls, 1,
                        "a healthy session (no outstanding async work) is NOT suppressed")
         XCTAssertTrue(w.injector.texts.isEmpty, "no watchdog nudge for a healthy session")
@@ -534,6 +582,11 @@ final class StallWatchdogEngineTests: XCTestCase {
             clock.advance(by: 1)
         }
 
+        // Wait for the FIRST line to reach the trace, then assert there is
+        // exactly one. Polling for its arrival separates "the line has not been
+        // written yet" from "the line was written twice", which a fixed sleep
+        // conflates into the same failure.
+        await poll(until: { traceLineCount(w, containing: "short-idle drive SUPPRESSED session=\(sid)") >= 1 })
         XCTAssertEqual(w.dispatcher.calls, 0,
                        "behavior unchanged: the drive stays suppressed every tick")
         XCTAssertEqual(traceLineCount(w, containing: "short-idle drive SUPPRESSED session=\(sid)"), 1,
@@ -612,6 +665,7 @@ final class StallWatchdogEngineTests: XCTestCase {
             try await Task.sleep(nanoseconds: 120_000_000)
             clock.advance(by: 1)
         }
+        await poll(until: { traceLineCount(w, containing: "short-idle drive SUPPRESSED session=\(sid)") >= 1 })
         XCTAssertEqual(traceLineCount(w, containing: "short-idle drive SUPPRESSED session=\(sid)"), 1,
                        "episode 1 logs SUPPRESSED once")
 
@@ -639,6 +693,7 @@ final class StallWatchdogEngineTests: XCTestCase {
             clock.advance(by: 1)
         }
 
+        await poll(until: { traceLineCount(w, containing: "short-idle drive SUPPRESSED session=\(sid)") >= 2 })
         XCTAssertEqual(traceLineCount(w, containing: "short-idle drive SUPPRESSED session=\(sid)"), 2,
                        "a NEW suppression episode logs the SUPPRESSED line again (one per episode)")
     }
@@ -666,7 +721,7 @@ final class StallWatchdogEngineTests: XCTestCase {
         // Now cross 45m -> fires.
         clock.advance(by: 15 * 60)  // total 46m
         w.engine.checkIdleStates()
-        try await Task.sleep(nanoseconds: 400_000_000)
+        await pollInjected(w, count: 1)
         XCTAssertEqual(w.injector.texts.count, 1, "past the opus 45m interval the watchdog nudges")
     }
 }

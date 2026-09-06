@@ -613,12 +613,30 @@ public final class Dispatcher: Dispatching, Sendable {
 
     // MARK: - Prompts
 
+    /// The bundled prompt resource, resolved in THIS target's bundle
+    /// (resource bundles are per-target, so tests must reach it through here
+    /// rather than their own module bundle). Exposed internal for the
+    /// install-path regression test.
+    ///
+    /// Deliberately NOT `Bundle.module`. The synthesized accessor probes only
+    /// the .app ROOT and a hardcoded build-machine path, calls `fatalError`
+    /// when both miss, and `build-app.sh` embeds the bundle in
+    /// `Contents/Resources/` — neither location. On the build machine the
+    /// hardcoded path hides it; on a user's Mac this static is reached from
+    /// `systemPrompt` on the default-ON auto-dispatch path and would crash the
+    /// app outright. `CoreResourceBundle` probes the packaged layouts and
+    /// returns nil instead, so a missing bundle falls through to the
+    /// `#filePath` candidates below and finally the loud stub.
+    public static var bundledPromptURL: URL? {
+        CoreResourceBundle.url(forResource: "dispatcher-system-prompt", withExtension: "txt")
+    }
+
     /// The Dispatcher system prompt. Synced with
     /// `Tools/dispatch-loop-hook/dispatcher-system-prompt.txt` which is
     /// the canonical source for the Python hook path. When editing,
     /// update both. The .txt file is what the Python hook reads at
     /// runtime; this static is what the Swift in-app path uses.
-    static let systemPrompt: String = {
+    public static let systemPrompt: String = {
         // Resolve the prompt file on ANY checkout. The previous hardcoded
         // /Users/main/... path broke CI — the runner lives under
         // /Users/runner/work/..., so the load silently fell back to the stub
@@ -626,6 +644,16 @@ public final class Dispatcher: Dispatching, Sendable {
         // source file's location at COMPILE time, so we derive the repo root
         // from it portably (works on the runner, the owner's machine, and any
         // future clone). The file is git-tracked, so it's always in-tree.
+        // FIRST candidate is the bundled SPM resource: the only one that
+        // exists on an end user's machine (the dmg has no checkout). The
+        // #filePath-derived candidates below only work where the BUILD
+        // machine's checkout exists at that path — which is why every
+        // install except the build machine's silently ran the stub until
+        // the resource was bundled (audit finding B1).
+        if let bundled = Dispatcher.bundledPromptURL,
+           let text = try? String(contentsOf: bundled, encoding: .utf8), !text.isEmpty {
+            return text
+        }
         let rel = "Tools/dispatch-loop-hook/dispatcher-system-prompt.txt"
         let repoRoot = URL(fileURLWithPath: #filePath)  // <repo>/Sources/SupervisorCore/Triage/Dispatcher.swift
             .deletingLastPathComponent()   // Triage/
@@ -644,7 +672,13 @@ public final class Dispatcher: Dispatching, Sendable {
             }
         }
         // Fallback: minimal inline version. Should never fire now that the
-        // path is checkout-relative.
+        // path is checkout-relative — so if it does, say so loudly (stderr;
+        // this static initializes before any TraceLog is injectable) instead
+        // of silently dispatching off a one-line stub. The stub keeps the
+        // loop functional; the warning keeps the degradation findable.
+        FileHandle.standardError.write(Data(
+            "Supervisor: dispatcher-system-prompt.txt not found at any candidate path; using the minimal inline dispatcher prompt\n".utf8
+        ))
         return "You are the dispatcher for an autonomous Claude Code session. Pick the next task and write the prompt. Call record_dispatch exactly once."
     }()
 

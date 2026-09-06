@@ -272,6 +272,33 @@ public final class Notifier: Notifying, @unchecked Sendable {
         }
     }
 
+    /// C2/D1: post a banner about SUPERVISOR ITSELF (cost cap hit, provider
+    /// unavailable). No flag category, no dismiss-tracking userInfo — there
+    /// is no flags row behind these — and a default sound because "sessions
+    /// are not being watched" is exactly the alert grade a sound exists for.
+    /// The title/body come from SystemEscalationEvent, so the banner, the
+    /// hover notice, and the remote page all say the same sentence.
+    @discardableResult
+    public func postSystemAlert(title: String, body: String) async -> Outcome {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "supervisor.system.\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        do {
+            try await center.add(request)
+            trace.emit("notifier", "posted system alert: \(title)")
+            return .posted
+        } catch {
+            trace.emit("notifier", "ERROR system alert center.add threw: \(error)")
+            return .failed(reason: "\(error)")
+        }
+    }
+
     /// Post a notification for a triage decision. Returns the outcome
     /// (mostly for tests / observability — the caller doesn't generally
     /// branch on it in v0.1.0).

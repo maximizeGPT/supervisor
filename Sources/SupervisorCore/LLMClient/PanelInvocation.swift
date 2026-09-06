@@ -138,7 +138,7 @@ public extension PanelCoordinator {
         redactor: any Redactor,
         traceLog: TraceLog = .shared,
         costRecorder: (@Sendable (_ model: String, _ usage: AnthropicUsage) -> Void)? = nil,
-        capCheck: (@Sendable () -> (cap: Double, spent: Double)?)? = nil
+        capCheck: (@Sendable () -> DailyCapGate.Verdict?)? = nil
     ) -> PanelCoordinator? {
         func client(for p: LLMProvider) -> LLMClient? {
             guard let key = try? keyStore.read(p), !key.isEmpty else { return nil }

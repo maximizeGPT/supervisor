@@ -440,7 +440,7 @@ final class LLMClientProviderTests: XCTestCase {
             baseURL: URL(string: "https://mock.deepseek.test")!,
             session: URLSession(configuration: cfg),
             costRecorder: { _, _ in capture.recorderCalls += 1 },
-            capCheck: { return (cap: 5.0, spent: 5.0) }  // exactly at cap
+            capCheck: { .init(cap: 5.0, spent: 5.0) }  // exactly at cap
         )
 
         let req = AnthropicMessageRequest(
@@ -471,7 +471,7 @@ final class LLMClientProviderTests: XCTestCase {
             redactor: DefaultRedactor(),
             baseURL: URL(string: "https://mock.anthropic.test")!,
             session: URLSession(configuration: cfg),
-            capCheck: { return (cap: 2.0, spent: 3.75) }  // over cap
+            capCheck: { .init(cap: 2.0, spent: 3.75) }  // over cap
         )
         let req = AnthropicMessageRequest(
             model: "claude-haiku-4-5-20251001", max_tokens: 1,
@@ -507,7 +507,7 @@ final class LLMClientProviderTests: XCTestCase {
             redactor: DefaultRedactor(),
             baseURL: URL(string: "https://mock.deepseek.test")!,
             session: URLSession(configuration: cfg),
-            capCheck: { return (cap: 5.0, spent: 4.99) }  // under cap
+            capCheck: { .init(cap: 5.0, spent: 4.99) }  // under cap
         )
         let req = AnthropicMessageRequest(
             model: "deepseek-chat", max_tokens: 16,
@@ -676,7 +676,7 @@ final class LLMClientProviderTests: XCTestCase {
             redactor: DefaultRedactor(),
             baseURL: URL(string: "https://mock.anthropic.test")!,
             session: URLSession(configuration: cfg),
-            capCheck: { (cap: 1.0, spent: 0.0) }
+            capCheck: { .init(cap: 1.0, spent: 0.0) }
         )
         // Estimate per call ≈ 0.5 (100k output tokens at Haiku's 5/1M).
         let req = AnthropicMessageRequest(
@@ -724,7 +724,7 @@ final class LLMClientProviderTests: XCTestCase {
             redactor: DefaultRedactor(),
             baseURL: URL(string: "https://mock.anthropic.test")!,
             session: URLSession(configuration: cfg),
-            capCheck: { (cap: 1.0, spent: 0.0) }  // spent stays 0 (no real recorder wired)
+            capCheck: { .init(cap: 1.0, spent: 0.0) }  // spent stays 0 (no real recorder wired)
         )
         let req = AnthropicMessageRequest(
             model: "claude-haiku-4-5-20251001",

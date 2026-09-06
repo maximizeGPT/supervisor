@@ -141,6 +141,49 @@ public struct ConfigPaths: Sendable {
         appSupportDir.appendingPathComponent("self-rebuild.marker", isDirectory: false)
     }
 
+    /// `~/Library/Application Support/Supervisor/intentional-restart.marker`
+    /// Written by the status-bar companion's Restart action IMMEDIATELY before
+    /// it terminates the main app, and read by the companion's reparent check
+    /// one tick later. Exactly analogous to `selfRebuildMarkerPath`, for the
+    /// other deliberate kill.
+    ///
+    /// Restart escalates to `forceTerminate()` when a hung app ignores the
+    /// polite quit, so no SIGTERM handler runs and the companion is orphaned.
+    /// Without this marker `reparentAction` saw `getppid() == 1` with no
+    /// deploy marker and paged "Supervisor stopped", then "recovered" seconds
+    /// later. The page fired for the remedy the previous page had told the
+    /// owner to perform, which is the worst possible time to cry wolf.
+    ///
+    /// Cleared by the relaunched app at startup, same as the self-rebuild
+    /// marker. Contents are a timestamp for the trace; only presence decides.
+    public var intentionalRestartMarkerPath: URL {
+        appSupportDir.appendingPathComponent("intentional-restart.marker", isDirectory: false)
+    }
+
+    /// `~/Library/Application Support/Supervisor/companion-incident.marker`
+    /// Written by the status-bar companion in the moment it detects the main
+    /// app died under it (reparenting to launchd) AND successfully paged the
+    /// owner about it. The dying companion cannot also send the recovery page
+    /// (it exits immediately), so the marker carries the incident across the
+    /// gap: the NEXT companion instance, on its first green tick, sees the
+    /// marker, sends the recovery page, and deletes it. Contents are the paged
+    /// kind plus a timestamp, for the trace log; only presence is decisive.
+    public var companionIncidentMarkerPath: URL {
+        appSupportDir.appendingPathComponent("companion-incident.marker", isDirectory: false)
+    }
+
+    /// `~/Library/Application Support/Supervisor/companion-page-failed.marker`
+    /// The incident marker's dark twin: written when the dying companion's
+    /// death page did NOT confirm delivery (failed, no usable webhook, or the
+    /// bounded attempt hung), meaning the owner never heard about the outage.
+    /// The NEXT companion instance, on its first green tick, sends the one
+    /// combined "stopped earlier and has recovered" page and deletes it.
+    /// Same contract as the incident marker: contents are for the trace log,
+    /// only presence is decisive.
+    public var companionFailedPageMarkerPath: URL {
+        appSupportDir.appendingPathComponent("companion-page-failed.marker", isDirectory: false)
+    }
+
     /// `~/Library/Logs/Supervisor/supervisor.log`
     public var traceLogPath: URL {
         logsDir.appendingPathComponent("supervisor.log", isDirectory: false)

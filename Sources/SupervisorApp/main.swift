@@ -26,6 +26,29 @@ import SupervisorCore
 import SupervisorUI
 import UserNotifications
 
+/// Late-bound sink for `CostRecordingHook`'s write-health edges.
+///
+/// The hook is constructed with the LLM client, which happens before the
+/// banner + remote delivery path exists in `enterRunningState`. Rather than
+/// reorder that setup (the client has to exist before the engine that uses
+/// it), the hook is given this relay and the delivery path fills in the
+/// handler a few dozen lines later. A failure before then is still traced by
+/// the hook; it just does not page, which is correct, because there is
+/// nothing to page through yet.
+final class CostStoreHealthRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _handler: (@Sendable (_ failing: Bool) -> Void)?
+
+    var handler: (@Sendable (_ failing: Bool) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _handler }
+        set { lock.lock(); _handler = newValue; lock.unlock() }
+    }
+
+    func report(failing: Bool) {
+        handler?(failing)
+    }
+}
+
 @MainActor
 final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
@@ -34,11 +57,14 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private let permissions: any PermissionChecker
     private let keyStore: any ProviderKeyStore
     private let activeProviderStore: any ActiveProviderStore
+    private let remoteNotifyURLStore: any RemoteNotifyURLStore
 
     // Onboarding
     private var onboarding: OnboardingWindowController?
     /// Main-run-loop liveness beat (see startAppAliveBeat).
     private var appAliveTimer: Timer?
+    /// Hourly spend line (see startHourlySpendLine).
+    private var hourlySpendTimer: Timer?
     /// Small floating panel shown when the launch keychain probe exceeds
     /// its watchdog (a SecurityAgent prompt is likely up, possibly hidden).
     private var keychainWaitPanel: NSPanel?
@@ -56,6 +82,12 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private var sessionStore: SessionStore?
     private var flagStore: FlagStore?
     private var costStore: CostStore?
+    /// The one write path for model spend. Held so it outlives the closure
+    /// that captured it and keeps its failure-streak state across calls.
+    private var costWriteHook: CostRecordingHook?
+    /// Late-bound sink for the hook's write-health edges. The hook is built
+    /// with the LLM client, before the banner + remote delivery path exists.
+    private var costHealthRelay: CostStoreHealthRelay?
     private var loopDispatchStore: LoopDispatchStore?
     private var planStore: PlanStore?
     private var auditStore: AuditStore?
@@ -68,6 +100,19 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private var discovery: SessionDiscovery?
     private var codexDiscovery: CodexSessionDiscovery?
     private var notifier: Notifier?
+    /// The off-machine escalation channel. Always constructed on entering
+    /// the running state (endpoint-less and disabled until the owner sets it
+    /// up — inert in that shape); nil only before then. Held so the config
+    /// watcher AND the panel's Remote escalation row can flip `enabled`,
+    /// complete a missing endpoint, and send a test, all without a relaunch.
+    private var remoteNotifier: RemoteNotifier?
+    /// Raw webhook URL as read by the launch keychain probe, off the main
+    /// thread, alongside the provider key (routeAfterKeychainProbe). Consumed
+    /// by enterRunningState so the running-state entry never touches the
+    /// Keychain on the main thread — that read can park its thread on a
+    /// SecurityAgent prompt. Nil means absent OR unreadable; the probe traces
+    /// which.
+    private var probedWebhookURL: String?
     private var router: InterventionRouter?
     private var bus: EventBus?
 
@@ -90,9 +135,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     override init() {
         try? paths.ensureDirectoriesExist()
         self.trace = TraceLog(path: paths.traceLogPath)
+        // Seed a commented config.yaml if the install has none. Every owner-
+        // facing message that says "edit config.yaml" was, until this line,
+        // pointing at a file no fresh install had — most visibly the cap-hit
+        // message, which names the exact key to raise. No-ops when a file is
+        // already there, and what it writes parses to the built-in defaults.
+        StarterConfig.seedIfAbsent(at: paths.configPath, trace: self.trace)
         self.permissions = LivePermissionChecker()
         self.keyStore = KeychainProviderKeyStore()
         self.activeProviderStore = FileActiveProviderStore(path: paths.activeProviderPath)
+        self.remoteNotifyURLStore = KeychainRemoteNotifyURLStore()
         super.init()
         // v0.2.0's one-shot legacy-key migration used to run right here,
         // synchronously, before applicationDidFinishLaunching. It now runs
@@ -167,6 +219,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private func routeAfterKeychainProbe() {
         let keyStore = self.keyStore
         let activeProviderStore = self.activeProviderStore
+        let remoteURLStore = self.remoteNotifyURLStore
         let trace = self.trace
 
         let watchdog = DispatchWorkItem { [weak self] in
@@ -192,9 +245,26 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             let activeProvider = (try? activeProviderStore.read()) ?? .anthropic
             let hasKey: Bool = ((try? keyStore.read(activeProvider)) ?? nil)?.isEmpty == false
 
+            // Remote-escalation webhook URL, read here for the same reason
+            // the provider key is: it is a Keychain item, and the first read
+            // after the owner stores it can raise its own SecurityAgent
+            // prompt. Off the main thread with the watchdog still armed,
+            // that wait is visible in the trace instead of looking like the
+            // app didn't open. A thrown read is distinguished from an absent
+            // item — but the error itself is never traced, because Keychain
+            // errors can quote the item and the URL is a bearer credential.
+            var storedWebhookURL: String?
+            do {
+                storedWebhookURL = try remoteURLStore.read()
+            } catch {
+                storedWebhookURL = nil
+                trace.emit("remote", "remote.unconfigured reason=keychain_read_failed")
+            }
+
             DispatchQueue.main.async { [weak self] in
                 watchdog.cancel()
                 guard let self else { return }
+                self.probedWebhookURL = storedWebhookURL
                 self.dismissKeychainWaitPanel()
                 let axOK = self.permissions.isAXGranted()
                 if !hasKey || !axOK {
@@ -217,6 +287,13 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // original bug, back through a side door).
         appAliveTimer?.invalidate()
         appAliveTimer = nil
+        blockedRepageTimer?.invalidate()
+        blockedRepageTimer = nil
+        // One last spend line so a session that quits mid-hour still accounts
+        // for what it spent.
+        hourlySpendTimer?.invalidate()
+        hourlySpendTimer = nil
+        emitHourlySpendLine()
         try? FileManager.default.removeItem(at: paths.appAlivePath)
         triageEngine?.stop()
         reviewEngine?.stop()
@@ -307,6 +384,38 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // mtime is the signal; the content is a debugging courtesy.
         try? "\(ProcessInfo.processInfo.processIdentifier) \(Date().timeIntervalSince1970)\n"
             .write(to: paths.appAlivePath, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: - Hourly spend line (2026-09-05)
+
+    /// One line an hour saying what supervision cost: calls made, input tokens
+    /// sent, how many of those the provider served from its prompt cache, and
+    /// the estimated dollars, plus the day's running total against the cap.
+    /// Same Timer shape as the app-alive beat. The owner's question was "why
+    /// did this fill $10 overnight" and the honest answer needs a number he can
+    /// scan, not 300 per-call lines an hour.
+    private func startHourlySpendLine() {
+        hourlySpendTimer?.invalidate()
+        let timer = Timer(timeInterval: 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.emitHourlySpendLine() }
+        }
+        // Generous tolerance: this is a log line, not a deadline, and the
+        // slack lets the OS coalesce it with other wakeups.
+        timer.tolerance = 300
+        RunLoop.main.add(timer, forMode: .common)
+        hourlySpendTimer = timer
+    }
+
+    private func emitHourlySpendLine() {
+        let window = LLMCallMeter.shared.drain()
+        // A silent hour is worth saying so: it is the proof the idle path is no
+        // longer paying to watch sessions that are not moving.
+        let dayTotal = try? costStore?.todayTotalUSD()
+        trace.emit("cost", LLMCallMeter.hourlyLine(
+            window,
+            dayTotalUSD: dayTotal ?? nil,
+            capUSD: UserConfig.load(from: paths.configPath).effectiveDailyCostCapUSD
+        ))
     }
 
     private func presentOnboarding() {
@@ -492,6 +601,18 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             trace.emit("app", "self-rebuild marker found; announced and cleared")
         }
 
+        // Intentional-restart marker: written by the companion's Restart
+        // action right before it terminated the previous instance, read by
+        // that instance's companion to suppress a false "Supervisor stopped"
+        // page. Its job is done the moment this launch happens, and a stale
+        // one would exempt a genuine death later, so clear it. Nothing is
+        // announced: the owner asked for this restart and is watching it.
+        let restartMarker = paths.intentionalRestartMarkerPath
+        if FileManager.default.fileExists(atPath: restartMarker.path) {
+            try? FileManager.default.removeItem(at: restartMarker)
+            trace.emit("app", "intentional-restart marker found; cleared")
+        }
+
         // Debug affordance: SUPERVISOR_DEBUG_FLASH=1 fires a sample action
         // flash every few seconds after launch, so the action-flash
         // animation can be verified on screen without waiting for a real
@@ -515,9 +636,141 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Remote escalation channel. Built here, ahead of the config watcher,
+        // so the watcher can flip it live when the owner edits config.yaml.
+        // The webhook URL was already read by the launch keychain probe (off
+        // the main thread — see probedWebhookURL); no Keychain I/O happens on
+        // this path. Always constructed (endpoint-less and disabled when the
+        // owner never set it up): the panel's Remote escalation row arms the
+        // channel live, and needs a running instance to apply to.
+        let remote = makeRemoteNotifier(config: userConfig, storedWebhookURL: probedWebhookURL)
+        self.remoteNotifier = remote
+
+        // The panel's Remote escalation row: seed the truth for first open,
+        // then wire the three actions. Every handler applies to the RUNNING
+        // notifier, so a save or a toggle takes effect with no relaunch
+        // (apply(endpoint:) / apply(_:) are the live seams).
+        hoverVM.seedRemoteEscalation(
+            webhookConfigured: !(probedWebhookURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty,
+            enabled: userConfig.remoteNotifyEnabled,
+            detail: userConfig.remoteNotifyDetail,
+            format: userConfig.remoteNotifyFormat
+        )
+        let webhookStore = self.remoteNotifyURLStore
+        hoverVM.saveRemoteWebhookHandler = { [weak remote] raw in
+            // The VM already validated; validating again here keeps the
+            // https gate on this path even if a future caller skips the VM.
+            let endpoint = try RemoteWebhookURL(validating: raw)
+            // Keychain write OFF the main thread: the first write under a
+            // fresh ACL can raise a SecurityAgent prompt, and the panel must
+            // not freeze behind it. Written from inside the app process, so
+            // the app's own signature owns the item's ACL and later launch
+            // probes read it without a prompt.
+            try await Task.detached(priority: .userInitiated) {
+                try webhookStore.write(raw)
+            }.value
+            remote?.apply(endpoint: endpoint)
+        }
+        let remoteConfigPath = paths.configPath
+        let remoteTrace = trace
+        hoverVM.setRemoteNotifyHandler = { [weak remote] enabled, detail, format in
+            // Persist first, then apply: the panel reflects the write's
+            // success, and config.yaml stays the durable source of truth
+            // (the watcher will re-apply the same values, which the
+            // notifier's no-change guard absorbs quietly).
+            do {
+                try RemoteNotifyConfigWriter.write(
+                    values: .init(enabled: enabled, detail: detail, format: format),
+                    to: remoteConfigPath
+                )
+            } catch {
+                remoteTrace.emit("remote", "remote.config_write_failed error=\(error)")
+                return false
+            }
+            remote?.apply(RemoteNotifier.Configuration(enabled: enabled, detail: detail, formatOverride: format))
+            return true
+        }
+        hoverVM.sendRemoteTestHandler = { [weak remote] in
+            await remote?.sendTest() ?? .failed(reason: "channel unavailable")
+        }
+        // C7: the row's delivery-health line reads the RUNNING notifier's
+        // record at render time, so "delivered 3m ago" is always about the
+        // channel a real escalation would use. Hover-only by choice: folding
+        // failures into the status bar's amber would mean a health file the
+        // companion re-reads every tick, and the menu icon's colors stay
+        // reserved for "is supervision alive".
+        hoverVM.remoteDeliveryHealthProvider = { [weak remote] in
+            remote?.deliveryHealth
+        }
+
+        // C6: the 45-minute "still waiting on you" re-page for sessions
+        // blocked on the owner. A periodic scanner over the flags table (the
+        // durable record), not per-flag timers, so a relaunch cannot orphan
+        // one; the policy itself is the pure BlockedSessionRepager. Same
+        // Timer shape as the app-alive beat. Five minutes is the scan
+        // cadence, not the reminder cadence: the 45m interval lives in the
+        // repager's ledger math, and a scan pass with nothing due is two
+        // store reads.
+        startBlockedRepageScanner()
+
+        // One `cost.hourly` line an hour: what supervision actually spent.
+        startHourlySpendLine()
+
         // Watch config.yaml for live changes — FSEvents fires on write/rename.
-        let watcher = ConfigWatcher(configPath: paths.configPath, trace: trace) { [weak hoverWindow] config in
+        let remoteURLStore = self.remoteNotifyURLStore
+        let watcherTrace = trace
+        let watcher = ConfigWatcher(configPath: paths.configPath, trace: trace) { [weak hoverWindow, weak hoverVM, weak remote] config in
             hoverWindow?.mergeUserConfig(additionalHostApps: config.additionalHostApps)
+            remote?.apply(RemoteNotifier.Configuration(
+                enabled: config.remoteNotifyEnabled,
+                detail: config.remoteNotifyDetail,
+                formatOverride: config.remoteNotifyFormat
+            ))
+            // Keep the panel's Remote escalation row in step with hand edits
+            // to config.yaml (the row's own writes also land here, where the
+            // re-seed is a no-op). URL-stored state is unchanged by a config
+            // edit, so it carries over as-is.
+            if let hoverVM {
+                hoverVM.seedRemoteEscalation(
+                    webhookConfigured: hoverVM.remoteWebhookConfigured,
+                    enabled: config.remoteNotifyEnabled,
+                    detail: config.remoteNotifyDetail,
+                    format: config.remoteNotifyFormat
+                )
+            }
+            // Late webhook arrival: the documented setup order stores the
+            // URL first and flips the switch second, and this config write
+            // is the moment the switch flips. When the channel is asked for
+            // but the notifier holds no endpoint yet, re-read the Keychain
+            // OFF the main thread (a Keychain read can park its thread on a
+            // SecurityAgent prompt; this callback runs on the main actor)
+            // and complete the notifier live. The https validation stays
+            // inside RemoteWebhookURL — the only constructor an endpoint
+            // has — so this path cannot weaken it.
+            if config.remoteNotifyEnabled, let remote, !remote.hasEndpoint {
+                DispatchQueue.global(qos: .utility).async {
+                    let raw: String?
+                    do {
+                        raw = try remoteURLStore.read()
+                    } catch {
+                        // Same rule as the launch probe: the fact of the
+                        // failure, never the error, which can quote the item.
+                        watcherTrace.emit("remote", "remote.unconfigured reason=keychain_read_failed")
+                        return
+                    }
+                    guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        watcherTrace.emit("remote", "remote.unconfigured reason=no_webhook_url_in_keychain enabled_in_config=true")
+                        return
+                    }
+                    do {
+                        remote.apply(endpoint: try RemoteWebhookURL(validating: raw))
+                    } catch {
+                        // The URL itself is never logged. It is a bearer credential.
+                        let detail = ((error as? RemoteNotifyError)?.errorDescription) ?? "unexpected"
+                        watcherTrace.emit("remote", "remote.unconfigured reason=invalid_webhook_url detail=\(detail)")
+                    }
+                }
+            }
         }
         watcher.start()
         self.configWatcher = watcher
@@ -546,29 +799,44 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let configPath = paths.configPath
+        // Spend writes go through CostRecordingHook, not `try?`. A discarded
+        // write is the read-side failure wearing the other face: reads keep
+        // succeeding, today's total stops moving, and the daily cap can never
+        // trip again. The hook traces it and escalates once per failure streak
+        // through the relay below, which the engine's system-event path fills
+        // in further down (the engine does not exist yet at this point).
+        let costHealthRelay = CostStoreHealthRelay()
+        let costHook = CostRecordingHook(
+            store: hookCostStore,
+            trace: trace,
+            onWriteHealthChanged: { [costHealthRelay] failing in
+                costHealthRelay.report(failing: failing)
+            }
+        )
+        self.costWriteHook = costHook
+        self.costHealthRelay = costHealthRelay
         let client = LLMClient(
             provider: activeProvider,
             apiKey: key,
             redactor: DefaultRedactor(),
             traceLog: trace,
-            costRecorder: { model, usage in
-                try? hookCostStore.recordHaiku(
-                    inputTokens: usage.input_tokens,
-                    outputTokens: usage.output_tokens,
-                    costUSD: TokenAccounting.costUSD(model: model, usage: usage)
-                )
-            },
-            capCheck: {
+            costRecorder: costHook.asCostRecorder,
+            capCheck: { [capTrace = trace] in
                 // Re-read config.yaml at each gate so a cap edit takes effect
                 // without a restart (same live-config posture as ConfigWatcher).
                 // The file is tiny; model calls are network-bound and seconds apart.
-                guard let cap = UserConfig.load(from: configPath).dailyCostCapUSD else { return nil }
-                let spent = (try? hookCostStore.todayTotalUSD()) ?? 0
-                return (cap: cap, spent: spent)
+                // `effectiveDailyCostCapUSD`, not the raw value: an install whose
+                // config.yaml never mentions spend still gets the default cap.
+                DailyCapGate.evaluate(
+                    cap: UserConfig.load(from: configPath).effectiveDailyCostCapUSD,
+                    spentUSD: { try hookCostStore.todayTotalUSD() },
+                    trace: capTrace
+                )
             }
         )
         self.llm = client
-        trace.emit("app", "LLM client ready provider=\(activeProvider.rawValue) model=\(activeProvider.defaultTriageModel) costRecorder=on capCheck=on")
+        let effectiveCap = UserConfig.load(from: configPath).effectiveDailyCostCapUSD
+        trace.emit("app", "LLM client ready provider=\(activeProvider.rawValue) model=\(activeProvider.defaultTriageModel) costRecorder=on capCheck=on daily_cap_usd=\(effectiveCap.map { String(format: "%.2f", $0) } ?? "off")")
 
         // Multi-model panel ("Second opinion"): wire the hover's panel handler to
         // a PanelCoordinator built from ALL configured provider keys, with the
@@ -582,17 +850,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         let panelCostStore = hookCostStore
         let panelConfigPath = configPath
         let panelTrace = trace
-        let panelCostRecorder: @Sendable (String, AnthropicUsage) -> Void = { model, usage in
-            try? panelCostStore.recordHaiku(
-                inputTokens: usage.input_tokens,
-                outputTokens: usage.output_tokens,
-                costUSD: TokenAccounting.costUSD(model: model, usage: usage)
+        // The panel spends against the same budget, so it records through the
+        // same hook: one write path, one failure trace, one page.
+        _ = panelCostStore
+        let panelCostRecorder: @Sendable (String, AnthropicUsage) -> Void = costHook.asCostRecorder
+        let panelCapCheck: @Sendable () -> DailyCapGate.Verdict? = { [capTrace = trace] in
+            DailyCapGate.evaluate(
+                cap: UserConfig.load(from: panelConfigPath).effectiveDailyCostCapUSD,
+                spentUSD: { try panelCostStore.todayTotalUSD() },
+                trace: capTrace
             )
-        }
-        let panelCapCheck: @Sendable () -> (cap: Double, spent: Double)? = {
-            guard let cap = UserConfig.load(from: panelConfigPath).dailyCostCapUSD else { return nil }
-            let spent = (try? panelCostStore.todayTotalUSD()) ?? 0
-            return (cap: cap, spent: spent)
         }
         let panelAvailable = panelKeyStore.availableProviders()
         hoverVM.setConfiguredProviders(panelAvailable)
@@ -665,8 +932,19 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // triage never reads Supervisor's own injected text back as the owner's
         // authorization for a destructive action.
         let injectionLedger = InjectionLedger()
+        // The router still takes one `any Notifying` and still does not know
+        // how many channels sit behind it. The remote notifier is always a
+        // secondary now (it always exists — the panel row can arm it live,
+        // so the fanout must be in place from launch); an unconfigured one
+        // short-circuits at its enabled gate, and the fanout's PRIMARY is
+        // the banner, so the outcome the router logs is still the banner's.
+        let localNotifier: any Notifying = notifier ?? TraceOnlyNotifier(trace: trace)
+        let deliveryNotifier: any Notifying = FanoutNotifier(
+            primary: localNotifier, secondaries: [remote], trace: trace
+        )
+        trace.emit("remote", "remote.channel_wired enabled=\(remote.currentConfiguration.enabled)")
         let router = InterventionRouter(
-            notifier: notifier ?? TraceOnlyNotifier(trace: trace),
+            notifier: deliveryNotifier,
             locator: locator,
             signalSender: signalSender,
             injector: CGEventInjector(trace: trace, llm: client),
@@ -780,6 +1058,35 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         engine.onDecision = { [weak self] decision in
             guard let self else { return }
             Task { @MainActor in self.handle(decision: decision) }
+        }
+        // C2/D1: Supervisor-is-down escalations (cost cap hit, provider
+        // 401/402/403). Throttled at the engine to once per incident per
+        // kind plus one 6-hour still-down repeat, so every surface here
+        // fires on those edges only: the local banner, the hover's
+        // force-shown notice, and the remote page (which adds a short
+        // storm-guard dedupe on its side). The closure runs
+        // on the engine's MainActor, so the hover call is direct; the two
+        // async deliveries hop through Tasks with the local bindings
+        // captured (the Swift-5.10 capture rule, same as onResult above).
+        let systemBanner = notifier
+        let systemRemote = remote
+        engine.onSystemEvent = { [weak hoverVM] event in
+            hoverVM?.announceSystemNotice(event.title)
+            Task { _ = await systemBanner?.postSystemAlert(title: event.title, body: event.body) }
+            Task { _ = await systemRemote.postSystemEvent(event) }
+        }
+        // Fill in the cost-write relay now that the delivery path exists. A
+        // failed spend write is not an LLM-call failure, so it cannot reach
+        // the owner through the engine's classify path; it rides the same
+        // surfaces instead. Only the edge INTO failure pages: recovery is
+        // traced, because a page saying "spend is being counted again" for a
+        // problem the owner may never have seen is noise.
+        costHealthRelay.handler = { [weak hoverVM] failing in
+            guard failing else { return }
+            let event = SystemEscalationEvent.triageDegraded(reason: .costStoreUnwritable)
+            Task { @MainActor in hoverVM?.announceSystemNotice(event.title) }
+            Task { _ = await systemBanner?.postSystemAlert(title: event.title, body: event.body) }
+            Task { _ = await systemRemote.postSystemEvent(event) }
         }
         engine.start()
         self.triageEngine = engine
@@ -940,6 +1247,122 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // wrote live items. Keep the `home=` / `keychainBase=` tokens stable;
         // Scripts/e2e/common.sh matches on them.
         trace.emit("app", "running state ready — watching \(paths.claudeProjectsDir.path) home=\(paths.home.path) keychainBase=\(LLMProvider.keychainServiceBase)")
+    }
+
+    // MARK: - Remote escalation channel
+
+    /// Build the off-machine escalation channel.
+    ///
+    /// `storedWebhookURL` is the raw Keychain value the launch probe read
+    /// off the main thread (routeAfterKeychainProbe); this function does no
+    /// Keychain I/O of its own. Fail-closed on the URL: one that will not
+    /// parse, or is not https, never becomes an endpoint.
+    ///
+    /// The notifier now ALWAYS exists (it used to be nil when neither a URL
+    /// nor the config switch was present): the hover panel's Remote
+    /// escalation row can arm the channel live — store a URL, flip the
+    /// switch, send a test — and each of those needs a running instance to
+    /// apply to. An endpoint-less, disabled notifier is inert (every post
+    /// short-circuits at the enabled gate before any composition or network
+    /// work), so the unconfigured majority pays one construction and one
+    /// trace line per launch, and never a byte on the wire.
+    private func makeRemoteNotifier(config: UserConfig, storedWebhookURL: String?) -> RemoteNotifier {
+        let configuration = RemoteNotifier.Configuration(
+            enabled: config.remoteNotifyEnabled,
+            detail: config.remoteNotifyDetail,
+            formatOverride: config.remoteNotifyFormat
+        )
+        let raw = storedWebhookURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var endpoint: RemoteWebhookURL?
+        if raw.isEmpty {
+            // Only worth a line when the owner asked for delivery and it
+            // cannot happen yet — that is the one state fixable from here
+            // (store a URL; the watcher or the panel applies it live).
+            if config.remoteNotifyEnabled {
+                trace.emit("remote", "remote.unconfigured reason=no_webhook_url_in_keychain enabled_in_config=true")
+            }
+        } else {
+            do {
+                endpoint = try RemoteWebhookURL(validating: raw)
+            } catch {
+                // The URL itself is never logged. It is a bearer credential.
+                let detail = ((error as? RemoteNotifyError)?.errorDescription) ?? "unexpected"
+                trace.emit("remote", "remote.unconfigured reason=invalid_webhook_url detail=\(detail)")
+            }
+        }
+        return RemoteNotifier(
+            endpoint: endpoint,
+            configuration: configuration,
+            redactor: DefaultRedactor(),
+            trace: trace
+        )
+    }
+
+    // MARK: - Blocked-session re-page (C6)
+
+    /// flagId -> when its last reminder was DELIVERED. Stamped on success
+    /// only, so a failed send retries on the next pass instead of silently
+    /// burning 45 minutes. In-memory on purpose: a relaunch restarts the
+    /// cadence, and a still-blocked session honestly deserves the nudge.
+    private var blockedReminderLedger: [String: Date] = [:]
+    private var blockedRepageTimer: Timer?
+
+    private func startBlockedRepageScanner() {
+        blockedRepageTimer?.invalidate()
+        let timer = Timer(timeInterval: 300, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.blockedRepageScanPass(now: Date()) }
+        }
+        timer.tolerance = 30
+        RunLoop.main.add(timer, forMode: .common)
+        blockedRepageTimer = timer
+    }
+
+    private func blockedRepageScanPass(now: Date) {
+        guard let flagStore, let sessionStore, let remote = remoteNotifier else { return }
+        // Cheap pre-gate: with the channel off or unarmed, every reminder
+        // would be skipped at the notifier's gates anyway — skip the store
+        // reads too.
+        guard remote.currentConfiguration.enabled, remote.hasEndpoint else { return }
+
+        // 2000, not a few hundred: the scan window IS the reminder's
+        // eligibility horizon (the store has no query-by-outcome), and a
+        // busy multi-session day can push hundreds of notify-only flags on
+        // top of one paused session from this morning. A blocked flag that
+        // rolls out of this window silently stops reminding while still
+        // inside its 24h horizon, so the window errs generous — 2000 rows
+        // of this table is a cheap indexed read every 5 minutes.
+        let flags = (try? flagStore.recent(limit: 2000)) ?? []
+        let sessions = (try? sessionStore.all()) ?? []
+        let reminders = BlockedSessionRepager.scan(
+            flags: flags,
+            sessions: sessions,
+            lastReminded: blockedReminderLedger,
+            now: now
+        )
+
+        // Ledger hygiene: entries whose flags rolled out of the scan window
+        // can never be consulted again, so drop them.
+        let liveIds = Set(flags.map(\.id))
+        blockedReminderLedger = blockedReminderLedger.filter { liveIds.contains($0.key) }
+
+        for reminder in reminders {
+            let (title, body) = BlockedSessionRepager.message(for: reminder, now: now)
+            trace.emit("remote", "blocked_reminder sending flag=\(reminder.flagId) outcome=\(reminder.outcome.rawValue) blocked_since=\(reminder.blockedSince)")
+            Task { @MainActor [weak self] in
+                // Kind carries the flag id so concurrent reminders for two
+                // different blocked sessions get distinct in-flight keys
+                // (and distinct trace kinds). Window 0: the 45m cadence is
+                // the ledger's job, and the ledger stamps on success only.
+                let outcome = await remote.postSystemMessage(
+                    title: title, body: body,
+                    kind: "blocked_reminder|\(reminder.flagId.prefix(8))"
+                )
+                if outcome == .posted {
+                    self?.blockedReminderLedger[reminder.flagId] = now
+                }
+                self?.trace.emit("remote", "blocked_reminder result flag=\(reminder.flagId) outcome=\(outcome)")
+            }
+        }
     }
 
     // MARK: - Flag routing

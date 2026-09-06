@@ -5,7 +5,9 @@ Claude Code sessions. Written for someone who has never built software; no
 terminal is required.
 
 Supervisor runs entirely on your Mac. It uses your own LLM API key; nothing
-leaves your machine except the same triage call you'd send the model yourself.
+leaves your machine except the same triage call you'd send the model yourself,
+plus the escalation message described in the README's Remote escalation
+delivery section if you turn that on yourself.
 
 **Requirements**
 - macOS 13 (Ventura) or newer, Apple Silicon (M-series).
@@ -47,10 +49,33 @@ show inline with a retry.
 - **Anthropic** (default): get a key at
   [console.anthropic.com](https://console.anthropic.com). At heavy use
   (~6 hours of Claude Code a day) triage runs roughly **$80/month**; light use
-  is much less. The app shows your real spend and lets you set a hard daily cap.
+  is much less. The app shows your real spend.
 - **Cheaper options:** Supervisor also accepts DeepSeek, Moonshot Kimi, MiniMax,
   Qwen, and OpenRouter keys (DeepSeek runs a few dollars a month at the same
   usage). The key step shows the estimated cost for whichever provider you pick.
+
+**The daily spend cap is on by default at $5.00.** You do not have to set it up.
+When today's recorded spend reaches the cap, Supervisor refuses model calls
+before they leave your Mac, pauses triage, and tells you it has stopped
+watching. The cap is there to stop a runaway, not to budget your day: heavy use
+on Anthropic runs about $2.67/day and the cheaper providers are a fraction of
+that, so normal use never reaches $5.
+
+To change it, edit `~/Library/Application Support/Supervisor/config.yaml`.
+Supervisor writes that file on first launch with every setting commented out at
+its default, so the keys are already there to uncomment. It is read live, so no
+relaunch:
+
+```yaml
+cost:
+  daily_cap_usd: 10.00   # your ceiling for a day of model spend
+  # daily_cap_usd: 0     # 0 removes the cap entirely. Nothing then bounds spend.
+```
+
+A value that does not parse is treated as a typo, not as "no cap": the $5.00
+default stays in force. If Supervisor cannot read today's spend at all it
+refuses the spend-heavy calls until the cost store reads again, and tells you
+the spend record is unreadable rather than reporting a cap it never measured.
 
 ### Step 2 of 5: Accessibility
 
@@ -117,13 +142,15 @@ security delete-generic-password -s live.supervisor.api.moonshot
 security delete-generic-password -s live.supervisor.api.minimax
 security delete-generic-password -s live.supervisor.api.qwenhf
 security delete-generic-password -s live.supervisor.api.openrouter
+security delete-generic-password -s live.supervisor.api.remotenotify
 security delete-generic-password -s live.supervisor.api
 rm -rf ~/Library/Application\ Support/Supervisor
 rm -rf ~/Library/Logs/Supervisor
 ```
 
-(The last `security` line clears the legacy single-key item from very early
-builds.)
+(The `remotenotify` line clears the remote-escalation webhook URL, if you ever
+stored one; the last `security` line clears the legacy single-key item from
+very early builds.)
 
 Then reopen Supervisor.
 

@@ -29,7 +29,18 @@
 //
 // Build-graph enforcement: Heartbeat and StatusBar depend on SupervisorCore
 // but the AnthropicClient module is only invoked from SupervisorApp + the
-// Triage engine. Network calls cannot originate from the companions.
+// Triage engine. LLM/API network calls cannot originate from the companions.
+//
+// ONE sanctioned exception to companion network silence: SupervisorStatusBar
+// delivers an engine-health page through the owner's remote escalation
+// webhook (RemoteNotifier.postSystemMessage) on green->red / sustained-amber
+// / recovery transitions. The reason is structural, not convenient: the
+// remote channel normally rides inside SupervisorApp, and a crashed or hung
+// SupervisorApp is precisely the event the owner most needs paged about —
+// the dead app cannot page itself, so the surviving companion must. The
+// exception is exactly that wide and no wider: transition edges only (never
+// per tick), the same enabled-switch + https-validated-Keychain-URL gates
+// the app uses, and still no LLM/API traffic of any kind.
 
 import PackageDescription
 
@@ -63,7 +74,16 @@ let package = Package(
                 .product(name: "GRDB", package: "GRDB.swift"),
                 .product(name: "KeychainAccess", package: "KeychainAccess"),
             ],
-            path: "Sources/SupervisorCore"
+            path: "Sources/SupervisorCore",
+            // The dispatcher system prompt ships as a REAL resource so every
+            // install gets it. Before this, the loader resolved a
+            // compile-time #filePath repo root — fine on CI and dev
+            // checkouts, but the notarized dmg silently dispatched off a
+            // 140-character stub on every machine except the build one
+            // (2026-09-03 audit finding B1). Canonical source stays
+            // Tools/dispatch-loop-hook/ for the Python hook; a test pins the
+            // two files byte-identical so they cannot drift.
+            resources: [.process("Resources")]
         ),
         .target(
             name: "SupervisorUI",
@@ -150,7 +170,13 @@ let package = Package(
         .testTarget(
             name: "SupervisorCoreTests",
             dependencies: ["SupervisorCore", "FakeClaudeScript"],
-            path: "Tests/SupervisorCoreTests"
+            path: "Tests/SupervisorCoreTests",
+            // The review-QA battery is data for the env-gated LiveReviewQATests
+            // harness, which reads it by explicit path (REVIEW_QA_SCENARIOS),
+            // never through Bundle.module. Excluded so the build stops warning
+            // about an unhandled file instead of processing it as a resource
+            // nothing loads.
+            exclude: ["Fixtures/review-qa-battery.json"]
         ),
         // v0.1.6.1: minimal UI test target so the host-app set has a
         // regression test (com.anthropic.claudefordesktop landing here
