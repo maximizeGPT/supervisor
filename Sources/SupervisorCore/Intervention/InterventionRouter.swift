@@ -221,15 +221,17 @@ public final class InterventionRouter {
         sessionCount > 1 && handle.cwd != targetCwd
     }
 
-    /// The single source of truth for "this handle is the shared Claude.app
-    /// desktop host" — the Electron app that multiplexes ALL conversations and
-    /// the app UI into one process. Both the inject path (which defers desktop
-    /// delivery to the screenshot/OCR injector) and the signal path (which must
-    /// NEVER SIGSTOP/SIGTERM this shared host: signal 17 to it froze the whole
-    /// app and every session in it, 2026-06-19) test the SAME predicate here so
-    /// the `execPath.contains(...)` string lives in exactly one place.
+    /// "This handle is the shared Claude.app desktop host" — the Electron app
+    /// that multiplexes ALL conversations and the app UI into one process. Both
+    /// the inject path (which defers desktop delivery to the screenshot/OCR
+    /// injector) and the signal path (which must NEVER SIGSTOP/SIGTERM this
+    /// shared host: signal 17 to it froze the whole app and every session in it,
+    /// 2026-06-19) test the SAME predicate. The predicate itself now lives on
+    /// `ProcessHandle.isSharedDesktopHost` so the hover's resume path (also a
+    /// signal path) reads the identical rule; this stays as the router's local
+    /// name for it.
     private func isClaudeDesktopHost(_ handle: ProcessHandle) -> Bool {
-        handle.execPath.contains("Claude.app/Contents/MacOS/Claude")
+        handle.isSharedDesktopHost
     }
 
     /// Resolve the target process for a decision. Prefer an exact **session-id**

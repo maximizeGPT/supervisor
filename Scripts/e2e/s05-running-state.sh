@@ -41,7 +41,7 @@ info "db ok: $APP_DB"
 
 PIDFILE="$APP_SUPPORT_DIR/supervisor.pid"
 [ -f "$PIDFILE" ] || fail "no single-instance pidfile at $PIDFILE"
-RECORDED="$(cat "$PIDFILE" | tr -cd '0-9')"
+RECORDED="$(recorded_pid "$PIDFILE")"
 [ "$RECORDED" = "$(app_pid)" ] || fail "pidfile records $RECORDED, launched pid is $(app_pid)"
 info "pidfile ok: $PIDFILE -> $RECORDED"
 

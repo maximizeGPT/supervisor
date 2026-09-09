@@ -604,3 +604,121 @@ final class DesktopConversationTargeterTests: XCTestCase {
                        "without nearX, falls back to the original pick")
     }
 }
+
+/// Audit item B6: `CGDisplayCreateImage` is deprecated (macOS 14.4) and
+/// obsoleted (15.0), and Apple's documented consequence on the legacy path is
+/// recurring Screen Recording prompts — desktop targeting would degrade on a
+/// current OS with no change on our side. Capture now goes through
+/// ScreenCaptureKit on macOS 14+, which is async, and the surrounding targeting
+/// arc is synchronous.
+///
+/// These tests cover the BRIDGE, which is the part that can hurt. The capture
+/// itself is not exercised: it needs a real display and a live Screen Recording
+/// grant, so calling it from the suite would either fail on a headless runner or
+/// raise a TCC prompt mid-test-run.
+final class DesktopCaptureBridgeTests: XCTestCase {
+
+    /// Off the main thread the bridge blocks the caller (the injector's
+    /// dedicated targeting queue), and returns as soon as the capture lands.
+    func testWaitReturnsTrueWhenTheCaptureCompletesOffMain() {
+        let targeter = DesktopConversationTargeter()
+        let sem = DispatchSemaphore(value: 0)
+        let done = expectation(description: "off-main wait returned")
+
+        DispatchQueue.global().async {
+            let ok = targeter.waitBounded(sem, timeout: 2.0)
+            XCTAssertTrue(ok, "a completed capture must be reported as success")
+            done.fulfill()
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { sem.signal() }
+
+        wait(for: [done], timeout: 5.0)
+    }
+
+    /// A capture that never returns must not hold the thread open. The whole
+    /// targeting arc degrades to a logged notify on a nil image, so a bounded
+    /// false is the correct answer, not an unbounded wait.
+    func testWaitGivesUpAtTheTimeoutInsteadOfHanging() {
+        let targeter = DesktopConversationTargeter()
+        let neverSignalled = DispatchSemaphore(value: 0)
+        let done = expectation(description: "off-main wait timed out")
+
+        DispatchQueue.global().async {
+            let started = Date()
+            let ok = targeter.waitBounded(neverSignalled, timeout: 0.3)
+            XCTAssertFalse(ok, "a capture that never lands must report failure")
+            XCTAssertLessThan(Date().timeIntervalSince(started), 3.0,
+                "the wait must be bounded by its timeout, not open-ended")
+            done.fulfill()
+        }
+
+        wait(for: [done], timeout: 5.0)
+    }
+
+    /// The main-thread guarantee. This codebase has lost launches to blocked
+    /// main threads, so on main the bridge pumps the run loop instead of holding
+    /// it: main-queue work scheduled DURING the wait must still run, and the
+    /// wait must still return the capture.
+    @MainActor
+    func testMainThreadWaitKeepsServicingTheMainQueue() {
+        XCTAssertTrue(Thread.isMainThread,
+            "this test only exercises the main-thread branch if it runs on the main thread")
+        let targeter = DesktopConversationTargeter()
+        let sem = DispatchSemaphore(value: 0)
+        var mainQueueWorkRan = false
+
+        // The signal is chained BEHIND the main-queue work rather than raced
+        // against it on a second independent timer. Two timers 100ms apart is a
+        // coin toss on a loaded runner, and losing that toss is what made this
+        // test flake on CI while the code under test was fine. Chaining makes
+        // the assertion causal instead: the capture cannot land until the main
+        // queue has been serviced, so a genuinely starved main thread fails both
+        // assertions together rather than one of them at random.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            mainQueueWorkRan = true
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { sem.signal() }
+        }
+
+        let ok = targeter.waitBounded(sem, timeout: 2.0)
+
+        XCTAssertTrue(ok, "the capture landed, so the main-thread wait must report success")
+        XCTAssertTrue(mainQueueWorkRan,
+            "main-queue work must run DURING the wait; a plain semaphore block on main would starve it")
+    }
+
+    /// A capture that already landed must be reported as a capture, even with no
+    /// budget left to wait for it. The old shape checked the clock before it
+    /// ever looked at the semaphore, so a completed capture with an exhausted
+    /// budget was reported as a timeout and the arc degraded to a notify for
+    /// nothing. Deterministic: no timers, no sleeps, and it fails against the
+    /// old implementation every time.
+    @MainActor
+    func testMainThreadWaitReportsACaptureThatAlreadyLanded() {
+        let targeter = DesktopConversationTargeter()
+        let sem = DispatchSemaphore(value: 0)
+        sem.signal()
+
+        XCTAssertTrue(targeter.waitBounded(sem, timeout: 0),
+            "a capture that already landed is a success, not a timeout")
+    }
+
+    /// The timeout applies on main too, so a stuck capture cannot pin the run
+    /// loop in the pump for longer than the capture is allowed to take.
+    @MainActor
+    func testMainThreadWaitIsAlsoBounded() {
+        let targeter = DesktopConversationTargeter()
+        let neverSignalled = DispatchSemaphore(value: 0)
+        let started = Date()
+
+        XCTAssertFalse(targeter.waitBounded(neverSignalled, timeout: 0.3))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3.0)
+    }
+
+    /// The capture budget stays a small, bounded number: the whole targeting arc
+    /// is only a few seconds, so a capture allowed to take longer than this
+    /// would outlive the thing it serves.
+    func testCaptureTimeoutStaysBounded() {
+        XCTAssertGreaterThan(DesktopConversationTargeter.captureTimeout, 0)
+        XCTAssertLessThanOrEqual(DesktopConversationTargeter.captureTimeout, 10)
+    }
+}

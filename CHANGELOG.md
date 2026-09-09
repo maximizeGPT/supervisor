@@ -6,6 +6,152 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.4.1] — 2026-09-08 (upgrades keep your grants, test instances stay off your screen)
+
+### Fixed
+
+- **Upgrading no longer drops the Accessibility grant.** It had happened three
+  releases running (0.3.1, 0.3.2, 0.4.0), and the cause was structural. macOS
+  keys an Accessibility or Screen Recording grant to the bundle id plus the
+  app's *designated requirement*, the codesign expression naming the
+  certificate that signed it. Supervisor had two paths writing to the same
+  `/Applications/Supervisor.app` under two different certificates:
+  `Scripts/make-dmg.sh` and `Scripts/notarize.sh` signed with Developer ID
+  (`... certificate leaf[subject.OU] = Q7HKTCTZXQ`), while
+  `Scripts/build-app.sh` signed with the local self-signed identity
+  (`... certificate leaf = H"33eff905..."`). `make-dmg.sh` re-signs
+  `build/Supervisor.app` in place, so a deploy right after a release shipped
+  Developer ID and the next ordinary deploy shipped self-signed again. Each
+  flip made the installed app a different program to TCC and both grants were
+  dropped. `Scripts/sign-adhoc.sh` now prefers the Developer ID identity when
+  it is in the keychain, so a development build and a release build of the same
+  tree produce a byte-identical designated requirement.
+- **`Scripts/deploy.sh` refuses to install a build signed by a different
+  certificate than the one already in `/Applications`.** It prints both
+  requirements and stops before touching anything.
+  `SUPERVISOR_ALLOW_IDENTITY_CHANGE=1` proceeds when the change is deliberate.
+  The same comparison is available standalone as
+  `Scripts/check-signing-identity.sh`, which also calls out an ad-hoc signature
+  (whose cdhash-based requirement changes on every single build) when there is
+  an existing install whose grants it would drop. A first install has no grant
+  to lose and is allowed through with a warning.
+  `Scripts/test-check-signing-identity.sh` exercises those exit codes against
+  scratch bundles.
+- **Extra hover pills on screen.** A test or deploy instance runs with its own
+  `SUPERVISOR_HOME`, and the single-instance lock is namespaced by that same
+  home, so an isolated instance coexists with a live Supervisor by design. Each
+  one also drew its own hover band, which is how a running harness put three
+  stacked "Watching. All clear" pills on the owner's screen. An instance whose
+  resolved home is not the real user home now presents no band at all, and says
+  so in the trace. With no `SUPERVISOR_HOME` set, nothing changes.
+- **The E2E harness now kills every instance it starts, on every exit path.**
+  Ctrl-C killed a scenario without running its cleanup at all, and `s13`
+  overwrote the recorded pid with the relaunched one, which left the instance it
+  had deliberately frozen alive and unkillable, its window still painted. Launch
+  pids now go in a ledger that teardown drains on normal exit, on `fail`, and on
+  SIGINT/SIGTERM.
+- **A live predecessor no longer keeps its band on screen after a relaunch.** A
+  Supervisor that dies takes its window with it, so the hung-incumbent takeover
+  was never the leak. An instance that is alive without the lock is: it survives
+  the filesystem-fallback path and the frozen case, and nothing looked for it.
+  The launch that claims the lock now terminates it, identified by full
+  executable path so a test instance can never signal an installed app.
+- **A key written from outside the app no longer locks the app out of it.**
+  Replacing a provider key with `security add-generic-password -s
+  live.supervisor.api.deepseek -a api-key -w <value> -A -U` left Supervisor
+  out of the item's access control list, so the next launch blocked on a macOS
+  SecurityAgent prompt (traced as `keychain probe still pending after 10s`)
+  and watched nothing until a human found the dialog behind other windows and
+  clicked Always Allow. A Keychain item's ACL is decided when the item is
+  created: `-U` replaces the stored value and leaves the ACL alone, and `-A`
+  only describes the ACL of an item being created, so the pair grants nothing.
+  Every write from outside the app process now deletes and recreates the item
+  with Supervisor.app in its trusted list, staging the new value first so a
+  failed rewrite can never leave the user with no key at all. macOS also keeps
+  a partition list stamped with the creating program's identity, and there is
+  no API to set that to another program's, so the first read of an item this
+  CLI created can still raise one prompt. One prompt answered once is the
+  point: before this, the app was not in the list at all.
+  `SupervisorDevTools` gained `inject-provider-key-from-env <provider>`, the
+  correct version of the hand-typed `security` command, and the E2E harness's
+  key seeding stopped using `-U`.
+- **The launch keychain-wait panel says what to look for.** It now names the
+  dialog by the text macOS actually shows (which quotes the Keychain item, not
+  "Supervisor"), says it can be on another desktop, says supervision is
+  stopped until it is answered, and names the cause. The 10s watchdog timing
+  is unchanged.
+- **A screen capture on the main thread held it instead of pumping it.**
+  `DesktopConversationTargeter.waitBounded` promises that on the main thread it
+  keeps servicing the run loop while a capture is in flight, so main-queue work
+  still runs. It blocked on the semaphore for 20ms out of every 25ms slice and
+  offered the run loop only a 5ms wall-clock window, which can elapse while the
+  thread is descheduled and service nothing. The share of time actually spent
+  servicing therefore collapsed exactly when the machine was busy. Measured
+  latency for main-queue work enqueued during a wait was 13.4ms on average and
+  45.2ms at worst under load; it is now 2.3ms and 3.6ms, and stays flat as load
+  rises. The wait now holds a 10ms repeating timer so each slice really enters
+  the run loop (`RunLoop.run(mode:before:)` services nothing at all when the
+  mode has no source or timer attached), polls the semaphore instead of
+  blocking on it, clamps each slice so it cannot overrun the deadline, and
+  counts a capture that landed inside the final slice as a capture rather than
+  a timeout. That last case was previously wrong every time: an already-landed
+  capture with no budget left was reported as a failure.
+
+### Changed
+
+- **A re-grant after an upgrade is one screen, not the five-step first run.**
+  A certificate change genuinely cannot preserve a TCC grant, so the re-grant
+  itself got short. Supervisor records a completed onboarding in
+  `~/Library/Application Support/Supervisor/onboarding-record.json`, and when
+  that record exists alongside a stored API key the setup window asks only for
+  the permissions actually missing: one screen when Accessibility alone was
+  dropped, two when Screen Recording went with it, none when neither did. No
+  key entry, no notifications step, no customization explainer, and the step
+  counter counts the real number of steps. Installs predating the record are
+  recognized by the existing SQLite database, which is created only after
+  onboarding completes, so the short path applies on the very next upgrade.
+  A genuine first run is unchanged.
+- **Losing only Screen Recording now routes to that one screen too.** The
+  launch check used to look at the API key and Accessibility alone, so a user
+  who kept Accessibility but lost Screen Recording to the same certificate
+  change ran on with desktop targeting quietly degraded to a notify. The record
+  stores whether Screen Recording was granted at the last clean launch, and
+  only a user who had it and lost it is asked again. Somebody who never granted
+  it, or who skips the step, is never prompted for it.
+
+- **The triage quality gate now reports its spread, or reports nothing.** The
+  95% recall figure quoted since v0.1.5 came from a single sweep. Running the
+  same corpus, the same rubric and the same key twice disagreed on 22 of 306
+  fixtures, a noise floor of 5 to 7 points per category, which is wider than
+  most of the differences anyone has claimed as an improvement. `PRINCIPLES.md`
+  section 6c now requires a spread across repeated runs, records which provider
+  the gate was measured against (the shipped triage provider, not an assumed
+  one), and calls a result unresolved when the runs disagree. False positives
+  held at zero in every category across every run, before and after.
+- **Destructive-command rubric.** The authorization exception no longer treats
+  a broad instruction as licence for a narrower destructive act, so "clean up
+  the repo" does not authorize `rm -rf ~`. The safe temporary-path list is
+  closed and now includes `Caches` and `.cache`. `FLUSHALL`, `DROP DATABASE`
+  and `TRUNCATE` are explicitly high severity, which **intentionally means
+  those commands now page a configured phone**, because remote escalation
+  delivers a notify outcome only at high severity.
+- **A severity rule that leaked across categories.** A paragraph in the shared
+  prompt preamble graded severity on irreversibility, and it was sent on every
+  category evaluation including the ones whose rubric fixes severity at medium.
+  An idle observation whose reasoning mentioned "production" could be graded
+  high, and a high-severity idle flag pages the owner's phone for an event that
+  category exists never to page for. The paragraph is now scoped to the two
+  categories that actually grade.
+
+### Documentation
+
+- **`docs/upgrading.md`**: what happens to the Accessibility permission on an
+  upgrade, why macOS does it, how to tell a stale System Settings entry from a
+  live grant, and the log lines that confirm which case you are in. Linked from
+  `README.md` and `INSTALL.md`.
+
 ## [0.4.0] — 2026-09-05 (remote escalation, honest cost, crash and hang paging)
 
 Escalations can reach the owner when the owner is not at the Mac, and the

@@ -60,6 +60,17 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     private let remoteNotifyURLStore: any RemoteNotifyURLStore
 
     // Onboarding
+    /// "Has this machine ever finished onboarding?" Presence of the record is
+    /// what lets an upgrade that lost its Accessibility grant show a one-step
+    /// re-grant instead of the whole five-step first-run flow. The database
+    /// path is the fallback evidence for installs that predate the record
+    /// (it is created in enterRunningState, so it only exists after a
+    /// completed onboarding). See docs/upgrading.md.
+    private lazy var onboardingRecordStore: any OnboardingRecordStore =
+        FileOnboardingRecordStore(
+            path: paths.onboardingRecordPath,
+            priorStateEvidence: [paths.databasePath]
+        )
     private var onboarding: OnboardingWindowController?
     /// Main-run-loop liveness beat (see startAppAliveBeat).
     private var appAliveTimer: Timer?
@@ -243,7 +254,26 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             // the user marked as active. Falls back to .anthropic for fresh
             // installs so the v0.1.x logic still holds.
             let activeProvider = (try? activeProviderStore.read()) ?? .anthropic
-            let hasKey: Bool = ((try? keyStore.read(activeProvider)) ?? nil)?.isEmpty == false
+
+            // A thrown Keychain read and an empty Keychain slot are not the
+            // same event, and `try?` collapsed them into one `false`. Both
+            // then produced the identical "onboarding needed hasKey=false"
+            // line, which Scripts/deploy.sh read as proof the Keychain was
+            // readable — so a real ACL failure printed "Keychain read PASS".
+            // Emit the outcome of the read itself, so a success has a marker
+            // of its own. The error is never traced: Keychain errors can
+            // quote the item.
+            var hasKey = false
+            var keyReadOK = true
+            do {
+                hasKey = (try keyStore.read(activeProvider))?.isEmpty == false
+            } catch {
+                keyReadOK = false
+            }
+            trace.emit(
+                "app",
+                "keychain.provider_key_read ok=\(keyReadOK) hasKey=\(hasKey) provider=\(activeProvider.rawValue)"
+            )
 
             // Remote-escalation webhook URL, read here for the same reason
             // the provider key is: it is a Keychain item, and the first read
@@ -267,11 +297,30 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
                 self.probedWebhookURL = storedWebhookURL
                 self.dismissKeychainWaitPanel()
                 let axOK = self.permissions.isAXGranted()
-                if !hasKey || !axOK {
-                    self.trace.emit("app", "onboarding needed (provider=\(activeProvider.rawValue) hasKey=\(hasKey) axOK=\(axOK))")
-                    self.presentOnboarding()
+                // Screen Recording joins the gate so a user who lost ONLY that
+                // one is routed to the short re-grant instead of silently
+                // running with desktop targeting degraded to a notify. The
+                // record is what keeps it honest: a user who never granted
+                // Screen Recording has `screenRecordingGranted == false` and is
+                // never asked. See OnboardingLaunchGate.
+                let priorInstall = self.onboardingRecordStore.read()
+                let screenOK = self.permissions.isScreenRecordingGranted()
+                let needsOnboarding = OnboardingLaunchGate.needsOnboarding(
+                    hasKey: hasKey,
+                    axGranted: axOK,
+                    screenRecordingGranted: screenOK,
+                    priorInstall: priorInstall
+                )
+                if needsOnboarding {
+                    self.trace.emit("app", "onboarding needed (provider=\(activeProvider.rawValue) hasKey=\(hasKey) axOK=\(axOK) screenOK=\(screenOK) hadScreen=\(priorInstall?.screenRecordingGranted ?? false))")
+                    self.presentOnboarding(priorInstall: priorInstall)
                 } else {
                     self.trace.emit("app", "onboarding skipped; entering running state (provider=\(activeProvider.rawValue))")
+                    // A clean launch IS a completed onboarding. Recording it
+                    // here (not only on the onboarding window's Done button)
+                    // is what backfills the marker for every user who
+                    // onboarded before this record existed.
+                    self.recordOnboardingCompletion()
                     self.enterRunningState(notifDegraded: false)
                 }
             }
@@ -347,11 +396,24 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
 
     private func showKeychainWaitPanel() {
         guard keychainWaitPanel == nil else { return }
-        let text = NSTextField(wrappingLabelWithString:
-            "Supervisor is waiting on a macOS Keychain permission prompt.\n\nLook for a dialog asking to allow access to \"Supervisor\" (it can be behind other windows) and click Always Allow.")
-        text.frame = NSRect(x: 16, y: 14, width: 328, height: 92)
+        // The old copy said "look for a dialog" and stopped there. Two things
+        // were missing and both cost the owner real time during the 2026-09
+        // stall: the prompt does not say "Supervisor" at the top (it names the
+        // KEYCHAIN ITEM, so people scanning for the app name skip past it),
+        // and it can open on a different Space, where "behind other windows"
+        // does not describe where to look. The cause is also worth naming: a
+        // key stored or replaced from outside the app owns its own permission,
+        // and the app is not in it until someone allows it once.
+        let text = NSTextField(wrappingLabelWithString: """
+            Supervisor is waiting on a macOS Keychain permission prompt, and it is not watching any sessions until that prompt is answered.
+
+            Find the dialog and click Always Allow. It is titled with the Keychain item, not with "Supervisor". The text reads "Supervisor wants to use your confidential information stored in live.supervisor.api…". It can be behind other windows or on another desktop, and Mission Control shows it.
+
+            This happens when a key or webhook was stored from outside the app, for example with security add-generic-password. Always Allow is a one-time answer.
+            """)
+        text.frame = NSRect(x: 18, y: 16, width: 404, height: 248)
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 120),
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 280),
             styleMask: [.titled, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
@@ -418,7 +480,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         ))
     }
 
-    private func presentOnboarding() {
+    private func presentOnboarding(priorInstall: OnboardingRecord?) {
         NSApp.setActivationPolicy(.regular)
 
         let vm = OnboardingViewModel(
@@ -433,21 +495,52 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
                     traceLog: trace
                 )
             },
+            priorInstall: priorInstall,
             trace: trace
         )
         let controller = OnboardingWindowController(vm: vm) { [weak self] notifDegraded in
             self?.onboardingCompleted(notifDegraded: notifDegraded)
         }
         self.onboarding = controller
+        // Say which way the screen gate went, the same way the hover band
+        // does. A scenario that stays in onboarding never reaches the running
+        // state, so the running-state abort-gate line never fires for it — this
+        // is the line s03 asserts to prove it is not painting on the owner's
+        // screen.
+        if controller.presentsOnScreen {
+            trace.emit("app", "onboarding window presented (real user home)")
+        } else {
+            trace.emit(
+                "app",
+                "onboarding window off screen: this instance resolves SUPERVISOR_HOME=\(paths.home.path), not the real user home; the window exists for the AX driver but is placed off every screen and never activated"
+            )
+        }
         controller.present()
     }
 
     private func onboardingCompleted(notifDegraded: Bool) {
         trace.emit("app", "onboarding complete notifDegraded=\(notifDegraded)")
+        recordOnboardingCompletion()
         onboarding?.dismiss()
         onboarding = nil
         NSApp.setActivationPolicy(.accessory)
         enterRunningState(notifDegraded: notifDegraded)
+    }
+
+    /// Stamp "onboarding is done on this machine, at this version". Read back
+    /// on the next launch to tell an upgrade apart from a first run. Cheap and
+    /// idempotent, so it runs on every clean launch as well as on the
+    /// onboarding window's Done.
+    private func recordOnboardingCompletion() {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+            ?? OnboardingRecord.unknownVersion
+        // Record the live Screen Recording state, not an aspiration. A user who
+        // skipped that step is written down as not having it, so the next
+        // launch does not reopen the window asking for it again.
+        onboardingRecordStore.write(OnboardingRecord(
+            completedVersion: version,
+            screenRecordingGranted: permissions.isScreenRecordingGranted()
+        ))
     }
 
     // MARK: - Running state
@@ -581,6 +674,16 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             additionalHostApps: userConfig.additionalHostApps
         )
         self.hoverWindow = hoverWindow
+        // Say which way the screen gate went, so a harness can prove the band
+        // stayed off the owner's screen without anyone squinting at pixels.
+        if ConfigPaths.isRealUserHome {
+            trace.emit("app", "hover band presented (real user home)")
+        } else {
+            trace.emit(
+                "app",
+                "hover band suppressed: this instance resolves SUPERVISOR_HOME=\(paths.home.path), not the real user home; an isolated instance must not draw on the owner's screen"
+            )
+        }
         hoverWindow.present()
 
         // Menu-bar health icon is owned by the SupervisorStatusBar companion,
@@ -967,20 +1070,21 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // v0.1.7: wire the resume handler for the expanded panel's
         // Resume button. Uses the same locator + signal sender as the
         // router's pause path, but sends SIGCONT instead of SIGSTOP.
-        hoverVM.resumeHandler = { [weak self] cwd in
-            guard let self else { return false }
-            guard let handle = locator.locate(targetCwd: cwd) else {
-                self.trace.emit("hover", "resume: locator returned nil for cwd=\(cwd)")
-                return false
-            }
-            do {
-                try signalSender.send(SIGCONT, to: handle.pid)
-                self.trace.emit("hover", "resume: SIGCONT sent pid=\(handle.pid) cwd=\(cwd)")
-                return true
-            } catch {
-                self.trace.emit("hover", "resume: SIGCONT failed pid=\(handle.pid) error=\(error)")
-                return false
-            }
+        //
+        // The resolution rules live in ResumeResolver, not inline here, for two
+        // reasons. It is a SIGNAL path, so it must resolve by the paused
+        // session's id first and must refuse the locator's Claude.app desktop
+        // fallback (SIGCONT to that shared Electron pid continues every
+        // conversation and not the stopped session); and this file is an
+        // executable target XCTest cannot import, so inline rules were
+        // untestable. The resolver reports WHY nothing was signalled and the
+        // panel shows that, instead of the old bare `false` that read as a
+        // completed resume.
+        let resumeResolver = ResumeResolver(
+            locator: locator, signalSender: signalSender, trace: trace
+        )
+        hoverVM.resumeHandler = { sessionId, cwd in
+            resumeResolver.resume(sessionId: sessionId, cwd: cwd)
         }
 
         // 5. Triage engine. v0.2.0: model comes from the active provider.
@@ -1608,6 +1712,13 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         let pidfile = paths.pidfilePath
         let myPID = ProcessInfo.processInfo.processIdentifier
 
+        // Read the outgoing record BEFORE the claim: a winning claim overwrites
+        // the file with our own, and this is the only record of who ran last
+        // (see the stale-predecessor sweep below). It carries the predecessor's
+        // home token as well as its pid, because the sweep may only signal an
+        // instance from our own world.
+        let previous = SingleInstanceGuard.readPredecessorRecord(at: pidfile)
+
         // Atomic claim (O_CREAT|O_EXCL) instead of read → decide → writePID:
         // closes the check-then-write TOCTOU where two near-simultaneous
         // launches both saw "no incumbent" and both entered the running state
@@ -1622,7 +1733,58 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             return handleDuplicateLaunch(incumbentPID: incumbentPID, pidfile: pidfile, myPID: myPID)
         case .claimed:
             trace.emit("app", "single-instance: claimed lock at \(pidfile.path) pid=\(myPID)")
+            retireStalePredecessor(previous: previous, myPID: myPID)
             return true
+        }
+    }
+
+    /// We hold the lock, but the instance that held it before us may still be
+    /// running — and a running Supervisor still has its hover band on screen.
+    ///
+    /// A DEAD predecessor cannot leave a band behind: macOS destroys a
+    /// process's windows when its WindowServer connection closes, so a crash, a
+    /// SIGKILL, and the takeover path's SIGTERM all take the band with them.
+    /// A predecessor that is alive without the lock does leave one, and it is
+    /// unreachable through the normal duplicate path precisely because it no
+    /// longer holds the flock. Frozen (SIGSTOPped) is the worst version: its
+    /// window stays painted and it can never run its own teardown.
+    ///
+    /// SIGTERM, not the polite quit: a wedged instance is what this exists for,
+    /// and a wedged instance does not answer AppleEvents. SIGTERM skips
+    /// `applicationWillTerminate`, so the predecessor never dismisses its own
+    /// band — the kernel closing its WindowServer connection is what removes it,
+    /// which is why killing it is the fix rather than asking it to tidy up.
+    ///
+    /// The decision and the signalling live in `SingleInstanceGuard` behind
+    /// injected probes; this maps the outcome onto the trace. A sweep that
+    /// signalled and did NOT get its process gets its own line and its own
+    /// stderr write, because the failure mode that matters is the quiet one:
+    /// the band this exists to remove is still on screen, and nothing retries.
+    private func retireStalePredecessor(previous: SingleInstanceGuard.PredecessorRecord?, myPID: Int32) {
+        let outcome = SingleInstanceGuard.retirePredecessor(
+            recorded: previous,
+            myPID: myPID,
+            myExecutablePath: Bundle.main.executablePath,
+            myHomeToken: ConfigPaths.homeIdentityHash,
+            holdsLock: SingleInstanceGuard.holdsExclusiveLock
+        )
+        switch outcome {
+        case .nothingToRetire:
+            return
+        case .skippedWithoutExclusiveLock:
+            trace.emit("app", "single-instance: no exclusive lock held (filesystem fallback); skipping the predecessor sweep")
+        case .retired(let pid):
+            let msg = "single-instance: predecessor pid=\(pid) was still alive without the lock; terminated it so its hover band cannot linger on screen"
+            trace.emit("app", msg)
+            FileHandle.standardError.write(Data("Supervisor: \(msg)\n".utf8))
+        case .signalFailed(let pid, let code):
+            let msg = "PREDECESSOR SWEEP FAILED: kill(SIGTERM) on pid=\(pid) failed errno=\(code); that instance keeps its hover band"
+            trace.emit("app", msg)
+            FileHandle.standardError.write(Data("Supervisor: \(msg)\n".utf8))
+        case .survivedTermination(let pid):
+            let msg = "PREDECESSOR SWEEP HUNG: pid=\(pid) is STILL alive ~2s after SIGCONT+SIGTERM; its hover band is still on screen and nothing will retry. Clear it with: kill -9 \(pid)"
+            trace.emit("app", msg)
+            FileHandle.standardError.write(Data("Supervisor: \(msg)\n".utf8))
         }
     }
 
@@ -1735,16 +1897,27 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         monitor.start()
     }
 
+    /// What the popover will actually do, so the trace does not claim a panel
+    /// appeared on a screen that never saw one. An isolated instance keeps the
+    /// monitor (its permission history is the only explanation for an AX-driven
+    /// scenario that stops being able to press things) and loses only the
+    /// panel.
+    private var popoverDisposition: String {
+        permissionPopover?.presentsOnScreen == false
+            ? "popover suppressed (isolated instance; nothing drawn on the owner's screen)"
+            : "presenting popover"
+    }
+
     private func handlePermissionEvent(_ event: PermissionEvent) {
         switch event {
         case .axRevoked:
-            trace.emit("app", "AX revoked — presenting popover")
+            trace.emit("app", "AX revoked — \(popoverDisposition)")
             permissionPopover?.present(reason: .accessibilityRevoked)
         case .axRegranted:
             trace.emit("app", "AX regranted — dismissing popover")
             permissionPopover?.dismiss()
         case .notificationsRevoked:
-            trace.emit("app", "notifications revoked — presenting popover")
+            trace.emit("app", "notifications revoked — \(popoverDisposition)")
             permissionPopover?.present(reason: .notificationsRevoked)
         case .notificationsRegranted:
             trace.emit("app", "notifications regranted — dismissing popover")

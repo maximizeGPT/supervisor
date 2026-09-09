@@ -200,15 +200,14 @@ public struct OnboardingScene: View {
         .animation(BrandMotion.standard, value: stepIndicatorText)
     }
 
+    /// Counter over whichever flow is running. A re-grant after an upgrade has
+    /// its own (much shorter) denominator, so this never promises five steps
+    /// and then delivers one. `vm.progress` owns the arithmetic; see
+    /// OnboardingFlow and docs/upgrading.md.
     private var stepIndicatorText: String {
-        switch vm.state {
-        case .keyEntry, .keyValidating: return "Step 1 of 5"
-        case .axCheck:                  return "Step 2 of 5"
-        case .screenRecordingCheck:     return "Step 3 of 5"
-        case .notifCheck:               return "Step 4 of 5"
-        case .customization:            return "Step 5 of 5"
-        case .complete:                 return ""
-        }
+        if case .complete = vm.state { return "" }
+        let p = vm.progress
+        return "Step \(p.index) of \(p.total)"
     }
 
     private var stepTitle: String {
@@ -218,8 +217,14 @@ public struct OnboardingScene: View {
             // doesn't say "Anthropic API key" when the user has DeepSeek
             // / Moonshot / etc. picked.
             return "\(vm.selectedProvider.displayName) API key"
-        case .axCheck:                  return "Accessibility access"
-        case .screenRecordingCheck:     return "Screen Recording access"
+        case .axCheck:
+            // On an upgrade the user already has Accessibility on in System
+            // Settings; macOS dropped Supervisor's entry because the app was
+            // replaced. Naming that is the difference between "why am I doing
+            // this again" and a ten-second fix.
+            return vm.flow.isRegrant ? "Turn Accessibility back on" : "Accessibility access"
+        case .screenRecordingCheck:
+            return vm.flow.isRegrant ? "Turn Screen Recording back on" : "Screen Recording access"
         case .notifCheck:               return "Notifications"
         case .customization:            return "Make it yours"
         case .complete:                 return "All set"

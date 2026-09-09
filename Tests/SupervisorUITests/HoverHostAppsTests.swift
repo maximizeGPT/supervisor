@@ -85,8 +85,14 @@ final class HoverHostAppsTests: XCTestCase {
             .appendingPathComponent("hover-test-\(UUID()).log"))
         let bus = EventBus(trace: trace)
         let vm = HoverViewModel(bus: bus, trace: trace)
+        // A non-host frontmost app is passed on purpose. `init` runs
+        // `applyVisibility` through the actionFlash sink, so on the live
+        // NSWorkspace read this line orders a real pill onto the owner's
+        // screen whenever a terminal happens to be in front. This test is
+        // about the host-app SET, not about the band.
         let controller = HoverWindowController(
             vm: vm,
+            frontmostBundleID: { "com.apple.Safari" },
             additionalHostApps: ["com.microsoft.VSCode"]
         )
         XCTAssertTrue(controller.claudeCodeHostApps.contains("com.microsoft.VSCode"),
@@ -101,7 +107,12 @@ final class HoverHostAppsTests: XCTestCase {
             .appendingPathComponent("hover-test-\(UUID()).log"))
         let bus = EventBus(trace: trace)
         let vm = HoverViewModel(bus: bus, trace: trace)
-        let controller = HoverWindowController(vm: vm)
+        // Same reason as above, plus `mergeUserConfig` itself re-runs
+        // `applyVisibility`, so this test has two draw paths, not one.
+        let controller = HoverWindowController(
+            vm: vm,
+            frontmostBundleID: { "com.apple.Safari" }
+        )
         XCTAssertFalse(controller.claudeCodeHostApps.contains("com.jetbrains.intellij"))
 
         controller.mergeUserConfig(additionalHostApps: ["com.jetbrains.intellij"])

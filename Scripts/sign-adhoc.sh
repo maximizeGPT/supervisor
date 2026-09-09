@@ -45,20 +45,58 @@ echo "[sign-adhoc] bundle: $APP"
 echo "[sign-adhoc] CFBundleIdentifier: $BUNDLE_ID"
 echo "[sign-adhoc] entitlements:       $ENTITLEMENTS"
 
-# Pick the signing identity. Prefer the stable self-signed identity from
-# Scripts/setup-signing-identity.sh: it gives a cert-based designated
-# requirement that survives rebuilds, so the Accessibility grant and the
-# Keychain access ACL persist after a self-deploy. Fall back to ad-hoc
-# ("-") when the cert is absent, so the build still works on a machine
-# that has not run the setup script. The cdhash-based ad-hoc DR is what
-# breaks grants on every rebuild; the stable identity is the fix.
+# Pick the signing identity.
+#
+# macOS keys an Accessibility / Screen Recording grant to the bundle id AND
+# the DESIGNATED REQUIREMENT, which names the signing certificate. Change the
+# certificate and the grant does not carry: the user is dropped back into
+# onboarding with no explanation. So the identity has to be not just stable
+# across rebuilds, but the SAME one the released dmg carries.
+#
+# That is the bug this order fixes. Until 0.4.0 this script always chose the
+# self-signed identity while Scripts/make-dmg.sh and Scripts/notarize.sh
+# signed the release with Developer ID, and both paths write to the same
+# /Applications/Supervisor.app. make-dmg.sh re-signs build/Supervisor.app in
+# place, so a deploy right after a release shipped Developer ID and the next
+# ordinary dev deploy shipped self-signed again. Accessibility dropped on
+# every flip, which is why it broke three releases running.
+#
+# Preference order:
+#   1. $SUPERVISOR_SIGN_IDENTITY   — explicit override (CI, another team).
+#   2. Developer ID                — the identity the public dmg is signed
+#                                    with, so a dev build and a release build
+#                                    of the same tree are the same app to TCC.
+#   3. "Supervisor Self-Signed"    — Scripts/setup-signing-identity.sh. Still
+#                                    cert-based, so still stable across
+#                                    rebuilds; for contributors with no
+#                                    Developer ID cert.
+#   4. ad-hoc ("-")                — last resort. Its DR is a bare cdhash that
+#                                    changes on EVERY build, so grants drop
+#                                    every single time. Loud about it.
+#
+# Same default as make-dmg.sh / notarize.sh, and the same env override, so the
+# three scripts cannot drift apart.
+DEVELOPER_ID="${SUPERVISOR_SIGN_IDENTITY:-Developer ID Application: Mohammed Wasif (Q7HKTCTZXQ)}"
 STABLE_IDENTITY="Supervisor Self-Signed"
-if security find-certificate -c "$STABLE_IDENTITY" >/dev/null 2>&1; then
+
+# find-identity (not find-certificate): a certificate with no usable private
+# key in this keychain cannot sign, and falling through to the next option is
+# better than a hard codesign failure late in the build.
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$DEVELOPER_ID"; then
+    SIGN_AS="$DEVELOPER_ID"
+    echo "[sign-adhoc] signing identity:   $DEVELOPER_ID"
+    echo "[sign-adhoc]                     (same identity as the release dmg; TCC grants carry)"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -qF "$STABLE_IDENTITY"; then
     SIGN_AS="$STABLE_IDENTITY"
     echo "[sign-adhoc] signing identity:   $STABLE_IDENTITY (stable, cert-based DR)"
+    echo "[sign-adhoc]                     NOTE: this is NOT the identity the release dmg uses."
+    echo "[sign-adhoc]                     Installing a release over this build re-grants once."
 else
     SIGN_AS="-"
-    echo "[sign-adhoc] signing identity:   ad-hoc (run setup-signing-identity.sh for grants that survive rebuilds)"
+    echo "[sign-adhoc] signing identity:   ad-hoc"
+    echo "[sign-adhoc]                     WARNING: an ad-hoc DR is a cdhash that changes every"
+    echo "[sign-adhoc]                     build, so Accessibility drops on EVERY deploy."
+    echo "[sign-adhoc]                     Run Scripts/setup-signing-identity.sh to fix."
 fi
 
 # Re-sign. --deep so nested code (the embedded Heartbeat) is signed too.

@@ -410,6 +410,13 @@ final class ProcessLocatorTests: XCTestCase {
 
         // Trace log assertions: the discriminating tag must fire with
         // the FakeClaudeCLI PID and the execPath that got skipped.
+        //
+        // Drain the write queue first. `TraceLog.emit` is queue.async, so
+        // reading the file straight after `locate` is a race the full suite
+        // loses under load — the three assertions below failed against an
+        // EMPTY trace, which reads like a locator regression rather than a
+        // flush that had not landed. `sync()` exists for exactly this.
+        trace.sync()
         let traceText = (try? String(contentsOf: traceURL, encoding: .utf8)) ?? ""
         XCTAssertTrue(
             traceText.contains("locator.exec_unrecognized"),

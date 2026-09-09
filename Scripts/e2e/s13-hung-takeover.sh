@@ -52,9 +52,14 @@ info "backdated app-alive marker 60s"
 # across instances: gate on lines AFTER this point, s12-style.
 LINES_BEFORE="$(wc -l < "$TRACE_LOG" | tr -cd '0-9')"
 
-"$APP_BIN" >"$RUN_ROOT/app-relaunch.stdout.log" 2>&1 &
-SECOND_PID=$!
-echo "$SECOND_PID" > "$APP_PID_FILE"
+# `primary` overwrites APP_PID_FILE with the newcomer, exactly as before. The
+# difference is that FIRST_PID is still in the launch ledger, so the FROZEN
+# incumbent is torn down on every exit path from here on. Before the ledger, a
+# failure in the takeover assertions below left a SIGSTOPped Supervisor alive
+# with its hover band painted on the owner's screen, unkillable by teardown
+# because APP_PID_FILE no longer named it.
+spawn_extra_app "$RUN_ROOT/app-relaunch.stdout.log" primary
+SECOND_PID="$E2E_LAST_PID"
 info "relaunched pid=$SECOND_PID"
 
 WAITED=0
@@ -90,7 +95,7 @@ while kill -0 "$FIRST_PID" 2>/dev/null; do
 done
 info "hung incumbent pid=$FIRST_PID terminated"
 
-RECORDED="$(cat "$APP_SUPPORT_DIR/supervisor.pid" 2>/dev/null | tr -cd '0-9')"
+RECORDED="$(recorded_pid "$APP_SUPPORT_DIR/supervisor.pid")"
 [ "$RECORDED" = "$SECOND_PID" ] || fail "pidfile records '$RECORDED', expected new pid $SECOND_PID"
 
 pass "s13 hung-takeover — frozen incumbent (the 'restart my laptop' state) was taken over; new pid=$SECOND_PID runs"

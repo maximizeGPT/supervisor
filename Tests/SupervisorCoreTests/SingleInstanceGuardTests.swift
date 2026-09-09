@@ -273,4 +273,361 @@ final class SingleInstanceGuardTests: XCTestCase {
         XCTAssertEqual(result, .claimed, "a filesystem quirk must not block launch")
         XCTAssertEqual(SingleInstanceGuard.readRecordedPID(at: pidfile), 1000)
     }
+
+    // MARK: - Stale predecessor sweep (the lingering hover band)
+
+    // A macOS window belongs to its process's WindowServer connection, so a
+    // Supervisor that DIES takes its hover band with it — the takeover path
+    // (SIGTERM the hung incumbent, reclaim the flock) cannot orphan a band, and
+    // neither can a crash. What CAN leave a band painted on the owner's screen
+    // is a predecessor that is still RUNNING while no longer holding the lock:
+    // the flock came back `.unavailable` so the incumbent ran lockless by
+    // design, or the incumbent was SIGSTOPped (a frozen process keeps its
+    // windows and can never run cleanup of its own). These pin who the winner
+    // may signal on the way in — and, just as important, who it may not.
+
+    private let predecessorPath = "/Applications/Supervisor.app/Contents/MacOS/Supervisor"
+    /// A `ConfigPaths.homeIdentityHash` shape: 12 hex chars. The literal value
+    /// is irrelevant; what matters is same-vs-different.
+    private let homeToken = "a1b2c3d4e5f6"
+    private let otherHomeToken = "0f0e0d0c0b0a"
+
+    func testStalePredecessorIsReportedWhenAliveAndTheSameBinary() {
+        let stale = SingleInstanceGuard.stalePredecessor(
+            recordedPID: 2000,
+            recordedHomeToken: homeToken,
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            isAlive: { $0 == 2000 },
+            executablePath: { _ in self.predecessorPath }
+        )
+        XCTAssertEqual(stale, 2000,
+                       "a live previous instance of this same binary is what leaves a band on screen")
+    }
+
+    func testDeadPredecessorIsNotSignalled() {
+        let stale = SingleInstanceGuard.stalePredecessor(
+            recordedPID: 2000,
+            recordedHomeToken: homeToken,
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            isAlive: { _ in false },
+            executablePath: { _ in XCTFail("a dead pid must not be introspected"); return nil }
+        )
+        XCTAssertNil(stale, "a dead predecessor already took its window with it")
+    }
+
+    func testOwnPidIsNeverAStalePredecessor() {
+        let stale = SingleInstanceGuard.stalePredecessor(
+            recordedPID: myPID,
+            recordedHomeToken: homeToken,
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            isAlive: { _ in XCTFail("our own pid must not be probed"); return true },
+            executablePath: { _ in nil }
+        )
+        XCTAssertNil(stale, "a relaunch that re-reads its own recorded pid must not SIGTERM itself")
+    }
+
+    func testNoRecordedPidMeansNoSweep() {
+        XCTAssertNil(SingleInstanceGuard.stalePredecessor(
+            recordedPID: nil,
+            recordedHomeToken: homeToken,
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            isAlive: { _ in XCTFail("nothing to probe"); return true },
+            executablePath: { _ in nil }
+        ))
+    }
+
+    /// The one that protects the owner. Under the E2E harness the test binary
+    /// is ALSO called "Supervisor", so a basename check would let a harness
+    /// instance SIGTERM the owner's installed app the moment a pid got reused.
+    /// Identity is the full executable path.
+    func testDifferentExecutablePathIsNeverSignalled() {
+        let stale = SingleInstanceGuard.stalePredecessor(
+            recordedPID: 2000,
+            recordedHomeToken: homeToken,
+            myPID: myPID,
+            myExecutablePath: "/tmp/supervisor-e2e/build/Supervisor",
+            myHomeToken: homeToken,
+            isAlive: { _ in true },
+            executablePath: { _ in self.predecessorPath }   // the owner's installed app
+        )
+        XCTAssertNil(stale,
+                     "a test instance must never signal the owner's installed Supervisor on a reused pid")
+    }
+
+    /// Unreadable path means unverifiable identity. `pidIsAliveSupervisor`
+    /// resolves that ambiguity toward "assume it is ours" because its cost is a
+    /// silent duplicate exit; here the cost is a signal to a stranger, so it
+    /// has to resolve the other way.
+    func testUnreadableExecutablePathIsNeverSignalled() {
+        XCTAssertNil(SingleInstanceGuard.stalePredecessor(
+            recordedPID: 2000,
+            recordedHomeToken: homeToken,
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            isAlive: { _ in true },
+            executablePath: { _ in nil }
+        ))
+    }
+
+    func testUnknownOwnExecutablePathDisablesTheSweep() {
+        XCTAssertNil(SingleInstanceGuard.stalePredecessor(
+            recordedPID: 2000,
+            recordedHomeToken: homeToken,
+            myPID: myPID,
+            myExecutablePath: nil,
+            myHomeToken: homeToken,
+            isAlive: { _ in XCTFail("with no identity of our own there is nothing to compare"); return true },
+            executablePath: { _ in nil }
+        ))
+    }
+
+    func testNonPositiveRecordedPidIsNeverSignalled() {
+        for bogus: Int32 in [0, -1] {
+            XCTAssertNil(SingleInstanceGuard.stalePredecessor(
+                recordedPID: bogus,
+                recordedHomeToken: homeToken,
+                myPID: myPID,
+                myExecutablePath: predecessorPath,
+                myHomeToken: homeToken,
+                isAlive: { _ in true },
+                executablePath: { _ in self.predecessorPath }
+            ), "pid \(bogus) must never be signalled — kill(0, SIGTERM) hits the whole process group")
+        }
+    }
+
+    // MARK: - Lock-holding is distinguishable from the fallback
+
+    /// `.claimed` has two sources: a real kernel lock, and the best-effort
+    /// fallback for a filesystem that cannot do advisory locks. Anything that
+    /// goes on to SIGNAL another process has to tell them apart, so the
+    /// distinction is readable rather than implied.
+    func testARealClaimHoldsTheExclusiveLock() {
+        let pidfile = tmpPidfile()
+        defer { try? FileManager.default.removeItem(at: pidfile) }
+
+        XCTAssertEqual(SingleInstanceGuard.claim(at: pidfile, myPID: 1000), .claimed)
+        XCTAssertTrue(SingleInstanceGuard.holdsExclusiveLock,
+                      "a winning claim must report that it holds the lock")
+    }
+
+    /// The fallback runs, but it holds nothing — so the predecessor sweep that
+    /// depends on this must stay its hand. Without the lock there is no proof
+    /// the other live instance is a leftover rather than a healthy incumbent,
+    /// and killing a healthy incumbent is how the pre-flock kill wars started.
+    func testUnavailableLockClaimsWithoutHoldingTheLock() {
+        let pidfile = tmpPidfile()
+        defer { try? FileManager.default.removeItem(at: pidfile) }
+
+        XCTAssertEqual(
+            SingleInstanceGuard.claim(at: pidfile, myPID: 1000, acquire: { _ in .unavailable }),
+            .claimed
+        )
+        XCTAssertFalse(SingleInstanceGuard.holdsExclusiveLock,
+                       "the filesystem fallback must never claim to hold the lock")
+    }
+
+    // MARK: - The pidfile carries WHOSE instance recorded the pid
+
+    // The executable path alone says "same binary", and two concurrent E2E runs
+    // share one .build/debug/Supervisor. On a reused pid that made each run a
+    // candidate to sweep the other, which would kill a scenario mid-drive and
+    // read as a mystery failure. The home token is the second axis: the same
+    // seam the flock and the UserDefaults suite are namespaced by, so "may I
+    // signal it" now answers the same way as "do we share a world".
+
+    func testClaimRecordsTheHomeTokenBesideThePid() {
+        let pidfile = tmpPidfile()
+        defer { try? FileManager.default.removeItem(at: pidfile) }
+
+        XCTAssertEqual(SingleInstanceGuard.claim(at: pidfile, myPID: 1000, homeToken: homeToken), .claimed)
+        let record = SingleInstanceGuard.readPredecessorRecord(at: pidfile)
+        XCTAssertEqual(record?.pid, 1000)
+        XCTAssertEqual(record?.homeToken, homeToken,
+                       "the next launcher can only check the home axis if the claim wrote it")
+    }
+
+    /// Backward compatibility, and it is not hypothetical: the pidfile a
+    /// launching app reads was written by the version it is REPLACING. An
+    /// upgrade in place always reads one of these once.
+    func testAPidfileWithoutATokenStillReadsItsPid() throws {
+        let pidfile = tmpPidfile()
+        defer { try? FileManager.default.removeItem(at: pidfile) }
+
+        try "4242\n".write(to: pidfile, atomically: true, encoding: .utf8)
+        XCTAssertEqual(SingleInstanceGuard.readRecordedPID(at: pidfile), 4242,
+                       "an old-format pidfile must still identify its incumbent, or the duplicate guard degrades into two live instances")
+        let record = SingleInstanceGuard.readPredecessorRecord(at: pidfile)
+        XCTAssertEqual(record?.pid, 4242)
+        XCTAssertNil(record?.homeToken, "absent must read as absent, never as a match")
+    }
+
+    /// The same old pidfile, on the sweep side. An absent token is
+    /// unverifiable identity, and the sweep's mistake costs a signal to a
+    /// process that may not be ours — so absence resolves to "do not signal".
+    func testAPidfileWithoutATokenIsNeverSwept() {
+        XCTAssertNil(SingleInstanceGuard.stalePredecessor(
+            recordedPID: 2000,
+            recordedHomeToken: nil,
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            isAlive: { _ in true },
+            executablePath: { _ in self.predecessorPath }
+        ), "a pidfile with no home token cannot prove the predecessor shares our world")
+    }
+
+    /// The residual this closes. Two concurrent E2E runs, one binary path, a
+    /// reused pid: without the home axis each run would sweep the other.
+    func testAPredecessorFromAnotherHomeIsNeverSignalled() {
+        XCTAssertNil(SingleInstanceGuard.stalePredecessor(
+            recordedPID: 2000,
+            recordedHomeToken: otherHomeToken,
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            isAlive: { _ in true },
+            executablePath: { _ in self.predecessorPath }
+        ), "two isolated runs share .build/debug/Supervisor; the same path is not the same instance")
+    }
+
+    // MARK: - The sweep itself (who gets signalled, and did it work)
+
+    // The call site used to be a private method on the app delegate: no test
+    // could reach it, so "we hold no lock" and "the signal landed" were both
+    // taken on faith. The whole sequence now lives here behind an injected
+    // signal sender, so these assert on the signals themselves.
+
+    private struct SignalRecorder {
+        private(set) var sent: [(pid: Int32, sig: Int32)] = []
+        mutating func record(_ pid: Int32, _ sig: Int32) { sent.append((pid, sig)) }
+        var signals: [Int32] { sent.map(\.sig) }
+    }
+
+    func testSweepWithoutTheExclusiveLockSendsNoSignal() {
+        var recorder = SignalRecorder()
+        let outcome = SingleInstanceGuard.retirePredecessor(
+            recorded: .init(pid: 2000, homeToken: homeToken),
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            holdsLock: false,
+            isAlive: { _ in true },
+            executablePath: { _ in self.predecessorPath },
+            sendSignal: { pid, sig in recorder.record(pid, sig); return 0 }
+        )
+        XCTAssertEqual(outcome, .skippedWithoutExclusiveLock(pid: 2000))
+        XCTAssertTrue(recorder.sent.isEmpty,
+                      "under the lockless fallback a live sibling is as likely to be a HEALTHY incumbent; killing it restarts the pre-flock kill wars")
+    }
+
+    func testSweepDoesNotSignalADifferentExecutablePath() {
+        var recorder = SignalRecorder()
+        let outcome = SingleInstanceGuard.retirePredecessor(
+            recorded: .init(pid: 2000, homeToken: homeToken),
+            myPID: myPID,
+            myExecutablePath: "/tmp/supervisor-e2e/build/Supervisor",
+            myHomeToken: homeToken,
+            holdsLock: true,
+            isAlive: { _ in true },
+            executablePath: { _ in self.predecessorPath },   // the owner's installed app
+            sendSignal: { pid, sig in recorder.record(pid, sig); return 0 }
+        )
+        XCTAssertEqual(outcome, .nothingToRetire)
+        XCTAssertTrue(recorder.sent.isEmpty,
+                      "a harness instance must never SIGTERM the owner's installed Supervisor on a reused pid")
+    }
+
+    func testSweepDoesNotSignalAPredecessorFromAnotherHome() {
+        var recorder = SignalRecorder()
+        let outcome = SingleInstanceGuard.retirePredecessor(
+            recorded: .init(pid: 2000, homeToken: otherHomeToken),
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            holdsLock: true,
+            isAlive: { _ in true },
+            executablePath: { _ in self.predecessorPath },
+            sendSignal: { pid, sig in recorder.record(pid, sig); return 0 }
+        )
+        XCTAssertEqual(outcome, .nothingToRetire)
+        XCTAssertTrue(recorder.sent.isEmpty, "same binary, different world: not ours to kill")
+    }
+
+    func testSweepSendsContThenTermToAFullMatch() {
+        var recorder = SignalRecorder()
+        var alive = true
+        let outcome = SingleInstanceGuard.retirePredecessor(
+            recorded: .init(pid: 2000, homeToken: homeToken),
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            holdsLock: true,
+            isAlive: { _ in alive },
+            executablePath: { _ in self.predecessorPath },
+            sendSignal: { pid, sig in
+                recorder.record(pid, sig)
+                if sig == SIGTERM { alive = false }
+                return 0
+            },
+            deathChecks: 3,
+            deathCheckInterval: 0,
+            wait: { _ in }
+        )
+        XCTAssertEqual(outcome, .retired(pid: 2000))
+        XCTAssertEqual(recorder.sent.map(\.pid), [2000, 2000])
+        XCTAssertEqual(recorder.signals, [SIGCONT, SIGTERM],
+                       "CONT first: SIGTERM alone is only queued for a STOPPED process, and a SIGSTOPped instance keeping its band painted is the case this exists for")
+    }
+
+    /// The sweep's own failure mode. SIGTERM is a request, and a predecessor
+    /// that ignores it keeps its WindowServer connection and its band. Before
+    /// this the hung case logged exactly like the successful one.
+    func testSweepReportsAPredecessorThatSurvivedTermination() {
+        var recorder = SignalRecorder()
+        let outcome = SingleInstanceGuard.retirePredecessor(
+            recorded: .init(pid: 2000, homeToken: homeToken),
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            holdsLock: true,
+            isAlive: { _ in true },          // never dies
+            executablePath: { _ in self.predecessorPath },
+            sendSignal: { pid, sig in recorder.record(pid, sig); return 0 },
+            deathChecks: 3,
+            deathCheckInterval: 0,
+            wait: { _ in }
+        )
+        XCTAssertEqual(outcome, .survivedTermination(pid: 2000),
+                       "a sweep that signalled and did not get its process must not report the same outcome as one that did")
+        XCTAssertEqual(recorder.signals, [SIGCONT, SIGTERM])
+    }
+
+    func testSweepReportsAFailedSignal() {
+        let outcome = SingleInstanceGuard.retirePredecessor(
+            recorded: .init(pid: 2000, homeToken: homeToken),
+            myPID: myPID,
+            myExecutablePath: predecessorPath,
+            myHomeToken: homeToken,
+            holdsLock: true,
+            isAlive: { _ in true },
+            executablePath: { _ in self.predecessorPath },
+            sendSignal: { _, sig in sig == SIGTERM ? -1 : 0 },
+            deathChecks: 3,
+            deathCheckInterval: 0,
+            wait: { _ in }
+        )
+        guard case .signalFailed(let pid, _) = outcome else {
+            return XCTFail("a failed SIGTERM must be reported as such, not as a retirement: \(outcome)")
+        }
+        XCTAssertEqual(pid, 2000)
+    }
 }

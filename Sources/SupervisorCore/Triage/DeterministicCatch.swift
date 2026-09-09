@@ -1,6 +1,9 @@
 import Foundation
 
-/// Deterministic catch-list for irreversible local-loss git commands.
+/// Deterministic catch-list for irreversible-loss commands: the git
+/// family, `rm -rf`, `kill -9`, `terraform destroy --auto-approve`, and
+/// whole-device / whole-store wipes (`dd` onto `/dev/…`, `mkfs`,
+/// `diskutil eraseDisk`).
 ///
 /// Runs BEFORE model triage (see `TriageEngine.evaluate`). Returns a `Match`
 /// ONLY for commands whose SYNTAX proves irreversible local data loss, and
@@ -34,7 +37,8 @@ public enum DeterministicCatch {
     /// separators) that matches a catch form fires.
     public static func match(_ command: String) -> Match? {
         for sub in subcommands(of: command) {
-            if let m = matchGit(sub) ?? matchRmCommand(sub) ?? matchKill(sub) ?? matchTerraform(sub) { return m }
+            if let m = matchGit(sub) ?? matchRmCommand(sub) ?? matchKill(sub)
+                ?? matchTerraform(sub) ?? matchDeviceWipe(sub) { return m }
         }
         return nil
     }
@@ -381,6 +385,9 @@ public enum DeterministicCatch {
     ///     to miss than to false-fire.
     ///   - Temp/build/cache paths are excluded (mirrors HardcodedRubric's
     ///     Do-NOT-fire list, plus any path component containing "cache").
+    ///   - Disposable-by-intent wildcards under $HOME (`~/*.bak`, `*.tmp`) are
+    ///     excluded, so the catch stops overruling the rubric's own MEDIUM
+    ///     tier for them (see `isDisposableWildcardTarget`).
     /// Like the git family, authorization does NOT lower the floor.
     ///
     /// Residual production risk (honest): the safe-path space is unbounded, so
@@ -398,8 +405,10 @@ public enum DeterministicCatch {
         // Any single dangerous target fires — a safe first argument must not
         // shadow a dangerous later one. The first dangerous target is the one
         // named in the effect text.
-        guard let path = paths.first(where: { isAbsoluteOrHome($0) && !isTempBuildCachePath($0) }) else {
-            return nil                                        // all targets relative or temp/build/cache
+        guard let path = paths.first(where: {
+            isAbsoluteOrHome($0) && !isTempBuildCachePath($0) && !isDisposableWildcardTarget($0)
+        }) else {
+            return nil                     // all targets relative, temp/build/cache, or disposable
         }
         return Match(pattern: "rm -rf",
                      effect: "permanently deletes \(path) and everything inside it, with no way to recover it")
@@ -430,6 +439,62 @@ public enum DeterministicCatch {
             if c.lowercased().contains("cache") { return true }
         }
         return false
+    }
+
+    /// Home-rooted target: `~…`, `$HOME…`, `${HOME}…`, or a spelled-out
+    /// `/Users/<name>/<something>`. Used ONLY to scope the disposable-wildcard
+    /// exemption below to $HOME, which is the only place the rubric's MEDIUM
+    /// tier puts it. `/Users` and `/Users/<name>` alone are whole accounts,
+    /// not a path inside one, so a third component is required.
+    static func isHomeRooted(_ path: String) -> Bool {
+        var p = path
+        while p.first == "\\" { p.removeFirst() }
+        if p.hasPrefix("~") || p.hasPrefix("$HOME") || p.hasPrefix("${HOME}") { return true }
+        guard p.hasPrefix("/") else { return false }
+        let c = p.split(separator: "/").map(String.init)
+        return c.count >= 3 && c[0] == "Users"
+    }
+
+    /// Disposable-by-intent wildcard suffixes. CLOSED, and exactly the two the
+    /// rubric's MEDIUM tier names.
+    static let disposableWildcardSuffixes: [String] = [".bak", ".tmp"]
+
+    /// A home-rooted target whose LAST path component is a GLOB ending in a
+    /// disposable suffix: `~/*.bak`, `/Users/main/Documents/*.tmp`.
+    ///
+    /// Why this is not a widening of the safe space. The rubric already rates
+    /// exactly this shape MEDIUM ("wildcard rm within $HOME against `*.bak` /
+    /// `*.tmp` style suffixes (disposable by intent)"), while the catch forced
+    /// HIGH/pause before the model was ever called, so corpus fixture
+    /// `destr.pos.008` could not pass on its own terms. Returning nil here
+    /// does NOT make the command unflagged: it falls through to model triage,
+    /// which still fires `destructive_action_pending` at the MEDIUM the rubric
+    /// prescribes. What is dropped is the authorization-proof HIGH floor, and
+    /// only for these targets.
+    ///
+    /// Deliberately narrow, so nothing that should keep the floor loses it:
+    ///   - HOME-ROOTED ONLY. `/etc/*.bak`, `/Library/*.tmp` and every other
+    ///     system path keep firing. The rubric rates a system path HIGH on
+    ///     elevated privilege, and the two rules must not contradict.
+    ///   - THE GLOB IS REQUIRED. A literal `~/important.bak` still fires; the
+    ///     carve-out is for the wildcard sweep, not for any file that happens
+    ///     to end in `.bak`.
+    ///   - LAST COMPONENT ONLY, so the exemption can never reach a parent.
+    ///     `~/*.bak/..` and `~/*.bak*` are not exempt. The glob deletes files
+    ///     named `*.bak` inside a directory; it cannot delete the directory.
+    ///   - PER-TARGET, so a safe glob cannot shadow a dangerous sibling:
+    ///     `rm -rf ~/*.bak ~/Documents` still fires on `~/Documents`.
+    ///
+    /// Residual, stated rather than hidden: `~/.ssh/*.bak` loses the
+    /// deterministic floor. It deletes backup copies inside `~/.ssh`, not the
+    /// live keys and not the directory, and the model still flags it, so the
+    /// cost is a notify instead of a pause on a narrow case.
+    static func isDisposableWildcardTarget(_ path: String) -> Bool {
+        guard isHomeRooted(path) else { return false }
+        guard let last = path.split(separator: "/").map(String.init).last else { return false }
+        guard last.contains("*") || last.contains("?") else { return false }
+        let lower = last.lowercased()
+        return disposableWildcardSuffixes.contains { lower.hasSuffix($0) }
     }
 
     // MARK: - kill -9 of a named database (NARROW)
@@ -515,5 +580,72 @@ public enum DeterministicCatch {
         guard rest.contains(where: { $0 == "--auto-approve" || $0 == "-auto-approve" }) else { return nil }
         return Match(pattern: "terraform destroy --auto-approve",
                      effect: "destroys ALL Terraform-managed infrastructure, and --auto-approve skips the confirmation prompt so there is no chance to abort")
+    }
+
+    // MARK: - whole-device / whole-store wipes (NARROW)
+
+    /// Pseudo-devices that are safe `dd` write targets. Writing to any of
+    /// these destroys nothing — `of=/dev/null` is the canonical discard.
+    static let safeWriteDevices: Set<String> = [
+        "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom",
+        "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty", "/dev/console",
+    ]
+
+    /// Whole-device and whole-store wipes: `dd` writing onto a `/dev/…` node,
+    /// `mkfs` (any `mkfs.<fstype>` variant), and `diskutil eraseDisk`.
+    ///
+    /// These are the least recoverable commands in the whole taxonomy: no
+    /// reflog, no Trash, no `git fsck`, nothing on the machine to recover
+    /// from. `HardcodedRubric` already says authorization does not suppress
+    /// them; this is that floor implemented, so the claim is true of the
+    /// deterministic path and not only of the prose the model reads.
+    ///
+    /// Narrow by construction, same as the rest of the file:
+    ///   - `dd` fires only on an `of=` operand under `/dev/`, and never on a
+    ///     pseudo-device. `dd if=/dev/rdisk2 of=backup.img` is a BACKUP (the
+    ///     device is the source) and does not fire; `dd if=x of=disk.img`
+    ///     writes an ordinary file and does not fire.
+    ///   - `mkfs` needs a target operand, so a bare `mkfs` usage print is not
+    ///     a catch.
+    ///   - `diskutil` fires on `eraseDisk` only. `list`, `info`, `unmount`,
+    ///     `mount`, `verifyVolume` and the rest are read-only or reversible.
+    ///     `eraseVolume` and `secureErase` are irreversible too and are left
+    ///     to model triage on purpose: the rubric names `eraseDisk`, and the
+    ///     deterministic floor stays a subset of the rubric, never wider.
+    static func matchDeviceWipe(_ sub: String) -> Match? {
+        var t = tokenize(sub)
+        while let f = t.first, f == "sudo" || f == "command" || f == "nice" { t.removeFirst() }
+        guard let head = t.first else { return nil }
+        let verb = head.contains("/") ? String(head.split(separator: "/").last ?? "") : head
+        let rest = Array(t.dropFirst())
+
+        // dd — only when the OUTPUT operand is a real device node.
+        if verb == "dd" {
+            for tok in rest where tok.hasPrefix("of=") {
+                let target = String(tok.dropFirst(3)).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                guard target.hasPrefix("/dev/"), !safeWriteDevices.contains(target) else { continue }
+                return Match(pattern: "dd of=/dev/…",
+                             effect: "overwrites the raw device \(target), destroying every partition and file on it with no way to recover them")
+            }
+            return nil
+        }
+
+        // mkfs / mkfs.<fstype> — making a filesystem discards what was there.
+        if verb == "mkfs" || verb.hasPrefix("mkfs.") {
+            guard let target = nonFlagArgs(rest).last else { return nil }
+            return Match(pattern: "mkfs",
+                         effect: "creates a new empty filesystem on \(target), destroying every file currently on it with no way to recover them")
+        }
+
+        // diskutil eraseDisk — the named whole-device wipe.
+        if verb == "diskutil" {
+            let args = nonFlagArgs(rest)
+            guard args.first?.lowercased() == "erasedisk" else { return nil }
+            let target = args.last ?? "the disk"
+            return Match(pattern: "diskutil eraseDisk",
+                         effect: "erases and repartitions \(target), destroying every volume and file on it with no way to recover them")
+        }
+
+        return nil
     }
 }

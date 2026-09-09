@@ -71,6 +71,16 @@ APP_DB="$APP_SUPPORT_DIR/supervisor.sqlite"
 APP_PID_FILE="$RUN_ROOT/app.pid"
 FAKE_CLI_PID_FILE="$RUN_ROOT/fake-claude.pid"
 
+# Append-only ledger of EVERY process this run started: one "<pid> <path>" line
+# each. APP_PID_FILE alone was never enough, because the multi-instance
+# scenarios overwrite it with the newest pid — s13 does exactly that right after
+# freezing the first instance — so the earlier pid stopped being teardown's
+# responsibility the moment it was overwritten. A frozen Supervisor keeps its
+# hover band painted on the owner's screen and can never run cleanup of its own,
+# so a failed s13 left a stuck pill behind. This ledger only grows: a pid
+# recorded at launch stays killable no matter what the scenario does afterwards.
+LAUNCHED_PIDS_FILE="$RUN_ROOT/launched.pids"
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -177,12 +187,61 @@ launch_app() {
     setup_fakehome
     verify_print_paths_gate
     "$APP_BIN" >"$RUN_ROOT/app.stdout.log" 2>&1 &
-    echo $! > "$APP_PID_FILE"
-    info "launched $APP_BIN pid=$(cat "$APP_PID_FILE")"
+    # Ledger FIRST, one command after the `&`, exactly as spawn_extra_app does
+    # and exactly as record_launched_pid documents. APP_PID_FILE is where the
+    # scenario looks; LAUNCHED_PIDS_FILE is where TEARDOWN looks, and teardown
+    # is the one that has to be right if the scenario dies between these two
+    # lines — an app missing from the ledger keeps running, with a window on
+    # the owner's screen and no one left to close it.
+    local pid=$!
+    record_launched_pid "$pid" "$APP_BIN"
+    echo "$pid" > "$APP_PID_FILE"
+    info "launched $APP_BIN pid=$pid"
+}
+
+# Add a pid to the teardown ledger. Called by every launch helper, immediately
+# after the `&`, so the gap between "a process exists" and "teardown knows about
+# it" is one command wide.
+record_launched_pid() {
+    local pid="$1" path="$2"
+    [ -n "$pid" ] || return 0
+    mkdir -p "$RUN_ROOT"
+    printf '%s %s\n' "$pid" "$path" >> "$LAUNCHED_PIDS_FILE"
+}
+
+# Launch an EXTRA app instance — the second click in s11, the relaunch in s12
+# and s13 — and record it before the caller can do anything else. Sets
+# E2E_LAST_PID. Scenarios must use this rather than a bare `"$APP_BIN" &`: a
+# hand-rolled launch is a process teardown has never heard of, and if the
+# scenario dies before its own cleanup line runs, that process keeps drawing a
+# band on the owner's screen.
+#
+#   spawn_extra_app <stdout-log> [record-as-primary]
+#
+# Pass a second argument to ALSO record the pid in APP_PID_FILE (the relaunch
+# scenarios treat the new instance as the primary one from then on). The ledger
+# entry is written either way, so the pid it displaces stays covered.
+spawn_extra_app() {
+    local log="$1" as_primary="${2:-}"
+    "$APP_BIN" >"$log" 2>&1 &
+    E2E_LAST_PID=$!
+    record_launched_pid "$E2E_LAST_PID" "$APP_BIN"
+    [ -n "$as_primary" ] && echo "$E2E_LAST_PID" > "$APP_PID_FILE"
+    return 0
 }
 
 app_pid() {
     cat "$APP_PID_FILE" 2>/dev/null || true
+}
+
+# The pid the APP recorded in its own pidfile. That file is "<pid> <homeToken>"
+# — the pid alone never said WHOSE instance wrote it, and the predecessor sweep
+# signals on that answer. Read the FIRST field only: the token is hex, so
+# stripping non-digits from the whole line (what the scenarios used to do)
+# would glue the token's digits onto the pid.
+recorded_pid() {
+    local file="${1:-$APP_SUPPORT_DIR/supervisor.pid}"
+    awk 'NR==1 {print $1; exit}' "$file" 2>/dev/null | tr -cd '0-9'
 }
 
 app_is_alive() {
@@ -218,7 +277,16 @@ await_running_ready() {
     if echo "$line" | grep -qF "keychainBase=live.supervisor.api"; then
         fail "ABORT-GATE: app resolved the LIVE keychain base. line: $line"
     fi
+    # Screen isolation, gated the same way filesystem isolation is. An instance
+    # under SUPERVISOR_HOME is invisible to the single-instance flock by design,
+    # so it runs alongside the owner's real app; before the gate, each one also
+    # drew its own hover band, and the owner ended up looking at three stacked
+    # "Watching. All clear" pills. The app says which way the gate went on its
+    # way into the running state, which is emitted before the ready line above.
+    grep -q "hover band suppressed" "$TRACE_LOG" \
+        || fail "ABORT-GATE: this instance did not suppress its hover band; it is drawing on the owner's screen"
     info "abort-gate ok: $line"
+    info "abort-gate ok: hover band suppressed (nothing drawn on the owner's screen)"
 }
 
 # Weaker gate for scenarios that stay IN onboarding (never reach running
@@ -298,7 +366,22 @@ seed_provider_key() {
         info "keychain item $service already seeded (ACL/approval preserved)"
         return
     fi
-    security add-generic-password -s "$service" -a "api-key" -w "$key" -A -U >/dev/null
+    # Delete-then-add, never -U. A Keychain item's ACL is decided when the item
+    # is CREATED: `-U` rewrites the password data and leaves the ACL of the
+    # existing item exactly as it was, and `-A` is an instruction about the ACL
+    # of an item being created, so `-A -U` on an existing item grants nothing.
+    # A seeded item whose value changed therefore kept whatever ACL it was born
+    # with, and the app's read of it raised a SecurityAgent prompt mid-run.
+    # (Same failure the owner hit on live.supervisor.api.deepseek in 2026-09.)
+    # `-A` on the fresh add is kept, and it is deliberate here and nowhere else:
+    # these are fake keys in a namespace the live app never reads, and the
+    # harness binary is re-signed by every `swift build`, so naming it with -T
+    # would bind the ACL to a signature that is stale by the next run. -A does
+    # NOT make the read silent (see README.md: the first read of a CLI-seeded
+    # item still needs one "Always Allow"), it just avoids adding a second,
+    # signature-shaped reason to re-prompt.
+    security delete-generic-password -s "$service" -a "api-key" >/dev/null 2>&1 || true
+    security add-generic-password -s "$service" -a "api-key" -w "$key" -A >/dev/null
     info "seeded keychain item $service"
 }
 
@@ -363,6 +446,7 @@ run_fake_session() {
         --interval-ms "$interval_ms" \
         --script "$fixture" \
         >"$RUN_ROOT/fake-claude.log" 2>&1 &
+    record_launched_pid "$!" "$FAKE_CLI_BIN"
     info "fake session $session_id replaying $(basename "$fixture") -> $proj_dir"
 }
 
@@ -370,35 +454,78 @@ run_fake_session() {
 # Teardown
 # ---------------------------------------------------------------------------
 
-# Kill ONLY the recorded pid — and only if it is still OUR binary (pids get
-# reused; the live Supervisor must never be a casualty of a stale pidfile).
-# Companions (Heartbeat/StatusBar) are spawned as children of our app from
-# the same BUILD_DIR, so we sweep direct children matching that path too;
-# a live installed Supervisor's companions run from /Applications and never
-# match.
+# Kill the pid recorded in a pid file, then drop the file. The identity check
+# and the signalling itself live in kill_pid_if_ours.
 kill_recorded_pid() {
-    local pid_file="$1" expected_path="$2" pid cmd child
+    local pid_file="$1" expected_path="$2" pid
     pid="$(cat "$pid_file" 2>/dev/null || true)"
-    [ -n "$pid" ] || return 0
-    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    if [ -n "$cmd" ] && echo "$cmd" | grep -qF "$expected_path"; then
-        for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-            local child_cmd
-            child_cmd="$(ps -p "$child" -o command= 2>/dev/null || true)"
-            if echo "$child_cmd" | grep -qF "$BUILD_DIR"; then
-                kill "$child" 2>/dev/null || true
-            fi
-        done
-        kill "$pid" 2>/dev/null || true
-        # Escalate only if it ignores TERM (it's OUR test instance).
-        local waited=0
-        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 5 ]; do sleep 1; waited=$((waited + 1)); done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-    fi
+    kill_pid_if_ours "$pid" "$expected_path"
     rm -f "$pid_file"
 }
 
+# The one place a process actually gets signalled. Kills `pid` only when it is
+# still running OUR binary — pids get reused, and the owner's live Supervisor
+# must never be a casualty of a stale pid. Companions (Heartbeat/StatusBar) are
+# spawned as children of our app from the same BUILD_DIR, so direct children
+# matching that path are swept too; a live installed Supervisor's companions run
+# from /Applications and never match.
+kill_pid_if_ours() {
+    local pid="$1" expected_path="$2" cmd child child_cmd waited=0
+    [ -n "$pid" ] || return 0
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [ -n "$cmd" ] || return 0
+    echo "$cmd" | grep -qF "$expected_path" || return 0
+
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+        child_cmd="$(ps -p "$child" -o command= 2>/dev/null || true)"
+        if echo "$child_cmd" | grep -qF "$BUILD_DIR"; then
+            kill "$child" 2>/dev/null || true
+        fi
+    done
+    # CONT before TERM. s13 SIGSTOPs an instance on purpose, and a stopped
+    # process is the one that most needs killing here: its window stays painted
+    # on the owner's screen. Waking it first makes the termination immediate
+    # instead of dependent on scheduler details.
+    kill -CONT "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+    # Escalate only if it ignores TERM (it's OUR test instance).
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 5 ]; do sleep 1; waited=$((waited + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Kill every pid in the launch ledger, newest first. This is the backstop that
+# makes "the harness kills everything it started" true on every exit path: the
+# pid files are per-role and get overwritten, the ledger never forgets.
+kill_all_launched_pids() {
+    local pid path
+    [ -f "$LAUNCHED_PIDS_FILE" ] || return 0
+    # Reverse order so a relaunched instance goes before the one it took over
+    # from; either order terminates everything, this one just reads better in
+    # the trace when a scenario is being debugged.
+    while read -r pid path; do
+        [ -n "${pid:-}" ] || continue
+        kill_pid_if_ours "$pid" "${path:-$APP_BIN}"
+    done < <(tail -r "$LAUNCHED_PIDS_FILE" 2>/dev/null || cat "$LAUNCHED_PIDS_FILE")
+    return 0
+}
+
 teardown() {
+    # Idempotent: fail() calls teardown directly and then exits, which fires the
+    # EXIT trap and calls it again. Re-entry is harmless but the second pass
+    # would report "evidence preserved" against a directory the first pass
+    # already moved.
+    [ "${E2E_TEARDOWN_DONE:-0}" = "1" ] && return 0
+    E2E_TEARDOWN_DONE=1
+
+    # `set -e` is in force and this runs from a trap: one nonzero command in the
+    # middle would abandon every cleanup step after it, which is precisely how a
+    # launched app leaks. Cleanup runs to completion regardless.
+    set +e
+
+    kill_all_launched_pids
     kill_recorded_pid "$APP_PID_FILE" "$APP_BIN"
     kill_recorded_pid "$FAKE_CLI_PID_FILE" "$FAKE_CLI_BIN"
     kill_recorded_pid "$FAKE_CLI_PID_FILE.child" "$FAKE_CLI_BIN"
@@ -432,6 +559,20 @@ teardown() {
 
 # Every scenario cleans up on ANY exit path; fail() also calls teardown so a
 # failed assertion never leaves a test instance running.
+#
+# INT and TERM get their own handlers because the EXIT trap alone does not
+# cover them equally. Measured on this bash: a SIGTERM does run the EXIT trap,
+# and a SIGINT does NOT run it at all. Ctrl-C during the 40s "waiting for
+# running state" poll is the ordinary way a developer stops a scenario, so the
+# most common interruption was the one path that leaked a running Supervisor
+# onto the owner's screen. These handlers exit through the EXIT trap, so there
+# is still exactly one teardown, and it is idempotent besides.
+#
+# A trap does not fire until the foreground command bash is waiting on returns,
+# so teardown latency after a Ctrl-C is the length of the longest foreground
+# sleep in the harness. Every poll here uses 1-2s. Keep it that way.
+trap 'echo "  ... interrupted (SIGINT); tearing down" >&2; exit 130' INT
+trap 'echo "  ... terminated (SIGTERM); tearing down" >&2; exit 143' TERM
 trap teardown EXIT
 
 assert_no_live_keychain_pollution

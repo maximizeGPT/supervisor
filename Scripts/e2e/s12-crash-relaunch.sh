@@ -43,8 +43,7 @@ info "crashed pid=$FIRST_PID (SIGKILL)"
 # line NEWER than the crash: truncate our view by line count.
 LINES_BEFORE="$(wc -l < "$TRACE_LOG" | tr -cd '0-9')"
 
-"$APP_BIN" >"$RUN_ROOT/app-relaunch.stdout.log" 2>&1 &
-echo $! > "$APP_PID_FILE"
+spawn_extra_app "$RUN_ROOT/app-relaunch.stdout.log" primary
 SECOND_PID="$(app_pid)"
 info "relaunched pid=$SECOND_PID"
 
@@ -61,7 +60,7 @@ echo "$READY_LINE" | grep -qF "home=$FAKEHOME" || fail "ABORT-GATE: relaunch rea
 info "relaunch ready: $READY_LINE"
 
 PIDFILE="$APP_SUPPORT_DIR/supervisor.pid"
-RECORDED="$(cat "$PIDFILE" | tr -cd '0-9')"
+RECORDED="$(recorded_pid "$PIDFILE")"
 [ "$RECORDED" = "$SECOND_PID" ] || fail "pidfile records $RECORDED; expected relaunched pid $SECOND_PID"
 
 pass "s12 crash-relaunch — SIGKILL'd instance did not block recovery; new pid=$SECOND_PID owns the lock"

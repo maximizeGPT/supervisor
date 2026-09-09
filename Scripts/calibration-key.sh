@@ -11,10 +11,13 @@
 #   source Scripts/calibration-key.sh   # exports the resolved key if found
 #   Scripts/calibration-key.sh          # just checks + reports availability
 #
-# PREFERENCE: Anthropic first (the 95% gate, PRINCIPLES section 6c, is
-# measured against Anthropic Haiku), then DeepSeek as a reproducible PROXY
-# when no Anthropic key is present. The resolved provider is printed so the
-# run self-documents which model it used. The key VALUE is never printed.
+# PREFERENCE: Anthropic first when a key exists, then DeepSeek. Neither is a
+# "proxy" for the other. PRINCIPLES section 6c measures the 95% gate against
+# the provider that actually SHIPS to the user, and this owner has no
+# Anthropic key, so DeepSeek deepseek-chat is his gate. The resolved provider
+# is printed so the run self-documents which model it used, because a recall
+# number means nothing without the model beside it. The key VALUE is never
+# printed.
 # Returns/exits 0 if resolved, 1 if not.
 
 # Configurable sources (override via env before sourcing).
@@ -31,7 +34,7 @@ _calib_sourced=0
 _calib_source=""
 _calib_provider="anthropic"
 
-# ─── Anthropic (preferred — the section 6c Haiku gate) ──────────────────────
+# ─── Anthropic (preferred when a key exists) ────────────────────────────────
 
 # 1. Environment — already provided.
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -88,7 +91,7 @@ if [ -z "$_calib_source" ] && [ -t 0 ] && [ -t 1 ]; then
     unset _v
 fi
 
-# ─── DeepSeek fallback (a PROXY for the Haiku gate, not the gate itself) ────
+# ─── DeepSeek (the shipped provider for an owner with no Anthropic key) ─────
 # The runner's resolveKey already accepts DEEPSEEK_API_KEY; this makes the
 # DeepSeek sweep reproducible (no per-run owner override). env -> Keychain.
 
@@ -109,8 +112,9 @@ fi
 if [ -n "$_calib_source" ]; then
     echo "[calib-key] provider=$_calib_provider key resolved from: $_calib_source"
     if [ "$_calib_provider" = "deepseek" ]; then
-        echo "[calib-key] NOTE: DeepSeek is a PROXY. The section 6c gate is Anthropic Haiku;"
-        echo "            a DeepSeek sweep is indicative, not the gate result of record."
+        echo "[calib-key] NOTE: this run measures DeepSeek. Per PRINCIPLES section 6c the"
+        echo "            gate is measured against the provider that ships, so name the"
+        echo "            provider and model beside any recall number from it."
     fi
     _calib_rc=0
 else
@@ -122,12 +126,20 @@ else
         echo "Provide one, then re-run the sweep. For the GATE (preferred), Anthropic:"
         echo "  1. export ANTHROPIC_API_KEY=sk-ant-..."
         echo "  2. security add-generic-password -s $KEYCHAIN_SERVICE -a \"\$USER\" -w"
+        echo "     (this is a calibration-only item: account \$USER, which the app never reads."
+        echo "      To set the key the APP reads, use the app's onboarding, or"
+        echo "      SUPERVISOR_PROVIDER_API_KEY=... swift run SupervisorDevTools \\"
+        echo "        inject-provider-key-from-env anthropic."
+        echo "      A raw 'security add-generic-password -a api-key' writes an item Supervisor"
+        echo "      is not allowed to read, and the next launch stalls on a permission prompt.)"
         echo "  3. echo 'ANTHROPIC_API_KEY=sk-ant-...' >> $ENV_FILE   (gitignored)"
         echo "  4. 1Password: install 'op', sign in, set SUPERVISOR_OP_ANTHROPIC_REF=op://Vault/Item/field"
         echo ""
-        echo "For a PROXY sweep (indicative, not the gate), DeepSeek:"
+        echo "For a DeepSeek sweep (the shipped provider when no Anthropic key exists):"
         echo "  export DEEPSEEK_API_KEY=sk-...   OR"
         echo "  security add-generic-password -s $DEEPSEEK_KEYCHAIN_SERVICE -a \"\$USER\" -w"
+        echo "  (calibration-only item, same caveat as above: to set the key the APP reads use"
+        echo "   SupervisorDevTools inject-provider-key-from-env deepseek)"
     } >&2
     _calib_rc=1
 fi

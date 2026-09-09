@@ -8,6 +8,15 @@
 //                               Use with ANTHROPIC_API_KEY=$(cat /tmp/sk.txt) ...
 //                               so the literal command in shell history / Bash
 //                               tool_use logs never contains the key.
+//   inject-provider-key-from-env <provider>
+//                               Read $SUPERVISOR_PROVIDER_API_KEY and write it
+//                               to the slot the APP reads,
+//                               live.supervisor.api.<provider>, with
+//                               Supervisor.app in the item's Keychain ACL.
+//                               Use this instead of a hand-typed
+//                               `security add-generic-password`: that writes an
+//                               item the app is not allowed to read, and the
+//                               next launch stalls on a permission prompt.
 //   delete-key                 Remove the entry.
 //   show                       Print whether a key is present.
 //   seed-offsets-eof <dir>     For every *.jsonl under <dir>/*/*.jsonl,
@@ -43,7 +52,7 @@ import SupervisorCore
 let args = CommandLine.arguments
 guard args.count >= 2 else {
     print("usage: SupervisorDevTools <subcommand>")
-    print("  keys:      inject-key KEY | inject-key-from-env | delete-key | show")
+    print("  keys:      inject-key KEY | inject-key-from-env | inject-provider-key-from-env PROVIDER | delete-key | show")
     print("  sessions:  seed-offsets-eof DIR | locate-session | inject-test")
     print("  desktop:   desktop-target | desktop-ocr-dump | desktop-title | ocr-dump | match-test | composer-probe | composer-focus-test | scroll-test")
     print("  analysis:  context-wiki ROOT | second-brain ROOT | trust-scorecard [--since DAYS]")
@@ -62,34 +71,145 @@ let keychainServiceLabel = KeychainAPIKeyStore.defaultService
 // base, so the E2E prefix isolates it exactly like the provider keys.
 let remoteURLStore = KeychainRemoteNotifyURLStore()
 
+// Every key/URL this CLI stores is stored for SUPERVISOR to read, from a
+// DIFFERENT process. A Keychain item's ACL is fixed at creation and lists only
+// the creating binary, so an item written here used to be unreadable by the
+// app: its next launch parked on a SecurityAgent prompt (which can hide behind
+// other windows) and supervision was blind until a human clicked Always Allow.
+// Neither `-A` nor `-U` saves an in-place update. See KeychainTrustedApps for
+// the full WHY. So writes go through TrustedAppKeychainWriter, which deletes
+// and recreates the item with Supervisor.app in its trusted list.
+
+/// Which app bundles to grant access to. The repo root is derived from this
+/// binary's own location (`.build/<config>/SupervisorDevTools`) so a developer
+/// build's bundle is trusted alongside the installed one. Recomputed per call
+/// rather than held in a global: main.swift top-level bindings are globals,
+/// and a global holding this would be one more thing strict concurrency has to
+/// reason about for no gain (the check is a handful of stat calls).
+func supervisorTrustedApps() -> KeychainTrustedApps {
+    var dir = URL(fileURLWithPath: CommandLine.arguments[0])
+        .resolvingSymlinksInPath()
+        .deletingLastPathComponent()
+    var repoRoot: String?
+    for _ in 0..<8 {
+        if FileManager.default.fileExists(atPath: dir.appendingPathComponent("Package.swift").path) {
+            repoRoot = dir.path
+            break
+        }
+        let parent = dir.deletingLastPathComponent()
+        if parent.path == dir.path { break }
+        dir = parent
+    }
+    return KeychainTrustedAppResolver.resolve(repoRoot: repoRoot)
+}
+
+/// Write one secret so the app can read it back without a permission prompt,
+/// and report honestly when it cannot promise that. Exits non-zero on failure,
+/// so a caller that returns from here knows the item is in place.
+func writeForTheApp(service: String, account: String, value: String, label: String) {
+    let trustedApps = supervisorTrustedApps()
+    do {
+        let outcome = try TrustedAppKeychainWriter(ops: SecAccessKeychainItemOps()).replace(
+            service: service, account: account, value: value,
+            label: label, trustedApps: trustedApps
+        )
+        if trustedApps.grantsSupervisorApp {
+            print("ok: created with Supervisor in the item's Keychain access list (\(trustedApps.appBundlePaths.joined(separator: ", ")))")
+            // Honest boundary. macOS enforces a partition list alongside the
+            // ACL, and it is stamped with the CREATING program's code
+            // identity, which is this CLI and not the app. There is no API to
+            // set it to another program's identity. So the app may still be
+            // asked once; what this write removes is the case where it is
+            // asked EVERY launch because it is not in the list at all.
+            print("      macOS may still ask once, the first time Supervisor reads an item another")
+            print("      program created. Click Always Allow and it stops asking.")
+        } else {
+            // Never claim a grant we did not make. Say which paths were checked
+            // so the fix is obvious, and say what the next launch will do.
+            print("WARN: no Supervisor.app found at \(trustedApps.missingAppBundlePaths.joined(separator: " or "))")
+            print("      The next Supervisor launch will raise a one-time macOS Keychain prompt.")
+            print("      Look for it behind other windows and click Always Allow, or install the")
+            print("      app and re-run this command.")
+        }
+        if outcome.hadPreviousItem && !outcome.previousValueWasReadable {
+            print("note: the previous item could not be read (that stale ACL is what this replaces)")
+        }
+        if outcome.stagingLeftBehind {
+            print("note: a staging item remains at account \(account)\(TrustedAppKeychainWriter.stagingAccountSuffix); delete it at leisure")
+        }
+    } catch let failure as TrustedAppKeychainWriter.Failure {
+        print("ERROR: \(failure.underlying)")
+        if failure.nothingWasWritten {
+            print("       Nothing was changed; any existing value is still in place.")
+        } else if failure.restoredPreviousValue {
+            print("       The previous value was put back.")
+        } else if let staged = failure.stagedRecoveryAccount {
+            print("       The new value is recoverable from account \(staged) under the same service.")
+        }
+        exit(1)
+    } catch {
+        print("ERROR: \(error)")
+        exit(1)
+    }
+}
+
 switch args[1] {
 case "inject-key":
     guard args.count >= 3 else {
         print("usage: SupervisorDevTools inject-key <key>")
         exit(2)
     }
-    do {
-        try store.write(args[2])
-        print("ok: key written (len=\(args[2].count)) service=\(keychainServiceLabel)")
-    } catch {
-        print("ERROR: \(error)")
-        exit(1)
-    }
+    writeForTheApp(
+        service: keychainServiceLabel,
+        account: KeychainAPIKeyStore.accountName,
+        value: args[2],
+        label: "Supervisor Anthropic API Key"
+    )
+    print("ok: key written (len=\(args[2].count)) service=\(keychainServiceLabel)")
 case "inject-key-from-env":
     guard let key = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"], !key.isEmpty else {
         print("ERROR: ANTHROPIC_API_KEY not set")
         exit(2)
     }
-    do {
-        try store.write(key)
-        print("ok: key from env written (len=\(key.count)) service=\(keychainServiceLabel)")
-    } catch {
-        print("ERROR: \(error)")
-        exit(1)
-    }
+    writeForTheApp(
+        service: keychainServiceLabel,
+        account: KeychainAPIKeyStore.accountName,
+        value: key,
+        label: "Supervisor Anthropic API Key"
+    )
+    print("ok: key from env written (len=\(key.count)) service=\(keychainServiceLabel)")
 case "delete-key":
     do { try store.delete(); print("ok: deleted service=\(keychainServiceLabel)") }
     catch { print("ERROR: \(error)"); exit(1) }
+case "inject-provider-key-from-env":
+    // The slot the APP actually reads (live.supervisor.api.<provider>).
+    // Before this existed, the only way to set a provider key outside
+    // onboarding was a hand-typed `security add-generic-password -s
+    // live.supervisor.api.<p> -a api-key -w <value> -A -U`. On an item that
+    // already existed, -U kept the old ACL and -A changed nothing, so the next
+    // launch stalled on a Keychain prompt with supervision blind behind it.
+    // This subcommand is that command, done correctly.
+    guard args.count >= 3, let provider = LLMProvider(rawValue: args[2]) else {
+        let names = LLMProvider.allCases.map(\.rawValue).joined(separator: " | ")
+        print("usage: SupervisorDevTools inject-provider-key-from-env <\(names)>")
+        print("  reads $SUPERVISOR_PROVIDER_API_KEY (env, not argv, so the key stays out of shell history)")
+        exit(2)
+    }
+    guard let providerKey = ProcessInfo.processInfo.environment["SUPERVISOR_PROVIDER_API_KEY"],
+          !providerKey.isEmpty else {
+        print("ERROR: SUPERVISOR_PROVIDER_API_KEY not set")
+        print("  use: SUPERVISOR_PROVIDER_API_KEY=$(cat /tmp/key.txt) swift run SupervisorDevTools inject-provider-key-from-env \(provider.rawValue)")
+        exit(2)
+    }
+    writeForTheApp(
+        service: provider.keychainService,
+        account: KeychainProviderKeyStore.accountName,
+        value: providerKey,
+        label: "Supervisor — \(provider.displayName) API Key"
+    )
+    print("ok: key from env written (len=\(providerKey.count)) service=\(provider.keychainService)")
+    print("next: make it the active provider by writing")
+    print("      {\"activeProvider\":\"\(provider.rawValue)\"} to \(ConfigPaths().activeProviderPath.path)")
 case "show":
     do {
         if let k = try store.read() {
@@ -647,22 +767,24 @@ case "remote-notify-url-from-env":
         print("ERROR: \((error as? RemoteNotifyError)?.errorDescription ?? "\(error)")")
         exit(1)
     }
-    do {
-        try remoteURLStore.write(raw.trimmingCharacters(in: .whitespacesAndNewlines))
-        print("ok: webhook stored host=\(endpoint.loggableHost) format=\(endpoint.format) service=\(KeychainRemoteNotifyURLStore.service)")
-        // Honest about the live-pickup boundary: a running app applies the
-        // stored URL on the next config.yaml change ONLY if it built the
-        // remote channel at launch (any URL present then, or the switch
-        // already on). An app launched with neither needs a relaunch, and
-        // remote-notify-test's channel check below is how to tell.
-        print("next: set remote_notify.enabled: true in ~/Library/Application Support/Supervisor/config.yaml")
-        print("      (a running Supervisor picks the URL up when that file is saved, unless it launched")
-        print("      with remote delivery fully unconfigured; then relaunch it once)")
-        print("then: swift run SupervisorDevTools remote-notify-test")
-    } catch {
-        print("ERROR: \(error)")
-        exit(1)
-    }
+    // writeForTheApp exits non-zero on failure, so reaching the next line
+    // means the item exists with the app in its ACL.
+    writeForTheApp(
+        service: KeychainRemoteNotifyURLStore.service,
+        account: KeychainRemoteNotifyURLStore.accountName,
+        value: raw.trimmingCharacters(in: .whitespacesAndNewlines),
+        label: "Supervisor Remote Notify Webhook"
+    )
+    print("ok: webhook stored host=\(endpoint.loggableHost) format=\(endpoint.format) service=\(KeychainRemoteNotifyURLStore.service)")
+    // Honest about the live-pickup boundary: a running app applies the
+    // stored URL on the next config.yaml change ONLY if it built the
+    // remote channel at launch (any URL present then, or the switch
+    // already on). An app launched with neither needs a relaunch, and
+    // remote-notify-test's channel check below is how to tell.
+    print("next: set remote_notify.enabled: true in ~/Library/Application Support/Supervisor/config.yaml")
+    print("      (a running Supervisor picks the URL up when that file is saved, unless it launched")
+    print("      with remote delivery fully unconfigured; then relaunch it once)")
+    print("then: swift run SupervisorDevTools remote-notify-test")
 case "prompt-bundle-probe":
     // Install-path proof for the dispatcher system prompt. Copy this binary
     // into a built Supervisor.app/Contents/MacOS/ and run it there: Bundle.main

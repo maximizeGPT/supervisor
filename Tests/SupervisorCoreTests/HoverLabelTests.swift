@@ -180,14 +180,18 @@ final class HoverLabelTests: XCTestCase {
 
         // Resume must drive session A (its cwd), not B.
         var resumedCwd: String?
-        vm.resumeHandler = { cwd in
+        var resumedSessionId: String?
+        vm.resumeHandler = { sessionId, cwd in
+            resumedSessionId = sessionId
             resumedCwd = cwd
-            return true
+            return .resumed(pid: 4242)
         }
         vm.resumePausedSession()
         try? await Task.sleep(nanoseconds: 80_000_000)
 
         XCTAssertEqual(resumedCwd, "/Users/main/a",
             "Resume must SIGCONT the paused session A, never the never-stopped B")
+        XCTAssertEqual(resumedSessionId, "A",
+            "the paused session's id must reach the resolver: cwd alone cannot pin which process to signal")
     }
 }

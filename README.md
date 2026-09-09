@@ -46,6 +46,7 @@ Everything runs on your Mac, on your own API key. Nothing leaves your machine ex
 3. Onboarding walks you through the rest: paste an API key, grant Accessibility, allow Notifications.
 
 Requires macOS 13 (Ventura) or later. Full first-run guide: **[INSTALL.md](./INSTALL.md)**.
+Upgrading from an earlier version: **[docs/upgrading.md](./docs/upgrading.md)**.
 
 ### Use it as a skill (no Mac needed)
 
@@ -123,7 +124,7 @@ unset SUPERVISOR_REMOTE_NOTIFY_SECRET_URL
 swift run SupervisorDevTools remote-notify-test
 ```
 
-The first Supervisor launch after storing the URL may show a macOS Keychain permission prompt; click Always Allow so later launches read the webhook without asking again.
+The first Supervisor launch after storing the URL may show a macOS Keychain permission prompt; click Always Allow so later launches read the webhook without asking again. The prompt is titled with the Keychain item rather than with "Supervisor", and it can open behind other windows or on another desktop. Supervisor does not start watching until it is answered, so if a launch appears to do nothing, look for it there. Store keys and the webhook through the app or through `SupervisorDevTools`, both of which name the app in the item's access list as it is created; a hand-written `security add-generic-password` does not, and `-A -U` on an item that already exists changes the stored value without changing its permissions, so the app stays locked out.
 
 **What gets sent.** At `detail: minimal`, the default, the message carries Supervisor's own verdict and nothing quoted from the session: the rubric category, the severity, what Supervisor did, an 8-character session prefix, and the working directory's basename. No command text, no assistant reasoning, no absolute paths. `detail: full` adds the triggering command and the plain-language reasoning, both passed through the same redaction layer the model calls use.
 

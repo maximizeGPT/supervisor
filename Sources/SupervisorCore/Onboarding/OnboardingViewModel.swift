@@ -51,6 +51,37 @@ public final class OnboardingViewModel: ObservableObject {
     /// with this false).
     @Published public private(set) var screenRecordingNeedsRelaunch: Bool = false
 
+    /// First run, or a returning user whose grant macOS dropped on upgrade.
+    /// The UI branches its copy on this; the state machine branches its route.
+    public let flow: OnboardingFlow
+
+    /// On a `.regrant`, the system permissions that were actually missing when
+    /// the window opened, in presentation order. Empty on a first run. This is
+    /// what makes the short path short: a permission that is already granted
+    /// never becomes a step, so it can neither be shown nor (in the case of
+    /// Screen Recording) trigger a spurious "quit and relaunch" prompt.
+    public let regrantPlan: [OnboardingPermissionStep]
+
+    /// Position in the running flow, for the step indicator.
+    public var progress: OnboardingProgress {
+        switch flow {
+        case .firstRun:
+            return OnboardingProgress(index: state.step, total: 5)
+        case .regrant:
+            let total = max(regrantPlan.count, 1)
+            let index: Int
+            switch state {
+            case .axCheck:
+                index = (regrantPlan.firstIndex(of: .accessibility) ?? 0) + 1
+            case .screenRecordingCheck:
+                index = (regrantPlan.firstIndex(of: .screenRecording) ?? total - 1) + 1
+            default:
+                index = total
+            }
+            return OnboardingProgress(index: min(index, total), total: total)
+        }
+    }
+
     // MARK: - Dependencies
 
     private let permissions: any PermissionChecker
@@ -66,11 +97,18 @@ public final class OnboardingViewModel: ObservableObject {
     /// provider means we skip step 1; AX already granted means we skip
     /// step 2; both means we go straight to step 3 (or to .complete if
     /// notifications are good too).
+    /// - Parameter priorInstall: the record a previously completed onboarding
+    ///   left behind, or nil on a machine that has never finished one. When it
+    ///   is present AND a key is already stored, this is an upgrade that lost a
+    ///   permission, not a first run, and the flow shrinks to the permissions
+    ///   that are actually missing. Defaults to nil so every existing caller
+    ///   and test keeps the full first-run behavior.
     public init(
         permissions: any PermissionChecker,
         keyStore: any ProviderKeyStore,
         activeProviderStore: any ActiveProviderStore,
         clientFactory: @escaping @Sendable (LLMProvider, String) -> LLMClient,
+        priorInstall: OnboardingRecord? = nil,
         trace: TraceLog = .shared
     ) {
         self.permissions = permissions
@@ -88,18 +126,54 @@ public final class OnboardingViewModel: ObservableObject {
         // "Has key" means: a key exists for the resume provider.
         let hasKey = (try? keyStore.read(resumeProvider))?.isEmpty == false
         let axOK = permissions.isAXGranted()
-        switch (hasKey, axOK) {
-        case (false, _):
-            self.state = .keyEntry()
-        case (true, false):
-            self.state = .axCheck()
-        case (true, true):
-            // Notifications status is async; start in axCheck and refresh.
-            // The view will call `recheckPermissions()` on appear, which
-            // moves us forward correctly without making init async.
-            self.state = .axCheck()
+
+        // A stored key AND a record of a completed onboarding is the upgrade
+        // signature: the Keychain item survives a signing-identity change,
+        // the TCC grant does not. Anything else is a first run, including a
+        // returning user who deleted their key (they have to enter one, so
+        // they get the full flow).
+        if let prior = priorInstall, hasKey {
+            self.flow = .regrant(previousVersion: prior.completedVersion)
+            var plan: [OnboardingPermissionStep] = []
+            if !axOK { plan.append(.accessibility) }
+            // Reached when Screen Recording is the only thing that went: the
+            // launch gate opens the window for a user who had the grant and
+            // lost it, and the plan then holds this step alone.
+            if !permissions.isScreenRecordingGranted() { plan.append(.screenRecording) }
+            self.regrantPlan = plan
+            switch plan.first {
+            case .accessibility:
+                self.state = .axCheck()
+            case .screenRecording:
+                self.state = .screenRecordingCheck()
+            case .none:
+                // Nothing is missing. Unreachable from the app, because
+                // `OnboardingLaunchGate` opens this window only when the key,
+                // Accessibility, or a previously-granted Screen Recording is
+                // absent, and each of those puts a step in the plan. Kept
+                // total anyway, and deliberately NOT `.complete`: the window
+                // controller's Combine sink fires on subscribe, so completing
+                // during init would call back before the controller is
+                // assigned. Fall through to the normal axCheck resume and let
+                // the tick advance.
+                self.state = .axCheck()
+            }
+        } else {
+            self.flow = .firstRun
+            self.regrantPlan = []
+            switch (hasKey, axOK) {
+            case (false, _):
+                self.state = .keyEntry()
+            case (true, false):
+                self.state = .axCheck()
+            case (true, true):
+                // Notifications status is async; start in axCheck and refresh.
+                // The view will call `recheckPermissions()` on appear, which
+                // moves us forward correctly without making init async.
+                self.state = .axCheck()
+            }
         }
-        trace.emit("onboarding", "viewmodel init state=\(state) provider=\(resumeProvider.rawValue)")
+        trace.emit("onboarding", "viewmodel init state=\(state) provider=\(resumeProvider.rawValue) flow=\(flow) plan=\(regrantPlan)")
     }
 
     // MARK: - Intents
@@ -144,6 +218,33 @@ public final class OnboardingViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Routing
+
+    /// Where the flow goes once Accessibility is satisfied.
+    ///
+    /// First run: on to Screen Recording, then notifications, then the
+    /// customization explainer. A re-grant skips straight past everything the
+    /// user has already been shown and already granted: if Screen Recording
+    /// was not in the plan it is already granted, so there is nothing left to
+    /// ask for and onboarding is done.
+    private func stateAfterAX() -> OnboardingState {
+        guard flow.isRegrant else { return .screenRecordingCheck() }
+        return regrantPlan.contains(.screenRecording)
+            ? .screenRecordingCheck()
+            : .complete(notifDegraded: false)
+    }
+
+    /// Where the flow goes once Screen Recording is satisfied. A re-grant ends
+    /// here: notification authorization is stored per bundle id and is not
+    /// affected by the signing-identity change that dropped the TCC grants,
+    /// and the customization explainer is information the user already has.
+    private func stateAfterScreenRecording() async -> OnboardingState {
+        guard flow.isRegrant else {
+            return .notifCheck(status: await permissions.notificationStatus())
+        }
+        return .complete(notifDegraded: false)
+    }
+
     /// Prompt for AX (triggers the macOS sheet on first call) and re-poll
     /// permission state. Called by the AX-step "Open System Settings" CTA
     /// and by a periodic refresh in the SwiftUI view.
@@ -160,8 +261,9 @@ public final class OnboardingViewModel: ObservableObject {
     public func recheckAX() async {
         guard case .axCheck = state else { return }
         if permissions.isAXGranted() {
-            trace.emit("onboarding", "AX granted; advancing to screen-recording step")
-            state = .screenRecordingCheck()
+            let next = stateAfterAX()
+            trace.emit("onboarding", "AX granted; advancing to \(next)")
+            state = next
         }
     }
 
@@ -182,8 +284,9 @@ public final class OnboardingViewModel: ObservableObject {
     public func confirmAX() async {
         guard case .axCheck = state else { return }
         let detected = permissions.isAXGranted()
-        trace.emit("onboarding", "AX confirmed by user (macOS reported granted=\(detected)); advancing to screen-recording step")
-        state = .screenRecordingCheck()
+        let next = stateAfterAX()
+        trace.emit("onboarding", "AX confirmed by user (macOS reported granted=\(detected)); advancing to \(next)")
+        state = next
     }
 
     /// User clicked "Skip for now" on the AX step. Matches the §6.6
@@ -194,8 +297,9 @@ public final class OnboardingViewModel: ObservableObject {
     /// triggers an action that needs AX.
     public func skipAX() async {
         guard case .axCheck = state else { return }
-        trace.emit("onboarding", "AX skipped by user; advancing to screen-recording step")
-        state = .screenRecordingCheck()
+        let next = stateAfterAX()
+        trace.emit("onboarding", "AX skipped by user; advancing to \(next)")
+        state = next
     }
 
     // MARK: - Screen Recording step
@@ -223,9 +327,9 @@ public final class OnboardingViewModel: ObservableObject {
             // Granted-but-not-effective until relaunch (RC fix #6): latch the
             // relaunch-needed flag so the UI can prompt a quit & relaunch.
             screenRecordingNeedsRelaunch = true
-            let status = await permissions.notificationStatus()
-            trace.emit("onboarding", "screen recording granted; advancing to notif step (notif=\(status)); relaunch required for capture")
-            state = .notifCheck(status: status)
+            let next = await stateAfterScreenRecording()
+            trace.emit("onboarding", "screen recording granted; advancing to \(next); relaunch required for capture")
+            state = next
         }
     }
 
@@ -245,9 +349,9 @@ public final class OnboardingViewModel: ObservableObject {
         // don't claim a relaunch is needed — Continue still advances, trusting
         // the user, and the runtime re-checks when a desktop inject needs it.
         if detected { screenRecordingNeedsRelaunch = true }
-        let status = await permissions.notificationStatus()
-        trace.emit("onboarding", "screen recording confirmed by user (macOS reported granted=\(detected)); advancing to notif step (notif=\(status)); relaunchNeeded=\(screenRecordingNeedsRelaunch)")
-        state = .notifCheck(status: status)
+        let next = await stateAfterScreenRecording()
+        trace.emit("onboarding", "screen recording confirmed by user (macOS reported granted=\(detected)); advancing to \(next); relaunchNeeded=\(screenRecordingNeedsRelaunch)")
+        state = next
     }
 
     /// User clicked "Skip for now" on the screen-recording step. Same
@@ -256,9 +360,9 @@ public final class OnboardingViewModel: ObservableObject {
     /// is told. Advances to the notification step.
     public func skipScreenRecording() async {
         guard case .screenRecordingCheck = state else { return }
-        let status = await permissions.notificationStatus()
-        trace.emit("onboarding", "screen recording skipped by user; advancing to notif step (notif=\(status))")
-        state = .notifCheck(status: status)
+        let next = await stateAfterScreenRecording()
+        trace.emit("onboarding", "screen recording skipped by user; advancing to \(next)")
+        state = next
     }
 
     /// Ask macOS to prompt the user for notifications. On success, re-poll

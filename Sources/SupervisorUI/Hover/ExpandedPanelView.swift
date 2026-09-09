@@ -247,6 +247,7 @@ public struct ExpandedPanelView: View {
         VStack(spacing: 0) {
             // 1. Pinned top: one compact status line (does not scroll).
             statusStrip
+            resumeFailureNotice
             divider
 
             // 2. Scrolling middle: the Flags list AND the collapsible sections
@@ -1169,6 +1170,24 @@ public struct ExpandedPanelView: View {
             line += " \u{00B7} Now: \(vm.detailLabel)"
         }
         return line
+    }
+
+    /// Why the last Resume did not happen. Renders only after a refused or
+    /// failed attempt, so it costs no height in the normal case. It exists
+    /// because the Resume button used to report success whenever the handler
+    /// returned: a resume that signalled the wrong process, or nothing at all,
+    /// looked identical to one that worked. Amber, not green, and it sits
+    /// directly under the control that produced it.
+    @ViewBuilder private var resumeFailureNotice: some View {
+        if let reason = vm.lastResumeFailure {
+            Text(reason)
+                .font(BrandFont.note)
+                .foregroundStyle(BrandColor.attention.color)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, BrandSpacing.md)
+                .padding(.bottom, BrandSpacing.xs)
+        }
     }
 
     /// The compact Resume control, shown inline on the status strip only while

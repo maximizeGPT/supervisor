@@ -45,6 +45,35 @@ swap_bundle() {
     fi
 }
 
+# 0. Refuse to swap in a build signed by a DIFFERENT certificate than the one
+# already installed. macOS keys the Accessibility and Screen Recording grants
+# to the app's DESIGNATED REQUIREMENT, which names the signing certificate. A
+# different certificate is a different app to TCC, both grants vanish, and the
+# owner lands back in onboarding with no explanation.
+#
+# This is the 0.3.1 / 0.3.2 / 0.4.0 regression, and it was structural rather
+# than accidental: build-app.sh signed dev builds with "Supervisor Self-Signed"
+# while make-dmg.sh re-signed build/Supervisor.app with Developer ID, and both
+# ended up rsynced into the same /Applications/Supervisor.app. Release day
+# flipped the identity one way, the next dev deploy flipped it back, and each
+# flip cost a re-grant. sign-adhoc.sh now prefers Developer ID so the two paths
+# agree; this check is what notices if they ever stop agreeing.
+#
+# Override for a deliberate identity change (a new certificate, a different
+# team): SUPERVISOR_ALLOW_IDENTITY_CHANGE=1. Say it out loud rather than
+# discovering it as a mystery re-grant.
+if [[ "${SUPERVISOR_ALLOW_IDENTITY_CHANGE:-0}" == "1" ]]; then
+    echo "[deploy] SUPERVISOR_ALLOW_IDENTITY_CHANGE=1: skipping the signing-identity check."
+    echo "[deploy] If the identity really changed, expect to re-grant Accessibility once."
+    Scripts/check-signing-identity.sh "$SRC" "$DEST" || true
+else
+    if ! Scripts/check-signing-identity.sh "$SRC" "$DEST"; then
+        echo "" >&2
+        echo "[deploy] ABORTED before touching $DEST. Nothing was changed." >&2
+        exit 3
+    fi
+fi
+
 # 1. Record the self-rebuild BEFORE anything is killed.
 #
 # Two jobs, and the second one sets the ordering. The new instance reads this
@@ -79,24 +108,32 @@ echo "[deploy] relaunching"
 open "$DEST"
 
 # 5. Post-deploy smoke test. The app's own trace is the authoritative
-# signal: it logs the onboarding decision (with axOK) only after the
-# first Keychain read succeeds, and it reaches "running state ready"
-# only when the LLM client's key read succeeds too. A signing
-# regression that broke the cert-based requirement shows up here as a
-# Keychain hang (no onboarding line) or a dropped AX grant (axOK=false),
-# instead of silently failing the next time the harness needs to fire.
+# signal, but only if the line being read can actually distinguish the
+# two outcomes. "onboarding needed" cannot: the app emits it for a
+# virgin install AND for a Keychain read that threw and was swallowed,
+# so gating on it printed "Keychain read PASS" over exactly the ACL
+# failure this test exists to catch. The app now emits the outcome of
+# the read itself, and `ok=true` appears only on a read that returned
+# without throwing. A dropped AX grant still shows up as axOK=false.
 echo "[deploy] smoke test: waiting for the new instance to report state"
 KEYCHAIN_OK=0
+KEYCHAIN_THREW=0
 AX_OK=0
 for _ in $(seq 1 20); do          # up to ~10s
     sleep 0.5
     NEW="$(tail -n +"$((LOG_BEFORE + 1))" "$LOG" 2>/dev/null)"
-    # Keychain: any onboarding decision means the first key read passed.
+    # Read the Keychain marker first: it is emitted on the background
+    # queue before the onboarding decision reaches the main queue, so it
+    # is already present in whatever this iteration sees.
+    if echo "$NEW" | grep -q "keychain.provider_key_read ok=true"; then
+        KEYCHAIN_OK=1
+    elif echo "$NEW" | grep -q "keychain.provider_key_read ok=false"; then
+        KEYCHAIN_THREW=1
+    fi
     if echo "$NEW" | grep -q "onboarding skipped"; then
-        KEYCHAIN_OK=1; AX_OK=1; break
+        AX_OK=1; break
     fi
     if echo "$NEW" | grep -q "onboarding needed"; then
-        KEYCHAIN_OK=1
         if echo "$NEW" | grep -q "axOK=true"; then AX_OK=1; fi
         break
     fi
@@ -104,11 +141,14 @@ done
 
 echo ""
 if [[ "$KEYCHAIN_OK" -eq 1 ]]; then
-    echo "[deploy] smoke: Keychain read PASS (app read its API key)"
+    echo "[deploy] smoke: Keychain read PASS (the provider-key read returned without throwing)"
+elif [[ "$KEYCHAIN_THREW" -eq 1 ]]; then
+    echo "[deploy] smoke: Keychain read FAIL (the app's read THREW — the item's ACL or the" >&2
+    echo "         signing identity regressed). Run setup-signing-identity.sh." >&2
 else
-    echo "[deploy] smoke: Keychain read FAIL (no onboarding decision in ~10s;"
-    echo "         the app likely hung on a Keychain access prompt, which means"
-    echo "         the signing identity regressed). Run setup-signing-identity.sh." >&2
+    echo "[deploy] smoke: Keychain read FAIL (no read outcome in the trace within ~10s;" >&2
+    echo "         the app likely hung on a Keychain access prompt, which means the" >&2
+    echo "         signing identity regressed). Run setup-signing-identity.sh." >&2
 fi
 if [[ "$AX_OK" -eq 1 ]]; then
     echo "[deploy] smoke: Accessibility PASS (grant survived the deploy)"

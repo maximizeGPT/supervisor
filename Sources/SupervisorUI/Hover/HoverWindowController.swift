@@ -74,9 +74,48 @@ public final class HoverWindowController {
     /// so existing callers (and tests) that only wire the boolean keep working.
     private let activeSessionCount: () -> Int
 
+    /// Which app is in front, as a bundle ID. Injected for the same reason
+    /// `isAnySessionActive` is, and for one more: it is the only input to the
+    /// visibility gate that lives outside this process entirely, so a test
+    /// that leaves it on the live `NSWorkspace` read is asserting against
+    /// whatever app the owner's Mac happens to have frontmost while
+    /// `swift test` runs, which is not a property of this code.
+    ///
+    /// That is not hypothetical. `ConfigTests.testKeychainStoreRoundTrip`
+    /// writes to the real login keychain; macOS raises a SecurityAgent prompt
+    /// over whatever was in front, and once it resolves the frontmost app is
+    /// the terminal that launched the run, which IS in `defaultHostApps`. `C`
+    /// sorts before `H`, so the hover gate tests ran on the far side of that
+    /// and saw a host app in front, on a full-suite run only. Nothing in the
+    /// controller was stateful across those tests; the state was the desktop.
+    private let frontmostBundleID: () -> String?
+
+    /// Whether this instance is allowed to put the band on the user's screen.
+    ///
+    /// False for any instance resolving a non-default `SUPERVISOR_HOME`, which
+    /// today means an E2E scenario. Those instances are invisible to the
+    /// single-instance flock on purpose (it is namespaced by the same home
+    /// seam), so they run ALONGSIDE the owner's real app, and until this gate
+    /// each one also drew its own band: the owner sent a screenshot of three
+    /// stacked "Watching. All clear" pills.
+    ///
+    /// Suppressing the window entirely, rather than drawing a band labelled as
+    /// a test instance that closes itself after a while:
+    ///   - a labelled band still occupies the same top-right anchor and still
+    ///     stacks, so three harness instances are still three pills;
+    ///   - self-closing needs a timer on the instance's own run loop, and the
+    ///     instances that leak are exactly the ones whose run loop stopped
+    ///     (SIGSTOPped by s13, wedged pre-UI). The pill that outlives its
+    ///     usefulness is the one that can never run its own cleanup;
+    ///   - no scenario asserts on the band's pixels. They read the trace log
+    ///     and the sqlite db, so nothing under test is lost.
+    let presentsOnScreen: Bool
+
     private var workspaceObserver: NSObjectProtocol?
     private var pollTimer: Timer?
-    private var currentlyVisible: Bool = false
+    /// Whether the band is currently ordered onto the screen. Readable by
+    /// tests so the suppression gate can be proven without a screen.
+    private(set) var currentlyVisible: Bool = false
     private var expandedCancellable: AnyCancellable?
     private var flashCancellable: AnyCancellable?
     private var frameObserver: NSObjectProtocol?
@@ -95,10 +134,16 @@ public final class HoverWindowController {
         vm: HoverViewModel,
         isAnySessionActive: @escaping () -> Bool = { true },
         activeSessionCount: (() -> Int)? = nil,
-        additionalHostApps: [String] = []
+        frontmostBundleID: @escaping () -> String? = {
+            NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        },
+        additionalHostApps: [String] = [],
+        presentsOnScreen: Bool = ConfigPaths.isRealUserHome
     ) {
         self.vm = vm
+        self.presentsOnScreen = presentsOnScreen
         self.isAnySessionActive = isAnySessionActive
+        self.frontmostBundleID = frontmostBundleID
         // If no explicit count provider is wired, fall back to 0/1 derived from
         // the activity boolean, preserving the prior single-band wording for
         // callers (and tests) that only pass `isAnySessionActive`.
@@ -200,6 +245,14 @@ public final class HoverWindowController {
         }
     }
 
+    /// Whether `present()` armed the visibility machinery (workspace observer +
+    /// poll timer). Readable by tests: it is the one production-side effect of
+    /// `present()` that can be asserted without ordering a real window onto a
+    /// real screen, which the test suite must never do.
+    var isVisibilityGateArmed: Bool {
+        workspaceObserver != nil && pollTimer != nil
+    }
+
     /// Merge user config into the live host-apps set.
     public func mergeUserConfig(additionalHostApps: [String]) {
         claudeCodeHostApps = Self.defaultHostApps.union(additionalHostApps)
@@ -207,6 +260,10 @@ public final class HoverWindowController {
     }
 
     public func present() {
+        // A non-default-home instance never observes and never polls either:
+        // an observer or a timer that can only decide "stay hidden" is just a
+        // second way for a future edit to reach `orderFrontRegardless`.
+        guard presentsOnScreen else { return }
         registerWorkspaceObserver()
         startPollTimer()
         applyVisibility()
@@ -253,6 +310,11 @@ public final class HoverWindowController {
     /// frontmost-terminal/session gate. Visibility reverts to that gate when
     /// the flash ends.
     private func forceShowForFlash() {
+        // The last gate before the band reaches the screen. Every force path
+        // (action flash, surfaceBriefly, the duplicate-launch activate signal)
+        // funnels through here, so the check belongs here and not only at the
+        // call sites.
+        guard presentsOnScreen else { return }
         if !userHasRepositioned {
             positionTopRight()
         }
@@ -266,6 +328,9 @@ public final class HoverWindowController {
     /// no-op when the user just clicked in Finder (Finder is frontmost), so
     /// attention events ride the same force mechanism as action flashes.
     public func surfaceBriefly(for seconds: TimeInterval = 4) {
+        // Never set the force flag for a suppressed instance: `applyVisibility`
+        // honors it, so leaving it latched would be a permanent bypass.
+        guard presentsOnScreen else { return }
         forcedVisibleByFlash = true
         forceShowForFlash()
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
@@ -280,6 +345,11 @@ public final class HoverWindowController {
     }
 
     private func applyVisibility() {
+        // A suppressed instance has no visibility to apply. Checked before the
+        // flash branch below so a flash raised by the engine cannot re-open the
+        // window through this path either.
+        guard presentsOnScreen else { return }
+
         // While a substantial action is flashing, keep the hover up no
         // matter what — the whole point is that the user sees Supervisor
         // act. The poll timer and workspace observer both route here, so
@@ -289,8 +359,8 @@ public final class HoverWindowController {
             return
         }
 
-        let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        let frontmostHostsClaudeCode = frontmostBundleID.map(claudeCodeHostApps.contains) ?? false
+        let frontmost = frontmostBundleID()
+        let frontmostHostsClaudeCode = frontmost.map(claudeCodeHostApps.contains) ?? false
         // One read of the live count drives both the show/hide gate and the
         // band's "N sessions" label, so the band always reflects the same
         // session set the visibility gate just saw.

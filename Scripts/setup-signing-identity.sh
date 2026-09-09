@@ -41,7 +41,11 @@ KEY_PEM="$SIGN_DIR/supervisor-codesign.key.pem"
 P12="$SIGN_DIR/supervisor-codesign.p12"
 # PKCS#12 needs a non-empty passphrase + a SHA1 MAC for macOS's
 # `security import` to verify it (LibreSSL's default MAC is rejected).
-P12_PASS="supervisor-local"
+# Generated fresh per run and never written anywhere: the .p12 exists only
+# for the seconds between `openssl pkcs12 -export` and `security import`,
+# and this script used to ship a fixed literal ("supervisor-local") that
+# anyone reading the repo could use against a .p12 it also left on disk.
+P12_PASS="$(openssl rand -hex 24)"
 
 # Helper: can codesign actually sign with this identity right now?
 can_sign() {
@@ -86,7 +90,11 @@ extendedKeyUsage       = critical, codeSigning
 subjectKeyIdentifier   = hash
 EOF
 
-# 3. Generate a 10-year self-signed cert + key.
+# 3. Generate a 10-year self-signed cert + key. `-nodes` leaves the key
+# unencrypted on disk, which is what keeps the pkcs12 export below
+# non-interactive on macOS's LibreSSL. Both staging files are 0600 inside a
+# 0700 directory, and step 5 deletes them the moment `security import`
+# succeeds — the Keychain is the only place the key is meant to live.
 openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout "$KEY_PEM" -out "$CERT_PEM" -days 3650 -config "$CONF" >/dev/null 2>&1
 chmod 600 "$KEY_PEM"
@@ -98,8 +106,30 @@ chmod 600 "$P12"
 
 # 5. Import into the login keychain. -T /usr/bin/codesign lets codesign
 # use the private key without an interactive prompt on each sign.
-security import "$P12" -k "$KEYCHAIN" -P "$P12_PASS" -T /usr/bin/codesign >/dev/null
-echo "[setup-signing] imported into login keychain"
+#
+# On success both staging files go. Nothing reads them again — the private
+# key lives in the Keychain from here — and leaving them behind meant every
+# machine that ever ran this script kept an unencrypted code-signing key
+# under Application Support forever.
+#
+# On failure they stay, because they are the only way to retry the import by
+# hand. The passphrase is printed in that one case: the plaintext key sits
+# right beside the .p12, so the passphrase guards nothing the directory does
+# not already expose, and without it the .p12 is unusable.
+if security import "$P12" -k "$KEYCHAIN" -P "$P12_PASS" -T /usr/bin/codesign >/dev/null; then
+    echo "[setup-signing] imported into login keychain"
+    rm -f "$KEY_PEM" "$P12"
+    echo "[setup-signing] removed the staged private key + .p12 (the key is in the Keychain now)"
+else
+    echo "[setup-signing] ERROR: 'security import' failed." >&2
+    echo "  The staging files are LEFT IN PLACE so you can retry:" >&2
+    echo "    key:  $KEY_PEM   (unencrypted private key)" >&2
+    echo "    p12:  $P12" >&2
+    echo "    pass: $P12_PASS" >&2
+    echo "  Retry:  security import \"$P12\" -k \"$KEYCHAIN\" -P '$P12_PASS' -T /usr/bin/codesign" >&2
+    echo "  Then delete both:  rm -f \"$KEY_PEM\" \"$P12\"" >&2
+    exit 1
+fi
 
 # 6. Let codesign use the key without the per-use prompt.
 security set-key-partition-list -S apple-tool:,apple: -k "" "$KEYCHAIN" >/dev/null 2>&1 || true

@@ -24,9 +24,13 @@ launch_app
 await_running_ready 40
 INCUMBENT="$(app_pid)"
 
-# Second launch, same env (same FAKEHOME => same pidfile/flock).
-"$APP_BIN" >"$RUN_ROOT/app2.stdout.log" 2>&1 &
-DUP_PID=$!
+# Second launch, same env (same FAKEHOME => same pidfile/flock). Via
+# spawn_extra_app so the duplicate is in the teardown ledger from the instant it
+# exists: if this scenario is interrupted (or fails) while the duplicate is
+# still deciding, that duplicate is a full Supervisor with a hover band, and
+# nothing else in the script would ever kill it.
+spawn_extra_app "$RUN_ROOT/app2.stdout.log"
+DUP_PID="$E2E_LAST_PID"
 info "launched duplicate pid=$DUP_PID"
 
 # The duplicate must exit BY ITSELF. wait-with-timeout: poll liveness.
@@ -45,7 +49,7 @@ assert_trace "another Supervisor is already running"
 
 kill -0 "$INCUMBENT" 2>/dev/null || fail "incumbent pid=$INCUMBENT died — the guard killed the wrong instance"
 PIDFILE="$APP_SUPPORT_DIR/supervisor.pid"
-RECORDED="$(cat "$PIDFILE" | tr -cd '0-9')"
+RECORDED="$(recorded_pid "$PIDFILE")"
 [ "$RECORDED" = "$INCUMBENT" ] || fail "pidfile records $RECORDED after the duplicate; expected incumbent $INCUMBENT"
 
 pass "s11 double-launch — duplicate bowed out, incumbent pid=$INCUMBENT unharmed"

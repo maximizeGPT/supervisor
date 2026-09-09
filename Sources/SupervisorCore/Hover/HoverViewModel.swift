@@ -121,6 +121,14 @@ public final class HoverViewModel: ObservableObject {
     /// Whether a resume from pause is in progress.
     @Published public private(set) var isResuming: Bool = false
 
+    /// Why the most recent Resume did NOT happen, in plain words, or nil when
+    /// the last attempt succeeded (or none has been made). The panel renders
+    /// this so a refused resume reads as a refusal: before this existed, a
+    /// resume that signalled nothing still cleared the paused state and looked
+    /// exactly like a successful one. Cleared when a new attempt starts and
+    /// when the pause itself is resolved.
+    @Published public private(set) var lastResumeFailure: String?
+
     // MARK: - Context Health (ambient audit surface)
 
     /// The ambient Context Health monitor, set by the app at construction. `nil`
@@ -245,9 +253,18 @@ public final class HoverViewModel: ObservableObject {
     /// Resets on each new flag.
     public let acknowledgeDebounceDuration: TimeInterval
 
-    /// Callback to resume a paused session. Takes cwd, returns true on
-    /// success. Wired in main.swift with ProcessLocator + SignalSender.
-    public var resumeHandler: ((String) async -> Bool)?
+    /// Callback to resume a paused session. Takes the PAUSED session's id and
+    /// its cwd, and reports what actually happened. Wired in main.swift to a
+    /// `ResumeResolver` (ProcessLocator + SignalSender).
+    ///
+    /// The session id is not decoration: resume sends a signal, so the target
+    /// must be the one process that was stopped. cwd alone cannot pin it (the
+    /// `claude` process cwd is usually the home dir, and concurrent sessions
+    /// share cwds), and the cwd walk's Claude.app fallback resolves to the
+    /// shared desktop host — signalling THAT would continue every conversation
+    /// at once while the paused session stayed frozen. The id pins the process
+    /// or the attempt honestly reports that nothing was resumed.
+    public var resumeHandler: ((_ sessionId: String, _ cwd: String) async -> ResumeOutcome)?
 
     /// v0.2.0 M3: callback to approve a plan. Takes the plan id; the app wires
     /// it to `TriageEngine.approvePlan(planId:)` (the SAME marked + ledgered
@@ -1229,26 +1246,31 @@ public final class HoverViewModel: ObservableObject {
         // recently active (RC fix #3). Falls back to sessionCwd only when no
         // paused cwd was captured (the single-session path).
         let cwd = pausedSessionCwd.isEmpty ? sessionCwd : pausedSessionCwd
-        guard isPaused, !cwd.isEmpty, let handler = resumeHandler else {
-            trace.emit("hover", "resume: precondition failed (isPaused=\(isPaused) cwd=\(cwd.isEmpty ? "empty" : "set") handler=\(resumeHandler == nil ? "nil" : "set"))")
+        // The paused session's id, pinned at pause time. It is the resolver's
+        // FIRST choice of target, so an empty cwd no longer blocks the attempt:
+        // an id alone can pin the process (the same reasoning that fixed the
+        // router's "no_cwd_on_decision" no-op). Only when NEITHER identifier is
+        // known is there nothing to act on.
+        let sessionId = pausedSessionId
+        guard isPaused, !(sessionId.isEmpty && cwd.isEmpty), let handler = resumeHandler else {
+            trace.emit("hover", "resume: precondition failed (isPaused=\(isPaused) session=\(sessionId.isEmpty ? "empty" : "set") cwd=\(cwd.isEmpty ? "empty" : "set") handler=\(resumeHandler == nil ? "nil" : "set"))")
             return
         }
-        // TODO(resume-resolver): resumeHandler resolves the target session by
-        // cwd only. With concurrent sessions sharing a cwd this is ambiguous; the
-        // resolver (main.swift + InterventionRouter, not owned here) should accept
-        // the paused sessionId (`pausedSessionId`) to SIGCONT the exact process.
-        // The hover now reports the correct paused session + its cwd; wiring the
-        // id through the handler signature is the remaining cross-file change.
         isResuming = true
+        lastResumeFailure = nil
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let ok = await handler(cwd)
+            let outcome = await handler(sessionId, cwd)
             self.isResuming = false
-            if ok {
-                self.trace.emit("hover", "resume: SIGCONT sent successfully cwd=\(cwd)")
+            // Acknowledge ONLY on a real SIGCONT. Every other outcome means no
+            // signal was sent, so the session is still stopped and the panel
+            // must keep saying so — and say why.
+            if outcome.didResume {
+                self.trace.emit("hover", "resume: SIGCONT sent successfully session=\(sessionId) cwd=\(cwd)")
                 self.acknowledgeFlag()
             } else {
-                self.trace.emit("hover", "resume: SIGCONT failed cwd=\(cwd)")
+                self.lastResumeFailure = outcome.userFacingReason
+                self.trace.emit("hover", "resume: no signal sent outcome=\(outcome) session=\(sessionId) cwd=\(cwd)")
             }
         }
     }
@@ -1352,6 +1374,9 @@ public final class HoverViewModel: ObservableObject {
         isKilled = false
         pausedSessionId = ""
         pausedSessionCwd = ""
+        // The pause is gone, so a stale "could not resume" line would describe
+        // a session that no longer exists. Clear it with the pause it belongs to.
+        lastResumeFailure = nil
         trace.emit("hover", "flag acknowledged; activity -> idle")
     }
 

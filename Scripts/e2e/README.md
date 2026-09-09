@@ -44,6 +44,14 @@ After that single approval, every scenario runs headless. (A fresh machine
 or CI needs the click again — this is a property of the macOS Keychain ACL,
 not the harness.)
 
+`seed_provider_key` reuses an existing item whenever the value already
+matches, so the approval survives. When the value does change it deletes and
+re-adds rather than passing `-U`: an item's ACL is fixed at creation, so `-U`
+would leave a changed key sitting behind the ACL of the item it replaced.
+That is the same failure that stalled a live launch after a provider key was
+replaced with `security add-generic-password ... -A -U`. The re-add costs one
+fresh approval, which is honest.
+
 ## Running
 
 ```bash
@@ -76,5 +84,29 @@ evidence (trace log, app stdout, DB) is preserved at
 | `s07-first-flag.sh` | rm -rf fixture → flag persisted (model path) | needs key |
 | `s11-double-launch.sh` | duplicate bows out, incumbent unharmed | yes* |
 | `s12-crash-relaunch.sh` | SIGKILL → relaunch reclaims the lock | yes* |
+| `s13-hung-takeover.sh` | frozen incumbent is taken over | yes* |
+| `selftest-teardown.sh` | the harness reclaims what it launched | yes (launches no app) |
 
 \* after the one-time Keychain approval above.
+
+## Nothing this harness starts may reach the owner's screen
+
+A scenario instance is a REAL Supervisor. Its `SUPERVISOR_HOME` makes it
+disjoint on disk, and the single-instance flock is namespaced by that same
+home, so it coexists with a live Supervisor by design. Two rules keep that
+isolation from ending at the filesystem:
+
+1. **The app suppresses its hover band when the resolved home is not the real
+   user home** (`ConfigPaths.isRealUserHome`). `await_running_ready` asserts the
+   `hover band suppressed` trace line, so a binary that lost the gate fails the
+   abort-gate instead of stacking a second pill on the owner's screen.
+2. **Every launched pid goes in the ledger** (`$RUN_ROOT/launched.pids`) at the
+   moment it is spawned, and teardown kills the whole ledger on every exit path
+   including `fail`, SIGINT and SIGTERM. Launch extra instances with
+   `spawn_extra_app`, never a bare `"$APP_BIN" &`: the per-role pid files get
+   overwritten (s13 replaces the frozen instance's pid with the relaunched one),
+   and a pid nothing records is a Supervisor nothing can kill.
+
+`selftest-teardown.sh` pins both rules against stand-in binaries, so it proves
+the contract without putting a window on anyone's screen. It also runs inside
+`swift test` as `E2ETeardownSelfTests`.

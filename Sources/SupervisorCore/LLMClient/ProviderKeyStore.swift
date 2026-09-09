@@ -46,7 +46,7 @@ public struct KeychainProviderKeyStore: ProviderKeyStore, @unchecked Sendable {
     private func keychain(for provider: LLMProvider) -> Keychain {
         Keychain(service: provider.keychainService)
             .accessibility(.afterFirstUnlock)
-            .label("Supervisor — \(provider.displayName) API Key")
+            .label("Supervisor \(provider.displayName) API Key")
     }
 }
 

@@ -29,6 +29,7 @@
 
 import Foundation
 import CoreGraphics
+import ScreenCaptureKit
 import Vision
 import AppKit
 
@@ -68,12 +69,167 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         CGPreflightScreenCaptureAccess()
     }
 
+    /// How long a single ScreenCaptureKit capture may take before we give up
+    /// and report a failed capture. A whole targeting arc is ~4s of screenshot,
+    /// OCR and polling, and a capture that has not returned in 4s is not going
+    /// to save the arc — a bounded failure degrades to a logged notify, an
+    /// unbounded wait would sit on the targeting queue forever.
+    static let captureTimeout: TimeInterval = 4.0
+
+    /// How long one slice of the main-thread pump may block inside the run
+    /// loop, and the period of the timer that keeps the run loop awake for the
+    /// duration of the wait. Small enough that the semaphore poll after each
+    /// slice notices a landed capture promptly, large enough that a capture
+    /// running the full `captureTimeout` costs a few hundred no-op wakeups
+    /// rather than a busy spin.
+    static let pumpInterval: TimeInterval = 0.01
+
     /// Capture the full main display as a CGImage. We capture the whole display
     /// (not just the Claude window) so OCR'd coordinates are already global
     /// screen points — the scale is 1:1 on the verified setup, and clicking
     /// expects global points. Returns nil if capture fails (no permission, etc.).
+    ///
+    /// macOS 14 deprecated `CGDisplayCreateImage` and macOS 15 marked it
+    /// obsoleted ("Please use ScreenCaptureKit instead"). The failure mode is
+    /// not a build error (the package deploys to macOS 13, so the symbol still
+    /// links): it is that Apple re-prompts for Screen Recording on the legacy
+    /// path, so desktop targeting would start asking the owner for permission
+    /// again and again on a current OS with no change on our side. So macOS 14+
+    /// captures through ScreenCaptureKit, and `CGDisplayCreateImage` stays only
+    /// as the macOS 13 path, where ScreenCaptureKit has no screenshot API.
+    ///
+    /// The return type, the nil-on-failure contract and the pixel dimensions are
+    /// unchanged, so every caller (and `recognizeRows`, which rescales OCR
+    /// coordinates off the image size) is unaffected.
     public func captureMainDisplay() -> CGImage? {
-        CGDisplayCreateImage(CGMainDisplayID())
+        let displayID = CGMainDisplayID()
+        if #available(macOS 14, *) {
+            return captureViaScreenCaptureKit(displayID: displayID)
+        }
+        return CGDisplayCreateImage(displayID)
+    }
+
+    /// ScreenCaptureKit capture, bridged back to this synchronous call.
+    ///
+    /// Two deliberate choices about the bridge:
+    ///
+    /// 1. It uses the COMPLETION-HANDLER APIs, not `async`. Their callbacks
+    ///    arrive on ScreenCaptureKit's own queues, so nothing here occupies a
+    ///    Swift-concurrency thread while the calling thread waits — the
+    ///    cooperative-pool starvation `Injector` already avoids by running this
+    ///    whole arc on a dedicated serial queue.
+    /// 2. It never blocks the main thread. Off main (the app's real path: the
+    ///    injector's `desktopTargetingQueue`) it waits on a semaphore, the same
+    ///    pattern `LLMConversationMatcher.match` uses for the same reason. On
+    ///    main (the dev CLI's path) it pumps the run loop in short slices
+    ///    instead, so it cannot deadlock against work that needs main — this
+    ///    codebase has lost launches to exactly that. Either way the wait is
+    ///    capped by `captureTimeout`.
+    @available(macOS 14, *)
+    private func captureViaScreenCaptureKit(displayID: CGDirectDisplayID) -> CGImage? {
+        final class Box: @unchecked Sendable {
+            var image: CGImage?
+            var failure: String?
+        }
+        let box = Box()
+        let sem = DispatchSemaphore(value: 0)
+
+        // Pixel (not point) dimensions, so the captured image matches what
+        // CGDisplayCreateImage produced on a HiDPI display and any consumer
+        // that saves the image sees the same resolution it always did.
+        let mode = CGDisplayCopyDisplayMode(displayID)
+
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+            guard let content else {
+                box.failure = "shareable_content_failed error=\(error.map(String.init(describing:)) ?? "nil")"
+                sem.signal()
+                return
+            }
+            // Prefer the requested display; fall back to the first shareable one
+            // so a display-id mismatch degrades to a capture rather than to nil.
+            guard let display = content.displays.first(where: { $0.displayID == displayID })
+                ?? content.displays.first else {
+                box.failure = "no_shareable_display"
+                sem.signal()
+                return
+            }
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let config = SCStreamConfiguration()
+            config.width = mode?.pixelWidth ?? display.width
+            config.height = mode?.pixelHeight ?? display.height
+            // The legacy capture excluded the pointer; keep it out so a cursor
+            // parked over a sidebar row cannot corrupt that row's OCR.
+            config.showsCursor = false
+            config.captureResolution = .best
+            SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, error in
+                box.image = image
+                if image == nil {
+                    box.failure = "capture_image_failed error=\(error.map(String.init(describing:)) ?? "nil")"
+                }
+                sem.signal()
+            }
+        }
+
+        if waitBounded(sem) == false {
+            trace.emit("desktop", "sck_capture timeout=\(Int(Self.captureTimeout))s (no image; caller degrades)")
+            return nil
+        }
+        if let failure = box.failure {
+            trace.emit("desktop", "sck_capture failed \(failure)")
+        }
+        return box.image
+    }
+
+    /// Wait for `sem` up to `timeout`. Returns false on timeout. Off the main
+    /// thread this blocks the caller (the injector's dedicated targeting
+    /// queue). On the main thread it never blocks: it polls the semaphore and
+    /// spends the rest of the wait inside the run loop, so main-thread work
+    /// scheduled during the wait still runs. `timeout` is a parameter so tests
+    /// can exercise both paths without sitting through a real capture timeout.
+    ///
+    /// Two things about the previous shape were wrong, and both of them meant
+    /// the main thread stopped being serviced:
+    ///
+    ///  1. It waited on the semaphore in 20ms blocking slices and pumped for
+    ///     5ms between them, so the thread was held for roughly 80% of the
+    ///     wait and the pump was a 5ms wall-clock deadline. Under CPU
+    ///     contention that window can elapse while the thread is descheduled,
+    ///     so the servicing duty cycle collapses exactly when the machine is
+    ///     busy. Measured here: main-queue service latency during the wait was
+    ///     13ms idle and 45ms worst case under load, against 2ms flat now.
+    ///  2. `RunLoop.run(mode:before:)` returns immediately, having serviced
+    ///     nothing, whenever the mode has no input source or timer attached
+    ///     (CFRunLoop reports the mode empty and gives up). That is reachable:
+    ///     inside a dispatch main-queue callback CoreFoundation deliberately
+    ///     leaves the main queue's port out of the wait set, so the default
+    ///     mode can look empty and the "pump" falls straight through. Holding a
+    ///     timer for the duration of the wait gives the loop a reason to
+    ///     actually run instead of returning at once.
+    func waitBounded(_ sem: DispatchSemaphore, timeout: TimeInterval = captureTimeout) -> Bool {
+        guard Thread.isMainThread else {
+            return sem.wait(timeout: .now() + timeout) == .success
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        // Keeps the default mode non-empty so each pump slice really enters the
+        // run loop and services sources, timers and the main queue. The block is
+        // deliberately empty: the timer exists to be attached, not to do work.
+        let pump = Timer(timeInterval: Self.pumpInterval, repeats: true) { _ in }
+        RunLoop.current.add(pump, forMode: .default)
+        defer { pump.invalidate() }
+        while true {
+            // Poll, never block. A blocking wait here would hold the main thread
+            // for its whole slice, which is the starvation this method exists to
+            // avoid.
+            if sem.wait(timeout: .now()) == .success { return true }
+            let now = Date()
+            if now >= deadline { break }
+            // Clamped so a pump slice cannot carry the wait past its deadline.
+            RunLoop.current.run(mode: .default,
+                                before: min(deadline, now.addingTimeInterval(Self.pumpInterval)))
+        }
+        // A capture that landed inside the final pump slice is a success, not a
+        // timeout.
+        return sem.wait(timeout: .now()) == .success
     }
 
     // MARK: - OCR (Path B transcription)

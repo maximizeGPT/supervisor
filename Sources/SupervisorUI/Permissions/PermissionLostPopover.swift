@@ -14,7 +14,27 @@ import SupervisorCore
 @MainActor
 public final class PermissionLostPopover {
 
-    private var window: NSWindow?
+    /// Internal, not private: the screen gate below is proven by asserting no
+    /// panel was ever built, and a private field cannot be asserted on.
+    private(set) var window: NSWindow?
+
+    /// Whether this instance may put the panel on the user's screen. False for
+    /// any instance resolving a non-default `SUPERVISOR_HOME` (an E2E
+    /// scenario), which runs alongside the owner's real app by design and must
+    /// not paint on his screen or take his focus — this panel calls
+    /// `NSApp.activate(ignoringOtherApps:)`, so an isolated instance whose AX
+    /// grant flickered would steal the keyboard mid-sentence.
+    ///
+    /// The gate is here rather than on `PermissionMonitor.start()`, and the
+    /// monitor keeps running in an isolated instance, for two reasons. The
+    /// monitor is the app's only account of what happened to its permissions,
+    /// and a harness run that loses those trace lines loses the one signal that
+    /// explains an AX-driven scenario suddenly unable to press anything. And
+    /// this class is the only part of that path that reaches the screen, so it
+    /// is the one place a future caller cannot route around — the same
+    /// reasoning that put the hover gate inside `forceShowForFlash` rather than
+    /// at its call sites.
+    public let presentsOnScreen: Bool
 
     public enum Reason: Sendable, Equatable {
         case accessibilityRevoked
@@ -44,9 +64,14 @@ public final class PermissionLostPopover {
         }
     }
 
-    public init() {}
+    public init(presentsOnScreen: Bool = ConfigPaths.isRealUserHome) {
+        self.presentsOnScreen = presentsOnScreen
+    }
 
     public func present(reason: Reason) {
+        // A suppressed instance never even builds the panel: an NSPanel that
+        // exists is one `makeKeyAndOrderFront` away from the owner's screen.
+        guard presentsOnScreen else { return }
         // Reuse a single window so rapid repeat presents don't pile up.
         if window == nil {
             let panel = NSPanel(

@@ -40,6 +40,22 @@ public struct ProcessHandle: Sendable, Equatable {
         self.execPath = execPath
         self.cwd = cwd
     }
+
+    /// True when this handle is the SHARED Claude.app desktop host — the
+    /// Electron process that multiplexes every conversation and the app UI
+    /// into one pid (what `locate`'s `claude_app_fallback` returns).
+    ///
+    /// Every signal-sending path must refuse it: SIGSTOP to that pid froze the
+    /// whole app and all of its sessions on 2026-06-19, and SIGCONT to it would
+    /// resume a process that was never the paused session. Typing into it is
+    /// still legitimate, which is why the inject path may accept it.
+    ///
+    /// This lives on the handle so the `execPath.contains(...)` string has
+    /// exactly one home: the router's signal guard and the hover's resume
+    /// resolver both read the SAME predicate rather than each spelling it out.
+    public var isSharedDesktopHost: Bool {
+        execPath.contains("Claude.app/Contents/MacOS/Claude")
+    }
 }
 
 /// Resolves a target cwd → the unique matching Claude Code PID. Returns nil

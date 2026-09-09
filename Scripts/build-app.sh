@@ -79,9 +79,9 @@ make_bundle() {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.4.0</string>
+    <string>0.4.1</string>
     <key>CFBundleVersion</key>
-    <string>7</string>
+    <string>8</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -207,7 +207,30 @@ echo "First-run flow:"
 echo "    open $APP_APP        # presents onboarding; the menu-bar icon"
 echo "                          # appears once the app enters its running state"
 echo
-echo "Reset onboarding (delete the Keychain key + state):"
-echo "    security delete-generic-password -s live.supervisor.api"
+# The reset recipe below has to name the services the app actually writes.
+# Since v0.2.0 those are "live.supervisor.api.<provider>", one per provider,
+# plus ".remotenotify" for the escalation webhook (KeychainRemoteNotifyURLStore
+# hangs off the same base). The old recipe printed only the bare
+# "live.supervisor.api", which is the pre-0.2.0 single-key item and deletes
+# nothing a current install uses — so following it left the key in place and
+# the app skipped onboarding again.
+#
+# Suffixes come out of LLMProvider.keychainService(base:) rather than a
+# literal list here, so adding a provider cannot silently rot this recipe.
+KEY_SUFFIXES="$(sed -n 's/^ *case \.[A-Za-z]*: *suffix = "\([a-z]*\)"/\1/p' \
+    Sources/SupervisorCore/LLMClient/LLMProvider.swift | tr '\n' ' ')"
+if [[ -z "$KEY_SUFFIXES" ]]; then
+    echo "[build-app] WARNING: could not read provider suffixes from LLMProvider.swift;" >&2
+    echo "            the reset recipe below falls back to the v0.4.0 list." >&2
+    KEY_SUFFIXES="anthropic deepseek moonshot minimax qwenhf openrouter "
+fi
+KEY_SUFFIXES="${KEY_SUFFIXES}remotenotify"
+
+echo "Reset onboarding (delete the Keychain items + state):"
+echo "    for s in $KEY_SUFFIXES; do"
+echo "        security delete-generic-password -s \"live.supervisor.api.\$s\" 2>/dev/null"
+echo "    done"
+echo "    # legacy pre-0.2.0 single-key item (bare service, no provider suffix):"
+echo "    security delete-generic-password -s live.supervisor.api 2>/dev/null"
 echo "    rm -rf ~/Library/Application\ Support/Supervisor"
 echo "    rm -rf ~/Library/Logs/Supervisor"

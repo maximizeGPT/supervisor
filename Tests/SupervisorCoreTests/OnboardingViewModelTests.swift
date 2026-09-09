@@ -54,7 +54,8 @@ final class OnboardingViewModelTests: XCTestCase {
     private func makeVM(
         permissions: StubChecker = StubChecker(),
         keyStore: ProviderKeyStore = InMemoryProviderKeyStore(),
-        activeProviderStore: ActiveProviderStore = InMemoryActiveProviderStore()
+        activeProviderStore: ActiveProviderStore = InMemoryActiveProviderStore(),
+        priorInstall: OnboardingRecord? = nil
     ) -> (OnboardingViewModel, StubChecker, ProviderKeyStore) {
         let session = mockSession()
         let trace = TraceLog(path: FileManager.default.temporaryDirectory
@@ -73,6 +74,7 @@ final class OnboardingViewModelTests: XCTestCase {
                     traceLog: trace
                 )
             },
+            priorInstall: priorInstall,
             trace: trace
         )
         return (vm, permissions, keyStore)
@@ -510,4 +512,182 @@ private final class OnboardingMockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+// MARK: - Upgrade re-grant flow
+//
+// macOS keys an Accessibility grant to the bundle id AND the designated
+// requirement, which names the signing certificate. When an upgrade is
+// signed by a different certificate the grant does not carry, the app
+// launches with hasKey=true / axOK=false, and onboarding opens. Before
+// this, that user walked all the way from step 2 to step 5 (Accessibility,
+// Screen Recording, Notifications, the customization explainer) even
+// though nothing but the one dropped permission had changed. These pin the
+// short path. See docs/upgrading.md.
+@MainActor
+extension OnboardingViewModelTests {
+
+    private func onboardedKeyStore() throws -> InMemoryProviderKeyStore {
+        let store = InMemoryProviderKeyStore()
+        try store.write("sk-ant-existing", for: .anthropic)
+        return store
+    }
+
+    /// The common case: Accessibility is the only thing macOS dropped, so the
+    /// whole flow is that one screen and then done. No Screen Recording step,
+    /// no notifications step, no customization explainer.
+    func testRegrantWithOnlyAXMissingIsASingleStep() async throws {
+        let checker = StubChecker()
+        checker.ax = false
+        checker.screen = true
+        let (vm, _, _) = makeVM(
+            permissions: checker,
+            keyStore: try onboardedKeyStore(),
+            priorInstall: OnboardingRecord(completedVersion: "0.3.2")
+        )
+
+        XCTAssertEqual(vm.flow, .regrant(previousVersion: "0.3.2"))
+        XCTAssertEqual(vm.regrantPlan, [.accessibility])
+        XCTAssertEqual(vm.state, .axCheck())
+        XCTAssertEqual(vm.progress, OnboardingProgress(index: 1, total: 1))
+
+        checker.ax = true
+        await vm.recheckAX()
+        XCTAssertEqual(vm.state, .complete(notifDegraded: false),
+                       "a re-grant ends the moment the dropped permission is back")
+    }
+
+    /// The signing-identity change drops Screen Recording along with
+    /// Accessibility, so when both are gone both are asked for, and nothing else.
+    func testRegrantAsksForBothDroppedPermissionsAndNothingElse() async throws {
+        let checker = StubChecker()
+        checker.ax = false
+        checker.screen = false
+        checker.notif = .denied
+        let (vm, _, _) = makeVM(
+            permissions: checker,
+            keyStore: try onboardedKeyStore(),
+            priorInstall: OnboardingRecord(completedVersion: "0.3.2")
+        )
+
+        XCTAssertEqual(vm.regrantPlan, [.accessibility, .screenRecording])
+        XCTAssertEqual(vm.progress, OnboardingProgress(index: 1, total: 2))
+
+        checker.ax = true
+        await vm.recheckAX()
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+        XCTAssertEqual(vm.progress, OnboardingProgress(index: 2, total: 2))
+
+        checker.screen = true
+        await vm.recheckScreenRecording()
+        XCTAssertEqual(vm.state, .complete(notifDegraded: false),
+                       "notifications survive the identity change, so the re-grant does not ask again")
+    }
+
+    /// The whole Screen-Recording-only path, from the launch decision to the
+    /// step the user lands on. The routing below is dead code unless the gate
+    /// opens the window for this case, so the two are asserted together.
+    func testScreenRecordingOnlyRegrantIsReachableFromTheLaunchGate() async throws {
+        let prior = OnboardingRecord(completedVersion: "0.4.0", screenRecordingGranted: true)
+        XCTAssertTrue(
+            OnboardingLaunchGate.needsOnboarding(
+                hasKey: true, axGranted: true, screenRecordingGranted: false, priorInstall: prior
+            ),
+            "the window has to open, or the routing under test is unreachable"
+        )
+
+        let checker = StubChecker()
+        checker.ax = true
+        checker.screen = false
+        let (vm, _, _) = makeVM(
+            permissions: checker,
+            keyStore: try onboardedKeyStore(),
+            priorInstall: prior
+        )
+        XCTAssertEqual(vm.regrantPlan, [.screenRecording])
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+        XCTAssertEqual(vm.progress, OnboardingProgress(index: 1, total: 1))
+
+        checker.screen = true
+        await vm.recheckScreenRecording()
+        XCTAssertEqual(vm.state, .complete(notifDegraded: false),
+                       "one step, then done")
+    }
+
+    /// Accessibility intact, Screen Recording gone: open on the step that is
+    /// actually missing rather than flashing an already-satisfied one.
+    func testRegrantOpensOnScreenRecordingWhenThatIsTheOnlyGap() throws {
+        let checker = StubChecker()
+        checker.ax = true
+        checker.screen = false
+        let (vm, _, _) = makeVM(
+            permissions: checker,
+            keyStore: try onboardedKeyStore(),
+            priorInstall: OnboardingRecord(completedVersion: "0.4.0")
+        )
+        XCTAssertEqual(vm.regrantPlan, [.screenRecording])
+        XCTAssertEqual(vm.state, .screenRecordingCheck())
+        XCTAssertEqual(vm.progress, OnboardingProgress(index: 1, total: 1))
+    }
+
+    /// Skip is still an exit, and on a re-grant it ends the flow rather than
+    /// dropping the user into three more screens they did not ask for.
+    func testRegrantSkipEndsTheFlow() async throws {
+        let checker = StubChecker()
+        checker.ax = false
+        checker.screen = true
+        let (vm, _, _) = makeVM(
+            permissions: checker,
+            keyStore: try onboardedKeyStore(),
+            priorInstall: OnboardingRecord(completedVersion: "0.3.1")
+        )
+        await vm.skipAX()
+        XCTAssertEqual(vm.state, .complete(notifDegraded: false))
+    }
+
+    /// A record with no stored key is somebody who wiped their key, not an
+    /// upgrade. They have to enter one, so they get the whole first-run flow.
+    func testPriorInstallWithoutAKeyIsStillAFirstRun() {
+        let checker = StubChecker()
+        checker.ax = false
+        let (vm, _, _) = makeVM(
+            permissions: checker,
+            priorInstall: OnboardingRecord(completedVersion: "0.4.0")
+        )
+        XCTAssertEqual(vm.flow, .firstRun)
+        XCTAssertEqual(vm.state, .keyEntry())
+        XCTAssertEqual(vm.regrantPlan, [])
+    }
+
+    /// The regression guard: with no prior-install record the five-step flow is
+    /// byte-for-byte what it always was, counter included.
+    func testFirstRunFlowAndCounterAreUnchanged() async throws {
+        let checker = StubChecker()
+        checker.ax = false
+        checker.screen = true
+        checker.notif = .authorized
+        let (vm, _, _) = makeVM(permissions: checker, keyStore: try onboardedKeyStore())
+
+        XCTAssertEqual(vm.flow, .firstRun)
+        XCTAssertEqual(vm.regrantPlan, [])
+        XCTAssertEqual(vm.state, .axCheck())
+        XCTAssertEqual(vm.progress, OnboardingProgress(index: 2, total: 5))
+
+        checker.ax = true
+        await vm.recheckAX()
+        XCTAssertEqual(vm.state, .screenRecordingCheck(),
+                       "a first run still gets the full introduction")
+        XCTAssertEqual(vm.progress, OnboardingProgress(index: 3, total: 5))
+
+        await vm.recheckScreenRecording()
+        XCTAssertEqual(vm.state, .notifCheck(status: .authorized))
+        XCTAssertEqual(vm.progress, OnboardingProgress(index: 4, total: 5))
+
+        vm.finishNotificationStep()
+        XCTAssertEqual(vm.state, .customization(notifDegraded: false))
+        XCTAssertEqual(vm.progress, OnboardingProgress(index: 5, total: 5))
+
+        vm.finishCustomizationStep()
+        XCTAssertEqual(vm.state, .complete(notifDegraded: false))
+    }
 }

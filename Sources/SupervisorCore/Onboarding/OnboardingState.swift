@@ -78,3 +78,45 @@ public extension OnboardingState {
         }
     }
 }
+
+// MARK: - First run vs re-grant
+
+/// Why the onboarding window is on screen.
+///
+/// A first run and an upgrade that lost a permission look identical to the
+/// launch check (`hasKey && !axOK`), but they deserve very different flows.
+/// The first-run user needs the whole five-step introduction. The returning
+/// user has already read all of it; macOS just dropped a grant because the
+/// app's signing identity changed underneath them (see docs/upgrading.md).
+/// They should be asked for exactly what is missing, and nothing else.
+public enum OnboardingFlow: Sendable, Equatable {
+    /// No completed onboarding on this machine.
+    case firstRun
+    /// A previous install completed onboarding. `previousVersion` is what it
+    /// recorded, or `OnboardingRecord.unknownVersion` when it was inferred.
+    case regrant(previousVersion: String)
+
+    public var isRegrant: Bool {
+        if case .regrant = self { return true }
+        return false
+    }
+}
+
+/// A system permission the re-grant flow can ask for. Ordered as presented.
+public enum OnboardingPermissionStep: Sendable, Equatable {
+    case accessibility
+    case screenRecording
+}
+
+/// Position in whichever flow is running, for the "Step N of M" indicator.
+/// The re-grant flow has its own (much shorter) denominator, so the counter
+/// stays honest instead of promising five steps and delivering one.
+public struct OnboardingProgress: Sendable, Equatable {
+    public let index: Int
+    public let total: Int
+
+    public init(index: Int, total: Int) {
+        self.index = index
+        self.total = total
+    }
+}

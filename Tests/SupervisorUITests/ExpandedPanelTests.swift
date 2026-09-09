@@ -275,9 +275,9 @@ final class ExpandedPanelTests: XCTestCase {
 
         // Wire resume handler that succeeds.
         var handlerCwd: String?
-        vm.resumeHandler = { cwd in
+        vm.resumeHandler = { _, cwd in
             handlerCwd = cwd
-            return true
+            return .resumed(pid: 4242)
         }
 
         vm.resumePausedSession()
@@ -312,7 +312,7 @@ final class ExpandedPanelTests: XCTestCase {
         vm.flagRaised(severity: .high, action: .pause, reasoningPlain: "danger")
 
         // Wire resume handler that fails.
-        vm.resumeHandler = { _ in return false }
+        vm.resumeHandler = { _, _ in return .notResolved }
 
         vm.resumePausedSession()
 
@@ -338,9 +338,9 @@ final class ExpandedPanelTests: XCTestCase {
     func testResumeNoOpWhenNotPaused() {
         let (vm, _) = makeVM()
         var handlerCalled = false
-        vm.resumeHandler = { _ in
+        vm.resumeHandler = { _, _ in
             handlerCalled = true
-            return true
+            return .resumed(pid: 4242)
         }
         // Not paused — resume should be a no-op.
         vm.resumePausedSession()

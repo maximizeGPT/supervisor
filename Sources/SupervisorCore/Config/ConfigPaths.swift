@@ -42,6 +42,37 @@ public struct ConfigPaths: Sendable {
         return FileManager.default.homeDirectoryForCurrentUser
     }
 
+    /// True when this process resolved the REAL user home — i.e. no
+    /// `SUPERVISOR_HOME` override, or one that points back at the real home.
+    ///
+    /// The on-screen hover band is gated on this. Every E2E scenario instance
+    /// runs with its own `SUPERVISOR_HOME` (Scripts/e2e/common.sh sets it, as
+    /// may any future harness), and the single-instance flock is
+    /// namespaced by that same seam (see `homeIdentityHash`), so such an
+    /// instance coexists with the owner's real app BY DESIGN — that isolation
+    /// is the point. What was never intended is that each isolated instance
+    /// also drew its own band on the owner's screen: the owner reported three
+    /// stacked "Watching. All clear" pills while a harness was running.
+    /// Isolation has to cover the screen too, not just the filesystem.
+    ///
+    /// Compares resolved paths rather than testing the variable's presence, so
+    /// `SUPERVISOR_HOME="$HOME"` (a legitimate no-op override) still counts as
+    /// the real home and behaves exactly like production.
+    public static var isRealUserHome: Bool {
+        isRealUserHome(environment: ProcessInfo.processInfo.environment)
+    }
+
+    /// Injectable-environment variant, for the same reason `resolvedHome` has
+    /// one: `ProcessInfo` caches its environment snapshot, so an in-test
+    /// `setenv` is not reliably visible.
+    public static func isRealUserHome(environment: [String: String]) -> Bool {
+        let resolved = resolvedHome(environment: environment)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        let real = FileManager.default.homeDirectoryForCurrentUser
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        return resolved == real
+    }
+
     /// Short stable identity for THIS instance's home — the first 12 hex
     /// chars of sha256(resolvedHome.path). Anything cross-process but
     /// machine-GLOBAL (the duplicate-launch activate DistributedNotification,
@@ -130,6 +161,17 @@ public struct ConfigPaths: Sendable {
     /// Backed by `FileActiveProviderStore`.
     public var activeProviderPath: URL {
         appSupportDir.appendingPathComponent("active-provider.json", isDirectory: false)
+    }
+
+    /// `~/Library/Application Support/Supervisor/onboarding-record.json`
+    /// Written the first time this machine finishes (or skips past) onboarding
+    /// and refreshed on every clean launch. Presence is the "this is an
+    /// upgrade, not a first run" signal: when macOS drops the Accessibility
+    /// grant because the app's signing identity changed, the returning user
+    /// gets only the permission that is actually missing instead of the whole
+    /// five-step flow. See docs/upgrading.md.
+    public var onboardingRecordPath: URL {
+        appSupportDir.appendingPathComponent("onboarding-record.json", isDirectory: false)
     }
 
     /// `~/Library/Application Support/Supervisor/self-rebuild.marker`

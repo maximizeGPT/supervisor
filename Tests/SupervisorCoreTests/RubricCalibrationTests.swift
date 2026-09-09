@@ -113,7 +113,33 @@ final class RubricCalibrationTests: XCTestCase {
         let candidates: [TriageCandidate]
         let inputTokens: Int
         let outputTokens: Int
+        /// Cached prompt-prefix tokens the provider billed at the cache-read
+        /// rate. Anthropic reports these separately from `input_tokens`;
+        /// LLMClient normalizes DeepSeek's `prompt_cache_hit_tokens` into the
+        /// same shape, so the cost math below is provider-agnostic.
+        let cacheReadTokens: Int
+        let cacheWriteTokens: Int
+        /// Wall-clock seconds for the (successful) API call. 0 for a
+        /// deterministic-catch short-circuit, which makes no call at all.
+        let seconds: Double
         let apiError: String?
+
+        init(fixture: CalibrationFixture, candidates: [TriageCandidate],
+             inputTokens: Int, outputTokens: Int,
+             cacheReadTokens: Int = 0, cacheWriteTokens: Int = 0,
+             seconds: Double = 0, apiError: String?) {
+            self.fixture = fixture
+            self.candidates = candidates
+            self.inputTokens = inputTokens
+            self.outputTokens = outputTokens
+            self.cacheReadTokens = cacheReadTokens
+            self.cacheWriteTokens = cacheWriteTokens
+            self.seconds = seconds
+            self.apiError = apiError
+        }
+
+        /// True when this fixture reached the provider (so it cost money).
+        var calledAPI: Bool { seconds > 0 || inputTokens > 0 || apiError != nil }
     }
 
     /// Retries on rate-limit errors using Anthropic's `retry-after` hint
@@ -147,11 +173,16 @@ final class RubricCalibrationTests: XCTestCase {
         let maxAttempts = 4
         for attempt in 1...maxAttempts {
             do {
+                let t0 = Date()
                 let response = try await client.createMessage(request)
+                let elapsed = Date().timeIntervalSince(t0)
                 let candidates = parseCandidates(from: response)
                 return RunResult(fixture: f, candidates: candidates,
                                  inputTokens: response.usage.input_tokens,
                                  outputTokens: response.usage.output_tokens,
+                                 cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+                                 cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
+                                 seconds: max(elapsed, 0.000_001),
                                  apiError: nil)
             } catch let e as AnthropicClientError {
                 if case .rateLimit(_, let retryAfter) = e, attempt < maxAttempts {
@@ -243,15 +274,29 @@ final class RubricCalibrationTests: XCTestCase {
 
     // MARK: - The sweep
 
+    /// Evenly-spread subset of the corpus, used to price a sweep before
+    /// paying for the whole thing. `SUPERVISOR_CALIB_SAMPLE=20` picks 20
+    /// fixtures spaced across the ordered corpus, so the sample keeps the
+    /// real category and kind mix (positives, negatives, adversarials, and
+    /// the destructive fixtures the deterministic catch answers for free)
+    /// instead of over-weighting whichever block comes first.
+    private func sampled(_ fixtures: [CalibrationFixture]) -> [CalibrationFixture] {
+        guard let raw = ProcessInfo.processInfo.environment["SUPERVISOR_CALIB_SAMPLE"],
+              let n = Int(raw), n > 0, n < fixtures.count
+        else { return fixtures }
+        return (0..<n).map { fixtures[$0 * fixtures.count / n] }
+    }
+
     func testCalibrateFullCorpus() async throws {
         let (key, provider) = try resolveKey()
         let client = makeClient(key: key, provider: provider)
 
-        let fixtures = FixtureCorpus.all
+        let fixtures = sampled(FixtureCorpus.all)
         let started = Date()
         print("=== CALIBRATION SWEEP ===")
         print("provider: \(provider.rawValue) model: \(provider.defaultTriageModel)")
-        print("fixtures: \(fixtures.count)")
+        print("fixtures: \(fixtures.count) of \(FixtureCorpus.all.count)")
+        print("deterministic catch: \(ProcessInfo.processInfo.environment["SUPERVISOR_DISABLE_CATCH"] == nil ? "ON (production path)" : "DISABLED")")
         print("started: \(ISO8601DateFormatter().string(from: started))")
 
         var results: [RunResult] = []
@@ -264,11 +309,23 @@ final class RubricCalibrationTests: XCTestCase {
         // BOTH limits with margin for response headers etc. Rate-limit
         // errors that still slip through are retried with the
         // server-suggested wait via runOne's loop.
-        let pacingNanos: UInt64 = 2_000_000_000  // 2s = 30 RPM
+        //
+        // Other providers do not publish Anthropic's Tier-1 floor and their
+        // own per-call latency already paces the sweep, so they use a short
+        // gap. Pacing changes wall time only, never a verdict.
+        let pacingNanos: UInt64 = provider == .anthropic ? 2_000_000_000 : 300_000_000
         for (i, f) in fixtures.enumerated() {
             let n = String(format: "%3d", i + 1)
             print("\(n)/\(fixtures.count)  \(f.name)")
             let r = await runOne(f, client: client, model: provider.defaultTriageModel)
+            let usd = TokenAccounting.costUSD(
+                model: provider.defaultTriageModel,
+                usage: AnthropicUsage(input_tokens: r.inputTokens, output_tokens: r.outputTokens,
+                                      cache_creation_input_tokens: r.cacheWriteTokens,
+                                      cache_read_input_tokens: r.cacheReadTokens))
+            print(String(format: "       in=%d cache_read=%d out=%d  %.2fs  $%.6f%@",
+                         r.inputTokens, r.cacheReadTokens, r.outputTokens, r.seconds, usd,
+                         r.calledAPI ? "" : "  (deterministic catch, no API call)"))
             results.append(r)
             if i < fixtures.count - 1 {
                 try? await Task.sleep(nanoseconds: pacingNanos)
@@ -283,10 +340,14 @@ final class RubricCalibrationTests: XCTestCase {
         var adversarial: [ReportAdversarial] = []
         var totalInputTokens = 0
         var totalOutputTokens = 0
+        var totalCacheReadTokens = 0
+        var totalCacheWriteTokens = 0
 
         for r in results {
             totalInputTokens += r.inputTokens
             totalOutputTokens += r.outputTokens
+            totalCacheReadTokens += r.cacheReadTokens
+            totalCacheWriteTokens += r.cacheWriteTokens
             let cat = r.fixture.targetCategory
             var s = stats[cat] ?? CategoryStats()
             let outcome = classify(r)
@@ -324,9 +385,24 @@ final class RubricCalibrationTests: XCTestCase {
             }
         }
 
-        // Token cost — Haiku 4.5 rates: $0.80/MTok input, $4/MTok output
-        let estimatedUSD = (Double(totalInputTokens) / 1_000_000.0) * 0.80
-                          + (Double(totalOutputTokens) / 1_000_000.0) * 4.00
+        // Token cost at the rates of the model that actually ran. This used
+        // to hardcode Haiku's $0.80/$4.00, so every DeepSeek sweep reported a
+        // number ~3x its real spend (trial-notes 2026-06-04 had to annotate
+        // "the report prints Haiku-rate ~$1.98" by hand). TokenAccounting is
+        // the same table production bills against, so the sweep's dollar
+        // figure and the app's recorded spend now agree by construction.
+        let estimatedUSD = TokenAccounting.costUSD(
+            model: provider.defaultTriageModel,
+            usage: AnthropicUsage(input_tokens: totalInputTokens,
+                                  output_tokens: totalOutputTokens,
+                                  cache_creation_input_tokens: totalCacheWriteTokens,
+                                  cache_read_input_tokens: totalCacheReadTokens))
+        let modelLabel = "\(provider.rawValue) / \(provider.defaultTriageModel)"
+        if !TokenAccounting.isKnownModel(provider.defaultTriageModel) {
+            print("WARNING: no price row for \(provider.defaultTriageModel) — reported spend is $0 and is WRONG, not free.")
+        }
+        print(String(format: "TOTAL SPEND: $%.4f  (%@, in=%d cache_read=%d out=%d)",
+                     estimatedUSD, modelLabel, totalInputTokens, totalCacheReadTokens, totalOutputTokens))
 
         // ───── Write report.json + summary.md ─────────────────────────
         let runStamp = isoStamp(started)
@@ -335,7 +411,7 @@ final class RubricCalibrationTests: XCTestCase {
 
         let reportJSON = buildReportJSON(
             stamp: runStamp, started: started, ended: ended,
-            fixtureCount: fixtures.count,
+            modelLabel: modelLabel, fixtureCount: fixtures.count,
             inputTokens: totalInputTokens, outputTokens: totalOutputTokens, estimatedUSD: estimatedUSD,
             stats: stats, failures: failures, adversarial: adversarial
         )
@@ -344,7 +420,7 @@ final class RubricCalibrationTests: XCTestCase {
 
         let summary = buildSummary(
             stamp: runStamp, started: started, ended: ended,
-            fixtureCount: fixtures.count,
+            modelLabel: modelLabel, fixtureCount: fixtures.count,
             inputTokens: totalInputTokens, outputTokens: totalOutputTokens, estimatedUSD: estimatedUSD,
             stats: stats, failures: failures, adversarial: adversarial
         )
@@ -381,6 +457,7 @@ final class RubricCalibrationTests: XCTestCase {
 
     private func buildReportJSON(
         stamp: String, started: Date, ended: Date,
+        modelLabel: String = "unrecorded",
         fixtureCount: Int,
         inputTokens: Int, outputTokens: Int, estimatedUSD: Double,
         stats: [String: CategoryStats],
@@ -391,6 +468,11 @@ final class RubricCalibrationTests: XCTestCase {
         var json: [String: Any] = [
             "run_id": stamp,
             "rubric_version_under_test": "v0.1.4",
+            // Which provider+model produced these numbers. A recall figure is
+            // only meaningful next to the model that produced it; PRINCIPLES
+            // section 6c's gate is measured against the SHIPPED triage
+            // provider, so the report has to name it.
+            "provider_model": modelLabel,
             "started_at": iso.string(from: started),
             "ended_at": iso.string(from: ended),
             "duration_seconds": ended.timeIntervalSince(started),
@@ -460,6 +542,7 @@ final class RubricCalibrationTests: XCTestCase {
 
     private func buildSummary(
         stamp: String, started: Date, ended: Date,
+        modelLabel: String = "unrecorded",
         fixtureCount: Int,
         inputTokens: Int, outputTokens: Int, estimatedUSD: Double,
         stats: [String: CategoryStats],
@@ -468,6 +551,7 @@ final class RubricCalibrationTests: XCTestCase {
         var lines: [String] = []
         lines.append("# Calibration sweep — \(stamp)")
         lines.append("")
+        lines.append("- **Provider / model**: `\(modelLabel)`")
         lines.append("- **Fixtures**: \(fixtureCount)")
         lines.append("- **Duration**: \(String(format: "%.1f", ended.timeIntervalSince(started))) s")
         lines.append("- **Token cost**: \(inputTokens) in / \(outputTokens) out = ~$\(String(format: "%.3f", estimatedUSD))")

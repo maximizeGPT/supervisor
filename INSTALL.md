@@ -25,6 +25,10 @@ delivery section if you turn that on yourself.
 2. Double-click the `.dmg` to open it.
 3. Drag **`Supervisor.app`** into the **Applications** folder shown next to it.
 
+Already running an older version? Drag the new one over it and keep reading at
+**[docs/upgrading.md](./docs/upgrading.md)**, which covers what happens to the
+Accessibility permission on an upgrade and how to get it back in one step.
+
 ## 2. First launch
 
 The download is **signed with a Developer ID and notarized by Apple**, so it
@@ -45,6 +49,26 @@ Pick a provider and paste its API key. Supervisor validates the key with a
 one-token test call before saving it to your macOS **Keychain** (encrypted,
 never written to disk in the clear). Invalid / rate-limited / network errors
 show inline with a retry.
+
+> **Set the key through the app, not through `security`.** A Keychain item's
+> permissions are fixed when the item is created, and an item created by
+> `security add-generic-password` grants access to `security`, not to
+> Supervisor. `-A` and `-U` do not change that on an item that already exists:
+> `-U` replaces the stored value and leaves the old permissions alone. The next
+> launch then stops on a macOS permission prompt, which can open behind other
+> windows or on another desktop, and Supervisor watches nothing until someone
+> finds it and clicks Always Allow. If you do need to write a key from a script,
+> use the tool that names the app in the item's access list as it creates it:
+>
+> ```
+> SUPERVISOR_PROVIDER_API_KEY=$(cat /tmp/key.txt) \
+>   swift run SupervisorDevTools inject-provider-key-from-env deepseek
+> ```
+>
+> macOS may still ask once, the first time Supervisor reads an item another
+> program created. Answer Always Allow and it stops asking. What the raw
+> `security` route gets you instead is a prompt the app cannot get past at all
+> until someone answers it, on every launch.
 
 - **Anthropic** (default): get a key at
   [console.anthropic.com](https://console.anthropic.com). At heavy use
@@ -151,6 +175,12 @@ rm -rf ~/Library/Logs/Supervisor
 (The `remotenotify` line clears the remote-escalation webhook URL, if you ever
 stored one; the last `security` line clears the legacy single-key item from
 very early builds.)
+
+Deleting is always safe. Re-**writing** one of these items by hand is what
+causes the stall described in step 1: the replacement keeps the old item's
+permissions, Supervisor is not in them, and the next launch waits on a prompt.
+Delete the item and let onboarding (or
+`SupervisorDevTools inject-provider-key-from-env`) recreate it instead.
 
 Then reopen Supervisor.
 

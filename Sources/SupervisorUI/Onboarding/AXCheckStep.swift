@@ -17,7 +17,7 @@ struct AXCheckStep: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: BrandSpacing.md) {
-            Text("Supervisor needs Accessibility access to type into your terminal when it acts for you. Open System Settings, then turn Supervisor on under Privacy and Security, then Accessibility.")
+            Text(bodyText)
                 .font(BrandFont.body)
                 .foregroundStyle(BrandColor.inkDeep.color)
                 .lineSpacing(6)
@@ -35,5 +35,19 @@ struct AXCheckStep: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    /// Upgrading is the common way to land back on this screen, and it is not
+    /// the user's doing. macOS ties an Accessibility grant to the certificate
+    /// that signed the app, so replacing Supervisor with a build signed
+    /// differently reads as a different program and the grant is dropped. The
+    /// old entry is usually still sitting in the list, switched off. Saying so
+    /// turns a confusing repeat of setup into one switch. See
+    /// docs/upgrading.md.
+    private var bodyText: String {
+        if vm.flow.isRegrant {
+            return "Supervisor was replaced by a newer build, and macOS drops Accessibility when an app is replaced. Open System Settings, go to Privacy and Security, then Accessibility, and switch Supervisor back on. Your API key and settings are still there, though the same change of signing identity can make macOS ask once for permission to use your Keychain."
+        }
+        return "Supervisor needs Accessibility access to type into your terminal when it acts for you. Open System Settings, then turn Supervisor on under Privacy and Security, then Accessibility."
     }
 }
