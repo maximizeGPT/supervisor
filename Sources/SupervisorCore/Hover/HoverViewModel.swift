@@ -718,6 +718,28 @@ public final class HoverViewModel: ObservableObject {
     /// `.ntfy` is for a self-hosted ntfy server on a host that says nothing.
     @Published public private(set) var remoteNotifyFormat: RemoteNotifyFormat?
 
+    /// Mirror of `remote_notify.reply_enabled`: the INBOUND half. Same
+    /// seeding rule as the switch above, and a separate published value
+    /// because it is a separate decision (agreeing to be paged is not
+    /// agreeing to be typed into).
+    @Published public private(set) var remoteReplyEnabled = false
+
+    /// Whether the owner has clicked to reveal the inbox topic.
+    ///
+    /// Default false, never written to disk, and cleared on three events:
+    /// Hide, a config re-seed, and the reply row leaving the screen (the
+    /// panel closing, the Controls group collapsing, or delivery being
+    /// switched off). This view model outlives the panel, so without that
+    /// last one a reveal would still be showing the next time the owner
+    /// opened the panel in front of somebody else.
+    ///
+    /// The topic is the entire credential in both directions: anyone who
+    /// learns it can read every page Supervisor sends and post a reply
+    /// Supervisor will act on. This feature's threat model names a topic
+    /// read off a screenshot, so the address and its QR stay off screen
+    /// until they are asked for, and go back off screen quickly.
+    @Published public private(set) var remoteReplyTopicRevealed = false
+
     /// True while a webhook save is in flight (disables the Save button).
     @Published public private(set) var isSavingRemoteWebhook = false
 
@@ -737,12 +759,17 @@ public final class HoverViewModel: ObservableObject {
     /// THROWS on Keychain failure so the panel can say so. nil in tests.
     public var saveRemoteWebhookHandler: ((String) async throws -> Void)?
 
-    /// Wired in main.swift: persists (enabled, detail, format) into
-    /// config.yaml's `remote_notify` block and applies the triple to the
-    /// running notifier. Returns false when the config write failed, in
-    /// which case the published state is left untouched — the panel must
-    /// never show a switch position the file does not hold. nil in tests.
-    public var setRemoteNotifyHandler: ((_ enabled: Bool, _ detail: RemoteNotifyDetail, _ format: RemoteNotifyFormat?) async -> Bool)?
+    /// Wired in main.swift: persists the whole `remote_notify` scalar block
+    /// into config.yaml and applies it to the running notifier. Returns
+    /// false when the config write failed, in which case the published
+    /// state is left untouched. The panel must never show a switch
+    /// position the file does not hold. nil in tests.
+    ///
+    /// One `Values` rather than a widening list of parameters, and that is
+    /// the writer's own argument: the reply switch is exactly the "future
+    /// key" its struct was built to absorb, and every scalar travels
+    /// together so a save can never carry three of four current values.
+    public var setRemoteNotifyHandler: ((RemoteNotifyConfigWriter.Values) async -> Bool)?
 
     /// Wired in main.swift to the RUNNING app's `RemoteNotifier.sendTest()`,
     /// so a green test proves the real channel, not a fresh lookalike.
@@ -794,18 +821,50 @@ public final class HoverViewModel: ObservableObject {
         return nil
     }
 
+    /// v0.4.2 feature 4b: reads the running `RemoteInboxSubscriber`'s health
+    /// at render time, same pull pattern as the delivery-health provider
+    /// above. nil in tests, before wiring, and on every install that never
+    /// turned the reply channel on.
+    public var remoteReplyInboxHealthProvider: (() -> RemoteInboxSubscriber.InboxHealth?)?
+
+    /// The INBOUND half's line, under the delivery-health line and only
+    /// when there is something wrong to say.
+    ///
+    /// Separate from the delivery line on purpose. The two halves are two
+    /// connections and they fail independently: pages can be landing on the
+    /// owner's phone perfectly while the endpoint refuses every read, and a
+    /// single line covering both would have to pick one and be wrong about
+    /// the other.
+    public func remoteReplyInboxHealthLine() -> String? {
+        Self.remoteReplyInboxLine(remoteReplyInboxHealthProvider?())
+    }
+
+    /// Pure formatter, so the wording is a table in tests. Silent unless the
+    /// endpoint has REFUSED us: an ordinary reconnect is what this loop does
+    /// all day and saying so would train the owner to ignore the line.
+    public nonisolated static func remoteReplyInboxLine(_ health: RemoteInboxSubscriber.InboxHealth?) -> String? {
+        guard let health, health.armed, let status = health.deniedStatus else { return nil }
+        return "Replies: your ntfy endpoint answered \(status). Replies are not arriving."
+    }
+
     /// Seed the row's state at launch (and on config re-load), so it shows
     /// the truth on first open instead of defaults.
     public func seedRemoteEscalation(
         webhookConfigured: Bool,
         enabled: Bool,
         detail: RemoteNotifyDetail,
-        format: RemoteNotifyFormat? = nil
+        format: RemoteNotifyFormat? = nil,
+        replyEnabled: Bool = false
     ) {
         remoteWebhookConfigured = webhookConfigured
         remoteNotifyEnabled = enabled
         remoteNotifyDetail = detail
         remoteNotifyFormat = format
+        remoteReplyEnabled = replyEnabled
+        // A re-seed is the config file speaking, and it can arrive because
+        // somebody rotated the webhook. Re-hide: the address on screen may
+        // no longer be the address that was revealed.
+        remoteReplyTopicRevealed = false
     }
 
     /// The row's one-line summary of current state. Derived (not stored) so
@@ -866,50 +925,141 @@ public final class HoverViewModel: ObservableObject {
         }
     }
 
-    /// The full remote-notify triple every write persists as one unit.
-    private typealias RemoteNotifyTriple = (enabled: Bool, detail: RemoteNotifyDetail, format: RemoteNotifyFormat?)
+    /// The full remote-notify scalar block every write persists as one unit.
+    private typealias RemoteNotifySettings = RemoteNotifyConfigWriter.Values
 
-    /// The triple the NEXT setter should compute its change against: the
+    /// The values the NEXT setter should compute its change against: the
     /// last ENQUEUED write while one is still pending, else the published
     /// state. Without this, two rapid clicks each read the published (still
     /// old) values and the second write silently reverts the first — the
-    /// stale-triple interleave the settings serialization exists to kill.
-    private var pendingRemoteNotifyTarget: RemoteNotifyTriple?
+    /// stale-value interleave the settings serialization exists to kill.
+    private var pendingRemoteNotifyTarget: RemoteNotifySettings?
 
     /// Tail of the strictly-serial write queue: each write awaits the one
     /// before it, so config.yaml always ends at the last thing clicked.
     private var remoteNotifyWriteTask: Task<Void, Never>?
 
-    private var currentRemoteNotifyTarget: RemoteNotifyTriple {
-        pendingRemoteNotifyTarget ?? (remoteNotifyEnabled, remoteNotifyDetail, remoteNotifyFormat)
+    private var currentRemoteNotifyTarget: RemoteNotifySettings {
+        pendingRemoteNotifyTarget ?? RemoteNotifySettings(
+            enabled: remoteNotifyEnabled,
+            detail: remoteNotifyDetail,
+            format: remoteNotifyFormat,
+            replyEnabled: remoteReplyEnabled
+        )
     }
 
     /// Flip `remote_notify.enabled`. State updates only after the config
     /// write succeeded, so the pill never shows a position config.yaml does
     /// not hold. A no-op (logged) when no handler is wired.
     public func setRemoteNotifyEnabled(_ enabled: Bool) {
-        let base = currentRemoteNotifyTarget
-        guard enabled != base.enabled else { return }
-        enqueueRemoteNotifyWrite((enabled, base.detail, base.format))
+        var target = currentRemoteNotifyTarget
+        guard enabled != target.enabled else { return }
+        target.enabled = enabled
+        enqueueRemoteNotifyWrite(target)
     }
 
     /// Select the detail level (minimal / full). Same honesty rule as the
     /// switch: published state follows the successful write, never precedes it.
     public func setRemoteNotifyDetail(_ detail: RemoteNotifyDetail) {
-        let base = currentRemoteNotifyTarget
-        guard detail != base.detail else { return }
-        enqueueRemoteNotifyWrite((base.enabled, detail, base.format))
+        var target = currentRemoteNotifyTarget
+        guard detail != target.detail else { return }
+        target.detail = detail
+        enqueueRemoteNotifyWrite(target)
     }
 
     /// C13: pin the wire shape (nil = auto-detect). Same write-then-reflect
     /// rule as the other two settings.
     public func setRemoteNotifyFormat(_ format: RemoteNotifyFormat?) {
-        let base = currentRemoteNotifyTarget
-        guard format != base.format else { return }
-        enqueueRemoteNotifyWrite((base.enabled, base.detail, format))
+        var target = currentRemoteNotifyTarget
+        guard format != target.format else { return }
+        target.format = format
+        enqueueRemoteNotifyWrite(target)
     }
 
-    private func enqueueRemoteNotifyWrite(_ target: RemoteNotifyTriple) {
+    // MARK: - Replies from the phone (the inbound half)
+
+    /// Flip `remote_notify.reply_enabled`. Same write-then-reflect rule as
+    /// the other three: the pill never shows a position config.yaml does
+    /// not hold.
+    ///
+    /// Turning it OFF re-hides the topic. The owner who just switched the
+    /// inbound half off has no reason to be left staring at the credential
+    /// that drives it.
+    public func setRemoteReplyEnabled(_ replyEnabled: Bool) {
+        var target = currentRemoteNotifyTarget
+        guard replyEnabled != target.replyEnabled else { return }
+        target.replyEnabled = replyEnabled
+        if !replyEnabled { remoteReplyTopicRevealed = false }
+        enqueueRemoteNotifyWrite(target)
+    }
+
+    /// Wired in main.swift to the endpoint the RUNNING app derived from the
+    /// stored webhook, so what the panel shows is the address replies would
+    /// actually be read from rather than one recomputed here from a
+    /// different copy of the config. nil in tests, and on every install
+    /// whose webhook cannot carry replies (Discord, Slack, a topic too
+    /// short), which is exactly when the row has nothing to offer.
+    ///
+    /// A provider rather than a stored value, matching the two health
+    /// providers above: pulled at render, so nothing keeps the topic in a
+    /// published property that a future view could bind to by accident.
+    public var remoteReplyInboxEndpointProvider: (() -> RemoteReplyEndpoint?)?
+
+    /// Show the inbox address. Deliberately a method and not a settable
+    /// property: revealing a credential is an action the owner takes, and
+    /// it is traced as one (without the topic, obviously).
+    public func revealRemoteReplyTopic() {
+        guard !remoteReplyTopicRevealed else { return }
+        remoteReplyTopicRevealed = true
+        trace.emit("hover", "owner revealed the reply inbox topic in the panel")
+    }
+
+    public func hideRemoteReplyTopic() {
+        guard remoteReplyTopicRevealed else { return }
+        remoteReplyTopicRevealed = false
+    }
+
+    /// The address line the row renders: masked until revealed, and nil
+    /// when this install has no inbox at all.
+    ///
+    /// The masking decision lives HERE rather than in the view, so it is a
+    /// thing a test can hold. A view that renders `endpoint.ownerSubscribeURL()`
+    /// and hides it with a modifier is one refactor away from putting the
+    /// topic back on screen.
+    public func remoteReplyInboxAddressLine() -> String? {
+        guard let endpoint = remoteReplyInboxEndpointProvider?() else { return nil }
+        return remoteReplyTopicRevealed
+            ? endpoint.ownerSubscribeURL().absoluteString
+            : endpoint.maskedSubscribeURL()
+    }
+
+    /// The address a QR code may be drawn from, or nil.
+    ///
+    /// nil while the topic is hidden, and that is the point: a QR image is
+    /// the topic in a form a camera reads across a room, so it is gated on
+    /// the same flag the text above is, next to it, where a change to one
+    /// rule is a change the other is read against.
+    public func remoteReplyInboxQRTarget() -> URL? {
+        guard remoteReplyTopicRevealed else { return nil }
+        return remoteReplyInboxEndpointProvider?()?.ownerSubscribeURL()
+    }
+
+    /// What the row says about the inbound half above the address. Derived,
+    /// so it cannot disagree with the flags it summarizes.
+    public var remoteReplyStatusLine: String {
+        guard remoteNotifyEnabled else {
+            return "Turn delivery on first. A reply answers a page."
+        }
+        guard remoteReplyEnabled else {
+            return "Off. Turn this on and anyone who can read the topic can send text into your sessions, so treat it like a password."
+        }
+        guard remoteReplyInboxEndpointProvider?() != nil else {
+            return "On, but this webhook cannot carry replies. It needs an ntfy topic URL."
+        }
+        return "On. Subscribe your phone to this topic to answer a page by replying to it, and guard it like a password: anyone who can read it can reply too."
+    }
+
+    private func enqueueRemoteNotifyWrite(_ target: RemoteNotifySettings) {
         guard let handler = setRemoteNotifyHandler else {
             trace.emit("hover", "remote notify setting: no handler wired (enabled=\(target.enabled) detail=\(target.detail.rawValue)) - ignoring")
             return
@@ -919,11 +1069,12 @@ public final class HoverViewModel: ObservableObject {
         remoteNotifyWriteTask = Task { @MainActor [weak self] in
             await previous?.value
             guard let self else { return }
-            if await handler(target.enabled, target.detail, target.format) {
+            if await handler(target) {
                 self.remoteNotifyEnabled = target.enabled
                 self.remoteNotifyDetail = target.detail
                 self.remoteNotifyFormat = target.format
-                self.trace.emit("hover", "owner set remote_notify enabled=\(target.enabled) detail=\(target.detail.rawValue) format=\(target.format?.rawValue ?? "auto")")
+                self.remoteReplyEnabled = target.replyEnabled
+                self.trace.emit("hover", "owner set remote_notify enabled=\(target.enabled) detail=\(target.detail.rawValue) format=\(target.format?.rawValue ?? "auto") reply_enabled=\(target.replyEnabled)")
             } else {
                 self.trace.emit("hover", "remote notify setting write FAILED (enabled=\(target.enabled) detail=\(target.detail.rawValue)); panel state unchanged")
             }
@@ -1102,6 +1253,36 @@ public final class HoverViewModel: ObservableObject {
         trace.emit("hover", "owner toggled loop_cap_disabled=\(next)")
     }
 
+    /// Called after the owner responds to a flag AT THE MAC. The remote
+    /// reply channel hangs its code retirement here: once a question has
+    /// been answered locally, the correlation code that was paged out to
+    /// answer it must stop working, or a page from an hour ago stays a live
+    /// write handle into a session whose question is already settled. nil
+    /// when the reply channel was never armed, which is most installs.
+    public var onFlagResponded: (@Sendable (String) -> Void)?
+
+    /// The same retirement, for the owner who never opens the panel.
+    ///
+    /// Swiping a flag banner away IS a response: the delegate already
+    /// records it as `user_response = dismissed`. Without this the code
+    /// paged out for that flag stayed live for the rest of its hour, so a
+    /// question the owner closed at the Mac left a working write handle
+    /// into the session on a topic anyone subscribed can read. Separate
+    /// from `onFlagResponded` because the two arrive by different routes
+    /// (the panel calls `respondToFlag`, the banner arrives at the
+    /// UNUserNotificationCenter delegate) and either can be wired without
+    /// the other.
+    public var onFlagBannerDismissed: (@Sendable (String) -> Void)?
+
+    /// Entry point for the notification-centre delegate, which lives in an
+    /// executable target no test can import. Keeping the call one line long
+    /// there puts the behaviour somewhere it can be tested.
+    public func noteFlagBannerDismissed(flagId: String) {
+        guard !flagId.isEmpty else { return }
+        trace.emit("hover", "flag banner dismissed id=\(flagId)")
+        onFlagBannerDismissed?(flagId)
+    }
+
     /// Record user response (dismiss / false positive) for a flag.
     public func respondToFlag(flagId: String, response: FlagUserResponse) {
         guard let store = flagStore else {
@@ -1111,6 +1292,7 @@ public final class HoverViewModel: ObservableObject {
         do {
             try store.markUserResponse(flagId: flagId, response: response)
             trace.emit("hover", "respondToFlag id=\(flagId) response=\(response.rawValue)")
+            onFlagResponded?(flagId)
             // Force the panel to re-read the store so the flag row reflects the
             // response immediately ("Dismissed"/"Overridden") rather than
             // showing stale unresponded state (RC fix #1).

@@ -151,12 +151,20 @@ public struct RemoteNotifyPayload: Sendable, Equatable {
     /// Build the payload for one intervention. `reason` comes from
     /// `RemoteNotifyPolicy.verdict`; the caller has already decided this
     /// event is worth sending.
+    /// `replyCode` is the correlation code minted for this page when the
+    /// inbound reply channel is armed (see `ReplyCorrelationTable`). It is
+    /// printed as the last line, because it is the only line the owner acts
+    /// on and a phone notification shows the start and the end of a body
+    /// more reliably than the middle. nil means the reply channel is off or
+    /// cannot carry replies, and the page then says nothing about replying,
+    /// so the honest caveat in the README stays true for that install.
     public static func compose(
         decision: TriageDecision,
         outcome: InterventionOutcome,
         reason: String,
         detail: RemoteNotifyDetail,
-        redactor: any Redactor
+        redactor: any Redactor,
+        replyCode: String? = nil
     ) -> RemoteNotifyPayload {
         let kind = RemoteNotifyPolicy.outcomeKind(outcome)
         let title = Notifier.plainTitle(for: outcome)
@@ -191,9 +199,18 @@ public struct RemoteNotifyPayload: Sendable, Equatable {
             }
         }
 
+        // Clip the body BEFORE the reply line is appended, so a long page
+        // can never truncate away the one line the owner has to type back.
+        let replyLine = replyCode.map { "Reply to answer: \($0) <your answer>" }
+        let bodyBudget = maxTextLength - (replyLine.map { $0.count + 1 } ?? 0)
+        var body = clip(lines.joined(separator: "\n"), to: max(0, bodyBudget))
+        if let replyLine {
+            body = body.isEmpty ? replyLine : body + "\n" + replyLine
+        }
+
         return RemoteNotifyPayload(
             title: title,
-            text: clip(lines.joined(separator: "\n"), to: maxTextLength),
+            text: body,
             category: category,
             severity: decision.candidate.severity.rawValue,
             outcomeKind: kind,

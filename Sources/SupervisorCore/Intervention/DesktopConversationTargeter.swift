@@ -109,6 +109,39 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
         return CGDisplayCreateImage(displayID)
     }
 
+    /// The only facts about an on-screen window that the "is this ours"
+    /// decision needs: a handle to match it back to the window it came from,
+    /// and the process that owns it. It is a plain value with no
+    /// ScreenCaptureKit in its signature, so the decision below is a pure
+    /// function over a list of these and can be tested with no display server,
+    /// no TCC grant and no live capture.
+    public struct CaptureWindowDescriptor: Equatable, Sendable {
+        public let windowID: CGWindowID
+        public let owningProcessID: pid_t?
+
+        public init(windowID: CGWindowID, owningProcessID: pid_t?) {
+            self.windowID = windowID
+            self.owningProcessID = owningProcessID
+        }
+    }
+
+    /// Which of `windows` belong to this process.
+    ///
+    /// The match is on owning pid, never on the window title. Titles are
+    /// user-visible text: the hover band retitles itself for whatever session
+    /// it is showing, onboarding retitles as the flow advances, and a title
+    /// match would also exclude somebody else's window that happened to be
+    /// named like ours. The pid is the identity the window server records.
+    ///
+    /// A window whose owning application ScreenCaptureKit could not resolve
+    /// (`owningProcessID` is nil) counts as not ours. Excluding an
+    /// unattributed window would blank out screen area the OCR path still
+    /// needs to read, which is the more expensive mistake of the two.
+    public static func ownWindowIDs(in windows: [CaptureWindowDescriptor],
+                                    ownProcessID: pid_t) -> Set<CGWindowID> {
+        Set(windows.filter { $0.owningProcessID == ownProcessID }.map(\.windowID))
+    }
+
     /// ScreenCaptureKit capture, bridged back to this synchronous call.
     ///
     /// Two deliberate choices about the bridge:
@@ -153,7 +186,28 @@ public struct DesktopConversationTargeter: @unchecked Sendable {
                 sem.signal()
                 return
             }
-            let filter = SCContentFilter(display: display, excludingWindows: [])
+            // Leave Supervisor's own windows out of the frame. The hover band
+            // and the expanded panel float ABOVE the window being targeted, so
+            // they can cover the very sidebar rows the OCR path is trying to
+            // read. A capture without our own UI in it is also the right
+            // starting point for any future vision path.
+            let ours = Self.ownWindowIDs(
+                in: content.windows.map {
+                    CaptureWindowDescriptor(windowID: $0.windowID,
+                                            owningProcessID: $0.owningApplication?.processID)
+                },
+                ownProcessID: ProcessInfo.processInfo.processIdentifier)
+            let ownWindows = content.windows.filter { ours.contains($0.windowID) }
+            if ownWindows.isEmpty {
+                // Nothing to exclude: enumeration came back empty, or none of
+                // the windows resolved to this process. Capture the whole
+                // display, which is what shipped before this filter existed. A
+                // filter problem has to degrade to a working capture, never to
+                // no capture. Counts only, never a window title.
+                self.trace.emit("desktop",
+                                "sck_filter unfiltered own=0 enumerated=\(content.windows.count)")
+            }
+            let filter = SCContentFilter(display: display, excludingWindows: ownWindows)
             let config = SCStreamConfiguration()
             config.width = mode?.pixelWidth ?? display.width
             config.height = mode?.pixelHeight ?? display.height

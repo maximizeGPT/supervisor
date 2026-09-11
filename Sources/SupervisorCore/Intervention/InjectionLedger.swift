@@ -33,6 +33,26 @@
 
 import Foundation
 
+/// WHO caused an injection. Both values are Supervisor typing, and neither
+/// is ever owner authorization, so `isSupervisorInjected` is true for both
+/// and the triage prompt tags both `[supervisor-injected]`. The distinction
+/// is for the record, not for the rubric.
+///
+/// `remoteOwner` is text that arrived over the inbound reply channel
+/// (`RemoteReplyGate`). It is the weaker of the two, not the stronger: the
+/// owner wrote it, but it reached this machine over a topic that is a
+/// bearer credential, so the honest statement is "this came off the wire",
+/// never "the owner said this at the keyboard". Conflating the two is
+/// exactly the laundering the impersonation gap is about, which is why this
+/// gets its own label instead of borrowing `owner`.
+public enum InjectionOrigin: String, Sendable, Equatable, CaseIterable {
+    /// Supervisor's own model-generated text: an answer, a redirect, a
+    /// dispatch proposal.
+    case supervisor
+    /// An owner's reply that arrived over the remote inbound channel.
+    case remoteOwner
+}
+
 /// Thread-safe (lock-guarded) so the router (which records) and the
 /// `@MainActor` TriageEngine (which reads) can share one instance without
 /// actor-hopping. Bounded per session; old entries are pruned on write.
@@ -42,6 +62,7 @@ public final class InjectionLedger: @unchecked Sendable {
         let normalized: String
         let raw: String
         let ts: Date
+        let origin: InjectionOrigin
     }
 
     private let lock = NSLock()
@@ -83,13 +104,22 @@ public final class InjectionLedger: @unchecked Sendable {
 
     /// Record that Supervisor injected `text` into `sessionId`. Call at inject
     /// time. Empty / whitespace-only text is ignored (nothing to correlate).
-    public func record(sessionId: String, text: String, at ts: Date = Date()) {
+    ///
+    /// `origin` defaults to `.supervisor` so every existing call site keeps
+    /// its exact behaviour; the remote reply path passes `.remoteOwner` so
+    /// the record can never be read back as the owner typing here.
+    public func record(
+        sessionId: String,
+        text: String,
+        at ts: Date = Date(),
+        origin: InjectionOrigin = .supervisor
+    ) {
         let normalized = Self.normalize(text)
         guard !normalized.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
         var entries = bySession[sessionId] ?? []
-        entries.append(Entry(normalized: normalized, raw: text, ts: ts))
+        entries.append(Entry(normalized: normalized, raw: text, ts: ts, origin: origin))
         // Prune by age (outside the window can never correlate) then by count.
         let cutoff = ts.addingTimeInterval(-correlationWindow)
         entries.removeAll { $0.ts < cutoff }
@@ -118,6 +148,34 @@ public final class InjectionLedger: @unchecked Sendable {
             }
         }
         return false
+    }
+
+    /// The origin recorded for a matching injection, or nil when nothing
+    /// correlates. Same matching rule as `isSupervisorInjected`, so the two
+    /// can never disagree about whether a turn was injected; this one also
+    /// says WHICH channel typed it.
+    ///
+    /// Deliberately NOT consulted by the rubric. `isSupervisorInjected`
+    /// stays the single authorization question and answers true for every
+    /// origin, so adding a channel here can never widen what counts as
+    /// owner authorization. This is the audit answer, not the gate.
+    public func origin(sessionId: String, text: String, asOf: Date) -> InjectionOrigin? {
+        let candidate = Self.normalize(text)
+        guard !candidate.isEmpty else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entries = bySession[sessionId] else { return nil }
+        let lowerBound = asOf.addingTimeInterval(-correlationWindow)
+        let upperBound = asOf.addingTimeInterval(skewSlack)
+        // Latest match wins: the same text injected twice by two channels is
+        // most honestly attributed to the one that typed it most recently.
+        for entry in entries.reversed() {
+            guard entry.ts >= lowerBound, entry.ts <= upperBound else { continue }
+            if Self.matches(injected: entry.normalized, turn: candidate, minLength: containmentMinLength) {
+                return entry.origin
+            }
+        }
+        return nil
     }
 
     /// Test/inspection hook: number of retained entries for a session.

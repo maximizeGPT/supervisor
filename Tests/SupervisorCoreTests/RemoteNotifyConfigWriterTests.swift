@@ -12,8 +12,25 @@ import XCTest
 
 final class RemoteNotifyConfigWriterTests: XCTestCase {
 
-    private func update(_ existing: String?, enabled: Bool, detail: RemoteNotifyDetail = .minimal) -> String {
-        RemoteNotifyConfigWriter.updatedYAML(existing, values: .init(enabled: enabled, detail: detail))
+    private func update(
+        _ existing: String?,
+        enabled: Bool,
+        detail: RemoteNotifyDetail = .minimal,
+        replyEnabled: Bool = false
+    ) -> String {
+        RemoteNotifyConfigWriter.updatedYAML(
+            existing,
+            values: .init(enabled: enabled, detail: detail, replyEnabled: replyEnabled)
+        )
+    }
+
+    /// Lines inside the file whose trimmed form starts with `key:`. The
+    /// two switches share a suffix, so counting them needs the line and not
+    /// the substring.
+    private func keyLineCount(_ key: String, in yaml: String) -> Int {
+        yaml.components(separatedBy: "\n")
+            .filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("\(key):") }
+            .count
     }
 
     // MARK: - From nothing
@@ -67,8 +84,13 @@ final class RemoteNotifyConfigWriterTests: XCTestCase {
         XCTAssertFalse(parsed.remoteNotifyEnabled)
         XCTAssertEqual(parsed.remoteNotifyDetail, .minimal)
         XCTAssertEqual(parsed.superviseCodex, false, "keys after the block must survive")
-        XCTAssertEqual(out.components(separatedBy: "enabled:").count, 2,
+        // Counted as LINES beginning with the key, not as occurrences of
+        // the substring: `reply_enabled:` contains `enabled:` and is a
+        // different key, and a substring count would call the correct
+        // output a duplicate.
+        XCTAssertEqual(keyLineCount("enabled", in: out), 1,
                        "exactly one enabled key after the rewrite")
+        XCTAssertEqual(keyLineCount("reply_enabled", in: out), 1)
     }
 
     func testMissingKeysAreInsertedIntoAnExistingBlock() {
@@ -152,12 +174,67 @@ final class RemoteNotifyConfigWriterTests: XCTestCase {
         let path = dir.appendingPathComponent("config.yaml")
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        try RemoteNotifyConfigWriter.write(values: .init(enabled: true, detail: .minimal), to: path)
+        try RemoteNotifyConfigWriter.write(values: .init(enabled: true, detail: .minimal, replyEnabled: false), to: path)
         XCTAssertTrue(UserConfig.load(from: path).remoteNotifyEnabled)
 
-        try RemoteNotifyConfigWriter.write(values: .init(enabled: false, detail: .full), to: path)
+        try RemoteNotifyConfigWriter.write(values: .init(enabled: false, detail: .full, replyEnabled: false), to: path)
         let reread = UserConfig.load(from: path)
         XCTAssertFalse(reread.remoteNotifyEnabled)
         XCTAssertEqual(reread.remoteNotifyDetail, .full)
+    }
+
+    // MARK: - reply_enabled (the inbound half's switch)
+
+    func testReplyEnabledRoundTripsThroughTheParser() {
+        let on = update(nil, enabled: true, replyEnabled: true)
+        XCTAssertTrue(UserConfig.parse(on).remoteReplyEnabled)
+        XCTAssertTrue(on.contains("reply_enabled: true"))
+
+        let off = update(on, enabled: true, replyEnabled: false)
+        XCTAssertFalse(UserConfig.parse(off).remoteReplyEnabled)
+        XCTAssertTrue(off.contains("reply_enabled: false"))
+    }
+
+    func testReplyEnabledIsAddedToABlockThatPredatesIt() {
+        // Every install that had remote escalation before v0.4.2 has a
+        // block with no reply key in it. The first panel save has to insert
+        // one INSIDE the block, not append it past the end where the
+        // parser's first-line-back rule would drop it on the floor.
+        let existing = "remote_notify:\n  enabled: true\n  detail: full\n\nother_key: 1\n"
+        let out = update(existing, enabled: true, detail: .full, replyEnabled: true)
+        let parsed = UserConfig.parse(out)
+        XCTAssertTrue(parsed.remoteReplyEnabled)
+        XCTAssertTrue(parsed.remoteNotifyEnabled)
+        XCTAssertEqual(parsed.remoteNotifyDetail, .full)
+        XCTAssertTrue(out.contains("other_key: 1"), "everything outside the block is untouched")
+    }
+
+    func testWritingTheOutboundSwitchNeverLandsOnTheReplyKey() {
+        // The two keys mean different things and one of them opens an
+        // inbound path. A write of `enabled` that matched `reply_enabled`
+        // by a looser rule would switch on a channel the owner never asked
+        // for, which is the exact failure the parser guards against too.
+        let existing = "remote_notify:\n  reply_enabled: true\n  enabled: false\n  detail: minimal\n"
+        let out = update(existing, enabled: true, replyEnabled: true)
+        let parsed = UserConfig.parse(out)
+        XCTAssertTrue(parsed.remoteNotifyEnabled)
+        XCTAssertTrue(parsed.remoteReplyEnabled)
+        XCTAssertEqual(keyLineCount("reply_enabled", in: out), 1,
+                       "one reply_enabled line, not a duplicate inserted alongside the one already there")
+        XCTAssertEqual(keyLineCount("enabled", in: out), 1)
+    }
+
+    func testAnInlineCommentSurvivesAReplyToggle() {
+        let existing = "remote_notify:\n  enabled: true\n  reply_enabled: false   # answered from the phone\n"
+        let out = update(existing, enabled: true, replyEnabled: true)
+        XCTAssertTrue(out.contains("reply_enabled: true # answered from the phone"),
+                      "the owner's note rides along onto the rewritten value")
+        XCTAssertTrue(UserConfig.parse(out).remoteReplyEnabled)
+    }
+
+    func testReplyToggleIsAFixedPoint() {
+        let once = update(nil, enabled: true, detail: .full, replyEnabled: true)
+        let twice = update(once, enabled: true, detail: .full, replyEnabled: true)
+        XCTAssertEqual(once, twice)
     }
 }

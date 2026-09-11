@@ -62,13 +62,13 @@ final class ConfigWatcherTests: XCTestCase {
         defer { watcher.stop() }
 
         // First write through the real (atomic, inode-replacing) writer.
-        try RemoteNotifyConfigWriter.write(values: .init(enabled: true, detail: .minimal), to: configPath)
+        try RemoteNotifyConfigWriter.write(values: .init(enabled: true, detail: .minimal, replyEnabled: false), to: configPath)
         await waitUntil(seen.values.contains(true), "the rename-based write must reload")
 
         // The write that proves re-arming: a watcher still holding the OLD
         // inode's descriptor would never see this one.
         let countAfterFirst = seen.values.count
-        try RemoteNotifyConfigWriter.write(values: .init(enabled: false, detail: .full), to: configPath)
+        try RemoteNotifyConfigWriter.write(values: .init(enabled: false, detail: .full, replyEnabled: false), to: configPath)
         await waitUntil(
             seen.values.count > countAfterFirst && seen.values.last == false,
             "a second atomic save after the inode swap must still live-reload"

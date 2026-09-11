@@ -44,11 +44,27 @@ public enum RemoteNotifyConfigWriter {
         /// C13: nil = auto-detect from the webhook host (written as
         /// `format: auto` so the key is visible and hand-editable).
         public var format: RemoteNotifyFormat?
+        /// `remote_notify.reply_enabled` (v0.4.2, feature 4b): the INBOUND
+        /// half. A separate key from `enabled` and a separate decision, so
+        /// it gets its own field rather than riding on the outbound switch.
+        ///
+        /// Required, with no default, on purpose. Every scalar in this
+        /// struct is written on every save, so a defaulted `false` here
+        /// would let a caller that only meant to change the detail level
+        /// silently switch the owner's reply channel off. Making the
+        /// compiler ask is cheaper than finding that in a trace.
+        public var replyEnabled: Bool
 
-        public init(enabled: Bool, detail: RemoteNotifyDetail, format: RemoteNotifyFormat? = nil) {
+        public init(
+            enabled: Bool,
+            detail: RemoteNotifyDetail,
+            format: RemoteNotifyFormat? = nil,
+            replyEnabled: Bool
+        ) {
             self.enabled = enabled
             self.detail = detail
             self.format = format
+            self.replyEnabled = replyEnabled
         }
     }
 
@@ -62,6 +78,7 @@ public enum RemoteNotifyConfigWriter {
         let enabledLine = "enabled: \(values.enabled ? "true" : "false")"
         let detailLine = "detail: \(values.detail.rawValue)"
         let formatLine = "format: \(values.format?.rawValue ?? "auto")"
+        let replyLine = "reply_enabled: \(values.replyEnabled ? "true" : "false")"
 
         guard let existing, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return """
@@ -69,6 +86,7 @@ public enum RemoteNotifyConfigWriter {
               \(enabledLine)
               \(detailLine)
               \(formatLine)
+              \(replyLine)
 
             """
         }
@@ -90,6 +108,7 @@ public enum RemoteNotifyConfigWriter {
             out.append("  \(enabledLine)")
             out.append("  \(detailLine)")
             out.append("  \(formatLine)")
+            out.append("  \(replyLine)")
             return out.joined(separator: "\n") + "\n"
         }
 
@@ -98,6 +117,7 @@ public enum RemoteNotifyConfigWriter {
         var replacedEnabled = false
         var replacedDetail = false
         var replacedFormat = false
+        var replacedReply = false
         var index = headerIndex + 1
 
         // Walk the block by the parser's own membership rule: blanks and
@@ -116,7 +136,16 @@ public enum RemoteNotifyConfigWriter {
             // ignores: the owner's inline comment (everything from " #" on)
             // rides along onto the rewritten value, so "detail: minimal
             // # verdict only" toggled from the panel keeps its note.
-            if trimmed.hasPrefix("enabled:"), !replacedEnabled {
+            if trimmed.hasPrefix("reply_enabled:"), !replacedReply {
+                // Tested BEFORE `enabled:`, and the parser's own reason
+                // applies here too: the two keys are distinct and a write
+                // meant for one must never land on the other. `hasPrefix`
+                // already keeps them apart (a line reading `reply_enabled:`
+                // does not start with `enabled:`), so this ordering is
+                // belt-and-braces against a future looser match.
+                lines[index] = lineIndent + replyLine + inlineComment(of: trimmed)
+                replacedReply = true
+            } else if trimmed.hasPrefix("enabled:"), !replacedEnabled {
                 lines[index] = lineIndent + enabledLine + inlineComment(of: trimmed)
                 replacedEnabled = true
             } else if trimmed.hasPrefix("detail:"), !replacedDetail {
@@ -132,6 +161,7 @@ public enum RemoteNotifyConfigWriter {
         // Missing keys are inserted right after the header, so they land
         // inside the block no matter what else the block holds. Reverse
         // order of appearance, so enabled ends up on top (insert reverses).
+        if !replacedReply { lines.insert(keyIndent + replyLine, at: headerIndex + 1) }
         if !replacedFormat { lines.insert(keyIndent + formatLine, at: headerIndex + 1) }
         if !replacedDetail { lines.insert(keyIndent + detailLine, at: headerIndex + 1) }
         if !replacedEnabled { lines.insert(keyIndent + enabledLine, at: headerIndex + 1) }

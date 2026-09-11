@@ -53,6 +53,18 @@ public final class InterventionRouter {
     /// self-authorization gap). Optional: nil disables recording (older wiring
     /// and tests that don't exercise the gap) with no behavior change.
     private let injectionLedger: InjectionLedger?
+    /// How the router names the window or tab to type into. Production
+    /// resolves the live desktop title, falling back to the frozen
+    /// `aiTitle` and then the branch, which is what the injector's
+    /// screenshot/OCR targeting matches on.
+    ///
+    /// A seam, and not only for tidiness: the default reads every JSON in
+    /// Claude Desktop's session store, which on a working machine is
+    /// hundreds of megabytes. Leaving that in the test path made a unit
+    /// test take twenty seconds and made its duration a function of how
+    /// much the developer had used Claude that month, which is precisely
+    /// the load-sensitive shape this repo keeps getting bitten by.
+    private let windowTitle: @Sendable (_ sessionId: String, _ branch: String?) -> String?
     private let trace: TraceLog
     /// Injectable clock (mirrors LoopController) so tests can drive the delivery
     /// dedup window deterministically instead of waiting on wall-clock time.
@@ -93,6 +105,11 @@ public final class InterventionRouter {
         humanActivity: any HumanActivityProbe = CGHumanActivityProbe(),
         humanActiveThresholdSeconds: TimeInterval = 2.0,
         injectionLedger: InjectionLedger? = nil,
+        windowTitle: @escaping @Sendable (_ sessionId: String, _ branch: String?) -> String? = { sessionId, branch in
+            DesktopConversationTargeter.readDesktopTitle(sessionId: sessionId)
+                ?? DesktopConversationTargeter.readAiTitle(sessionId: sessionId)
+                ?? branch
+        },
         now: @escaping () -> Date = { Date() },
         maxDeliveryAttempts: Int = 2,
         deliveryDedupWindow: TimeInterval = 1800,
@@ -107,6 +124,7 @@ public final class InterventionRouter {
         self.humanActivity = humanActivity
         self.humanActiveThresholdSeconds = humanActiveThresholdSeconds
         self.injectionLedger = injectionLedger
+        self.windowTitle = windowTitle
         self.now = now
         self.maxDeliveryAttempts = maxDeliveryAttempts
         self.deliveryDedupWindow = deliveryDedupWindow
@@ -243,10 +261,10 @@ public final class InterventionRouter {
     /// resolve, which is exactly what keeps a no-cwd pause from silently
     /// degrading. Returns nil when neither resolves. Shared by the inject path
     /// and the signal (pause/kill) path so the resolution lives in one place.
-    private func resolveTarget(_ decision: TriageDecision, cwd: String?, op: String) -> (handle: ProcessHandle, sessionConfirmed: Bool)? {
-        if !decision.sessionId.isEmpty,
-           let byId = locator.locate(bySessionId: decision.sessionId) {
-            trace.emit("router", "intervention.\(op).target_by_session_id pid=\(byId.pid) session=\(decision.sessionId) exec=\(byId.execPath)")
+    private func resolveTarget(sessionId: String, cwd: String?, op: String) -> (handle: ProcessHandle, sessionConfirmed: Bool)? {
+        if !sessionId.isEmpty,
+           let byId = locator.locate(bySessionId: sessionId) {
+            trace.emit("router", "intervention.\(op).target_by_session_id pid=\(byId.pid) session=\(sessionId) exec=\(byId.execPath)")
             return (byId, true)
         }
         if let cwd = cwd, !cwd.isEmpty, let byCwd = locator.locate(targetCwd: cwd) {
@@ -266,8 +284,8 @@ public final class InterventionRouter {
     /// signal path must NOT do this (it can't target a conversation inside
     /// Electron and SIGSTOP would freeze the whole app), so it uses the plain
     /// `resolveTarget` and lets `signalOrDegrade` degrade the desktop host.
-    private func resolveInjectTarget(_ decision: TriageDecision, cwd: String, op: String) -> (handle: ProcessHandle, sessionConfirmed: Bool)? {
-        guard let target = resolveTarget(decision, cwd: cwd, op: op) else { return nil }
+    private func resolveInjectTarget(sessionId: String, cwd: String, op: String) -> (handle: ProcessHandle, sessionConfirmed: Bool)? {
+        guard let target = resolveTarget(sessionId: sessionId, cwd: cwd, op: op) else { return nil }
         if !target.sessionConfirmed, isClaudeDesktopHost(target.handle) {
             trace.emit("router", "intervention.\(op).desktop_host_deferred_to_injector pid=\(target.handle.pid)")
             return (target.handle, true)
@@ -362,7 +380,7 @@ public final class InterventionRouter {
             await postInjectDegraded(decision, intendedText: text, reason: "no_cwd_on_decision")
             return
         }
-        guard let target = resolveInjectTarget(decision, cwd: cwd, op: "inject") else {
+        guard let target = resolveInjectTarget(sessionId: decision.sessionId, cwd: cwd, op: "inject") else {
             trace.emit("router", "intervention.inject.degraded reason=locator_nil cwd=\(cwd)")
             await postInjectDegraded(decision, intendedText: text, reason: "locator_nil")
             return
@@ -412,7 +430,7 @@ public final class InterventionRouter {
             }
             injectionLedger?.record(sessionId: decision.sessionId, text: markedText)
             let preSize = transcriptSize(sessionId: decision.sessionId)
-            let bytes = try await injector.inject(text: markedText, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readDesktopTitle(sessionId: decision.sessionId) ?? DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
+            let bytes = try await injector.inject(text: markedText, claudeCodePID: handle.pid, targetWindowTitle: windowTitle(decision.sessionId, decision.branch))
             // The injector returns keystroke bytes POSTED, not proof of delivery:
             // a paste into an unfocused composer vanishes and still returns a
             // count. Confirm a real turn actually appended to the transcript
@@ -648,7 +666,7 @@ public final class InterventionRouter {
             await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
             return
         }
-        guard let target = resolveInjectTarget(decision, cwd: cwd, op: "continue") else {
+        guard let target = resolveInjectTarget(sessionId: decision.sessionId, cwd: cwd, op: "continue") else {
             trace.emit("router", "intervention.continue.degraded reason=locator_nil cwd=\(cwd)")
             await continueDegradeToMedium(decision, proposal: proposal, justification: justification)
             return
@@ -687,7 +705,7 @@ public final class InterventionRouter {
             }
             injectionLedger?.record(sessionId: decision.sessionId, text: markedText)
             let preSize = transcriptSize(sessionId: decision.sessionId)
-            let bytes = try await injector.inject(text: markedText, claudeCodePID: handle.pid, targetWindowTitle: DesktopConversationTargeter.readDesktopTitle(sessionId: decision.sessionId) ?? DesktopConversationTargeter.readAiTitle(sessionId: decision.sessionId) ?? decision.branch)
+            let bytes = try await injector.inject(text: markedText, claudeCodePID: handle.pid, targetWindowTitle: windowTitle(decision.sessionId, decision.branch))
             // Confirm the proposal actually landed as a turn (see inject path).
             if await injectLanded(sessionId: decision.sessionId, sincePreSize: preSize) {
                 // Fix #12: confirmed landing — for opt-in decisions, suppress
@@ -775,7 +793,7 @@ public final class InterventionRouter {
         // to notify (the "no_cwd_on_decision" regression). Only when NEITHER the
         // session id NOR a cwd can pin a process do we degrade, with a reason
         // that names what was actually missing, not a misleading bare "no cwd."
-        guard let target = resolveTarget(decision, cwd: cwd, op: opName) else {
+        guard let target = resolveTarget(sessionId: decision.sessionId, cwd: cwd, op: opName) else {
             // Locator already logged its own discriminating tag
             // (locator.not_found / locator.ambiguous / locator.sysctl_failed).
             // The router's degraded line gives the operational layer; the reason
@@ -852,6 +870,139 @@ public final class InterventionRouter {
         } catch {
             trace.emit("router", "intervention.\(opName).degraded reason=unexpected_throw=\(error) pid=\(handle.pid) cwd=\(cwd ?? "")")
             await postNotify(decision)
+        }
+    }
+}
+
+// MARK: - Remote owner replies (v0.4.2, feature 4b)
+
+/// The one route from the inbound reply channel to a keyboard.
+///
+/// It lives here, in the same file and on the same type as `injectOrDegrade`,
+/// so that it calls the SAME private helpers rather than a second copy of
+/// them: the same `injectionBlockReason`, the same `resolveInjectTarget`, the
+/// same human-active gate, the same `injectionLedger`, the same `injector`.
+/// A parallel implementation in its own file could not reach these (Swift's
+/// `private` is file-scoped) and would have to restate every gate, which is
+/// how the two drift and how the second one ends up missing the screen.
+///
+/// What it deliberately does NOT do:
+///
+///   - it never signals. A remote reply cannot pause or kill anything. An
+///     inbound channel whose credential is a URL path must not be able to
+///     send a process a signal, and the way to guarantee that is for this
+///     path to have no code that does.
+///   - it never posts a notifier outcome. `InterventionOutcome` is the
+///     vocabulary of Supervisor's own decisions and it is persisted onto
+///     flag rows; a reply is not one of those, and minting an outcome for
+///     it would put remote text into a column the rubric reads.
+///   - it never falls back. If the target cannot be confirmed, the reply is
+///     refused, not typed into whatever session happens to be open. A
+///     misrouted supervisor answer is embarrassing; a misrouted remote
+///     instruction is a stranger's text in a session they never named.
+extension InterventionRouter: RemoteReplyInjecting {
+
+    public func injectRemoteReply(_ request: RemoteReplyInjection) async -> RemoteReplyInjectionResult {
+        // The harm screen, again. `RemoteReplyGate` already ran it, and this
+        // is not redundancy for its own sake: the gate's screen is what
+        // keeps hostile text away from this method, and THIS one is the
+        // invariant that no caller, present or future, reaches a keystroke
+        // without passing it. There is no other way into the injector from
+        // outside, so screening here makes "nothing injects unscreened" a
+        // property of the code rather than a property of the call graph.
+        if let blockReason = injectionBlockReason(request.text, op: "remote_reply", session: request.sessionId) {
+            return .screenBlocked(reason: blockReason)
+        }
+        guard !request.sessionId.isEmpty else {
+            return .failed(reason: "no_session")
+        }
+        guard let cwd = request.cwd, !cwd.isEmpty else {
+            trace.emit("router", "intervention.remote_reply.refused reason=no_cwd session=\(request.sessionId)")
+            return .failed(reason: "no_cwd")
+        }
+        // `resolveTarget`, NOT `resolveInjectTarget`. The difference is the
+        // Claude.app desktop host: the inject variant promotes that shared
+        // Electron pid to "confirmed" and defers picking the CONVERSATION
+        // to the injector's screenshot and OCR matching. That is a
+        // reasonable trade for Supervisor's own answer to a question it
+        // watched being asked. It is not a reasonable trade for a string
+        // that arrived on a topic a stranger may hold, so the remote path
+        // uses the plain resolver and a desktop session simply resolves
+        // unconfirmed and is refused below.
+        //
+        // The practical effect: replies work for a session Supervisor can
+        // pin by session id (the CLI, resolved from its argv), and are
+        // refused for a Claude Desktop conversation. That is a real
+        // limitation and the honest one.
+        guard let target = resolveTarget(sessionId: request.sessionId, cwd: cwd, op: "remote_reply") else {
+            trace.emit("router", "intervention.remote_reply.refused reason=locator_nil session=\(request.sessionId)")
+            return .failed(reason: "locator_nil")
+        }
+        let handle = target.handle
+        // Stricter than the local inject path on purpose. Locally, an
+        // unconfirmed target is allowed through when only one session is
+        // live, because the text is Supervisor's own answer to that
+        // session's own question. Here the text came off a shared topic, so
+        // an unconfirmed target is refused outright: "probably the right
+        // session" is not a standard to type a stranger-reachable string at.
+        guard target.sessionConfirmed else {
+            trace.emit(
+                "router",
+                "intervention.remote_reply.refused reason=unconfirmed_target session=\(request.sessionId) handle_cwd=\(handle.cwd)"
+            )
+            return .failed(reason: "unconfirmed_target")
+        }
+        if humanIsActivelyTyping(op: "remote_reply", session: request.sessionId) {
+            // The owner is at the Mac. Whatever they meant to send from
+            // their phone, they can finish here, and typing into a composer
+            // they are using would clobber a draft.
+            return .failed(reason: "human_active")
+        }
+        do {
+            let markedText = SupervisorInjectionMarker.wrap(request.text)
+            // Record BEFORE typing, same reason as the local path: the user
+            // turn can reach the JSONL and be triaged before any delivery
+            // confirmation finishes. The `remoteOwner` origin is what stops
+            // this text ever being read back as the owner authorizing
+            // something at the keyboard.
+            injectionLedger?.record(
+                sessionId: request.sessionId,
+                text: markedText,
+                at: now(),
+                origin: .remoteOwner
+            )
+            let preSize = transcriptSize(sessionId: request.sessionId)
+            let bytes = try await injector.inject(
+                text: markedText,
+                claudeCodePID: handle.pid,
+                targetWindowTitle: windowTitle(request.sessionId, request.branch)
+            )
+            if await injectLanded(sessionId: request.sessionId, sincePreSize: preSize) {
+                trace.emit(
+                    "router",
+                    "intervention.remote_reply.fired pid=\(handle.pid) bytes=\(bytes) session=\(request.sessionId) answering=\(request.outcomeKind) delivery=confirmed"
+                )
+                return .injected
+            }
+            trace.emit(
+                "router",
+                "intervention.remote_reply.degraded reason=paste_no_turn_landed pid=\(handle.pid) bytes=\(bytes) session=\(request.sessionId)"
+            )
+            return .failed(reason: "paste_no_turn_landed")
+        } catch let err as InjectError {
+            let reason: String
+            switch err {
+            case .noHostingApp:               reason = "no_hosting_app"
+            case .unsupportedHost(let b):     reason = "unsupported_host_\(b)"
+            case .activationFailed(let b):    reason = "activation_failed_\(b)"
+            case .eventCreationFailed:        reason = "event_creation_failed"
+            case .targetUnresolvable(let r):  reason = "target_unresolvable_\(r)"
+            }
+            trace.emit("router", "intervention.remote_reply.degraded reason=\(reason) pid=\(handle.pid)")
+            return .failed(reason: reason)
+        } catch {
+            trace.emit("router", "intervention.remote_reply.degraded reason=unexpected session=\(request.sessionId)")
+            return .failed(reason: "unexpected")
         }
     }
 }

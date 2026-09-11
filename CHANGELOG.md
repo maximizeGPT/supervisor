@@ -8,6 +8,67 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing yet.
 
+## [0.5.0] — 2026-09-11 (answer a page from your phone)
+
+### Added
+
+- **Replies from your phone (`remote_notify.reply_enabled`, off by default).**
+  A page that is waiting on you now carries a 6-character code. Reply to that
+  ntfy notification with the code and your answer and Supervisor types the
+  answer into the session that was blocked. There are no keywords: everything
+  after the code is what reaches the agent. The inbox is the topic your
+  webhook already points at, so rotating the webhook rotates the inbox, and
+  there is no second secret to store or revoke. A code is single-use, bound to
+  one session, and good for an hour; a code Supervisor did not issue gets no
+  answer back, only a local trace line, and five of those in ten minutes
+  switches replies off and pages you once to say so.
+
+  **Read the honesty note in the README before turning this on.** On ntfy.sh a
+  topic is public in both directions, so anyone who can subscribe to your topic
+  reads the code off the same page you do. The code is no defence against that
+  person, and for them read access to the topic amounts to write access to the
+  sessions Supervisor pages you about. `InjectionSafetyScreen` still runs on
+  every accepted reply, but it screens for harmful command shapes and not for
+  intent.
+- **"Allow replies from your phone" in the hover panel's Remote escalation
+  row.** The switch, the inbox address, and a QR code of that address for the
+  ntfy app. The address is masked by default behind a Reveal button and the QR
+  is not drawn until you reveal it, because the topic is the whole credential
+  in both directions and a settings panel is a thing people screenshot. The
+  mask is a fixed width and never a prefix of the real topic. Copy works while
+  the address is still masked, so getting the topic onto a phone never requires
+  putting it on screen.
+
+### Changed
+
+- `RemoteNotifyConfigWriter.Values` now carries `replyEnabled`, with no default
+  value. Every scalar in the `remote_notify` block is written on every save, so
+  a defaulted value would let a change to one setting silently switch another
+  off. The hover panel's config handler takes one `Values` rather than a
+  parameter per key.
+
+### Fixed
+
+- The README said "Delivery is one-way", which stopped being true with the
+  reply path. The privacy summary now also names the messages you send back.
+- **`Scripts/export-public.sh` could not publish a release, and `--retag` would
+  have corrupted the private one.** The export worktree is a worktree of the
+  private repo, so both repos share one local tag namespace while the same tag
+  name legitimately points at different commits in each (private `v0.4.0` is
+  the release commit, public `v0.4.0` is the export commit). Fetching the
+  public tags therefore hit "would clobber existing tag" on every shared
+  version and killed the script, and the existing-tag guard read the private
+  tag from that same namespace, so it refused correct exports and under
+  `--retag` would have rewritten the private release tag onto the public export
+  commit. The fetch no longer asks for tags, the guard asks the public remote
+  with `ls-remote`, and the tag is staged under `refs/supervisor-export/` and
+  pushed by explicit refspec, so it cannot collide. Found the hard way during
+  the 0.4.1 release, which was this script's first end-to-end run.
+- Two load-sensitive tests that failed under CPU contention while the product
+  was correct. `TriageEngineTests` read the trace log without draining
+  `TraceLog`'s async write queue first, which failed about 35% of runs under
+  load and looked like the engine skipping its trace tags.
+
 ## [0.4.1] — 2026-09-08 (upgrades keep your grants, test instances stay off your screen)
 
 ### Fixed
@@ -1145,6 +1206,20 @@ main app** (`Sources/SupervisorApp/main.swift`, `Sources/SupervisorStatusBar/`,
   `SessionReportExporterTests`, and the UI `PlanViewTests` / `AuditLogViewTests`).
 - The full suite is ~775 tests, 0 failures, across the harness baseline and the
   hardening pass.
+
+---
+
+## Pre-launch numbering (retired)
+
+Everything below this line belongs to the development numbering used before
+Supervisor was released publicly. That line ran to 0.9.3 and was retired on
+2026-06-29, when the first public release restarted the sequence at 0.3.0. So
+a version number below can repeat one above it: the 0.5.0 dated 2026-05-26 is
+not the 0.5.0 dated 2026-09-11, and neither is a predecessor of the other.
+Nothing here was ever tagged or published. It is kept because the reasoning in
+these entries is still the reasoning behind code that is still running.
+
+---
 
 ## [0.9.3] — 2026-06-03
 

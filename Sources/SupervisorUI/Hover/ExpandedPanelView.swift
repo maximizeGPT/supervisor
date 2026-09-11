@@ -75,6 +75,11 @@ public struct ExpandedPanelView: View {
     @State private var webhookDraft = ""
     @State private var showWebhookField = false
 
+    /// Transient "Copied" confirmation on the reply inbox address. Panel-
+    /// local and short-lived; the address itself is never held here, it is
+    /// pulled from the view model at the moment of the click.
+    @State private var copiedReplyTopic = false
+
     public init(vm: HoverViewModel) {
         self.vm = vm
     }
@@ -633,6 +638,144 @@ public struct ExpandedPanelView: View {
                                 : BrandColor.mute.color
                         )
                 }
+                // The INBOUND half, when it has been refused outright. Its
+                // own line rather than a clause on the one above: pages can
+                // be landing perfectly while replies are not arriving at
+                // all, and one line covering both would be wrong about one
+                // of them. Absent while the reply channel is off or healthy.
+                if let replyLine = vm.remoteReplyInboxHealthLine() {
+                    Text(replyLine)
+                        .font(BrandFont.monoSmall)
+                        .foregroundStyle(BrandColor.attention.color)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if vm.remoteNotifyEnabled {
+                    remoteReplyRow
+                }
+            }
+        }
+    }
+
+    // MARK: - Replies from your phone (inside the Remote escalation row)
+
+    /// The INBOUND half's controls: the switch, the address a phone
+    /// subscribes to, and a QR of that address.
+    ///
+    /// THE ADDRESS IS MASKED UNTIL THE OWNER ASKS FOR IT, and that is the
+    /// one thing about this row worth stating twice. The ntfy topic is the
+    /// entire credential in both directions: whoever knows it reads every
+    /// escalation Supervisor sends and can post a string Supervisor will
+    /// read back. This feature's own threat model names a topic caught on a
+    /// screenshot or read over a shoulder, and a panel that renders it by
+    /// default is that screenshot. So the text is bulleted out and the QR
+    /// (which is the same secret in a form a camera reads across a room) is
+    /// not drawn at all until `Reveal` is clicked.
+    ///
+    /// The masking rule itself lives in the view model, not here. This
+    /// view asks for a line and gets whichever one it is entitled to.
+    ///
+    /// The webhook URL above is handled the same way and always has been:
+    /// it goes in through a `SecureField` and is never rendered back, not
+    /// even masked. Both halves are the same credential.
+    private var remoteReplyRow: some View {
+        VStack(alignment: .leading, spacing: BrandSpacing.xs) {
+            Text("Allow replies from your phone")
+                .font(BrandFont.caption)
+                .tracking(0.4)
+                .foregroundStyle(BrandColor.mute.color)
+                .padding(.top, BrandSpacing.xs)
+
+            HStack(spacing: BrandSpacing.sm) {
+                togglePill(
+                    title: vm.remoteReplyEnabled ? "Replies: on" : "Replies: off",
+                    systemImage: vm.remoteReplyEnabled ? "arrowshape.turn.up.left.fill" : "arrowshape.turn.up.left",
+                    tint: vm.remoteReplyEnabled ? BrandColor.signal.color : BrandColor.mute.color,
+                    action: { vm.setRemoteReplyEnabled(!vm.remoteReplyEnabled) }
+                )
+                Spacer()
+            }
+
+            Text(vm.remoteReplyStatusLine)
+                .font(BrandFont.note)
+                .foregroundStyle(BrandColor.mute.color)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if vm.remoteReplyEnabled, let address = vm.remoteReplyInboxAddressLine() {
+                replyTopicAddress(address)
+                // Only ever non-nil once the owner has revealed the topic;
+                // the gate is in the view model so the text and the image
+                // can never disagree about whether the secret is showing.
+                if let target = vm.remoteReplyInboxQRTarget(),
+                   let qr = ReplyTopicQRCode.image(for: target) {
+                    VStack(alignment: .leading, spacing: BrandSpacing.xxs) {
+                        Image(nsImage: qr)
+                            .interpolation(.none)
+                            .frame(width: ReplyTopicQRCode.sidePoints, height: ReplyTopicQRCode.sidePoints)
+                            .padding(BrandSpacing.xs)
+                            .background(BrandColor.paper.color, in: RoundedRectangle(cornerRadius: BrandRadius.control))
+                            .accessibilityLabel("QR code for your reply inbox topic")
+                        Text("Scan this in the ntfy app to subscribe. Anyone who scans it can read your escalations and reply to them.")
+                            .font(BrandFont.note)
+                            .foregroundStyle(BrandColor.attention.color)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        // The view model outlives this view, so a revealed topic would
+        // still be revealed the next time the panel opened. Putting it away
+        // on disappear means a reveal lasts as long as the owner is looking
+        // at it and no longer. Fires when the panel closes, when Controls
+        // collapses, and when delivery is switched off.
+        .onDisappear { vm.hideRemoteReplyTopic() }
+    }
+
+    /// The address line plus its Reveal and Copy affordances.
+    ///
+    /// Copy works whether or not the topic is revealed, deliberately. It
+    /// puts the address on the clipboard without ever putting it on the
+    /// screen, which is the SAFER of the two ways to get it onto a phone,
+    /// so gating it behind the reveal would push owners toward the more
+    /// exposed path to reach the less exposed one.
+    private func replyTopicAddress(_ address: String) -> some View {
+        VStack(alignment: .leading, spacing: BrandSpacing.xxs) {
+            Text(address)
+                .font(BrandFont.monoSmall)
+                .foregroundStyle(BrandColor.ink.color)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: BrandSpacing.sm) {
+                Button {
+                    if vm.remoteReplyTopicRevealed {
+                        vm.hideRemoteReplyTopic()
+                    } else {
+                        vm.revealRemoteReplyTopic()
+                    }
+                } label: {
+                    Text(vm.remoteReplyTopicRevealed ? "Hide" : "Reveal")
+                        .font(BrandFont.caption)
+                        .foregroundStyle(BrandColor.signal.color)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    guard let target = vm.remoteReplyInboxEndpointProvider?()?.ownerSubscribeURL() else { return }
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(target.absoluteString, forType: .string)
+                    withAnimation(BrandMotion.standard) { copiedReplyTopic = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                        withAnimation(BrandMotion.standard) { copiedReplyTopic = false }
+                    }
+                } label: {
+                    Text(copiedReplyTopic ? "Copied" : "Copy")
+                        .font(BrandFont.caption)
+                        .foregroundStyle(BrandColor.signal.color)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Spacer()
             }
         }
     }

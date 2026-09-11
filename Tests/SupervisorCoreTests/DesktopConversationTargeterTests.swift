@@ -721,4 +721,71 @@ final class DesktopCaptureBridgeTests: XCTestCase {
         XCTAssertGreaterThan(DesktopConversationTargeter.captureTimeout, 0)
         XCTAssertLessThanOrEqual(DesktopConversationTargeter.captureTimeout, 10)
     }
+
+    // MARK: - Own-window exclusion (the capture filter's decision)
+
+    private typealias Win = DesktopConversationTargeter.CaptureWindowDescriptor
+
+    /// Supervisor's own windows float above the window being targeted, so the
+    /// hover band and the expanded panel can cover the sidebar rows the OCR
+    /// path reads. Every window this process owns is excluded, and only those.
+    func testOwnWindowIDsPicksEveryWindowOfThisProcess() {
+        let ours: pid_t = 501
+        let windows = [
+            Win(windowID: 11, owningProcessID: ours),        // hover band
+            Win(windowID: 12, owningProcessID: ours),        // expanded panel
+            Win(windowID: 13, owningProcessID: ours),        // onboarding
+            Win(windowID: 20, owningProcessID: 777),         // Claude.app
+            Win(windowID: 21, owningProcessID: 42)           // some other app
+        ]
+
+        XCTAssertEqual(DesktopConversationTargeter.ownWindowIDs(in: windows, ownProcessID: ours),
+                       [11, 12, 13])
+    }
+
+    /// A window ScreenCaptureKit could not attribute to an application is NOT
+    /// ours. Excluding it would punch a hole in the frame the OCR path still
+    /// has to read, which is the worse of the two mistakes.
+    func testUnattributedWindowIsNotOurs() {
+        let windows = [
+            Win(windowID: 30, owningProcessID: nil),
+            Win(windowID: 31, owningProcessID: 501)
+        ]
+
+        XCTAssertEqual(DesktopConversationTargeter.ownWindowIDs(in: windows, ownProcessID: 501),
+                       [31])
+    }
+
+    /// Nothing enumerated, or nothing of ours in what was enumerated, yields an
+    /// empty exclusion set. That is the case the capture treats as its fallback:
+    /// it captures the display unfiltered and traces, so a filter problem
+    /// degrades to a working capture rather than to no capture.
+    func testEmptyExclusionDrivesTheUnfilteredFallback() {
+        XCTAssertTrue(DesktopConversationTargeter.ownWindowIDs(in: [], ownProcessID: 501).isEmpty)
+
+        let noneOfOurs = [
+            Win(windowID: 40, owningProcessID: 777),
+            Win(windowID: 41, owningProcessID: nil)
+        ]
+        XCTAssertTrue(DesktopConversationTargeter.ownWindowIDs(in: noneOfOurs,
+                                                              ownProcessID: 501).isEmpty)
+    }
+
+    /// The decision reads a pid and nothing else. A window title is
+    /// user-visible text that changes as the UI changes, so the descriptor does
+    /// not carry one: two windows that differ only in owner are classified
+    /// differently, and there is no title field for a match to drift onto.
+    func testDecisionIsPidOnly() {
+        let sameID: CGWindowID = 55
+        XCTAssertEqual(DesktopConversationTargeter.ownWindowIDs(
+            in: [Win(windowID: sameID, owningProcessID: 501)], ownProcessID: 501), [sameID])
+        XCTAssertTrue(DesktopConversationTargeter.ownWindowIDs(
+            in: [Win(windowID: sameID, owningProcessID: 502)], ownProcessID: 501).isEmpty)
+    }
+
+    /// The live capture asks the OS for this process's pid, so the value the
+    /// filter is built from has to be a real, positive pid.
+    func testCurrentProcessIdentifierIsUsable() {
+        XCTAssertGreaterThan(ProcessInfo.processInfo.processIdentifier, 0)
+    }
 }

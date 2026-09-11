@@ -62,6 +62,26 @@ public enum StarterConfig {
         #   # auto reads the format from the webhook host. Set it explicitly
         #   # (ntfy) for a self-hosted endpoint whose host says nothing.
         #   format: auto
+        #   # Let a reply to an ntfy page be typed into the session that
+        #   # was paged. Off by default and separate from enabled, because
+        #   # this one is INBOUND.
+        #   #
+        #   # READ THIS BEFORE TURNING IT ON. On ntfy.sh a topic is public
+        #   # in both directions. Supervisor only accepts a reply that
+        #   # opens with the code printed in the page it answers, uses each
+        #   # code once, and expires it in an hour, which stops anyone who
+        #   # can post but is not subscribed (five wrong codes switches
+        #   # this off and pages you). It does NOT stop anyone who IS
+        #   # subscribed: they can read the code off the page and answer
+        #   # before you do. On a public topic, whoever knows it can type
+        #   # into the sessions you get paged about. If that matters, use
+        #   # an ntfy server where subscribing needs a token.
+        #   #
+        #   # Replies can only answer. There is no remote pause and no
+        #   # remote kill. ntfy webhooks only, topic at least 16
+        #   # characters, and a Claude Desktop conversation cannot be
+        #   # answered this way (only a session Supervisor can pin by id).
+        #   reply_enabled: false
 
         # hover:
         #   # Extra terminal bundle IDs to treat as Claude Code hosts, on top

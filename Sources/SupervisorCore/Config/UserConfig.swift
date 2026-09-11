@@ -96,6 +96,18 @@ public struct UserConfig: Sendable, Equatable {
     /// self-hosted ntfy server. `auto`, absence, and typos all mean nil.
     public let remoteNotifyFormat: RemoteNotifyFormat?
 
+    /// `remote_notify.reply_enabled` (v0.4.2, feature 4b). Off unless the
+    /// file says otherwise, and a SEPARATE switch from `enabled` on
+    /// purpose: outbound is a message leaving the Mac, inbound is a string
+    /// arriving from a topic that anyone holding the URL can post to, and
+    /// nobody should acquire the second by having agreed to the first.
+    ///
+    /// It nests inside `remote_notify` because it has no meaning without
+    /// it: the reply arrives on the topic the page went out on. Both
+    /// switches, a stored webhook, and an ntfy-shaped URL are ALL required
+    /// before a single byte is read (see `RemoteReplyEndpoint.derive`).
+    public let remoteReplyEnabled: Bool
+
     public init(
         additionalHostApps: [String] = [],
         dailyCostCapUSD: Double? = nil,
@@ -103,7 +115,8 @@ public struct UserConfig: Sendable, Equatable {
         superviseCodex: Bool? = nil,
         remoteNotifyEnabled: Bool = false,
         remoteNotifyDetail: RemoteNotifyDetail = .minimal,
-        remoteNotifyFormat: RemoteNotifyFormat? = nil
+        remoteNotifyFormat: RemoteNotifyFormat? = nil,
+        remoteReplyEnabled: Bool = false
     ) {
         self.additionalHostApps = additionalHostApps
         self.dailyCostCapUSD = dailyCostCapUSD
@@ -112,6 +125,7 @@ public struct UserConfig: Sendable, Equatable {
         self.remoteNotifyEnabled = remoteNotifyEnabled
         self.remoteNotifyDetail = remoteNotifyDetail
         self.remoteNotifyFormat = remoteNotifyFormat
+        self.remoteReplyEnabled = remoteReplyEnabled
     }
 
     /// Parse a config.yaml string. Returns a default (empty) config
@@ -136,6 +150,7 @@ public struct UserConfig: Sendable, Equatable {
         var remoteEnabled = false
         var remoteDetail: RemoteNotifyDetail = .minimal
         var remoteFormat: RemoteNotifyFormat?
+        var remoteReplyEnabled = false
 
         for rawLine in yaml.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(rawLine)
@@ -220,6 +235,12 @@ public struct UserConfig: Sendable, Equatable {
                 if indent > remoteNotifyIndent {
                     if let value = Self.scalarValue(of: "enabled", in: trimmed) {
                         remoteEnabled = (value == "true" || value == "yes" || value == "on")
+                    } else if let value = Self.scalarValue(of: "reply_enabled", in: trimmed) {
+                        // Distinct from `enabled`: the two keys have
+                        // different prefixes, so `reply_enabled` can never
+                        // be read as `enabled` or the other way round, and
+                        // switching outbound on never switches inbound on.
+                        remoteReplyEnabled = (value == "true" || value == "yes" || value == "on")
                     } else if let value = Self.scalarValue(of: "detail", in: trimmed) {
                         remoteDetail = RemoteNotifyDetail(rawValue: value) ?? .minimal
                     } else if let value = Self.scalarValue(of: "format", in: trimmed) {
@@ -257,7 +278,8 @@ public struct UserConfig: Sendable, Equatable {
             superviseCodex: superviseCodex,
             remoteNotifyEnabled: remoteEnabled,
             remoteNotifyDetail: remoteDetail,
-            remoteNotifyFormat: remoteFormat
+            remoteNotifyFormat: remoteFormat,
+            remoteReplyEnabled: remoteReplyEnabled
         )
     }
 

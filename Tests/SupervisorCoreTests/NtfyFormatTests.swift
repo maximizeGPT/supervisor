@@ -170,13 +170,13 @@ final class NtfyFormatTests: XCTestCase {
     func testConfigWriterRoundTripsTheFormatKey() {
         let out = RemoteNotifyConfigWriter.updatedYAML(
             "remote_notify:\n  enabled: true\n  detail: minimal\n",
-            values: .init(enabled: true, detail: .minimal, format: .ntfy)
+            values: .init(enabled: true, detail: .minimal, format: .ntfy, replyEnabled: false)
         )
         XCTAssertEqual(UserConfig.parse(out).remoteNotifyFormat, .ntfy)
 
         let backToAuto = RemoteNotifyConfigWriter.updatedYAML(
             out,
-            values: .init(enabled: true, detail: .minimal, format: nil)
+            values: .init(enabled: true, detail: .minimal, format: nil, replyEnabled: false)
         )
         XCTAssertNil(UserConfig.parse(backToAuto).remoteNotifyFormat)
         XCTAssertTrue(backToAuto.contains("format: auto"),

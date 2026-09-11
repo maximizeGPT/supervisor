@@ -33,7 +33,7 @@ Supervisor watches each session and acts in your place:
 - **Keeps it moving.** It nudges an idle session forward toward its objective instead of letting it stall the moment you step away.
 - **Stops the dangerous stuff.** When an action looks destructive, it flags it and tells you why, in one sentence you can actually read, and pauses the session when it can do so safely.
 
-Everything runs on your Mac, on your own API key. Nothing leaves your machine except the same model calls you would make yourself, plus the escalation message described in [Remote escalation delivery](#remote-escalation-delivery) if you turn that on yourself. It ships off, and its default message quotes nothing from your session.
+Everything runs on your Mac, on your own API key. Nothing leaves your machine except the same model calls you would make yourself, plus the escalation message described in [Remote escalation delivery](#remote-escalation-delivery) if you turn that on yourself, and, if you also turn on replies, the messages you send back. It ships off, and its default message quotes nothing from your session.
 
 **New in 0.4.0:** escalations reach your phone. Discord, Slack or ntfy, off by default, and the status-bar companion pages you when the app itself crashes or hangs, because the process that most needs reporting is the one that cannot report itself. Model spend is now metered, traced hourly, and capped at $5/day by default: the idle path used to re-buy the same verdict every 60 seconds, about $11/day against sessions that had been silent for hours, and it now settles onto a 30-minute rung for well under $1. From 0.3.x: launch reliability, an opt-in Second Brain, supervised Codex sessions, a second-opinion panel across other models, context health monitoring, and the portable Agent Skill below.
 
@@ -130,7 +130,27 @@ The first Supervisor launch after storing the URL may show a macOS Keychain perm
 
 **When it fires.** Only events where the session is blocked on you, plus high-severity flags: pause, kill, a medium-confidence dispatch waiting on your approval, a low-confidence dispatch waiting on your direction, an answer Supervisor could not type for you, a missing Screen Recording permission, and any high-severity notify. Work Supervisor handled by itself stays local. Repeats of the same session, outcome and category collapse to one message per minute, so a stuck loop pages you once.
 
-**The honest caveat.** You get pinged. You cannot answer from your phone, so a blocked session still says "go to your Mac." Delivery is one-way.
+**The honest caveat.** You get pinged. Answering from your phone is a separate opt-in described below, and with it off a blocked session still says "go to your Mac."
+
+### Reply from your phone
+
+Off by default, and a second switch on top of delivery: you need both on. Turn it on in the hover panel's Remote escalation row ("Allow replies from your phone"), or set `remote_notify.reply_enabled: true` in config.yaml. It needs an ntfy webhook. Discord and Slack webhooks can only be posted to, so the panel says so on those and the channel stays inert.
+
+With it on, a page that is waiting on you carries a 6-character code. Reply to that notification with the code and your answer, and Supervisor types the answer into the session that was blocked:
+
+```
+a7k2mq yes, rebase onto main and force-push
+```
+
+Type your answer; there are no magic words. There is no `approve` and no `deny`, so no word you might reasonably start a sentence with can quietly mean something else. Everything after the code is what reaches the agent.
+
+The inbox is the topic your webhook already points at, so there is nothing extra to create and nothing extra to revoke. Rotating the webhook rotates the inbox with it. The panel shows that inbox URL masked, with a Reveal button and a QR code you can scan into the ntfy app, because the URL is the credential and a panel is a thing people screenshot.
+
+A code is single-use, bound to one session, and good for an hour. A code Supervisor did not issue gets no answer back at all, only a line in the local trace log. Five of those in ten minutes and Supervisor switches replies off, pages you once to say it happened, and leaves them off until you switch them off and on again, either in the panel row or through `reply_enabled` in config.yaml.
+
+**What the code protects, and what it does not.** On ntfy.sh a topic is public in both directions. Anyone who knows the topic can subscribe to it, and a subscriber sees the code on the same page you do, at the same moment you do. So the code is no defence against somebody who can read your topic, and for that person read access to the topic amounts to write access to the sessions Supervisor pages you about. Against everyone else it is doing real work: text posted to the topic without a live code never reaches a session, an accepted reply is bound to the one page it answers, and a code cannot be spent twice.
+
+Behind the code there is one more check, `InjectionSafetyScreen`, the same deny-list Supervisor runs in front of its own injections. It refuses the shapes a harmful instruction carries: piping the network into a shell, reading credentials out, destructive escalation like `rm -rf` on a home or system path. It matches shapes, so "delete the tests and push the branch" is ordinary English and goes straight through it. Turn replies on only if you are willing to treat the topic in your webhook URL as the secret it is: long, random, never in a screenshot, never pasted into an issue.
 
 ## Pricing
 

@@ -121,8 +121,8 @@ final class RemoteEscalationPanelTests: XCTestCase {
     func testToggleReflectsOnlyAfterTheWriteSucceeds() async {
         let vm = makeVM()
         let written = Box<(Bool, RemoteNotifyDetail)>()
-        vm.setRemoteNotifyHandler = { enabled, detail, _ in
-            written.value = (enabled, detail)
+        vm.setRemoteNotifyHandler = { values in
+            written.value = (values.enabled, values.detail)
             return true
         }
         vm.seedRemoteEscalation(webhookConfigured: true, enabled: false, detail: .minimal)
@@ -139,7 +139,7 @@ final class RemoteEscalationPanelTests: XCTestCase {
 
     func testFailedConfigWriteLeavesThePanelStateUntouched() async {
         let vm = makeVM()
-        vm.setRemoteNotifyHandler = { _, _, _ in false }
+        vm.setRemoteNotifyHandler = { _ in false }
         vm.seedRemoteEscalation(webhookConfigured: true, enabled: false, detail: .minimal)
 
         vm.setRemoteNotifyEnabled(true)
@@ -159,11 +159,11 @@ final class RemoteEscalationPanelTests: XCTestCase {
             var triples: [(Bool, RemoteNotifyDetail)] = []
         }
         let writes = Writes()
-        vm.setRemoteNotifyHandler = { enabled, detail, _ in
+        vm.setRemoteNotifyHandler = { values in
             // A slow write, so the second click lands while this one is
             // still in flight.
             try? await Task.sleep(nanoseconds: 100_000_000)
-            writes.triples.append((enabled, detail))
+            writes.triples.append((values.enabled, values.detail))
             return true
         }
         vm.seedRemoteEscalation(webhookConfigured: true, enabled: false, detail: .minimal)
@@ -181,7 +181,7 @@ final class RemoteEscalationPanelTests: XCTestCase {
     func testNoOpToggleDoesNotCallTheHandler() async {
         let vm = makeVM()
         let called = Counter()
-        vm.setRemoteNotifyHandler = { _, _, _ in called.bump(); return true }
+        vm.setRemoteNotifyHandler = { _ in called.bump(); return true }
         vm.seedRemoteEscalation(webhookConfigured: true, enabled: true, detail: .minimal)
         vm.setRemoteNotifyEnabled(true)
         try? await Task.sleep(nanoseconds: 50_000_000)

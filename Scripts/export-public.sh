@@ -290,8 +290,14 @@ if [[ -n "$(git -C "$PUBLIC_WT" status --porcelain)" ]]; then
     die "$PUBLIC_WT has uncommitted changes. Deal with them first; this script wipes its contents."
 fi
 
-say "fetching $PUBLIC_REMOTE"
-git -C "$PUBLIC_WT" fetch "$PUBLIC_REMOTE" --quiet --tags
+say "fetching $PUBLIC_REMOTE (branches only)"
+# --no-tags is load-bearing, not tidiness. The export worktree is a worktree OF
+# THE PRIVATE REPO, so both repos share ONE local tag namespace, and the same
+# tag name legitimately points at different commits in each: private v0.4.0 is
+# the release commit, public v0.4.0 is the export commit. Fetching the public
+# tags therefore hits "would clobber existing tag" on every shared version and,
+# under set -e, kills the release. Only the branch is needed here.
+git -C "$PUBLIC_WT" fetch "$PUBLIC_REMOTE" --quiet --no-tags
 
 say "resetting $PUBLIC_WT to $PUBLIC_REMOTE/main on $BRANCH"
 git -C "$PUBLIC_WT" checkout -B "$BRANCH" "$PUBLIC_REMOTE/main" --quiet
@@ -314,27 +320,42 @@ say "committed export tip $(git -C "$PUBLIC_WT" rev-parse --short HEAD)"
 # There is deliberately no way to pass a tag target. The only commit this
 # script will tag is the one it just created. v0.3.2 shipped with its tag one
 # commit behind the export; that cannot happen through this path.
-EXISTING="$(git -C "$PUBLIC_WT" rev-parse -q --verify "refs/tags/$VERSION^{commit}" 2>/dev/null || true)"
+# The collision check asks the PUBLIC REMOTE, not the local tag namespace.
+# Locally, refs/tags/$VERSION is the PRIVATE tag (the release commit), which is
+# a different commit by design and is none of this script's business. Reading it
+# here used to make the script refuse a correct export, and with --retag it
+# would have rewritten the private tag to point at the public export commit.
+EXISTING="$(git -C "$PUBLIC_WT" ls-remote --tags "$PUBLIC_REMOTE" "refs/tags/$VERSION" 2>/dev/null | awk '{print $1}' | head -1)"
+if [[ -n "$EXISTING" ]]; then
+    # ls-remote gives the tag object for an annotated tag, so peel to a commit.
+    EXISTING="$(git -C "$PUBLIC_WT" rev-parse -q --verify "$EXISTING^{commit}" 2>/dev/null || echo "$EXISTING")"
+fi
 if [[ -n "$EXISTING" && "$EXISTING" != "$EXPORT_TIP" ]]; then
     if [[ "$RETAG" != "1" ]]; then
-        die "tag $VERSION already exists at $(git -C "$PUBLIC_WT" rev-parse --short "$EXISTING"),
-    which is not the export tip $(git -C "$PUBLIC_WT" rev-parse --short "$EXPORT_TIP").
+        die "$PUBLIC_REMOTE already publishes tag $VERSION at $EXISTING,
+    which is not the export tip $EXPORT_TIP.
     Re-run with --retag to move it, once you are sure that is what you want."
     fi
-    say "moving existing tag $VERSION (--retag)"
+    say "moving already-published tag $VERSION (--retag)"
 fi
-git -C "$PUBLIC_WT" tag -f "$VERSION" "$EXPORT_TIP" >/dev/null
 
-TAGGED="$(git -C "$PUBLIC_WT" rev-parse "refs/tags/$VERSION^{commit}")"
+# Staged under refs/supervisor-export/, NOT refs/tags/. A local tag of the same
+# name would collide with the private release tag in this shared namespace; a
+# private ref cannot. It is pushed to refs/tags/$VERSION on the public remote
+# below, which is the only place this tag is meant to exist.
+EXPORT_TAG_REF="refs/supervisor-export/$VERSION"
+git -C "$PUBLIC_WT" update-ref "$EXPORT_TAG_REF" "$EXPORT_TIP"
+
+TAGGED="$(git -C "$PUBLIC_WT" rev-parse "$EXPORT_TAG_REF^{commit}")"
 [[ "$TAGGED" == "$EXPORT_TIP" ]] \
     || die "REFUSING to continue: $VERSION resolved to $TAGGED, not the export tip $EXPORT_TIP"
-say "tag $VERSION verified at the export tip"
+say "tag $VERSION staged at the export tip (as $EXPORT_TAG_REF, so the private tag is untouched)"
 
 # --- 7. Hand the push back to a human ---------------------------------------
 echo
 say "done locally. Nothing has been pushed. To publish:"
 echo "    git -C $PUBLIC_WT push $PUBLIC_REMOTE HEAD:main"
-echo "    git -C $PUBLIC_WT push --force $PUBLIC_REMOTE $VERSION"
+echo "    git -C $PUBLIC_WT push --force $PUBLIC_REMOTE $EXPORT_TAG_REF:refs/tags/$VERSION"
 echo
 say "then verify the tag landed where you think it did:"
 echo "    git -C $PUBLIC_WT ls-remote --tags $PUBLIC_REMOTE $VERSION"

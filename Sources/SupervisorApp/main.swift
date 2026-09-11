@@ -117,6 +117,15 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     /// watcher AND the panel's Remote escalation row can flip `enabled`,
     /// complete a missing endpoint, and send a test, all without a relaunch.
     private var remoteNotifier: RemoteNotifier?
+    /// v0.4.2 feature 4b, the inbound half. All three are always
+    /// constructed and all three are inert until `armRemoteReply` finds a
+    /// config switch, a stored ntfy webhook, and a topic long enough to be
+    /// worth arming on. Held so the config watcher can arm and disarm live,
+    /// exactly like the outbound notifier.
+    private var replyCorrelations: ReplyCorrelationTable?
+    private var replyCodeMinter: ArmedReplyCodeMinter?
+    private var replyGate: RemoteReplyGate?
+    private var replySubscriber: RemoteInboxSubscriber?
     /// Raw webhook URL as read by the launch keychain probe, off the main
     /// thread, alongside the provider key (routeAfterKeychainProbe). Consumed
     /// by enterRunningState so the running-state entry never touches the
@@ -746,7 +755,21 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // this path. Always constructed (endpoint-less and disabled when the
         // owner never set it up): the panel's Remote escalation row arms the
         // channel live, and needs a running instance to apply to.
-        let remote = makeRemoteNotifier(config: userConfig, storedWebhookURL: probedWebhookURL)
+        // The reply correlation table is built BEFORE the notifier because
+        // the notifier prints its codes. It is wrapped in a minter that
+        // stays disarmed until `armRemoteReply` proves a reply could
+        // actually be read, so a page never advertises a channel nobody is
+        // listening on.
+        let correlations = ReplyCorrelationTable()
+        let minter = ArmedReplyCodeMinter(table: correlations, armed: false)
+        self.replyCorrelations = correlations
+        self.replyCodeMinter = minter
+
+        let remote = makeRemoteNotifier(
+            config: userConfig,
+            storedWebhookURL: probedWebhookURL,
+            replyCodeMinter: minter
+        )
         self.remoteNotifier = remote
 
         // The panel's Remote escalation row: seed the truth for first open,
@@ -757,7 +780,8 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             webhookConfigured: !(probedWebhookURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty,
             enabled: userConfig.remoteNotifyEnabled,
             detail: userConfig.remoteNotifyDetail,
-            format: userConfig.remoteNotifyFormat
+            format: userConfig.remoteNotifyFormat,
+            replyEnabled: userConfig.remoteReplyEnabled
         )
         let webhookStore = self.remoteNotifyURLStore
         hoverVM.saveRemoteWebhookHandler = { [weak remote] raw in
@@ -776,21 +800,29 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         }
         let remoteConfigPath = paths.configPath
         let remoteTrace = trace
-        hoverVM.setRemoteNotifyHandler = { [weak remote] enabled, detail, format in
+        hoverVM.setRemoteNotifyHandler = { [weak remote] values in
             // Persist first, then apply: the panel reflects the write's
             // success, and config.yaml stays the durable source of truth
             // (the watcher will re-apply the same values, which the
             // notifier's no-change guard absorbs quietly).
+            //
+            // `reply_enabled` rides in `values` and needs no separate
+            // application step here: the write lands in config.yaml, the
+            // ConfigWatcher fires on it, and `rearmRemoteReply` at the
+            // bottom of that callback arms or disarms the inbound half. One
+            // path for a panel click and a hand edit, which is the only way
+            // the two can be guaranteed to mean the same thing.
             do {
-                try RemoteNotifyConfigWriter.write(
-                    values: .init(enabled: enabled, detail: detail, format: format),
-                    to: remoteConfigPath
-                )
+                try RemoteNotifyConfigWriter.write(values: values, to: remoteConfigPath)
             } catch {
                 remoteTrace.emit("remote", "remote.config_write_failed error=\(error)")
                 return false
             }
-            remote?.apply(RemoteNotifier.Configuration(enabled: enabled, detail: detail, formatOverride: format))
+            remote?.apply(RemoteNotifier.Configuration(
+                enabled: values.enabled,
+                detail: values.detail,
+                formatOverride: values.format
+            ))
             return true
         }
         hoverVM.sendRemoteTestHandler = { [weak remote] in
@@ -804,6 +836,32 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // reserved for "is supervision alive".
         hoverVM.remoteDeliveryHealthProvider = { [weak remote] in
             remote?.deliveryHealth
+        }
+        // The same pull, for the INBOUND half. Read through `self` rather
+        // than captured, because the subscriber is built later (and rebuilt
+        // on a config change) by `armRemoteReply`; nil until then, which is
+        // the honest answer for an install with no reply channel.
+        hoverVM.remoteReplyInboxHealthProvider = { [weak self] in
+            self?.replySubscriber?.inboxHealth
+        }
+        // The address the panel shows (masked until the owner reveals it).
+        // Derived from the RUNNING notifier's stored webhook and its
+        // resolved format, which are the same two inputs `armRemoteReply`
+        // derives the READER's endpoint from, so the row can never
+        // advertise a topic replies are not actually read from.
+        //
+        // Read off the notifier rather than off the subscriber on purpose.
+        // The subscriber only holds an endpoint once the channel is armed,
+        // and arming happens a config-watcher hop after the owner clicks
+        // the switch; a row sourced from it would spend that hop telling
+        // the owner their perfectly good ntfy webhook cannot carry replies.
+        // nil here means what it says: this webhook cannot carry replies,
+        // which is the honest and immediate answer for Discord and Slack.
+        hoverVM.remoteReplyInboxEndpointProvider = { [weak self] in
+            guard let remote = self?.remoteNotifier,
+                  let webhook = remote.currentEndpoint else { return nil }
+            let format = remote.currentConfiguration.formatOverride ?? webhook.format
+            return RemoteReplyEndpoint.derive(from: webhook, format: format)
         }
 
         // C6: the 45-minute "still waiting on you" re-page for sessions
@@ -822,7 +880,7 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
         // Watch config.yaml for live changes — FSEvents fires on write/rename.
         let remoteURLStore = self.remoteNotifyURLStore
         let watcherTrace = trace
-        let watcher = ConfigWatcher(configPath: paths.configPath, trace: trace) { [weak hoverWindow, weak hoverVM, weak remote] config in
+        let watcher = ConfigWatcher(configPath: paths.configPath, trace: trace) { [weak self, weak hoverWindow, weak hoverVM, weak remote] config in
             hoverWindow?.mergeUserConfig(additionalHostApps: config.additionalHostApps)
             remote?.apply(RemoteNotifier.Configuration(
                 enabled: config.remoteNotifyEnabled,
@@ -838,7 +896,8 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
                     webhookConfigured: hoverVM.remoteWebhookConfigured,
                     enabled: config.remoteNotifyEnabled,
                     detail: config.remoteNotifyDetail,
-                    format: config.remoteNotifyFormat
+                    format: config.remoteNotifyFormat,
+                    replyEnabled: config.remoteReplyEnabled
                 )
             }
             // Late webhook arrival: the documented setup order stores the
@@ -867,6 +926,13 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
                     }
                     do {
                         remote.apply(endpoint: try RemoteWebhookURL(validating: raw))
+                        // The reply channel derives its topic from this
+                        // same URL, so it has to be re-evaluated now that
+                        // one exists. Without this the inbound half stays
+                        // inert until the NEXT config write, which for an
+                        // owner who set the URL and the switch in one go is
+                        // "it just does not work".
+                        Task { @MainActor [weak self] in self?.rearmRemoteReply(config: config) }
                     } catch {
                         // The URL itself is never logged. It is a bearer credential.
                         let detail = ((error as? RemoteNotifyError)?.errorDescription) ?? "unexpected"
@@ -874,6 +940,12 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
+            // Feature 4b: re-evaluate the inbound reply channel on every
+            // config write, so `reply_enabled` takes effect the same way
+            // `enabled` does, with no relaunch. AFTER the late-webhook
+            // block, so a write that both stores a URL and flips the switch
+            // is seen in that order.
+            self?.rearmRemoteReply(config: config)
         }
         watcher.start()
         self.configWatcher = watcher
@@ -1066,6 +1138,34 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             trace: trace
         )
         self.router = router
+
+        // v0.4.2 feature 4b: the inbound reply channel. Built after the
+        // router because the router IS the only thing that can type a reply
+        // (see `InterventionRouter.injectRemoteReply`), and armed only if
+        // every gate agrees.
+        armRemoteReply(config: userConfig, router: router, remote: remote, correlations: correlations, minter: minter)
+        // Local resolution retires the remote code. Dismissing or
+        // overriding a flag in the panel closes the question the page
+        // asked, so the code that page carried dies with it rather than
+        // staying live for its TTL.
+        //
+        // Narrower than it sounds, and worth being exact about: an owner
+        // who walks over and types the answer into the terminal touches
+        // neither the panel nor the banner, so that code stays live until
+        // its hour is up. Closing that needs a session-side signal neither
+        // of these hooks has.
+        hoverVM.onFlagResponded = { [weak correlations] flagId in
+            correlations?.retireAll(flagId: flagId)
+        }
+        // The same retirement for the owner who never opens the panel.
+        // Swiping the banner away is already recorded as a response
+        // (`user_response = dismissed`, in the delegate below), so the code
+        // paged out to answer that question has to die with it. Without
+        // this it stayed live for the rest of its hour on a topic anyone
+        // subscribed can read.
+        hoverVM.onFlagBannerDismissed = { [weak correlations] flagId in
+            correlations?.retireAll(flagId: flagId)
+        }
 
         // v0.1.7: wire the resume handler for the expanded panel's
         // Resume button. Uses the same locator + signal sender as the
@@ -1370,7 +1470,11 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
     /// short-circuits at the enabled gate before any composition or network
     /// work), so the unconfigured majority pays one construction and one
     /// trace line per launch, and never a byte on the wire.
-    private func makeRemoteNotifier(config: UserConfig, storedWebhookURL: String?) -> RemoteNotifier {
+    private func makeRemoteNotifier(
+        config: UserConfig,
+        storedWebhookURL: String?,
+        replyCodeMinter: (any ReplyCodeMinting)? = nil
+    ) -> RemoteNotifier {
         let configuration = RemoteNotifier.Configuration(
             enabled: config.remoteNotifyEnabled,
             detail: config.remoteNotifyDetail,
@@ -1398,7 +1502,156 @@ final class SupervisorAppDelegate: NSObject, NSApplicationDelegate {
             endpoint: endpoint,
             configuration: configuration,
             redactor: DefaultRedactor(),
-            trace: trace
+            trace: trace,
+            replyCodeMinter: replyCodeMinter
+        )
+    }
+
+    // MARK: - Remote reply channel (v0.4.2, feature 4b)
+
+    /// `armRemoteReply` with the collaborators looked up from `self`, for
+    /// the two callers that only hold a `UserConfig` (the config watcher
+    /// and the late-Keychain-webhook completion). A no-op before the
+    /// running state has built them.
+    private func rearmRemoteReply(config: UserConfig) {
+        guard let remote = remoteNotifier,
+              let router = router,
+              let correlations = replyCorrelations,
+              let minter = replyCodeMinter else { return }
+        armRemoteReply(
+            config: config,
+            router: router,
+            remote: remote,
+            correlations: correlations,
+            minter: minter
+        )
+    }
+
+    /// Arm or disarm the inbound reply channel against the current config
+    /// and webhook, and keep the minter honest about which it is.
+    ///
+    /// FOUR conditions, all required, and each one is a real refusal rather
+    /// than a formality:
+    ///
+    ///   `remote_notify.enabled`        outbound is on. Inbound has no
+    ///                                  meaning without the page it answers.
+    ///   `remote_notify.reply_enabled`  the owner asked for the inbound half
+    ///                                  specifically. Agreeing to send is
+    ///                                  not agreeing to receive.
+    ///   a stored webhook               there is somewhere to derive a topic
+    ///                                  from.
+    ///   an ntfy topic, long enough     Discord and Slack webhooks cannot
+    ///                                  carry replies at all, and a short
+    ///                                  topic is one a stranger can guess
+    ///                                  into and lock the owner out of.
+    ///
+    /// Safe to call repeatedly: the subscriber's own `apply` absorbs a
+    /// no-change call, so the config watcher can run this on every write.
+    private func armRemoteReply(
+        config: UserConfig,
+        router: InterventionRouter,
+        remote: RemoteNotifier,
+        correlations: ReplyCorrelationTable,
+        minter: ArmedReplyCodeMinter
+    ) {
+        let wantsReplies = config.remoteNotifyEnabled && config.remoteReplyEnabled
+        var endpoint: RemoteReplyEndpoint?
+        if wantsReplies, let webhook = remote.currentEndpoint {
+            let format = config.remoteNotifyFormat ?? webhook.format
+            endpoint = RemoteReplyEndpoint.derive(from: webhook, format: format)
+            if endpoint == nil,
+               let why = RemoteReplyEndpoint.unavailableReason(from: webhook, format: format) {
+                trace.emit("remote", "remote.reply_unavailable reason=\(why)")
+            }
+        }
+        let armed = wantsReplies && endpoint != nil
+
+        let gateConfig = RemoteReplyGate.Configuration(enabled: armed)
+        if let existing = replyGate {
+            existing.apply(gateConfig)
+        } else {
+            let notifierForPages = remote
+            let disarmOnLockout = minter
+            let gate = RemoteReplyGate(
+                correlations: correlations,
+                injecting: router,
+                configuration: gateConfig,
+                trace: trace,
+                onLockout: { [weak self] failures, window in
+                    // Stop advertising a channel that is no longer reading.
+                    disarmOnLockout.setArmed(false)
+                    // Then PAGE, and only then stop the reader. The order is
+                    // the whole point: `onLockout` runs inside the
+                    // subscriber's own task, so stopping first cancels that
+                    // task and the POST dies with it as URLError.cancelled.
+                    // The owner would learn nothing, which is exactly the
+                    // silence this page exists to break.
+                    //
+                    // The copy and the dedupe window live in
+                    // `RemoteReplyPage` so both are testable against a real
+                    // notifier. The window is ZERO, and that is the fix for
+                    // a real hole rather than tidiness: the system dedupe
+                    // key is `system|<kind>`, so an hour here would not
+                    // suppress a repeat of one lockout, it would suppress
+                    // the SECOND lockout. The page itself tells the owner to
+                    // re-arm, whoever flooded the topic is still there when
+                    // they do, and the page they would never see is the one
+                    // saying it happened again.
+                    _ = await notifierForPages.postRemoteReplyLockout(
+                        failures: failures,
+                        window: window
+                    )
+                    Task { @MainActor [weak self] in self?.replySubscriber?.stop() }
+                },
+                onAcknowledge: { ack in
+                    // Feature 4c: say something back. The owner sent a reply
+                    // into a channel that, until now, answered with silence
+                    // whether it worked or not. Content-free by
+                    // construction: `RemoteReplyAcknowledgement` holds the
+                    // whole sentence, so there is no template a caller can
+                    // interpolate session text into, and the topic is
+                    // publicly readable.
+                    _ = await notifierForPages.postRemoteReplyAcknowledgement(ack)
+                }
+            )
+            replyGate = gate
+        }
+        guard let gate = replyGate else { return }
+
+        // Mint codes only while something is genuinely reading. `armed`
+        // alone is not enough: a lockout lives on the gate, not in the
+        // config, so any unrelated config write would otherwise put
+        // "reply with this code" back on every page while the reader was
+        // stopped. `apply` above has already cleared a lockout if this
+        // write was the owner's off-and-on, so asking afterwards gives the
+        // post-recovery answer.
+        minter.setArmed(armed && !gate.isLockedOut)
+
+        if let existing = replySubscriber {
+            existing.apply(endpoint: endpoint, enabled: armed)
+        } else {
+            let notifierForDenials = remote
+            let subscriber = RemoteInboxSubscriber(
+                endpoint: endpoint,
+                enabled: armed,
+                trace: trace,
+                onDenied: { status in
+                    // The two halves fail independently, and that is what
+                    // makes this page possible at all: the endpoint is
+                    // refusing the READ while the POST still works, so the
+                    // owner can be told on the channel that has stopped
+                    // carrying their replies.
+                    _ = await notifierForDenials.postRemoteReplyInboxDenied(status: status)
+                }
+            ) { [weak gate] message in
+                await gate?.accept(message)
+            }
+            replySubscriber = subscriber
+            subscriber.start()
+        }
+        trace.emit(
+            "remote",
+            "remote.reply_armed=\(armed) switch=\(config.remoteReplyEnabled) outbound=\(config.remoteNotifyEnabled) endpoint=\(endpoint == nil ? "none" : "ntfy")"
         )
     }
 
@@ -2123,8 +2376,12 @@ MainActor.assumeIsolated {
 /// UNNotificationDismissActionIdentifier with the flag row id in userInfo.
 /// Honesty rule: only the unambiguous dismiss is recorded — a plain tap
 /// (default action) opens the app, which is engagement, not approval, so it is
-/// deliberately NOT written. The write goes through markUserResponseIfUnset so
-/// a banner dismissal never overwrites an explicit panel response. `nonisolated`
+/// deliberately NOT written. v0.4.2 feature 4b hangs the remote-reply code
+/// retirement off the same unambiguous dismiss, for the same reason: the
+/// question that page asked is closed, so the code that answered it must stop
+/// working rather than stay live for the rest of its hour. The write goes
+/// through markUserResponseIfUnset so a banner dismissal never overwrites an
+/// explicit panel response. `nonisolated`
 /// + hop-to-MainActor is the standard way to satisfy the SDK's nonisolated
 /// delegate requirement from a main-actor app delegate (PR #45's pattern).
 extension SupervisorAppDelegate: UNUserNotificationCenterDelegate {
@@ -2149,6 +2406,12 @@ extension SupervisorAppDelegate: UNUserNotificationCenterDelegate {
                   response.actionIdentifier == UNNotificationDismissActionIdentifier,
                   let flagId = content.userInfo[Notifier.flagIdUserInfoKey] as? String {
             Task { @MainActor in
+                // The remote-reply code dies FIRST, and unconditionally.
+                // It is in-memory state with no failure mode, while the
+                // store write below can throw; ordering it after would let
+                // a locked database leave a live write handle into the
+                // session on a publicly readable topic.
+                self.hoverVM?.noteFlagBannerDismissed(flagId: flagId)
                 guard let store = self.flagStore else { return }
                 do {
                     try store.markUserResponseIfUnset(flagId: flagId, response: .dismissed)

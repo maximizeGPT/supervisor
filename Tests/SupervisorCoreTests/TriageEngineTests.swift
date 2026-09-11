@@ -501,6 +501,18 @@ final class TriageEngineTests: XCTestCase {
         // Trace assertions: new tag fires; old router degraded-inject
         // tag does NOT fire (because the action was downgraded before
         // the router saw it).
+        //
+        // Drain the write queue first. `TraceLog.emit` is queue.async, and
+        // both tags below are emitted from evaluateAssistantText() BEFORE
+        // onDecision fires, so waiting on `captured.waitFor` only proves the
+        // decision landed, not that its trace lines reached disk. Reading
+        // the file straight after the wait is a race the full suite (and
+        // this test run in isolation) loses under load: both assertions
+        // below failed against an EMPTY trace at a measured ~35% rate,
+        // which reads like the engine skipped the tags rather than a flush
+        // that had not landed yet. `sync()` exists for exactly this (see
+        // the same fix in ProcessLocatorTests).
+        trace.sync()
         let traceText = (try? String(contentsOf: traceURL, encoding: .utf8)) ?? ""
         XCTAssertTrue(traceText.contains("assistant_text.no_cwd_session_start_not_seen"),
                       "engine must emit the discriminating cache-miss trace tag")

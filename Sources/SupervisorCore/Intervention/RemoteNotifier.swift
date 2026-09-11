@@ -209,6 +209,24 @@ public struct RemoteWebhookURL: Sendable, Equatable {
     }
 }
 
+/// Mints the correlation code a page carries so the owner can answer it.
+///
+/// A seam rather than a direct dependency on `ReplyCorrelationTable` so the
+/// notifier keeps knowing nothing about the inbound half: it asks for a code
+/// when it is about to page, prints whatever it gets, and a nil means the
+/// page simply does not offer a reply. Nothing about the outbound path
+/// changes when the inbound half is off, which is the state almost every
+/// install is in.
+public protocol ReplyCodeMinting: Sendable {
+    func mintReplyCode(
+        sessionId: String,
+        cwd: String?,
+        branch: String?,
+        outcomeKind: String,
+        flagId: String?
+    ) -> String?
+}
+
 public final class RemoteNotifier: Notifying, @unchecked Sendable {
 
     /// Live-reloadable knobs. Everything here can change while the app runs,
@@ -269,6 +287,10 @@ public final class RemoteNotifier: Notifying, @unchecked Sendable {
     private let redactor: any Redactor
     private let trace: TraceLog
     private let now: @Sendable () -> Date
+    /// Optional, and nil for every install that has not armed the inbound
+    /// reply channel. Set means "print a reply code on pages that carry
+    /// one"; it can never cause a POST that would not otherwise happen.
+    private let replyCodeMinter: (any ReplyCodeMinting)?
 
     private let lock = NSLock()
     private var configuration: Configuration
@@ -334,10 +356,12 @@ public final class RemoteNotifier: Notifying, @unchecked Sendable {
         transport: any RemoteNotifyTransport = URLSessionRemoteNotifyTransport(),
         redactor: any Redactor = DefaultRedactor(),
         trace: TraceLog = .shared,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        replyCodeMinter: (any ReplyCodeMinting)? = nil
     ) {
         self.endpoint = endpoint
         self.configuration = configuration
+        self.replyCodeMinter = replyCodeMinter
         self.transport = transport
         self.redactor = redactor
         self.trace = trace
@@ -399,7 +423,11 @@ public final class RemoteNotifier: Notifying, @unchecked Sendable {
         return endpoint != nil
     }
 
-    private var currentEndpoint: RemoteWebhookURL? {
+    /// The endpoint as a value. Public because the inbound reply channel
+    /// derives its topic from the SAME URL rather than storing a second
+    /// copy of it (see `RemoteReplyEndpoint.derive`), and `RemoteWebhookURL`
+    /// is already the type that refuses to print itself.
+    public var currentEndpoint: RemoteWebhookURL? {
         lock.lock(); defer { lock.unlock() }
         return endpoint
     }
@@ -469,12 +497,26 @@ public final class RemoteNotifier: Notifying, @unchecked Sendable {
         }
         defer { releaseInFlight(key) }
 
+        // Mint the reply code here and not earlier: every gate above can
+        // still refuse this page, and a code minted for a page that is
+        // never sent is a live code nobody has seen, which is a code an
+        // attacker could guess into. Minting after the last gate means
+        // every live code corresponds to a page that was at least
+        // attempted.
+        let replyCode = replyCodeMinter?.mintReplyCode(
+            sessionId: decision.sessionId,
+            cwd: decision.cwd,
+            branch: decision.branch,
+            outcomeKind: kind,
+            flagId: decision.flagId
+        )
         let payload = RemoteNotifyPayload.compose(
             decision: decision,
             outcome: outcome,
             reason: reason,
             detail: config.detail,
-            redactor: redactor
+            redactor: redactor,
+            replyCode: replyCode
         )
         let wire: RemoteNotifyPayload.WireBody
         do {
